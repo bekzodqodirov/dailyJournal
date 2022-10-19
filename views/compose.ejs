@@ -1,0 +1,16 @@
+<%- include("header"); -%>
+<h1><strong>Compose</strong></h1>
+
+<form action="/compose" method="post">
+    <div class="input-group col-lg-12">
+    <span class="input-group-text"><strong>Title</strong></span> 
+    <input type="text" class="form-control" name="title"><br>   
+
+    <span class="input-group-text"><strong>Post</strong></span>
+    <textarea class="form-control " aria-label="With textarea" rows="10" name="post"></textarea>
+    </div>
+    <button type="submit" type="button" class="btn btn-primary">Publish</button>
+
+</form>
+
+<%- include("footer"); -%>
