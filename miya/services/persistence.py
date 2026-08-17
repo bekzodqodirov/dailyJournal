@@ -79,6 +79,10 @@ async def _apply_settlement(
     A repayment larger than the outstanding balance is recorded in full against
     the last debt rather than dropped — the owner said it happened.
     """
+    # The session runs with autoflush=False, so without this flush a second
+    # settlement in the same extraction would not see the first one's payment
+    # rows or status changes and would pay the same debt again.
+    await session.flush()
     debts = list(
         await session.scalars(
             sa.select(Debt)

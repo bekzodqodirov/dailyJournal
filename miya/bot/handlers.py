@@ -1,4 +1,12 @@
-"""Assistant bot handlers (spec §7A). Owner-only — every other user is ignored."""
+"""Assistant bot handlers (spec §7A). Owner-only — every other user is ignored.
+
+Ordering rule for every content handler: **commit first, reply second.** The
+reply goes out only after `session_scope` has committed, and it is best-effort
+— a Telegram failure (network, flood limit) must never roll back ingested data
+or, worse, lose the owner's message entirely. Pre-ingest Telegram calls
+(`send_chat_action`, downloads) are equally best-effort or guarded so an API
+hiccup cannot kill the handler before anything reached the database.
+"""
 
 from __future__ import annotations
 
@@ -46,65 +54,101 @@ def _media_path(suffix: str) -> Path:
     return settings.media_dir / f"{stamp}-{uuid.uuid4().hex[:8]}{suffix}"
 
 
-async def _ingest_and_reply(message: Message, interaction, session) -> None:
-    result = await process_interaction(session, interaction)
-    if not result.ok:
-        await message.answer(replies.FAILED_EXTRACTION_HINT)
+async def _safe_answer(message: Message, text: str | None) -> None:
+    """Reply after the data is durable; a failed send only costs the receipt."""
+    if not text:
         return
-    await message.answer(replies.confirmation(result.applied))
+    try:
+        await message.answer(text)
+    except Exception:
+        log.exception("could not send reply to owner (data is committed)")
+
+
+async def _typing(message: Message) -> None:
+    try:
+        await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    except Exception:
+        log.debug("send_chat_action failed", exc_info=True)
+
+
+async def _download(bot: Bot, message: Message, media, path: Path) -> bool:
+    """Fetch a file from Telegram; on failure tell the owner instead of dying."""
+    try:
+        await bot.download(media, destination=path)
+        return True
+    except Exception:
+        log.exception("could not download media from Telegram")
+        await _safe_answer(
+            message, "⚠️ Faylni yuklab bo'lmadi — qaytadan yuborib ko'ring."
+        )
+        return False
+
+
+# --- commands ---------------------------------------------------------------
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(replies.HELP)
+    await _safe_answer(message, replies.HELP)
 
 
 @router.message(Command("yordam", "help"))
 async def cmd_help(message: Message) -> None:
-    await message.answer(replies.HELP)
+    await _safe_answer(message, replies.HELP)
 
 
 @router.message(Command("qarz"))
 async def cmd_debts(message: Message) -> None:
     async with session_scope() as session:
         balances = await queries.open_debts(session)
-    await message.answer(replies.debts_report(balances))
+    await _safe_answer(message, replies.debts_report(balances))
 
 
 @router.message(Command("vada", "va_da"))
 async def cmd_promises(message: Message) -> None:
     async with session_scope() as session:
         items = await queries.open_promises(session)
-    await message.answer(replies.promises_report(items))
+    await _safe_answer(message, replies.promises_report(items))
 
 
 @router.message(Command("bugun"))
 async def cmd_today(message: Message) -> None:
     async with session_scope() as session:
         summary = await queries.day_summary(session)
-    await message.answer(replies.day_report(summary))
+    await _safe_answer(message, replies.day_report(summary))
+
+
+@router.message(Command("tekshir"))
+async def cmd_review(message: Message) -> None:
+    async with session_scope() as session:
+        flagged, total = await queries.flagged_interactions(session)
+        body = replies.review_report(flagged, total)
+    await _safe_answer(message, body)
 
 
 @router.message(Command("kim"))
 async def cmd_person(message: Message, command: CommandObject) -> None:
     name = (command.args or "").strip()
     if not name:
-        await message.answer("Ism yozing: <code>/kim Akmal</code>")
+        await _safe_answer(message, "Ism yozing: <code>/kim Akmal</code>")
         return
 
     async with session_scope() as session:
         people = list(await session.scalars(sa.select(Person)))
         person, score = best_match(name, people)
         if person is None or score < 70:
-            await message.answer(f"❓ <b>{name}</b> topilmadi.")
-            return
-        summary = await queries.person_summary(session, person)
-    await message.answer(replies.person_report(summary))
+            body = replies.person_not_found(name)
+        else:
+            body = replies.person_report(await queries.person_summary(session, person))
+    await _safe_answer(message, body)
+
+
+# --- content ----------------------------------------------------------------
 
 
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await _typing(message)
     async with session_scope() as session:
         interaction = await create_interaction(
             session,
@@ -113,16 +157,23 @@ async def on_text(message: Message) -> None:
             text=message.text,
             occurred_at=message.date.astimezone(settings.tz),
         )
-        await _ingest_and_reply(message, interaction, session)
+        result = await process_interaction(session, interaction)
+        reply = (
+            replies.confirmation(result.applied)
+            if result.ok
+            else replies.FAILED_EXTRACTION_HINT
+        )
+    await _safe_answer(message, reply)
 
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message, bot: Bot) -> None:
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await _typing(message)
     media = message.voice or message.audio
     suffix = ".ogg" if message.voice else ".mp3"
     path = _media_path(suffix)
-    await bot.download(media, destination=path)
+    if not await _download(bot, message, media, path):
+        return
 
     async with session_scope() as session:
         interaction = await create_interaction(
@@ -143,20 +194,25 @@ async def on_voice(message: Message, bot: Bot) -> None:
         )
         text = await transcribe_into(session, interaction, path)
         if text is None:
-            await message.answer(
-                "⚠️ Ovozni matnga o'girib bo'lmadi. Fayl saqlandi, keyinroq urinaman."
+            reply = replies.TRANSCRIPTION_FAILED_HINT
+        else:
+            interaction.media = {**(interaction.media or {}), "processed": True}
+            result = await process_interaction(session, interaction)
+            reply = (
+                replies.confirmation(result.applied)
+                if result.ok
+                else replies.FAILED_EXTRACTION_HINT
             )
-            return
-        interaction.media = {**(interaction.media or {}), "processed": True}
-        await _ingest_and_reply(message, interaction, session)
+    await _safe_answer(message, reply)
 
 
 @router.message(F.photo)
 async def on_photo(message: Message, bot: Bot) -> None:
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    await _typing(message)
     photo = message.photo[-1]  # highest resolution
     path = _media_path(".jpg")
-    await bot.download(photo, destination=path)
+    if not await _download(bot, message, photo, path):
+        return
 
     async with session_scope() as session:
         interaction = await create_interaction(
@@ -176,17 +232,31 @@ async def on_photo(message: Message, bot: Bot) -> None:
         # Photos sent straight to the bot are always vision-processed (spec §6).
         described = await describe_into(session, interaction, path)
         if described is None and not message.caption:
-            await message.answer("⚠️ Rasmni o'qib bo'lmadi. Saqlandi, keyinroq urinaman.")
-            return
-        interaction.media = {**(interaction.media or {}), "processed": True}
-        await _ingest_and_reply(message, interaction, session)
+            reply = replies.PHOTO_FAILED_HINT
+        else:
+            interaction.media = {**(interaction.media or {}), "processed": True}
+            result = await process_interaction(session, interaction)
+            if not result.ok:
+                reply = replies.FAILED_EXTRACTION_HINT
+            elif described is None:
+                # The caption was extracted, but the image itself was not read —
+                # the owner must not be told everything succeeded.
+                reply = (
+                    replies.confirmation(result.applied)
+                    + "\n"
+                    + replies.VISION_PARTIAL_HINT
+                )
+            else:
+                reply = replies.confirmation(result.applied)
+    await _safe_answer(message, reply)
 
 
 @router.message(F.video_note | F.video | F.document | F.sticker)
 async def on_unsupported(message: Message) -> None:
-    await message.answer(
+    await _safe_answer(
+        message,
         "📎 Bu turdagi fayl hozircha qo'llab-quvvatlanmaydi — "
-        "keyingi bosqichda qo'shiladi."
+        "keyingi bosqichda qo'shiladi.",
     )
 
 

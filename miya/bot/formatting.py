@@ -139,3 +139,21 @@ def bullet_list(lines: list[str], *, empty: str) -> str:
     if not lines:
         return empty
     return "\n".join(f"• {line}" for line in lines)
+
+
+# Telegram rejects messages over 4096 chars; leave margin for the HTML tags.
+TELEGRAM_LIMIT = 3900
+
+
+def clip(text: str, *, limit: int = TELEGRAM_LIMIT) -> str:
+    """Hard-cap a message body so one oversized reply can never fail to send.
+
+    Cuts on a line boundary where possible, so an open HTML tag is not split
+    mid-entity (all our markup is single-line).
+    """
+    if len(text) <= limit:
+        return text
+    cut = text.rfind("\n", 0, limit)
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut] + "\n…<i>(qisqartirildi)</i>"

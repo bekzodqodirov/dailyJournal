@@ -67,8 +67,10 @@ async def collect_due(
     due = await queries.due_items(session, horizon_days=horizon_days)
 
     for balance in due["debts"]:
-        # A balance spans several debt rows, so key on person + currency.
-        ref = f"{balance.person.id}:{balance.currency.value}"
+        # A balance spans several debt rows, so key on person + direction +
+        # currency. Direction matters: "they owe me" and "I owe them" are two
+        # different reminders, and one must not suppress the other for 24h.
+        ref = f"{balance.person.id}:{balance.direction.value}:{balance.currency.value}"
         if await _already_sent(session, "debt", ref, now):
             continue
         bundle.debts.append(balance)

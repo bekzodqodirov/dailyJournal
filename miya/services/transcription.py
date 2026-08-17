@@ -82,12 +82,21 @@ class ElevenLabsScribe(Transcriber):
                 f"Scribe returned {response.status_code}: {response.text[:300]}"
             )
 
-        payload = response.json()
-        return Transcript(
-            text=(payload.get("text") or "").strip(),
-            language=payload.get("language_code"),
-            duration=_duration_from_payload(payload),
-        )
+        # Any parsing surprise must surface as TranscriptionError: callers
+        # treat that as "flag needs_review and keep the dedupe hash". A raw
+        # exception here would roll the hash back and re-bill Scribe for the
+        # same file on every sweep.
+        try:
+            payload = response.json()
+            return Transcript(
+                text=(payload.get("text") or "").strip(),
+                language=payload.get("language_code"),
+                duration=_duration_from_payload(payload),
+            )
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise TranscriptionError(
+                f"Scribe returned an unparseable body: {exc}"
+            ) from exc
 
 
 def _duration_from_payload(payload: dict) -> float:

@@ -225,20 +225,43 @@ async def scan_directory(
     return results
 
 
-def purge_old_audio(*, now: datetime | None = None) -> int:
+async def protected_audio_paths(session: AsyncSession) -> set[str]:
+    """Paths whose audio is the only copy of unprocessed owner data.
+
+    A file whose transcription failed (needs_review) or whose interaction was
+    never processed must survive retention — deleting it would destroy raw
+    input the owner has not seen yet, which the spec forbids.
+    """
+    rows = await session.scalars(
+        sa.select(Interaction.media["path"].astext).where(
+            Interaction.media["path"].astext.isnot(None),
+            sa.or_(
+                Interaction.needs_review.is_(True),
+                Interaction.processed.is_(False),
+            ),
+        )
+    )
+    return {p for p in rows if p}
+
+
+async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None) -> int:
     """Delete audio older than AUDIO_RETENTION_DAYS from both media folders.
 
-    Only files are removed — interactions and transcripts stay. Returns the
-    number of files deleted.
+    Only files are removed — interactions and transcripts stay, and audio that
+    is still the sole copy of unreviewed data is skipped. Returns the number
+    of files deleted.
     """
     now_ts = (now or datetime.now(settings.tz)).timestamp()
     cutoff = now_ts - settings.audio_retention_days * 86400
+    protected = await protected_audio_paths(session)
     deleted = 0
     for directory in (Path(settings.call_recordings_dir), settings.media_dir):
         if not directory.is_dir():
             continue
         for path in directory.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
+                continue
+            if str(path) in protected:
                 continue
             try:
                 if path.stat().st_mtime < cutoff:

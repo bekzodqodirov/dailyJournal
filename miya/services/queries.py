@@ -255,3 +255,15 @@ async def upcoming_events(
             .order_by(Event.start_at)
         )
     )
+
+
+async def flagged_interactions(
+    session: AsyncSession, *, limit: int = 10
+) -> tuple[list[Interaction], int]:
+    """Interactions whose processing failed (`/tekshir`): newest first, plus count."""
+    stmt = sa.select(Interaction).where(Interaction.needs_review.is_(True))
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = list(
+        await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
+    )
+    return rows, total or 0

@@ -85,7 +85,8 @@ async def call_scan_job(bot: Bot) -> None:
 
 
 async def retention_job() -> None:
-    await asyncio.to_thread(call_recordings.purge_old_audio)
+    async with session_scope() as session:
+        await call_recordings.purge_old_audio(session)
 
 
 async def run() -> None:

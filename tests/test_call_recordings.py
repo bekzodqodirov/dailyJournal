@@ -274,7 +274,9 @@ async def test_scan_of_a_missing_directory_is_a_quiet_noop(session, monkeypatch)
 # --- retention ---------------------------------------------------------------
 
 
-def test_retention_deletes_only_old_audio(recordings_dir, monkeypatch, tmp_path):
+async def test_retention_deletes_only_old_audio(
+    session, recordings_dir, monkeypatch, tmp_path
+):
     monkeypatch.setattr(settings, "audio_retention_days", 90)
     media_dir = tmp_path / "bot_media"
     media_dir.mkdir()
@@ -287,10 +289,32 @@ def test_retention_deletes_only_old_audio(recordings_dir, monkeypatch, tmp_path)
     old_voice = _write_audio(media_dir, "note.ogg", age_seconds=91 * 86400)
     transcriptless = _write_audio(recordings_dir, "keep.txt", age_seconds=91 * 86400)
 
-    deleted = cr.purge_old_audio()
+    deleted = await cr.purge_old_audio(session)
 
     assert deleted == 2
     assert not old_call.exists()
     assert not old_voice.exists()
     assert new_call.exists()
     assert transcriptless.exists()  # only audio suffixes are touched
+
+
+async def test_retention_spares_audio_awaiting_review(
+    session, recordings_dir, stub_scribe, stub_extract, monkeypatch
+):
+    """A failed transcription's audio is the only copy of that call — keep it."""
+    monkeypatch.setattr(settings, "audio_retention_days", 90)
+    stub_scribe(fail=True)
+    stub_extract()
+    path = _write_audio(
+        recordings_dir, "Call recording Akmal_250101_120000.m4a", age_seconds=120
+    )
+    await cr.scan_directory(session)
+
+    # Age the file past the retention window after ingestion.
+    old = time.time() - 91 * 86400
+    os.utime(path, (old, old))
+
+    deleted = await cr.purge_old_audio(session)
+
+    assert deleted == 0
+    assert path.exists()

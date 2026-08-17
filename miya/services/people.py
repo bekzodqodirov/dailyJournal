@@ -102,6 +102,20 @@ async def resolve_person(
     if not name:
         return None
 
+    # The bot and the call-recording worker are separate processes; without a
+    # lock, two concurrent ingestions naming the same new person both pass the
+    # not-found check and insert duplicates (there is no usable unique
+    # constraint — matching is fuzzy). A transaction-scoped advisory lock on
+    # the normalised name serialises exactly the conflicting pair: the second
+    # writer waits for the first commit and then finds the person it created.
+    await session.execute(
+        sa.select(
+            sa.func.pg_advisory_xact_lock(
+                sa.func.hashtext("miya:person"), sa.func.hashtext(normalise(name))
+            )
+        )
+    )
+
     people = list(await session.scalars(sa.select(Person)))
     person, score = best_match(name, people)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 from miya.bot.formatting import (
     PRIORITY_LABEL,
     bullet_list,
+    clip,
     clock,
     debt_line,
     escape,
@@ -18,8 +19,20 @@ from miya.services.persistence import Applied
 from miya.services.queries import DaySummary, DebtBalance, PersonSummary
 
 FAILED_EXTRACTION_HINT = (
-    "⚠️ Yozib oldim, lekin ma'lumot ajratib bo'lmadi — keyinroq qayta ko'raman."
+    "⚠️ Yozib oldim, lekin ma'lumot ajratib bo'lmadi — /tekshir ro'yxatida turadi."
 )
+
+TRANSCRIPTION_FAILED_HINT = (
+    "⚠️ Ovozni matnga o'girib bo'lmadi. Fayl saqlandi — /tekshir ro'yxatida turadi."
+)
+
+PHOTO_FAILED_HINT = "⚠️ Rasmni o'qib bo'lmadi. Saqlandi — /tekshir ro'yxatida turadi."
+
+VISION_PARTIAL_HINT = (
+    "⚠️ Rasmning o'zini o'qib bo'lmadi — faqat izoh bo'yicha yozdim. "
+    "/tekshir ro'yxatida turadi."
+)
+
 
 HELP = """\
 <b>MIYA</b> — sizning ikkinchi miyangiz.
@@ -32,8 +45,13 @@ qarz, va'da, xarajat va vazifalarni o'zim ajratib olib yozib qo'yaman.
 /vada — ochiq va'dalar
 /bugun — bugungi holat
 /kim &lt;ism&gt; — odam bo'yicha xulosa
+/tekshir — qayta ishlanmagan yozuvlar
 /yordam — shu ro'yxat
 """
+
+
+def person_not_found(name: str) -> str:
+    return f"❓ <b>{escape(name)}</b> topilmadi."
 
 
 def confirmation(applied: Applied) -> str:
@@ -93,7 +111,7 @@ def confirmation(applied: Applied) -> str:
     if applied.facts:
         lines.append(f"🧠 {applied.facts} ta yangi ma'lumot eslab qolindi")
 
-    return "\n".join(lines)
+    return clip("\n".join(lines))
 
 
 def debts_report(balances: list[DebtBalance]) -> str:
@@ -120,7 +138,7 @@ def debts_report(balances: list[DebtBalance]) -> str:
         ]
         blocks.append("<b>Sen qarzdorsan</b>\n" + bullet_list(lines, empty="—"))
 
-    return "\n\n".join(blocks)
+    return clip("\n\n".join(blocks))
 
 
 def promises_report(items) -> str:
@@ -145,7 +163,7 @@ def promises_report(items) -> str:
         blocks.append("<b>Sen va'da bergansan</b>\n" + bullet_list(mine, empty="—"))
     if theirs:
         blocks.append("<b>Senga va'da berishgan</b>\n" + bullet_list(theirs, empty="—"))
-    return "\n\n".join(blocks)
+    return clip("\n\n".join(blocks))
 
 
 def day_report(summary: DaySummary) -> str:
@@ -184,7 +202,7 @@ def day_report(summary: DaySummary) -> str:
         parts.append("🧾 " + ", ".join(counts))
 
     parts.append(f"\n<i>{summary.interactions} ta yozuv</i>")
-    return "\n\n".join(parts)
+    return clip("\n\n".join(parts))
 
 
 def person_report(summary: PersonSummary) -> str:
@@ -225,7 +243,7 @@ def person_report(summary: PersonSummary) -> str:
             f"{clock(last.occurred_at)} · jami {summary.total_interactions} ta"
         )
 
-    return "\n\n".join(parts)
+    return clip("\n\n".join(parts))
 
 
 def reminder(debts, promises, tasks, events) -> str:
@@ -256,4 +274,40 @@ def reminder(debts, promises, tasks, events) -> str:
         lines = [f"{escape(e.title)} · {clock(e.start_at)}" for e in events]
         blocks.append("📅 <b>Yaqin uchrashuvlar</b>\n" + bullet_list(lines, empty="—"))
 
-    return "\n\n".join(blocks)
+    return clip("\n\n".join(blocks))
+
+
+SOURCE_LABEL = {
+    "assistant_bot": "xabar",
+    "telegram_userbot": "telegram",
+    "phone_call": "qo'ng'iroq",
+    "manual": "qo'lda",
+    "receipt_photo": "rasm",
+    "calendar": "kalendar",
+}
+
+
+def review_report(interactions, total: int) -> str:
+    """`/tekshir`: what failed processing and still needs the owner's eye."""
+    if not interactions:
+        return "✅ Qayta ishlanmagan yozuv yo'q."
+
+    lines = []
+    for it in interactions:
+        label = SOURCE_LABEL.get(it.source.value, it.source.value)
+        preview = (it.raw_text or it.transcript or "").strip().replace("\n", " ")
+        if len(preview) > 60:
+            preview = preview[:60] + "…"
+        detail = f" — {escape(preview)}" if preview else ""
+        filename = (it.meta or {}).get("filename")
+        if not preview and filename:
+            detail = f" — {escape(filename)}"
+        lines.append(
+            f"{short_date(it.occurred_at.date())} {clock(it.occurred_at)} · "
+            f"{label}{detail}"
+        )
+
+    header = f"⚠️ <b>{total} ta yozuv qayta ishlanmagan</b>"
+    if total > len(interactions):
+        header += f" (oxirgi {len(interactions)} tasi)"
+    return clip(header + "\n" + bullet_list(lines, empty="—"))
