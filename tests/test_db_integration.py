@@ -22,31 +22,6 @@ from miya.db.enums import (
     InteractionSource,
     PromiseMadeBy,
 )
-from miya.db.session import SessionLocal, engine
-
-pytestmark = pytest.mark.asyncio
-
-
-async def _database_available() -> bool:
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(sa.text("SELECT 1 FROM interactions LIMIT 0"))
-        return True
-    except Exception:
-        return False
-
-
-@pytest.fixture
-async def session():
-    if not await _database_available():
-        pytest.skip("no migrated database reachable at DATABASE_URL")
-    async with SessionLocal() as s:
-        yield s
-        await s.rollback()
-        # Leave the database as we found it.
-        await s.execute(sa.delete(m.Interaction))
-        await s.execute(sa.delete(m.Person))
-        await s.commit()
 
 
 @pytest.fixture

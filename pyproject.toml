@@ -11,7 +11,15 @@ extend-exclude = [".venv", "venv", "alembic/versions"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "C4", "SIM", "RUF"]
-ignore = ["B008"]  # FastAPI's Depends() in defaults
+ignore = [
+    "B008",  # FastAPI's Depends() in argument defaults
+    # This codebase is deliberately multilingual: Cyrillic in the extraction
+    # prompt, Uzbek apostrophes, en dashes in prose. The ambiguous-unicode
+    # rules flag all of it as a typo.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

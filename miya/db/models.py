@@ -365,6 +365,23 @@ class UsageLog(Base):
     __table_args__ = (sa.Index("ix_usage_log_created_at", "created_at"),)
 
 
+class ReminderLog(Base):
+    """One row per reminder actually sent, so nothing is pinged twice in a day."""
+
+    __tablename__ = "reminder_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(sa.Text, nullable=False)  # debt|promise|task|event
+    # Stable key for the thing reminded about: a row id, or "person:currency"
+    # for a debt balance that spans several rows.
+    ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    sent_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.Index("ix_reminder_log_kind_ref_sent", "kind", "ref", "sent_at"),
+    )
+
+
 __all__ = [
     "ChatMonitor",
     "DailyReport",
@@ -375,6 +392,7 @@ __all__ = [
     "Memory",
     "Person",
     "Promise",
+    "ReminderLog",
     "Task",
     "Transaction",
     "UsageLog",

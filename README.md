@@ -7,9 +7,10 @@ reports back in Uzbek.
 
 Owner-facing language is Uzbek. Code, comments and commits are English.
 
-**Status: Phase 0 (skeleton) complete.** The database schema, the internal API,
-Docker Compose and migrations are in place and verified. Nothing ingests data
-yet — that is Phase 1.
+**Status: Phase 1 complete.** The assistant bot captures text, voice and photos;
+Claude Haiku extracts structured facts; debts, promises, transactions, events and
+tasks are persisted and queryable; due reminders go out hourly. Call recordings
+and the passive Telegram reader are Phases 2 and 4.
 
 ---
 
@@ -55,21 +56,27 @@ Requires Docker with Compose v2.
 
 ```bash
 cp .env.example .env      # then fill it in — see "Configuration" below
-make up                   # builds, starts db + api, applies migrations
+make up                   # builds, starts everything, applies migrations
 make health               # {"status":"ok", ...}
+make bot                  # tail the assistant bot's logs
 ```
+
+Before `make up`, fill in at least `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`,
+`ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` and `API_BEARER_TOKEN`. The bot and
+worker refuse to start without a bot token and owner id rather than run
+unrestricted.
 
 `make help` lists every target.
 
 | Target | What it does |
 |---|---|
-| `make up` | Build and start `db` + `api`, then migrate |
+| `make up` | Build and start db, api, bot and worker, then migrate |
 | `make down` | Stop everything (the database volume is kept) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
 | `make psql` | Open a psql shell |
 | `make logs` / `make ps` | Tail logs / show container status |
-| `make bot` / `make worker` | Assistant bot / scheduler (Phase 1) |
+| `make bot` / `make worker` | Tail the assistant bot / scheduler logs |
 | `make test` / `make lint` / `make fmt` | Local dev loop |
 
 ### Local development without Docker
@@ -79,8 +86,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 make test          # schema + API tests; DB tests skip if no database
 ```
 
-The database tests in `tests/test_db_integration.py` skip automatically unless
-`DATABASE_URL` points at a migrated PostgreSQL with the `vector` extension.
+Database-backed tests skip automatically unless `DATABASE_URL` points at a
+migrated PostgreSQL with the `vector` extension. Anthropic and ElevenLabs are
+never called from the test suite — the client is stubbed, so `make test` costs
+nothing and needs no keys.
 
 ---
 
@@ -106,9 +115,62 @@ Credentials in `.env.example` are intentionally blank; blank integer keys
 
 ---
 
+## Using the bot
+
+Send the bot a note, a voice message or a receipt photo and it replies with what
+it recorded:
+
+> **you:** Akmal akaga 5 mln so'm berdim, 25-avgustgacha qaytaradi
+> **MIYA:** 💰 Qarz: → senga 5 mln so'm, muddat: 25-avg
+> 🤝 Va'da: U — 25-avgustda qaytaradi
+
+| Command | What it answers |
+|---|---|
+| `/qarz` | Open balances, split into who owes you and who you owe |
+| `/vada` | Open promises, split into yours and theirs |
+| `/bugun` | Today: money in and out, people spoken to, new debts and promises |
+| `/kim <ism>` | One person: balances, promises, last contact |
+| `/yordam` | The command list |
+
+Reminders arrive on the hour for anything due today, tomorrow, or already
+overdue — once per item per 24 hours, and never inside `QUIET_HOURS`.
+
+---
+
+## How extraction works
+
+1. Text, a Scribe transcript and any vision output are concatenated into one
+   block (`miya/services/ingest.py`).
+2. That block goes to Claude Haiku with a **structured output schema** derived
+   from the Pydantic model in `miya/services/extraction.py`, so the API itself
+   guarantees the response validates. The static system prompt sits behind a
+   cache breakpoint; `CURRENT_DATE` and the message go in the user turn, where
+   they cannot invalidate the cached prefix.
+3. Transport errors, refusals and truncation get one retry with a
+   "valid JSON only" nudge. If that also fails, the interaction is flagged
+   `needs_review` and kept — **the raw input is never lost**.
+4. Names resolve through rapidfuzz against display names and aliases at
+   threshold 85, with honorifics ("aka", "opa") stripped first. A matched
+   person learns the new spelling as an alias.
+5. Debts, promises, transactions, events and tasks are written, each linked to
+   the interaction that produced it. Repayments pay down that person's open
+   debts in the same currency, oldest due date first.
+6. Facts are stored in `memories` without an embedding; Phase 3 backfills them
+   with bge-m3.
+
+> **Prompt caching does not engage yet.** Claude Haiku 4.5 has a 4096-token
+> minimum cacheable prefix and the extraction system prompt is roughly 400
+> tokens, so the breakpoint is a no-op today — caching is silently skipped
+> rather than reported as an error. The cost model in the spec assumes it will
+> help; it will only do so once the prompt grows (few-shot examples, a person
+> glossary) past that floor. `usage_log` records `cache_read_tokens` on every
+> call, so the moment it starts working the numbers will show it.
+
+---
+
 ## Data model
 
-Twelve tables (`miya/db/models.py`, migration `alembic/versions/0001_initial_schema.py`):
+Thirteen tables (`miya/db/models.py`, migrations under `alembic/versions/`):
 
 * **`people`** — display name plus an `aliases` array, so "Akmal aka" and
   "Akmal GZ" resolve to one person. GIN-indexed for fuzzy matching.
@@ -123,6 +185,8 @@ Twelve tables (`miya/db/models.py`, migration `alembic/versions/0001_initial_sch
   `vector_cosine_ops`.
 * **`daily_reports`**, **`usage_log`** — report archive and per-call API cost
   accounting (feeds `/xarajat` in Phase 5).
+* **`reminder_log`** — one row per reminder sent, so nothing is pinged twice
+  within 24 hours.
 
 Invariants enforced by the schema and covered by tests:
 
@@ -181,14 +245,15 @@ messages, never marks chats as read, and never bulk-downloads history — and
 | Phase | Scope | Status |
 |---|---|---|
 | **0** | Repo, Compose, schema + migration, health API, Makefile, README | ✅ done |
-| **1** | Assistant bot, Scribe, Haiku extraction, person resolution, `/qarz` `/vada` `/bugun` `/kim`, reminders | next |
-| **2** | Syncthing share + folder watcher → phone-call interactions | |
+| **1** | Assistant bot, Scribe, Haiku extraction, person resolution, `/qarz` `/vada` `/bugun` `/kim`, reminders | ✅ done |
+| **2** | Syncthing share + folder watcher → phone-call interactions | next |
 | **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | |
 | **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | |
 | **5** | `/xarajat`, purge tooling, backfill, retention jobs | |
 
-Dependencies are added per phase rather than up front — Phase 0 installs only
-FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler.
+Dependencies are added per phase rather than up front. Phase 0 installed
+FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
+`anthropic`, `aiogram` and `rapidfuzz`.
 
 ---
 
@@ -202,14 +267,43 @@ measured, not assumed.
 
 ---
 
-## Verification (Phase 0)
+## Verification
 
-Against PostgreSQL 16.14 with pgvector 0.6.0:
+125 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic and
+ElevenLabs clients are stubbed throughout, so the suite is free and offline.
 
-* `alembic upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly.
-* `alembic check` reports no drift between the models and the migration.
-* Enum labels land as written (`direction` is `in`, not `in_`).
-* Money round-trips as an exact `Decimal`; HNSW cosine search returns the
-  expected row; deleting an interaction cascades to every derived row.
+**Schema and migrations**
+* `upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly, and
+  `alembic check` reports no drift between the models and the migrations.
+* Enum labels land as written (`direction` is `in`, not `in_`); money
+  round-trips as an exact `Decimal`; HNSW cosine search returns the expected
+  row; deleting an interaction cascades to every derived row.
+
+**Extraction**
+* Amounts convert to exact `Decimal` through `str`, never a binary float.
+* Unparseable dates are dropped rather than failing the batch.
+* `CURRENT_DATE` is in the user turn, not the cached system prompt.
+* A transport error retries once with a JSON nudge; two failures surface as an
+  error and flag `needs_review`; a refusal does not retry.
+
+**Money**
+* Balances are `amount` minus payments, per currency, and a settled debt leaves
+  the open list.
+* A partial repayment marks a debt `partially_paid`, a full one settles it, and
+  a repayment spanning several debts is applied oldest due date first.
+* A repayment with no matching debt is surfaced to the owner, not discarded.
+* Repayments never cross currencies.
+
+**Bot**
+* An unset `OWNER_TELEGRAM_ID` locks everyone out rather than opening the bot.
+* A contact name containing HTML is escaped before it reaches Telegram.
+* Uzbek money and date formatting: `5 mln so'm`, `500 ming so'm`, `$300`,
+  `25-avg`, `3 kun kechikdi`.
+
+**Reminders**
+* Quiet hours wrap midnight correctly (23:30–07:30).
+* The same item is not pinged twice within 24 hours, and returns after.
+
+**API**
 * `/health` returns `ok`/200 with a database and `degraded`/503 without one;
   `/v1/config` returns 401 without the bearer token.

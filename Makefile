@@ -11,9 +11,10 @@ env: ## Create .env from .env.example if it does not exist
 	@test -f .env || (cp .env.example .env && echo "Created .env — fill it in before 'make up'")
 
 # --- Docker -----------------------------------------------------------------
-up: env ## Build and start db + api, then run migrations
+up: env ## Build and start everything, then run migrations
 	$(COMPOSE) up -d --build db api
 	$(MAKE) migrate
+	$(COMPOSE) up -d --build bot worker
 	@echo "API: http://127.0.0.1:$${API_PORT:-8000}/health"
 
 down: ## Stop everything (volumes are kept)
@@ -46,11 +47,11 @@ psql: ## Open a psql shell
 	$(COMPOSE) exec db psql -U $${POSTGRES_USER:-miya} -d $${POSTGRES_DB:-miya}
 
 # --- Processes --------------------------------------------------------------
-bot: ## Run the assistant bot (Phase 1)
-	$(COMPOSE) run --rm bot
+bot: ## Tail the assistant bot logs
+	$(COMPOSE) logs -f --tail=100 bot
 
-worker: ## Run the scheduler / worker (Phase 1)
-	$(COMPOSE) run --rm worker
+worker: ## Tail the scheduler logs
+	$(COMPOSE) logs -f --tail=100 worker
 
 shell: ## Shell into the api container
 	$(COMPOSE) run --rm api bash

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import time
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -100,6 +101,15 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def media_dir(self) -> Path:
+        """Where bot-supplied voice notes and photos are kept.
+
+        A sibling of the call-recordings share so both live on the same
+        encrypted volume and share one retention policy.
+        """
+        return Path(self.call_recordings_dir).parent / "bot_media"
 
     @property
     def report_time_parsed(self) -> time:

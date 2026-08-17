@@ -15,3 +15,8 @@ APScheduler==3.11.0
 
 # --- HTTP -------------------------------------------------------------------
 httpx==0.28.1
+
+# --- Phase 1: assistant bot, extraction, person resolution ------------------
+anthropic==0.122.0
+aiogram==3.30.0
+rapidfuzz==3.14.5
