@@ -7,10 +7,12 @@ reports back in Uzbek.
 
 Owner-facing language is Uzbek. Code, comments and commits are English.
 
-**Status: Phase 1 complete.** The assistant bot captures text, voice and photos;
-Claude Haiku extracts structured facts; debts, promises, transactions, events and
-tasks are persisted and queryable; due reminders go out hourly. Call recordings
-and the passive Telegram reader are Phases 2 and 4.
+**Status: Phase 2 complete.** The assistant bot captures text, voice and photos;
+call recordings sync in from the phone via Syncthing and are transcribed and
+extracted like everything else; debts, promises, transactions, events and tasks
+are persisted and queryable; due reminders go out hourly; audio past the
+retention window is deleted nightly. The RAG/report layer and the passive
+Telegram reader are Phases 3 and 4.
 
 ---
 
@@ -168,6 +170,45 @@ overdue — once per item per 24 hours, and never inside `QUIET_HOURS`.
 
 ---
 
+## Call recordings (Syncthing)
+
+The phone's call recordings reach the VPS through Syncthing — device-authenticated,
+end-to-end encrypted sync; no cloud in between.
+
+**One-time pairing:**
+
+1. `make up` starts the `syncthing` container. Open its UI over an SSH tunnel:
+   `ssh -L 8384:127.0.0.1:8384 vps` → http://127.0.0.1:8384. Set a UI password
+   immediately (Actions → Settings → GUI).
+2. Install the Syncthing app on the phone, add the VPS as a remote device
+   (Actions → Show ID on the VPS side; scan the QR from the phone).
+3. On the phone, share the call-recordings folder (on Samsung usually
+   `Internal storage/Recordings/Call`) with the VPS device.
+4. Accept the share in the VPS UI and point it at `/var/syncthing/call_recordings`,
+   **receive-only** — the VPS must never push deletions back to the phone.
+
+**What happens next:** the worker sweeps the folder every minute. A file counts
+as ready when it has an audio extension, is non-empty, is not a Syncthing temp
+file, and has not been modified for 30 seconds. Each ready file is hashed
+(SHA-256) and skipped if that hash was ever ingested — so re-syncs, renames and
+conflict copies never double-bill Scribe. The filename is parsed defensively
+(`Call recording <name-or-number>_YYMMDD_HHMMSS.m4a`); whatever fails to parse
+falls back to the file's mtime and an unlinked person. A phone number in the
+name is matched against `people.phone` on the last 9 digits, so `+998 90
+123-45-67` and `901234567` agree. The audio then flows through the same
+pipeline as a voice note: Scribe transcript → Haiku extraction → rows. When a
+call produces something concrete (a debt, a promise, a transaction) the bot
+sends a short summary; routine calls land silently and appear in the daily
+report (Phase 3).
+
+A transcription failure marks the interaction `needs_review` and keeps the hash
+row, so a broken file is not retried (and re-billed) every minute. The nightly
+retention job (04:15) deletes audio older than `AUDIO_RETENTION_DAYS` from both
+the recordings share and the bot-media folder — interactions and transcripts
+outlive the audio.
+
+---
+
 ## Data model
 
 Thirteen tables (`miya/db/models.py`, migrations under `alembic/versions/`):
@@ -246,8 +287,8 @@ messages, never marks chats as read, and never bulk-downloads history — and
 |---|---|---|
 | **0** | Repo, Compose, schema + migration, health API, Makefile, README | ✅ done |
 | **1** | Assistant bot, Scribe, Haiku extraction, person resolution, `/qarz` `/vada` `/bugun` `/kim`, reminders | ✅ done |
-| **2** | Syncthing share + folder watcher → phone-call interactions | next |
-| **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | |
+| **2** | Syncthing share + folder watcher → phone-call interactions | ✅ done |
+| **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | next |
 | **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | |
 | **5** | `/xarajat`, purge tooling, backfill, retention jobs | |
 

@@ -83,7 +83,6 @@ services:
       - "22000:22000/tcp"
       - "22000:22000/udp"
       - "21027:21027/udp"
-    profiles: ["phase2"]
 
 volumes:
   db_data:

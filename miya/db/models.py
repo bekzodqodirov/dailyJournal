@@ -129,6 +129,12 @@ class Interaction(Base):
             "created_at",
             postgresql_where=sa.text("processed = false"),
         ),
+        # Call-recording dedupe: hash lookups happen once a minute (spec §7C).
+        sa.Index(
+            "ix_interactions_media_sha256",
+            sa.text("(media ->> 'sha256')"),
+            postgresql_where=sa.text("source = 'phone_call'"),
+        ),
     )
 
 
