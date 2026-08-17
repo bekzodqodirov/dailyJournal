@@ -8,13 +8,15 @@ from datetime import datetime
 from typing import Any
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from miya import __version__
 from miya.api.deps import require_token
 from miya.config import settings
 from miya.db.session import engine
+from miya.services.embeddings import EmbeddingError, get_local_embedder
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +88,34 @@ async def config() -> dict[str, Any]:
         "batch_flush_hours": settings.batch_flush_hours,
         "audio_retention_days": settings.audio_retention_days,
     }
+
+
+class EmbedRequest(BaseModel):
+    texts: list[str] = Field(min_length=1, max_length=256)
+
+
+class EmbedResponse(BaseModel):
+    vectors: list[list[float]]
+    model: str
+    dim: int
+
+
+@api.post("/embed", tags=["embeddings"], response_model=EmbedResponse)
+async def embed(body: EmbedRequest) -> EmbedResponse:
+    """Embedding service for the bot and worker (see services/embeddings.py).
+
+    This process is the only one holding bge-m3 in RAM; always the local
+    embedder here, never get_embedder(), or a misconfigured EMBED_SERVICE_URL
+    would make the API proxy to itself forever.
+    """
+    try:
+        vectors = await get_local_embedder().embed(body.texts)
+    except EmbeddingError as exc:
+        log.exception("embed request failed")
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return EmbedResponse(
+        vectors=vectors, model=settings.embed_model, dim=settings.embed_dim
+    )
 
 
 app.include_router(api)

@@ -45,3 +45,34 @@ def test_config_rejects_a_wrong_token(client, monkeypatch):
     monkeypatch.setattr(settings, "api_bearer_token", "s3cret")
     resp = client.get("/v1/config", headers={"Authorization": "Bearer nope"})
     assert resp.status_code == 401
+
+
+def test_embed_endpoint_serves_vectors(client, monkeypatch):
+    from miya.api import main as api_main
+
+    class _Stub:
+        async def embed(self, texts):
+            return [[0.0] * settings.embed_dim for _ in texts]
+
+    monkeypatch.setattr(settings, "api_bearer_token", "s3cret")
+    monkeypatch.setattr(api_main, "get_local_embedder", lambda: _Stub())
+
+    resp = client.post(
+        "/v1/embed",
+        headers={"Authorization": "Bearer s3cret"},
+        json={"texts": ["salom", "yuk"]},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["vectors"]) == 2
+    assert body["dim"] == settings.embed_dim
+
+
+def test_embed_endpoint_requires_auth_and_texts(client, monkeypatch):
+    monkeypatch.setattr(settings, "api_bearer_token", "s3cret")
+    assert client.post("/v1/embed", json={"texts": ["x"]}).status_code == 401
+    resp = client.post(
+        "/v1/embed", headers={"Authorization": "Bearer s3cret"}, json={"texts": []}
+    )
+    assert resp.status_code == 422

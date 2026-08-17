@@ -79,7 +79,12 @@ unrestricted.
 | `make psql` | Open a psql shell |
 | `make logs` / `make ps` | Tail logs / show container status |
 | `make bot` / `make worker` | Tail the assistant bot / scheduler logs |
+| `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make test` / `make lint` / `make fmt` | Local dev loop |
+
+On first start the api container downloads the bge-m3 embedding model (~2 GB,
+cached in a volume). Until it finishes, `/qidir` and semantic search politely
+report that search is not ready yet; everything else works immediately.
 
 ### Local development without Docker
 
@@ -111,6 +116,9 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `USERBOT_ENABLED` | One-flag kill switch for the passive Telegram reader |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
 | `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
+| `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
+| `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
+| `GCAL_CALENDAR_ID`, `GCAL_PULL_MINUTES`, `GCAL_DAYS_AHEAD` | Which calendar, how often, how far ahead |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.
@@ -132,10 +140,22 @@ it recorded:
 | `/vada` | Open promises, split into yours and theirs |
 | `/bugun` | Today: money in and out, people spoken to, new debts and promises |
 | `/kim <ism>` | One person: balances, promises, last contact |
+| `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
+| `/hisobot` | Generate and send today's report right now |
+| `/reja` | Tomorrow's time-blocked plan |
+| `/tekshir` | Inputs whose processing failed and needs the owner's eye |
 | `/yordam` | The command list |
 
+Free-form **questions** (ending in `?` or starting with an interrogative like
+*qancha*, *kim*, *сколько*) are answered instead of logged. Money and debt
+figures in those answers always come from SQL tools — Sonnet only phrases the
+result; it is instructed and structurally unable to invent a number that is
+not in a tool result.
+
 Reminders arrive on the hour for anything due today, tomorrow, or already
-overdue — once per item per 24 hours, and never inside `QUIET_HOURS`.
+overdue — once per item per 24 hours, and never inside `QUIET_HOURS`. The
+daily report lands at `REPORT_TIME` (19:00 Tashkent = 22:00 in China) with the
+day's money, people, debts, completions and tomorrow's plan.
 
 ---
 
@@ -206,6 +226,46 @@ row, so a broken file is not retried (and re-billed) every minute. The nightly
 retention job (04:15) deletes audio older than `AUDIO_RETENTION_DAYS` from both
 the recordings share and the bot-media folder — interactions and transcripts
 outlive the audio.
+
+---
+
+## Memory, reports and calendar
+
+**Long-term memory.** Extraction's `facts` land in `memories` with a NULL
+embedding; a worker job embeds them with bge-m3 (1024-dim, multilingual
+uz/ru/zh) every two minutes and pgvector's HNSW index serves cosine search.
+Only the api container loads the model — the bot and worker call its
+`POST /v1/embed` over the compose network (`EMBED_SERVICE_URL`), so the ~2 GB
+of weights sit in RAM once, not three times.
+
+**RAG chat.** A question to the bot goes to Sonnet with a fixed toolbox:
+`open_debts`, `person_summary`, `spending_summary`, `due_items`,
+`upcoming_events`, `search_memories`, `recent_interactions`. The SQL tools are
+the only source of financial figures; `search_memories` covers contextual
+questions. If the model or a tool fails, the owner gets an honest "try again
+later" instead of a guess.
+
+**Daily report.** At `REPORT_TIME` the worker gathers the day from SQL,
+renders a deterministic data block, and asks Sonnet to phrase it in Uzbek; the
+result is stored in `daily_reports` (upsert per date) and sent to the owner.
+If the Sonnet call fails, the deterministic block itself is stored and sent —
+a report day is never lost. `/hisobot` runs the same path on demand, and
+`/reja` produces the tomorrow plan that also closes the report.
+
+**Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
+Google Cloud Console, save it to `secrets/google_oauth.json`, then
+
+```bash
+ssh -L 8765:127.0.0.1:8765 <vps>     # keep open during the flow
+make gcal-auth                        # prints a URL — open it locally
+```
+
+After the token exists the worker pulls the next `GCAL_DAYS_AHEAD` days every
+`GCAL_PULL_MINUTES` (upsert by `gcal_event_id` — re-pulls update, never
+duplicate) and pushes extracted events that have a concrete future time,
+marked `[MIYA]` in the description. Date-only events (midnight) stay local so
+the calendar isn't spammed with 00:00 entries. Without the token both jobs are
+quiet no-ops.
 
 ---
 
@@ -288,13 +348,14 @@ messages, never marks chats as read, and never bulk-downloads history — and
 | **0** | Repo, Compose, schema + migration, health API, Makefile, README | ✅ done |
 | **1** | Assistant bot, Scribe, Haiku extraction, person resolution, `/qarz` `/vada` `/bugun` `/kim`, reminders | ✅ done |
 | **2** | Syncthing share + folder watcher → phone-call interactions | ✅ done |
-| **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | next |
-| **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | |
+| **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | ✅ done |
+| **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | next |
 | **5** | `/xarajat`, purge tooling, backfill, retention jobs | |
 
 Dependencies are added per phase rather than up front. Phase 0 installed
 FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
-`anthropic`, `aiogram` and `rapidfuzz`.
+`anthropic`, `aiogram` and `rapidfuzz`; Phase 3 added `sentence-transformers`
+(and with it torch, CPU-only) plus the Google Calendar client libraries.
 
 ---
 
@@ -310,8 +371,9 @@ measured, not assumed.
 
 ## Verification
 
-125 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic and
-ElevenLabs clients are stubbed throughout, so the suite is free and offline.
+185 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+ElevenLabs and Google clients are stubbed throughout (the embedder too), so
+the suite is free and offline.
 
 **Schema and migrations**
 * `upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly, and
@@ -347,4 +409,21 @@ ElevenLabs clients are stubbed throughout, so the suite is free and offline.
 
 **API**
 * `/health` returns `ok`/200 with a database and `degraded`/503 without one;
-  `/v1/config` returns 401 without the bearer token.
+  `/v1/config` and `/v1/embed` return 401 without the bearer token.
+
+**Memory and RAG (Phase 3)**
+* NULL-embedding memories are backfilled in batches; pgvector ranks a pinned
+  query vector's neighbours in the expected order.
+* A money question routes through the SQL tool and the exact figure is in the
+  model's context before it answers; an unknown person or a broken tool comes
+  back as an error the model can phrase, never a crash.
+* Question routing: `?` or a leading interrogative goes to RAG; question words
+  mid-sentence stay log entries.
+* The daily report upserts by date, and an Anthropic outage stores and sends
+  the deterministic data block instead of losing the day.
+
+**Google Calendar (Phase 3)**
+* Pulls upsert by `gcal_event_id` — re-pulls change nothing, edits update the
+  row in place, and a pushed event is never re-imported as a duplicate.
+* Pushes carry the `[MIYA]` marker and Tashkent wall-clock times, skip
+  date-only and past events, and a failed insert stays queued for retry.

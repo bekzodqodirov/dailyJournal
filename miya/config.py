@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     # --- Embeddings ---------------------------------------------------------
     embed_model: str = "BAAI/bge-m3"
     embed_dim: int = 1024
+    # When set (bot/worker containers), embedding requests go to the API
+    # process over HTTP so only one process holds the ~2 GB model in RAM.
+    # Empty (api container) means load the model locally.
+    embed_service_url: str = ""
 
     # --- Telegram -----------------------------------------------------------
     assistant_bot_token: str = ""
@@ -64,6 +68,10 @@ class Settings(BaseSettings):
 
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
+    google_token_json: str = "./secrets/google_token.json"
+    gcal_calendar_id: str = "primary"
+    gcal_pull_minutes: int = 30
+    gcal_days_ahead: int = 14
 
     # --- Call recordings ----------------------------------------------------
     call_recordings_dir: str = "/data/call_recordings"

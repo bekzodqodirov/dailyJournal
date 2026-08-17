@@ -22,11 +22,13 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import Message
 
 from miya.bot import replies
+from miya.bot.formatting import clip
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Person
 from miya.db.session import session_scope
-from miya.services import queries
+from miya.services import memories, planner, queries, rag, reports
+from miya.services.embeddings import EmbeddingError, get_embedder
 from miya.services.ingest import (
     create_interaction,
     describe_into,
@@ -60,8 +62,15 @@ async def _safe_answer(message: Message, text: str | None) -> None:
         return
     try:
         await message.answer(text)
+        return
     except Exception:
         log.exception("could not send reply to owner (data is committed)")
+    # Model-composed replies can contain broken HTML; a plain-text retry beats
+    # the owner never seeing the answer at all.
+    try:
+        await message.answer(text, parse_mode=None)
+    except Exception:
+        log.exception("plain-text retry failed too")
 
 
 async def _typing(message: Message) -> None:
@@ -126,6 +135,40 @@ async def cmd_review(message: Message) -> None:
     await _safe_answer(message, body)
 
 
+@router.message(Command("qidir"))
+async def cmd_search(message: Message, command: CommandObject) -> None:
+    query = (command.args or "").strip()
+    if not query:
+        await _safe_answer(message, "Nima qidiray? <code>/qidir bojxona</code>")
+        return
+
+    await _typing(message)
+    try:
+        async with session_scope() as session:
+            hits = await memories.search(session, get_embedder(), query, k=8)
+        body = replies.search_results(hits, query)
+    except EmbeddingError:
+        log.warning("semantic search unavailable", exc_info=True)
+        body = replies.SEARCH_UNAVAILABLE
+    await _safe_answer(message, body)
+
+
+@router.message(Command("hisobot"))
+async def cmd_report(message: Message) -> None:
+    await _typing(message)
+    async with session_scope() as session:
+        content = await reports.generate_report(session)
+    await _safe_answer(message, clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"))
+
+
+@router.message(Command("reja"))
+async def cmd_plan(message: Message) -> None:
+    await _typing(message)
+    async with session_scope() as session:
+        content = await planner.plan_tomorrow(session)
+    await _safe_answer(message, clip(f"📅 <b>Ertangi reja</b>\n\n{content}"))
+
+
 @router.message(Command("kim"))
 async def cmd_person(message: Message, command: CommandObject) -> None:
     name = (command.args or "").strip()
@@ -149,6 +192,24 @@ async def cmd_person(message: Message, command: CommandObject) -> None:
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     await _typing(message)
+    if rag.looks_like_question(message.text):
+        # Questions are answered, not extracted — but they still land in
+        # interactions ("every input lands here"), marked so `/tekshir` and
+        # the extractor both leave them alone.
+        async with session_scope() as session:
+            interaction = await create_interaction(
+                session,
+                source=InteractionSource.assistant_bot,
+                direction=Direction.in_,
+                text=message.text,
+                occurred_at=message.date.astimezone(settings.tz),
+                meta={"kind": "question"},
+            )
+            interaction.processed = True
+            reply = clip(await rag.answer(session, message.text))
+        await _safe_answer(message, reply)
+        return
+
     async with session_scope() as session:
         interaction = await create_interaction(
             session,

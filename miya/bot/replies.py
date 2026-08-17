@@ -40,11 +40,17 @@ HELP = """\
 Menga shunchaki yozing, ovozli xabar yuboring yoki chek rasmini tashlang —
 qarz, va'da, xarajat va vazifalarni o'zim ajratib olib yozib qo'yaman.
 
+Savol bersangiz (masalan, «Akmal menga qancha qarz?») — bazadagi aniq
+raqamlar bilan javob beraman.
+
 <b>Buyruqlar</b>
 /qarz — ochiq qarzlar
 /vada — ochiq va'dalar
 /bugun — bugungi holat
 /kim &lt;ism&gt; — odam bo'yicha xulosa
+/qidir &lt;so'z&gt; — xotiradan qidirish
+/hisobot — kunlik hisobot
+/reja — ertangi reja
 /tekshir — qayta ishlanmagan yozuvlar
 /yordam — shu ro'yxat
 """
@@ -275,6 +281,24 @@ def reminder(debts, promises, tasks, events) -> str:
         blocks.append("📅 <b>Yaqin uchrashuvlar</b>\n" + bullet_list(lines, empty="—"))
 
     return clip("\n\n".join(blocks))
+
+
+def search_results(hits, query: str) -> str:
+    """`/qidir`: raw semantic hits — no LLM, just what memory holds."""
+    if not hits:
+        return f"🔍 <b>{escape(query)}</b> bo'yicha xotirada hech narsa topilmadi."
+
+    lines = [
+        f"{short_date(h.memory.occurred_at.date())} · {escape(h.memory.content)}"
+        for h in hits
+    ]
+    return clip(f"🔍 <b>{escape(query)}</b>\n" + bullet_list(lines, empty="—"))
+
+
+SEARCH_UNAVAILABLE = (
+    "⚠️ Qidiruv hozircha ishlamayapti (embedding xizmati tayyor emas) — "
+    "birozdan keyin qayta urinib ko'ring."
+)
 
 
 SOURCE_LABEL = {

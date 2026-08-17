@@ -257,6 +257,134 @@ async def upcoming_events(
     )
 
 
+@dataclass(slots=True)
+class SpendingSummary:
+    date_from: date
+    date_to: date  # inclusive
+    income: dict[Currency, Decimal] = field(default_factory=dict)
+    expense: dict[Currency, Decimal] = field(default_factory=dict)
+    by_category: list[tuple[str, Currency, Decimal]] = field(default_factory=list)
+    biggest: list[Transaction] = field(default_factory=list)
+
+
+async def spending_summary(
+    session: AsyncSession, date_from: date, date_to: date
+) -> SpendingSummary:
+    """Income/expense over a local date range, inclusive on both ends."""
+    start, _ = day_bounds(date_from)
+    _, end = day_bounds(date_to)
+    summary = SpendingSummary(date_from=date_from, date_to=date_to)
+
+    totals = await session.execute(
+        sa.select(Transaction.type, Transaction.currency, sa.func.sum(Transaction.amount))
+        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .group_by(Transaction.type, Transaction.currency)
+    )
+    for txn_type, currency, total in totals.all():
+        bucket = summary.income if txn_type.value == "income" else summary.expense
+        bucket[currency] = total
+
+    categories = await session.execute(
+        sa.select(
+            sa.func.coalesce(Transaction.category, "other"),
+            Transaction.currency,
+            sa.func.sum(Transaction.amount).label("total"),
+        )
+        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(Transaction.type == "expense")
+        .group_by(Transaction.category, Transaction.currency)
+        .order_by(sa.desc("total"))
+        .limit(10)
+    )
+    summary.by_category = [(c, cur, total) for c, cur, total in categories.all()]
+
+    summary.biggest = list(
+        await session.scalars(
+            sa.select(Transaction)
+            .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+            .where(Transaction.type == "expense")
+            .order_by(Transaction.amount.desc())
+            .limit(5)
+        )
+    )
+    return summary
+
+
+async def events_between(
+    session: AsyncSession, start: datetime, end: datetime
+) -> list[Event]:
+    """Planned events in [start, end), soonest first."""
+    return list(
+        await session.scalars(
+            sa.select(Event)
+            .where(Event.status == "planned")
+            .where(Event.start_at >= start, Event.start_at < end)
+            .order_by(Event.start_at)
+        )
+    )
+
+
+@dataclass(slots=True)
+class CompletedToday:
+    settled_debts: list[Debt] = field(default_factory=list)
+    done_promises: list[Promise] = field(default_factory=list)
+    done_tasks: list[Task] = field(default_factory=list)
+
+
+async def completed_on(session: AsyncSession, day: date) -> CompletedToday:
+    """What got closed out on one local day (for the daily report)."""
+    start, end = day_bounds(day)
+    return CompletedToday(
+        settled_debts=list(
+            await session.scalars(
+                sa.select(Debt).where(
+                    Debt.settled_at.isnot(None),
+                    Debt.settled_at >= start,
+                    Debt.settled_at < end,
+                )
+            )
+        ),
+        done_promises=list(
+            await session.scalars(
+                sa.select(Promise).where(
+                    Promise.status == PromiseStatus.done,
+                    Promise.completed_at >= start,
+                    Promise.completed_at < end,
+                )
+            )
+        ),
+        done_tasks=list(
+            await session.scalars(
+                sa.select(Task).where(
+                    Task.status == TaskStatus.done,
+                    Task.completed_at >= start,
+                    Task.completed_at < end,
+                )
+            )
+        ),
+    )
+
+
+async def recent_interactions(
+    session: AsyncSession,
+    *,
+    person_id: int | None = None,
+    days: int = 7,
+    limit: int = 20,
+) -> list[Interaction]:
+    """Recent interaction summaries, newest first (RAG context)."""
+    since = datetime.now(settings.tz) - timedelta(days=days)
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.occurred_at >= since)
+        .order_by(Interaction.occurred_at.desc())
+        .limit(limit)
+    )
+    if person_id is not None:
+        stmt = stmt.where(Interaction.person_id == person_id)
+    return list(await session.scalars(stmt))
+
+
 async def flagged_interactions(
     session: AsyncSession, *, limit: int = 10
 ) -> tuple[list[Interaction], int]:

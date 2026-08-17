@@ -3,7 +3,11 @@
 Jobs:
   * reminders    — hourly, on the hour; quiet-hours aware (Phase 1)
   * call_scan    — every minute; ingests new call recordings (Phase 2)
-  * retention    — daily at 04:00; deletes audio past AUDIO_RETENTION_DAYS
+  * retention    — daily at 04:15; deletes audio past AUDIO_RETENTION_DAYS
+  * embed        — every 2 min; backfills bge-m3 vectors for new memories
+  * daily_report — cron at REPORT_TIME; composes and sends the day's report
+  * gcal_pull    — every GCAL_PULL_MINUTES; Google → events (when authed)
+  * gcal_push    — every 5 min; extracted events → Google (when authed)
 """
 
 from __future__ import annotations
@@ -21,9 +25,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import replies
+from miya.bot.formatting import clip
 from miya.config import settings
 from miya.db.session import engine, session_scope
-from miya.services import call_recordings, reminders
+from miya.services import call_recordings, gcal, memories, reminders, reports
+from miya.services.embeddings import EmbeddingError, get_embedder
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +95,56 @@ async def retention_job() -> None:
         await call_recordings.purge_old_audio(session)
 
 
+async def embed_job() -> None:
+    """Backfill embeddings for memories created since the last tick."""
+    async with session_scope() as session:
+        try:
+            embedded = await memories.embed_pending(session, get_embedder())
+        except EmbeddingError as exc:
+            # Rows stay NULL and are retried next tick; typical cause is the
+            # api container still downloading/loading the model.
+            log.warning("embedding backfill failed, will retry: %s", exc)
+            return
+    if embedded:
+        log.info("embedded %d new memories", embedded)
+
+
+async def report_job(bot: Bot) -> None:
+    """Compose, store and deliver the daily report (cron at REPORT_TIME)."""
+    async with session_scope() as session:
+        content = await reports.generate_report(session)
+    # The report is committed before the send: a Telegram failure costs the
+    # notification, never the report itself (`/hisobot` re-reads it).
+    try:
+        await bot.send_message(
+            settings.owner_telegram_id,
+            clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"),
+        )
+    except Exception:
+        log.exception("could not deliver the daily report")
+
+
+async def gcal_pull_job() -> None:
+    api = gcal.get_api()
+    if api is None:
+        log.debug("google calendar not configured — skipping pull")
+        return
+    async with session_scope() as session:
+        changed = await gcal.pull(session, api)
+    if changed:
+        log.info("gcal pull: %d events created/updated", changed)
+
+
+async def gcal_push_job() -> None:
+    api = gcal.get_api()
+    if api is None:
+        return
+    async with session_scope() as session:
+        pushed = await gcal.push_pending(session, api)
+    if pushed:
+        log.info("gcal push: %d events created in Google Calendar", pushed)
+
+
 async def run() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -124,6 +180,38 @@ async def run() -> None:
         retention_job,
         CronTrigger(hour=4, minute=15, timezone=settings.timezone),
         id="retention",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        embed_job,
+        IntervalTrigger(minutes=2),
+        id="embed",
+        max_instances=1,
+        coalesce=True,
+    )
+    report_at = settings.report_time_parsed
+    scheduler.add_job(
+        report_job,
+        CronTrigger(
+            hour=report_at.hour, minute=report_at.minute, timezone=settings.timezone
+        ),
+        args=[bot],
+        id="daily_report",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        gcal_pull_job,
+        IntervalTrigger(minutes=settings.gcal_pull_minutes),
+        id="gcal_pull",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        gcal_push_job,
+        IntervalTrigger(minutes=5),
+        id="gcal_push",
         max_instances=1,
         coalesce=True,
     )

@@ -30,6 +30,8 @@ services:
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets:ro
+      # bge-m3 weights (~2 GB) download once and survive rebuilds.
+      - hf_cache:/root/.cache/huggingface
     # Localhost only — the API is not exposed publicly (spec §10).
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
@@ -44,9 +46,14 @@ services:
     build: .
     restart: on-failure:5
     env_file: .env
+    environment:
+      # Only the api container holds the embedding model in RAM.
+      EMBED_SERVICE_URL: http://api:8000
     depends_on:
       db:
         condition: service_healthy
+      api:
+        condition: service_started
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets:ro
@@ -56,12 +63,17 @@ services:
     build: .
     restart: on-failure:5
     env_file: .env
+    environment:
+      EMBED_SERVICE_URL: http://api:8000
     depends_on:
       db:
         condition: service_healthy
+      api:
+        condition: service_started
     volumes:
       - ./data:/data
-      - ./secrets:/app/secrets:ro
+      # Writable: the Google token file is rewritten on OAuth refresh.
+      - ./secrets:/app/secrets
     command: ["python", "-m", "miya.worker.main"]
 
   syncthing:
@@ -87,3 +99,4 @@ services:
 volumes:
   db_data:
   syncthing_config:
+  hf_cache:

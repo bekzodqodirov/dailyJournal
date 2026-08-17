@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 .PHONY: help env up down restart logs ps health migrate revision downgrade psql \
-        bot worker shell install test lint fmt check
+        bot worker shell install test lint fmt check gcal-auth
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -55,6 +55,10 @@ worker: ## Tail the scheduler logs
 
 shell: ## Shell into the api container
 	$(COMPOSE) run --rm api bash
+
+gcal-auth: ## One-time Google Calendar OAuth (use with: ssh -L 8765:127.0.0.1:8765)
+	$(COMPOSE) run --rm -p 127.0.0.1:8765:8765 -v ./secrets:/app/secrets worker \
+		python -m miya.tools.gcal_auth
 
 # --- Local development ------------------------------------------------------
 install: ## Install dev dependencies into the active virtualenv
