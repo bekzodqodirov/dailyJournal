@@ -180,7 +180,12 @@ day's money, people, debts, completions and tomorrow's plan.
    person learns the new spelling as an alias.
 5. Debts, promises, transactions, events and tasks are written, each linked to
    the interaction that produced it. Repayments pay down that person's open
-   debts in the same currency, oldest due date first.
+   debts **on the side they were made on**, in the same currency, oldest due
+   date first. With a regular supplier the owner is often owed and owing at
+   once, so "Akmal 5 mln qaytardi" must not touch what the owner owes Akmal.
+   When the text genuinely does not say who paid whom and both sides are open,
+   nothing is paid — MIYA asks instead, because a wrong balance is worse than
+   a missing one.
 6. Facts are stored in `memories` without an embedding; Phase 3 backfills them
    with bge-m3.
 
@@ -445,7 +450,7 @@ measured, not assumed.
 
 ## Verification
 
-273 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+280 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -466,6 +471,8 @@ too), so the suite is free and offline.
 **Money**
 * Balances are `amount` minus payments, per currency, and a settled debt leaves
   the open list.
+* A repayment settles the side it was made on; with debts open both ways and
+  no stated direction it settles nothing and asks the owner.
 * A partial repayment marks a debt `partially_paid`, a full one settles it, and
   a repayment spanning several debts is applied oldest due date first.
 * A repayment with no matching debt is surfaced to the owner, not discarded.
@@ -503,6 +510,11 @@ too), so the suite is free and offline.
   date-only and past events, and a failed insert stays queued for retry.
 
 **Userbot, windows and batches (Phase 4)**
+* The whole chain is walked end to end against the real schema: stored
+  messages → window → Batch API → a debt, a promise and a memory on the right
+  person, then a chat purge that leaves nothing behind.
+* An interrupted result stream is replayed on the next poll without
+  re-applying what already landed.
 * The userbot package is parsed by a test that fails if any Telegram-writing
   call (`send_message`, `send_read_acknowledge`, `iter_messages`, …) appears.
 * `USERBOT_ENABLED=false` returns before a client is even constructed; a
