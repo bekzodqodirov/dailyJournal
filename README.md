@@ -364,6 +364,29 @@ Invariants enforced by the schema and covered by tests:
 
 ---
 
+## Internal API
+
+Bound to `127.0.0.1`, bearer-token authenticated, and deliberately thin: every
+route reads through the same services the bot does, so an HTTP client and
+Telegram can never report different balances.
+
+| Route | What it does |
+|---|---|
+| `GET /health` | Liveness + database reachability (public, for healthchecks) |
+| `GET /v1/config` | Effective non-secret configuration |
+| `GET /v1/debts` | Open balances, filterable by `direction` and `person_id` |
+| `POST /v1/debts/{id}/settle` | Record a payment against one debt |
+| `GET /v1/promises` | Open promises |
+| `GET /v1/transactions` | Income/expense totals over `date_from`…`date_to` |
+| `GET /v1/people/{id}/summary` | One person's balances, promises and contact |
+| `POST /v1/ask` | RAG answer (same SQL-first path as the bot) |
+| `POST /v1/report/today` | Generate and store today's report |
+| `GET /v1/plan/tomorrow` | Tomorrow's plan |
+| `GET /v1/usage` | API spend over a range |
+| `POST /v1/embed` | Embedding service for the bot and worker |
+
+---
+
 ## Security
 
 * **The API is bound to `127.0.0.1`.** So is Postgres. Nothing but Syncthing's
@@ -455,7 +478,7 @@ measured, not assumed.
 
 ## Verification
 
-280 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+293 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -495,7 +518,10 @@ too), so the suite is free and offline.
 
 **API**
 * `/health` returns `ok`/200 with a database and `degraded`/503 without one;
-  `/v1/config` and `/v1/embed` return 401 without the bearer token.
+  every `/v1/*` route returns 401 without the bearer token.
+* The HTTP layer and the bot read the same services, and a test asserts they
+  report byte-identical balances — a debt settled over HTTP disappears from
+  the query `/qarz` uses.
 
 **Memory and RAG (Phase 3)**
 * NULL-embedding memories are backfilled in batches; pgvector ranks a pinned
