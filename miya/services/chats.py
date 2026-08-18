@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.db.enums import ChatType
@@ -86,20 +87,33 @@ async def get_monitor(session: AsyncSession, tg_chat_id: int) -> ChatMonitor | N
 
 
 async def ensure_monitor(session: AsyncSession, dialog: DialogInfo) -> ChatMonitor:
-    """Fetch the monitor row for a chat, creating it with spec defaults."""
+    """Fetch the monitor row for a chat, creating it with spec defaults.
+
+    Two messages from a chat MIYA has never seen can be handled concurrently,
+    and `tg_chat_id` is unique — so a plain check-then-insert loses the race
+    with an IntegrityError that would drop a message. An upsert that does
+    nothing on conflict, followed by a read, is safe from either side.
+    """
     monitor = await get_monitor(session, dialog.tg_chat_id)
     if monitor is not None:
         return monitor
-    monitor = ChatMonitor(
-        tg_chat_id=dialog.tg_chat_id,
-        chat_type=dialog.chat_type,
-        title=dialog.title,
-        monitor_enabled=default_monitor_enabled(dialog.chat_type),
-        vision_enabled=False,
-        docs_enabled=True,
+
+    await session.execute(
+        insert(ChatMonitor)
+        .values(
+            tg_chat_id=dialog.tg_chat_id,
+            chat_type=dialog.chat_type,
+            title=dialog.title,
+            monitor_enabled=default_monitor_enabled(dialog.chat_type),
+            vision_enabled=False,
+            docs_enabled=True,
+        )
+        .on_conflict_do_nothing(index_elements=[ChatMonitor.tg_chat_id])
     )
-    session.add(monitor)
     await session.flush()
+    monitor = await get_monitor(session, dialog.tg_chat_id)
+    if monitor is None:  # pragma: no cover - the upsert just guaranteed a row
+        raise RuntimeError(f"chat monitor for {dialog.tg_chat_id} vanished")
     return monitor
 
 

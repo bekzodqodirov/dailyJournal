@@ -22,6 +22,7 @@ import asyncio
 import logging
 import sys
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -35,10 +36,12 @@ from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction
 from miya.db.session import engine, session_scope
 from miya.services import audio, documents
+from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
-from miya.services.ingest import create_interaction, transcribe_into
+from miya.services.ingest import create_interaction
 from miya.services.media_policy import MediaKind, MediaPlan, plan_for
 from miya.services.people import resolve_person
+from miya.services.transcription import TranscriptionError, get_transcriber
 from miya.services.vision import describe_image
 
 log = logging.getLogger(__name__)
@@ -119,22 +122,32 @@ def _file_info(message: object) -> tuple[str | None, int | None, str | None]:
 # --- ingestion ---------------------------------------------------------------
 
 
-async def _apply_plan(
-    session,
-    client: TelegramClient,
-    message: object,
-    interaction: Interaction,
-    plan: MediaPlan,
-    suffix: str,
-) -> None:
-    """Download and process one message's media according to `plan`."""
+@dataclass(slots=True)
+class MediaOutcome:
+    """Result of the slow half of ingestion, computed with no database held."""
+
+    path: Path | None = None
+    audio_path: Path | None = None
+    transcript: object | None = None  # Transcript
+    vision: object | None = None  # VisionResult
+    document: object | None = None  # DocumentText
+    skip_reason: str | None = None
+    failed: bool = False  # download or conversion failed; needs the owner's eye
+
+
+async def fetch_media(
+    client: TelegramClient, message: object, plan: MediaPlan, suffix: str
+) -> MediaOutcome:
+    """Download and process media **outside any transaction**.
+
+    Scribe can take minutes on a long voice message. Doing that inside the
+    ingest transaction would pin a pooled connection and — worse — hold the
+    person-resolution advisory lock the whole time, stalling every other
+    writer in the system. So the slow work happens here, with nothing held,
+    and only the results are persisted afterwards.
+    """
     if not plan.download:
-        if plan.skip_reason:
-            interaction.media = {
-                **(interaction.media or {}),
-                "skipped": plan.skip_reason,
-            }
-        return
+        return MediaOutcome(skip_reason=plan.skip_reason)
 
     path = _media_path(suffix)
     try:
@@ -143,50 +156,98 @@ async def _apply_plan(
         log.exception(
             "could not download media for message %s", getattr(message, "id", "?")
         )
-        interaction.needs_review = True
-        return
+        return MediaOutcome(failed=True)
     if not path.is_file():
-        interaction.needs_review = True
-        return
+        return MediaOutcome(failed=True)
 
-    interaction.media = {**(interaction.media or {}), "path": str(path)}
+    outcome = MediaOutcome(path=path)
 
     if plan.transcribe:
         audio_path = path
         if plan.extract_audio:
             audio_path = path.with_suffix(".mp3")
             if not await audio.extract_audio(path, audio_path):
-                interaction.needs_review = True
-                return
-            interaction.media = {
-                **(interaction.media or {}),
-                "audio_path": str(audio_path),
-            }
-        await transcribe_into(session, interaction, audio_path)
-        return
+                outcome.failed = True
+                return outcome
+            outcome.audio_path = audio_path
+        try:
+            outcome.transcript = await get_transcriber().transcribe(audio_path)
+        except TranscriptionError as exc:
+            log.error("transcription failed for a Telegram message: %s", exc)
+            outcome.failed = True
+        return outcome
 
     if plan.vision:
-        result = await describe_image(path)
-        if result.error:
-            log.warning("vision failed for message: %s", result.error)
-            interaction.needs_review = True
-            return
-        interaction.meta = {**(interaction.meta or {}), "vision": result.text}
-        return
+        outcome.vision = await describe_image(path)
+        return outcome
 
     if plan.read_document:
-        parsed = await documents.read_document_async(path)
-        if parsed is None:
-            interaction.media = {
-                **(interaction.media or {}),
-                "skipped": "unreadable",
+        outcome.document = await documents.read_document_async(path)
+        if outcome.document is None:
+            outcome.skip_reason = "unreadable"
+    return outcome
+
+
+async def persist_media(
+    session, interaction: Interaction, outcome: MediaOutcome
+) -> None:
+    """Write what `fetch_media` produced. Short, and inside one transaction."""
+    media = dict(interaction.media or {})
+    if outcome.skip_reason:
+        media["skipped"] = outcome.skip_reason
+    if outcome.path:
+        media["path"] = str(outcome.path)
+    if outcome.audio_path:
+        media["audio_path"] = str(outcome.audio_path)
+
+    if outcome.failed:
+        interaction.needs_review = True
+
+    if outcome.transcript is not None:
+        interaction.transcript = outcome.transcript.text
+        await usage_service.record_transcription_usage(
+            session,
+            provider=settings.transcriber,
+            model=getattr(get_transcriber(), "model", None),
+            seconds=outcome.transcript.duration,
+            source_interaction_id=interaction.id,
+        )
+        if outcome.transcript.language:
+            interaction.meta = {
+                **(interaction.meta or {}),
+                "asr_language": outcome.transcript.language,
             }
-            return
-        interaction.transcript = parsed.text
+
+    if outcome.vision is not None:
+        if outcome.vision.usage is not None:
+            await usage_service.record_anthropic_usage(
+                session,
+                model=outcome.vision.model,
+                operation="vision",
+                usage=outcome.vision.usage,
+                source_interaction_id=interaction.id,
+            )
+        if outcome.vision.error:
+            log.warning("vision failed for message: %s", outcome.vision.error)
+            interaction.needs_review = True
+        else:
+            interaction.meta = {
+                **(interaction.meta or {}),
+                "vision": outcome.vision.text,
+            }
+
+    if outcome.document is not None:
+        interaction.transcript = outcome.document.text
         interaction.meta = {
             **(interaction.meta or {}),
-            "document": {"truncated": parsed.truncated, "detail": parsed.detail},
+            "document": {
+                "truncated": outcome.document.truncated,
+                "detail": outcome.document.detail,
+            },
         }
+
+    media["processed"] = True
+    interaction.media = media
 
 
 async def _counterparty(session, message, monitor: ChatMonitor):
@@ -247,7 +308,11 @@ async def ingest_message(client: TelegramClient, message) -> bool:
     """
     kind = kind_of(message)
     filename, size, mime = _file_info(message)
+    plan: MediaPlan | None = None
+    interaction_id: int | None = None
 
+    # Transaction 1: decide, dedupe, resolve the person and store the message.
+    # Short by design — see fetch_media().
     async with session_scope() as session:
         chat = await message.get_chat()
         monitor = await ensure_monitor(
@@ -301,11 +366,20 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             media=media,
             meta={"tg_message_id": message.id},
         )
-        if media is not None:
-            await _apply_plan(
-                session, client, message, interaction, plan, _SUFFIX.get(kind, ".bin")
-            )
-            interaction.media = {**(interaction.media or {}), "processed": True}
+        interaction_id = interaction.id
+        if media is None:
+            return True
+
+    # The message is durable now. Everything slow happens with no database
+    # connection and no advisory lock held.
+    outcome = await fetch_media(client, message, plan, _SUFFIX.get(kind, ".bin"))
+
+    # Transaction 2: record what came back.
+    async with session_scope() as session:
+        interaction = await session.get(Interaction, interaction_id)
+        if interaction is None:  # purged while the download ran
+            return True
+        await persist_media(session, interaction, outcome)
     return True
 
 

@@ -7,7 +7,7 @@ and pins the fix.
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import httpx
@@ -18,7 +18,13 @@ from miya.bot import replies
 from miya.bot.formatting import TELEGRAM_LIMIT, clip
 from miya.config import settings
 from miya.db import models as m
-from miya.db.enums import Currency, DebtDirection, DebtStatus
+from miya.db.enums import (
+    Currency,
+    DebtDirection,
+    DebtStatus,
+    Direction,
+    WindowStatus,
+)
 from miya.db.session import SessionLocal
 from miya.services import extraction as ex
 from miya.services import reminders
@@ -336,3 +342,154 @@ async def test_a_one_sided_repayment_still_needs_no_direction(session):
 
     assert debt.status is DebtStatus.settled
     assert applied.ambiguous_settlements == []
+
+
+# --- purge must not resurrect a half-deleted conversation --------------------
+
+
+async def test_a_purged_window_never_resurrects_its_surviving_messages(session):
+    """Repro: a conversation crossing midnight, purged for one of those days.
+
+    The window row went with the second day; the FK nulled the first day's
+    message window_id, and the flush job re-windowed it — re-billing the
+    extraction and recreating the very rows the owner had just deleted.
+    """
+    from miya.db.enums import InteractionSource
+    from miya.services import purge, windows
+
+    now = datetime.now(TZ)
+    base = (now - timedelta(days=2)).replace(hour=23, minute=50, second=0, microsecond=0)
+    for index, when in enumerate([base, base + timedelta(minutes=15)]):
+        session.add(
+            m.Interaction(
+                source=InteractionSource.telegram_userbot,
+                direction=Direction.in_,
+                tg_chat_id=-100999,
+                occurred_at=when,
+                raw_text=f"xabar {index}",
+            )
+        )
+    await session.flush()
+
+    [window] = await windows.flush_ready_windows(session, now=now)
+    window.status = WindowStatus.applied
+    await session.execute(
+        sa.update(m.Interaction)
+        .where(m.Interaction.window_id == window.id)
+        .values(processed=True)
+    )
+    await session.flush()
+    # The window ended on the day after its first message.
+    assert (
+        window.started_at.astimezone(TZ).date() != window.ended_at.astimezone(TZ).date()
+    )
+
+    day = window.ended_at.astimezone(TZ).date()
+    await purge.execute(session, await purge.plan_range(session, day, day))
+    await session.flush()
+
+    survivor = await session.scalar(sa.select(m.Interaction))
+    assert survivor is not None and survivor.window_id is None  # FK nulled it
+    assert await windows.flush_ready_windows(session, now=now) == []
+
+
+# --- every billed attempt is accounted for -----------------------------------
+
+
+async def test_a_retried_extraction_reports_both_billed_calls(monkeypatch):
+    """An attempt that hits max_tokens is charged; it must reach usage_log."""
+    from types import SimpleNamespace
+
+    def _usage(input_tokens, output_tokens):
+        return SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        )
+
+    responses = [
+        SimpleNamespace(
+            stop_reason="max_tokens", usage=_usage(500, 4096), parsed_output=None
+        ),
+        SimpleNamespace(
+            stop_reason="end_turn",
+            usage=_usage(600, 200),
+            parsed_output=ex.ExtractionResult(summary="ok"),
+        ),
+    ]
+
+    class _Stub:
+        def __init__(self):
+            self.messages = self
+
+        async def parse(self, **kwargs):
+            return responses.pop(0)
+
+    monkeypatch.setattr(ex, "get_client", lambda: _Stub())
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert outcome.ok
+    assert outcome.usage.calls == 2
+    assert outcome.usage.input_tokens == 1100  # both attempts, not just the last
+    assert outcome.usage.output_tokens == 4296
+
+
+async def test_two_failed_attempts_still_report_their_cost(monkeypatch):
+    from types import SimpleNamespace
+
+    def _response():
+        return SimpleNamespace(
+            stop_reason="max_tokens",
+            usage=SimpleNamespace(
+                input_tokens=500,
+                output_tokens=4096,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+            ),
+            parsed_output=None,
+        )
+
+    class _Stub:
+        def __init__(self):
+            self.messages = self
+
+        async def parse(self, **kwargs):
+            return _response()
+
+    monkeypatch.setattr(ex, "get_client", lambda: _Stub())
+
+    outcome = await ex.extract("juda uzun matn")
+
+    assert not outcome.ok
+    assert outcome.usage is not None and outcome.usage.calls == 2
+
+
+# --- a brand-new chat seen twice at once -------------------------------------
+
+
+async def test_two_messages_from_a_new_chat_do_not_collide(session):
+    """Telethon can hand us two updates from an unknown chat concurrently."""
+    from miya.db.enums import ChatType
+    from miya.db.session import SessionLocal
+    from miya.services.chats import DialogInfo, ensure_monitor
+
+    dialog = DialogInfo(tg_chat_id=-100555, chat_type=ChatType.group, title="Yangi")
+
+    async def register(delay: float) -> int:
+        await asyncio.sleep(delay)
+        async with SessionLocal() as s:
+            monitor = await ensure_monitor(s, dialog)
+            await s.commit()
+            return monitor.id
+
+    ids = await asyncio.gather(register(0), register(0.01))
+
+    assert ids[0] == ids[1]
+    total = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(m.ChatMonitor)
+        .where(m.ChatMonitor.tg_chat_id == -100555)
+    )
+    assert total == 1

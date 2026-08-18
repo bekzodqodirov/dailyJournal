@@ -107,6 +107,13 @@ async def _unclaimed_by_chat(session: AsyncSession) -> dict[int, list[Interactio
             sa.select(Interaction)
             .where(Interaction.source == InteractionSource.telegram_userbot)
             .where(Interaction.window_id.is_(None))
+            # `processed` is the real guard, not just `window_id`. A window row
+            # can disappear from under its members — `/unut` on a date range
+            # takes the window when its ended_at falls inside but leaves the
+            # messages from the evening before, and the FK nulls their
+            # window_id. Without this those messages would be re-windowed,
+            # re-billed, and would resurrect the very rows the owner deleted.
+            .where(Interaction.processed.is_(False))
             .where(Interaction.tg_chat_id.isnot(None))
             .order_by(Interaction.tg_chat_id, Interaction.occurred_at, Interaction.id)
         )

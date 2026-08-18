@@ -252,6 +252,46 @@ def parse_extraction_json(text: str) -> ExtractionResult | None:
         return None
 
 
+class UsageTally:
+    """Tokens billed across every attempt of one extraction (spec §9).
+
+    A retried extraction is two paid calls, not one: an attempt that hits
+    ``max_tokens`` or fails validation is still charged. Reporting only the
+    last attempt would quietly understate what MIYA costs, so the attempts are
+    summed and recorded as a single usage row.
+    """
+
+    __slots__ = (
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "calls",
+        "input_tokens",
+        "output_tokens",
+    )
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.cache_read_input_tokens = 0
+        self.cache_creation_input_tokens = 0
+        self.calls = 0
+
+    def add(self, usage: object) -> None:
+        if usage is None:
+            return
+        self.calls += 1
+        for field in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
+            setattr(self, field, getattr(self, field) + (getattr(usage, field, 0) or 0))
+
+    def or_none(self) -> UsageTally | None:
+        return self if self.calls else None
+
+
 async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcome:
     """Run one extraction. Never raises — failures come back as `error`."""
     if not text or not text.strip():
@@ -262,6 +302,7 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
     system = extraction_system_block()
     messages = [{"role": "user", "content": build_user_content(text, now=now)}]
 
+    tally = UsageTally()
     last_error: str | None = None
     for attempt in (1, 2):
         if attempt == 2:
@@ -286,9 +327,11 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
             log.warning("extraction attempt %d failed: %s", attempt, last_error)
             continue
 
+        tally.add(response.usage)
+
         if response.stop_reason == "refusal":
             return ExtractionOutcome(
-                error="refusal", model=settings.extract_model, usage=response.usage
+                error="refusal", model=settings.extract_model, usage=tally.or_none()
             )
         if response.stop_reason == "max_tokens":
             last_error = "max_tokens: extraction truncated"
@@ -301,7 +344,12 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
         return ExtractionOutcome(
             result=response.parsed_output,
             model=settings.extract_model,
-            usage=response.usage,
+            usage=tally.or_none(),
         )
 
-    return ExtractionOutcome(error=last_error or "unknown", model=settings.extract_model)
+    return ExtractionOutcome(
+        error=last_error or "unknown",
+        model=settings.extract_model,
+        # Two failed-but-billed attempts still cost money; record them.
+        usage=tally.or_none(),
+    )
