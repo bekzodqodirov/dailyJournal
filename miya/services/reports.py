@@ -17,6 +17,7 @@ import anthropic
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.bot.formatting import escape
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
@@ -80,7 +81,14 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
 
 
 def render_data_block(data: ReportData) -> str:
-    """Deterministic report input — also the no-API fallback report."""
+    """Deterministic report input — also the no-API fallback report.
+
+    Names and descriptions are HTML-escaped here, not later. They come from
+    Telegram contacts and message text, which a counterparty controls: a
+    supplier who sets his first name to "<b" would otherwise produce a report
+    Telegram refuses to render, silently costing the owner his evening summary.
+    Escaping before Sonnet sees the text means the model copies the safe form.
+    """
     s = data.summary
     lines: list[str] = [f"HISOBOT KUNI: {data.day.isoformat()}"]
 
@@ -91,14 +99,14 @@ def render_data_block(data: ReportData) -> str:
         for cur, total in s.expense.items():
             lines.append(f"- chiqim: {format_money(total, cur)}")
         for category, cur, total in s.by_category:
-            lines.append(f"- {category}: {format_money(total, cur)}")
+            lines.append(f"- {escape(category)}: {format_money(total, cur)}")
     else:
         lines.append("- bugun pul harakati yozilmadi")
 
     lines.append("\n👥 MULOQOTLAR:")
     lines.append(f"- jami {s.interactions} ta yozuv")
     for person, n in s.people_seen[:10]:
-        lines.append(f"- {person.display_name}: {n} ta")
+        lines.append(f"- {escape(person.display_name)}: {n} ta")
 
     lines.append("\n🧾 YANGI QARZ/VA'DALAR:")
     if s.new_debts or s.new_promises:
@@ -112,16 +120,18 @@ def render_data_block(data: ReportData) -> str:
     for b in data.due.get("debts", []):
         side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
         lines.append(
-            f"- {b.person.display_name}: "
+            f"- {escape(b.person.display_name)}: "
             f"{format_money(b.outstanding, b.currency)} ({side}, "
             f"muddat: {b.earliest_due})"
         )
         due_lines += 1
     for p, person in data.due.get("promises", []):
-        lines.append(f"- va'da: {person.display_name} — {p.description}")
+        lines.append(
+            f"- va'da: {escape(person.display_name)} — {escape(p.description)}"
+        )
         due_lines += 1
     for t in data.due.get("tasks", []):
-        lines.append(f"- vazifa: {t.description} (muddat: {t.due_date})")
+        lines.append(f"- vazifa: {escape(t.description)} (muddat: {t.due_date})")
         due_lines += 1
     if not due_lines:
         lines.append("- yo'q")
@@ -132,9 +142,9 @@ def render_data_block(data: ReportData) -> str:
         if c.settled_debts:
             lines.append(f"- yopilgan qarzlar: {len(c.settled_debts)} ta")
         for p in c.done_promises:
-            lines.append(f"- va'da bajarildi: {p.description}")
+            lines.append(f"- va'da bajarildi: {escape(p.description)}")
         for t in c.done_tasks:
-            lines.append(f"- vazifa bajarildi: {t.description}")
+            lines.append(f"- vazifa bajarildi: {escape(t.description)}")
     else:
         lines.append("- yo'q")
 

@@ -29,7 +29,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import replies
-from miya.bot.formatting import clip
+from miya.bot.formatting import clip, escape
 from miya.config import settings
 from miya.db.session import engine, session_scope
 from miya.services import (
@@ -45,6 +45,26 @@ from miya.services import (
 from miya.services.embeddings import EmbeddingError, get_embedder
 
 log = logging.getLogger(__name__)
+
+
+async def notify(bot: Bot, text: str) -> bool:
+    """Send to the owner; retry as plain text if Telegram rejects the HTML.
+
+    Report and reminder bodies carry names and descriptions that a
+    counterparty controls, and the report itself is composed by a model. A
+    single stray tag must not silently cost the owner his evening summary.
+    """
+    try:
+        await bot.send_message(settings.owner_telegram_id, clip(text))
+        return True
+    except Exception:
+        log.warning("HTML send failed, retrying as plain text", exc_info=True)
+    try:
+        await bot.send_message(settings.owner_telegram_id, clip(text), parse_mode=None)
+        return True
+    except Exception:
+        log.exception("could not reach the owner at all")
+        return False
 
 
 async def reminder_job(bot: Bot) -> None:
@@ -64,7 +84,8 @@ async def reminder_job(bot: Bot) -> None:
         if not body:
             return
 
-        await bot.send_message(settings.owner_telegram_id, f"⏰ <b>Eslatma</b>\n\n{body}")
+        if not await notify(bot, f"⏰ <b>Eslatma</b>\n\n{body}"):
+            return
         # Recorded only after a successful send, so a failed ping is retried.
         await reminders.mark_sent(session, bundle)
 
@@ -94,13 +115,7 @@ async def call_scan_job(bot: Bot) -> None:
         # a routine call lands silently and shows up in the daily report.
         if result.applied and not result.applied.is_empty():
             body = replies.confirmation(result.applied)
-            try:
-                await bot.send_message(
-                    settings.owner_telegram_id,
-                    f"📞 <b>Qo'ng'iroqdan yozib olindi</b>\n\n{body}",
-                )
-            except Exception:
-                log.exception("could not notify owner about recording %s", filename)
+            await notify(bot, f"📞 <b>Qo'ng'iroqdan yozib olindi</b>\n\n{body}")
 
 
 async def retention_job() -> None:
@@ -128,13 +143,7 @@ async def report_job(bot: Bot) -> None:
         content = await reports.generate_report(session)
     # The report is committed before the send: a Telegram failure costs the
     # notification, never the report itself (`/hisobot` re-reads it).
-    try:
-        await bot.send_message(
-            settings.owner_telegram_id,
-            clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"),
-        )
-    except Exception:
-        log.exception("could not deliver the daily report")
+    await notify(bot, f"📊 <b>Kunlik hisobot</b>\n\n{content}")
 
 
 async def gcal_pull_job() -> None:
@@ -190,13 +199,11 @@ async def backup_job(bot: Bot) -> None:
         return
     # A backup that stopped working is worth waking the owner for — it is the
     # only thing standing between a disk failure and losing everything.
-    try:
-        await bot.send_message(
-            settings.owner_telegram_id,
-            clip(f"⚠️ <b>Zaxira nusxa muvaffaqiyatsiz</b>\n\n<code>{result.error}</code>"),
-        )
-    except Exception:
-        log.exception("could not report the backup failure")
+    await notify(
+        bot,
+        "⚠️ <b>Zaxira nusxa muvaffaqiyatsiz</b>\n\n"
+        f"<code>{escape(result.error or 'unknown')}</code>",
+    )
 
 
 async def run() -> None:

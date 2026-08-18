@@ -7,6 +7,7 @@ and pins the fix.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -493,3 +494,73 @@ async def test_two_messages_from_a_new_chat_do_not_collide(session):
         .where(m.ChatMonitor.tg_chat_id == -100555)
     )
     assert total == 1
+
+
+# --- untrusted text in owner-facing HTML -------------------------------------
+
+
+async def _plain(value):
+    return value
+
+
+async def test_a_hostile_contact_name_cannot_break_the_daily_report(session, monkeypatch):
+    """A Telegram contact picks their own name; it lands in an HTML message."""
+    from miya.services import planner, reports
+
+    # gather() builds tomorrow's plan; keep the model out of this test.
+    monkeypatch.setattr(planner, "plan_for", lambda *a, **k: _plain("REJA"))
+
+    person = await resolve_person(session, "<b>Akmal</b>")
+    interaction = await _interaction(session)
+    interaction.person_id = person.id
+    session.add(
+        m.Promise(
+            made_by="them",
+            person_id=person.id,
+            description="<script>alert(1)</script> to'laydi",
+            due_date=date(2026, 1, 1),
+            source_interaction_id=interaction.id,
+        )
+    )
+    await session.flush()
+
+    data = await reports.gather(session, datetime.now(TZ).date())
+    block = reports.render_data_block(data)
+
+    assert "<b>Akmal</b>" not in block
+    assert "&lt;b&gt;Akmal&lt;/b&gt;" in block
+    assert "<script>" not in block
+
+
+async def test_the_planner_escapes_event_titles_too(session):
+    from miya.services import planner
+
+    session.add(
+        m.Event(
+            title="<i>Bojxona</i>",
+            start_at=datetime.now(TZ) + timedelta(days=1),
+            location="<b>Toshkent</b>",
+            source="extracted",
+            status="planned",
+        )
+    )
+    await session.flush()
+
+    inputs = await planner.plan_inputs(
+        session, (datetime.now(TZ) + timedelta(days=1)).date()
+    )
+    block = planner.render_inputs(inputs)
+
+    assert "<i>Bojxona</i>" not in block
+    assert "&lt;i&gt;Bojxona&lt;/i&gt;" in block
+
+
+async def test_search_results_are_labelled_as_other_peoples_words(session):
+    """Prompt-injection guard: a supplier's text must arrive quoted, not obeyed."""
+    from miya.services import rag
+
+    output = await rag._run_tool(session, None, "recent_interactions", {})
+    payload = json.loads(output)
+
+    assert payload["note"] == rag.UNTRUSTED_NOTE
+    assert "results" in payload

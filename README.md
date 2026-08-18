@@ -478,7 +478,7 @@ measured, not assumed.
 
 ## Verification
 
-302 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+305 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -564,6 +564,11 @@ too), so the suite is free and offline.
 **Cost, purge and backups (Phase 5)**
 * `/xarajat` groups real `usage_log` rows by operation and reports fractions
   of a cent, which `money()` would have rounded away to `$0`.
+* Names and descriptions from Telegram are HTML-escaped before they reach the
+  report or the plan, and every worker notification retries as plain text — a
+  contact who renames himself "<b" cannot silence the evening summary.
+* Search results reaching the RAG loop are labelled as other people's words,
+  so a supplier cannot smuggle instructions or a balance claim into an answer.
 * A purge plan counts exactly what would go before anything is deleted;
   executing removes the person, their debts and promises, every derived row,
   and the media files — while leaving other people untouched.

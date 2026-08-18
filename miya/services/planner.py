@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta
 import anthropic
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.bot.formatting import escape
 from miya.config import settings
 from miya.services import queries
 from miya.services.extraction import get_client
@@ -55,15 +56,19 @@ async def plan_inputs(session: AsyncSession, day: date) -> PlanInputs:
 
 
 def render_inputs(inputs: PlanInputs) -> str:
-    """Deterministic text block: prompt input and the no-API fallback."""
+    """Deterministic text block: prompt input and the no-API fallback.
+
+    Titles, names and descriptions are escaped for the same reason as in
+    reports.py — they are attacker-influenced and end up in an HTML message.
+    """
     lines: list[str] = [f"REJA KUNI: {inputs.day.isoformat()}"]
 
     lines.append("\nBELGILANGAN UCHRASHUVLAR:")
     if inputs.events:
         for ev in inputs.events:
             when = ev.start_at.astimezone(settings.tz).strftime("%H:%M")
-            where = f" ({ev.location})" if ev.location else ""
-            lines.append(f"- {when} — {ev.title}{where}")
+            where = f" ({escape(ev.location)})" if ev.location else ""
+            lines.append(f"- {when} — {escape(ev.title)}{where}")
     else:
         lines.append("- yo'q")
 
@@ -71,7 +76,7 @@ def render_inputs(inputs: PlanInputs) -> str:
     tasks = inputs.due.get("tasks", [])
     if tasks:
         for t in tasks:
-            lines.append(f"- {t.description} (muddat: {t.due_date})")
+            lines.append(f"- {escape(t.description)} (muddat: {t.due_date})")
     else:
         lines.append("- yo'q")
 
@@ -80,7 +85,8 @@ def render_inputs(inputs: PlanInputs) -> str:
     if promises:
         for p, person in promises:
             lines.append(
-                f"- {person.display_name}: {p.description} (muddat: {p.due_date})"
+                f"- {escape(person.display_name)}: {escape(p.description)} "
+                f"(muddat: {p.due_date})"
             )
     else:
         lines.append("- yo'q")
@@ -91,7 +97,8 @@ def render_inputs(inputs: PlanInputs) -> str:
         for b in debts:
             side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
             lines.append(
-                f"- {b.person.display_name}: {b.outstanding} {b.currency.value} "
+                f"- {escape(b.person.display_name)}: "
+                f"{b.outstanding} {b.currency.value} "
                 f"({side}, muddat: {b.earliest_due})"
             )
     else:
