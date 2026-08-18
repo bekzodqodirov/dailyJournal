@@ -478,7 +478,7 @@ measured, not assumed.
 
 ## Verification
 
-310 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+315 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -563,7 +563,9 @@ too), so the suite is free and offline.
   window that fails everywhere still keeps its text and shows up in
   `/tekshir`.
 * The media policy is table-tested per media type against both chat settings,
-  and every document parser runs against a real file.
+  and every document parser runs against a real file. A downloaded document
+  keeps its real extension, without which nothing could parse it, and one that
+  still fails to parse is flagged for `/tekshir` rather than silently dropped.
 
 **Cost, purge and backups (Phase 5)**
 * `/xarajat` groups real `usage_log` rows by operation and reports fractions
@@ -575,7 +577,9 @@ too), so the suite is free and offline.
   so a supplier cannot smuggle instructions or a balance claim into an answer.
 * A purge plan counts exactly what would go before anything is deleted;
   executing removes the person, their debts and promises, every derived row,
-  and the media files — while leaving other people untouched.
+  the media files **and the conversation windows** — while leaving other
+  people untouched. A surviving window would have been re-extracted hours
+  later and recreated exactly what the owner asked to forget.
 * The backup test does the full round trip where `age` and `pg_dump` exist:
   dump → encrypt → decrypt → a dump containing `CREATE TABLE public.debts`,
   written `0600`. A failing dump leaves no `.partial` file behind, and

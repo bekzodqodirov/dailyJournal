@@ -68,7 +68,15 @@ async def create_backup(*, now: datetime | None = None) -> BackupResult:
         return BackupResult(error="no_recipient")
 
     now = now or datetime.now(settings.tz)
-    target = backup_dir() / f"miya-{now.strftime('%Y%m%d-%H%M%S')}{BACKUP_SUFFIX}"
+    try:
+        directory = backup_dir()
+    except OSError as exc:
+        # mkdir can fail on a misconfigured volume. This function promises not
+        # to raise — it is a scheduler job — so report instead.
+        log.exception("backup directory is not usable")
+        return BackupResult(error=f"backup directory unusable: {exc}")
+
+    target = directory / f"miya-{now.strftime('%Y%m%d-%H%M%S')}{BACKUP_SUFFIX}"
     partial = target.with_suffix(target.suffix + ".partial")
 
     # pg_dump | age -r <recipient> -o <file>. The plaintext only ever exists
@@ -147,7 +155,12 @@ def prune_old(*, now: datetime | None = None) -> int:
     now = now or datetime.now(settings.tz)
     cutoff = now - timedelta(days=settings.backup_retention_days)
     pruned = 0
-    for path in backup_dir().glob(f"*{BACKUP_SUFFIX}"):
+    try:
+        candidates = list(backup_dir().glob(f"*{BACKUP_SUFFIX}"))
+    except OSError:
+        log.warning("backup directory is not readable; nothing pruned", exc_info=True)
+        return 0
+    for path in candidates:
         match = _STAMP_RE.search(path.name)
         if match is None:
             continue

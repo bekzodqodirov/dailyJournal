@@ -184,7 +184,11 @@ async def fetch_media(
     if plan.read_document:
         outcome.document = await documents.read_document_async(path)
         if outcome.document is None:
+            # The policy only plans a read for a format we support, so failing
+            # here means a real document was lost — the owner should see it in
+            # /tekshir rather than never hearing about it.
             outcome.skip_reason = "unreadable"
+            outcome.failed = True
     return outcome
 
 
@@ -283,6 +287,20 @@ _SUFFIX = {
 }
 
 
+def _suffix_for(kind: MediaKind, filename: str | None) -> str:
+    """Where a download lands. Documents keep their real extension.
+
+    documents.read_document() dispatches on the suffix, so a `.bin` path made
+    every invoice and packing list in every monitored chat unreadable — the
+    text was dropped with nothing flagged.
+    """
+    if kind is MediaKind.document and filename:
+        suffix = Path(filename).suffix
+        if suffix:
+            return suffix
+    return _SUFFIX.get(kind, ".bin")
+
+
 async def already_stored(session, tg_chat_id: int, message) -> bool:
     """Guard against re-ingesting a message (reconnect replay, or backfill).
 
@@ -372,7 +390,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
 
     # The message is durable now. Everything slow happens with no database
     # connection and no advisory lock held.
-    outcome = await fetch_media(client, message, plan, _SUFFIX.get(kind, ".bin"))
+    outcome = await fetch_media(client, message, plan, _suffix_for(kind, filename))
 
     # Transaction 2: record what came back.
     async with session_scope() as session:

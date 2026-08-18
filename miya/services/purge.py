@@ -55,6 +55,10 @@ class PurgePlan:
     date_to: date | None = None
     counts: dict[str, int] = field(default_factory=dict)
     files: list[str] = field(default_factory=list)
+    # Windows holding the rendered transcript of the purged messages. They must
+    # go too: a pending one would be re-extracted hours later and recreate the
+    # person and debts the owner just deleted.
+    window_ids: list[int] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not self.interaction_ids and not self.counts.get("debts")
@@ -106,6 +110,13 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
                 if value:
                     files.append(value)
         plan.files = files
+
+        window_ids = await session.scalars(
+            sa.select(Interaction.window_id)
+            .where(Interaction.id.in_(ids), Interaction.window_id.isnot(None))
+            .distinct()
+        )
+        plan.window_ids = [w for w in window_ids if w]
     return plan
 
 
@@ -123,6 +134,14 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
         person_id=person.id,
     )
     await _collect(session, plan)
+    # Windows attributed to this person even if their messages were already
+    # purged: the window still holds the rendered transcript verbatim.
+    person_windows = await session.scalars(
+        sa.select(ConversationWindow.id).where(
+            ConversationWindow.person_id == person.id
+        )
+    )
+    plan.window_ids = sorted({*plan.window_ids, *person_windows})
     # Debts and promises hang off the person too, not only off an interaction.
     plan.counts["debts"] = (
         await session.scalar(
@@ -204,6 +223,16 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         # Cascades take the derived rows (debts, promises, memories, …).
         await session.execute(
             sa.delete(Interaction).where(Interaction.id.in_(plan.interaction_ids))
+        )
+
+    if plan.window_ids:
+        # A surviving window is a second copy of the conversation, and a
+        # pending one would be extracted hours later — recreating the person
+        # and the debts the owner just asked to forget, and billing him for it.
+        await session.execute(
+            sa.delete(ConversationWindow).where(
+                ConversationWindow.id.in_(plan.window_ids)
+            )
         )
 
     if plan.kind == "chat" and plan.tg_chat_id is not None:

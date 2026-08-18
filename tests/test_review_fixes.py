@@ -10,6 +10,7 @@ import asyncio
 import json
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -649,3 +650,142 @@ async def test_clipped_items_are_not_marked_as_sent(session):
     # The next sweep therefore offers the ones that were left out.
     second = await reminders.collect_due(session)
     assert len(second.promises) == len(bundle.promises) - rendered["promise"]
+
+
+# --- /unut must not leave a second copy of the conversation -------------------
+
+
+async def test_forgetting_a_person_takes_their_conversation_windows(session):
+    """Repro: the window survived, still pending, holding the full transcript.
+
+    The next batch tick re-extracted it and recreated the person and the debts
+    the owner had just asked to forget — and billed him for it.
+    """
+    from miya.db.enums import InteractionSource
+    from miya.services import purge, windows
+
+    person = await resolve_person(session, "Akmal")
+    now = datetime.now(TZ)
+    for index in range(2):
+        session.add(
+            m.Interaction(
+                source=InteractionSource.telegram_userbot,
+                direction=Direction.in_,
+                person_id=person.id,
+                tg_chat_id=-700,
+                occurred_at=now - timedelta(hours=1, minutes=index),
+                raw_text=f"Akmal aka, {index} mln qarz berdim",
+            )
+        )
+    await session.flush()
+
+    [window] = await windows.flush_ready_windows(session, now=now)
+    assert window.status is WindowStatus.pending
+
+    plan = await purge.plan_person(session, person)
+    assert window.id in plan.window_ids
+
+    await purge.execute(session, plan)
+    await session.flush()
+
+    remaining = await session.scalar(
+        sa.select(sa.func.count()).select_from(m.ConversationWindow)
+    )
+    assert remaining == 0
+
+    # Nothing is left for the batch job to resurrect.
+    from miya.services.windows import pending_windows
+
+    assert await pending_windows(session) == []
+
+
+async def test_forgetting_a_chat_also_clears_windows_whose_person_is_kept(session):
+    from miya.db.enums import InteractionSource
+    from miya.services import purge, windows
+
+    person = await resolve_person(session, "Dilshod")
+    now = datetime.now(TZ)
+    session.add(
+        m.Interaction(
+            source=InteractionSource.telegram_userbot,
+            direction=Direction.in_,
+            person_id=person.id,
+            tg_chat_id=-701,
+            occurred_at=now - timedelta(hours=1),
+            raw_text="salom",
+        )
+    )
+    await session.flush()
+    await windows.flush_ready_windows(session, now=now)
+
+    await purge.execute(session, await purge.plan_chat(session, -701))
+    await session.flush()
+
+    assert (
+        await session.scalar(sa.select(sa.func.count()).select_from(m.ConversationWindow))
+        == 0
+    )
+    # The person themselves is untouched by a chat purge.
+    assert await session.get(m.Person, person.id) is not None
+
+
+# --- a document must keep its extension to be readable at all ----------------
+
+
+def test_a_downloaded_document_keeps_its_real_extension():
+    """Repro: every monitored-chat document landed as .bin and never parsed."""
+    from miya.services.media_policy import MediaKind
+    from miya.userbot.main import _suffix_for
+
+    assert _suffix_for(MediaKind.document, "hisob-faktura.pdf") == ".pdf"
+    assert _suffix_for(MediaKind.document, "narxlar.xlsx") == ".xlsx"
+    # Voice and photo still use their own known suffixes.
+    assert _suffix_for(MediaKind.voice, None) == ".ogg"
+    assert _suffix_for(MediaKind.photo, "whatever") == ".jpg"
+    # A document with no usable name falls back rather than crashing.
+    assert _suffix_for(MediaKind.document, None) == ".bin"
+
+
+async def test_a_real_document_survives_the_userbot_path(monkeypatch, tmp_path):
+    """End to end through fetch_media: bytes in, parsed text out."""
+    from miya.services.media_policy import MediaKind, MediaPlan
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+    payload = b"tovar,narx\nyuk,5000000\n"
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(payload)
+
+    outcome = await ub.fetch_media(
+        _Client(),
+        object(),
+        MediaPlan(kind=MediaKind.document, download=True, read_document=True),
+        ub._suffix_for(MediaKind.document, "narxlar.csv"),
+    )
+
+    assert outcome.document is not None
+    assert "yuk | 5000000" in outcome.document.text
+    assert outcome.failed is False
+
+
+async def test_an_unreadable_document_is_flagged_rather_than_lost(monkeypatch, tmp_path):
+    from miya.services.media_policy import MediaKind, MediaPlan
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(b"not really a pdf")
+
+    outcome = await ub.fetch_media(
+        _Client(),
+        object(),
+        MediaPlan(kind=MediaKind.document, download=True, read_document=True),
+        ".pdf",
+    )
+
+    assert outcome.document is None
+    assert outcome.failed is True  # shows up in /tekshir

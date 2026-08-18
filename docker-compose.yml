@@ -20,6 +20,22 @@ services:
       timeout: 5s
       retries: 20
 
+  # A fresh clone has no ./data (it is gitignored), so Docker creates the
+  # bind-mount root-owned while every app container runs as uid 10001 — the
+  # first voice note would fail to save and the backup job would crash. This
+  # runs once, as root, before anything else starts.
+  init:
+    build: .
+    user: root
+    volumes:
+      - ./data:/data
+    command:
+      - sh
+      - -c
+      - mkdir -p /data/call_recordings /data/bot_media /data/backups
+        && chown -R 10001:10001 /data
+    restart: "no"
+
   api:
     build: .
     restart: unless-stopped
@@ -27,6 +43,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets:ro
@@ -52,6 +70,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
       api:
         condition: service_started
     volumes:
@@ -68,6 +88,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
       api:
         condition: service_started
     volumes:
@@ -88,6 +110,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      init:
+        condition: service_completed_successfully
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets:ro
