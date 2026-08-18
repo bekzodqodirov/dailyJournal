@@ -142,3 +142,161 @@ def test_display_names_fall_back_through_what_telegram_gave_us():
     )
     anonymous = SimpleNamespace(first_name=None, last_name=None, username=None, id=77)
     assert userbot.display_name_of(anonymous) == "tg:77"
+
+
+# --- the two-phase media path ------------------------------------------------
+
+
+async def test_media_work_happens_with_no_transaction_held(monkeypatch, tmp_path):
+    """fetch_media must not touch the database — that is the whole point.
+
+    Any session it opened would hold a pooled connection (and the person
+    advisory lock) for the length of a Scribe call.
+    """
+    from miya.db import session as db_session
+    from miya.services.media_policy import MediaPlan
+    from miya.services.transcription import Transcript
+    from miya.userbot import main as ub
+
+    def _explode(*args, **kwargs):  # pragma: no cover - must never run
+        raise AssertionError("fetch_media opened a database session")
+
+    monkeypatch.setattr(db_session, "SessionLocal", _explode)
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(b"audio")
+
+    class _Scribe:
+        name = "elevenlabs"
+        model = "scribe_v1"
+
+        async def transcribe(self, path, *, language_hint=None):
+            return Transcript(text="Akmalga 5 mln berdim", language="uz", duration=12.0)
+
+    monkeypatch.setattr(ub, "get_transcriber", lambda: _Scribe())
+
+    outcome = await ub.fetch_media(
+        _Client(),
+        SimpleNamespace(id=1),
+        MediaPlan(kind=MediaKind.voice, download=True, transcribe=True),
+        ".ogg",
+    )
+
+    assert outcome.transcript.text == "Akmalga 5 mln berdim"
+    assert outcome.failed is False
+
+
+async def test_a_transcription_failure_is_carried_back_not_raised(monkeypatch, tmp_path):
+    from miya.services.media_policy import MediaPlan
+    from miya.services.transcription import TranscriptionError
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(b"audio")
+
+    class _Broken:
+        model = "scribe_v1"
+
+        async def transcribe(self, path, *, language_hint=None):
+            raise TranscriptionError("scribe is down")
+
+    monkeypatch.setattr(ub, "get_transcriber", lambda: _Broken())
+
+    outcome = await ub.fetch_media(
+        _Client(),
+        SimpleNamespace(id=1),
+        MediaPlan(kind=MediaKind.voice, download=True, transcribe=True),
+        ".ogg",
+    )
+
+    assert outcome.failed is True
+    assert outcome.transcript is None
+
+
+async def test_a_declined_download_records_why(monkeypatch):
+    from miya.services.media_policy import MediaPlan
+    from miya.userbot import main as ub
+
+    outcome = await ub.fetch_media(
+        None,
+        SimpleNamespace(id=1),
+        MediaPlan(kind=MediaKind.photo, download=False, skip_reason="vision_disabled"),
+        ".jpg",
+    )
+    assert outcome.skip_reason == "vision_disabled"
+    assert outcome.path is None
+
+
+async def test_persist_media_writes_the_transcript_and_the_bill(session, monkeypatch):
+    from datetime import datetime
+
+    import sqlalchemy as sa
+
+    from miya.config import settings
+    from miya.db import models as m
+    from miya.db.enums import Direction, InteractionSource
+    from miya.services.transcription import Transcript
+    from miya.userbot import main as ub
+
+    interaction = m.Interaction(
+        source=InteractionSource.telegram_userbot,
+        direction=Direction.in_,
+        tg_chat_id=-1,
+        occurred_at=datetime.now(settings.tz),
+        media={"type": "voice", "processed": False},
+    )
+    session.add(interaction)
+    await session.flush()
+
+    class _Scribe:
+        model = "scribe_v1"
+
+    monkeypatch.setattr(ub, "get_transcriber", lambda: _Scribe())
+
+    await ub.persist_media(
+        session,
+        interaction,
+        ub.MediaOutcome(
+            path=Path("/data/x.ogg"),
+            transcript=Transcript(text="salom", language="uz", duration=30.0),
+        ),
+    )
+    await session.flush()
+
+    assert interaction.transcript == "salom"
+    assert interaction.media["processed"] is True
+    assert interaction.media["path"] == "/data/x.ogg"
+    assert interaction.meta["asr_language"] == "uz"
+
+    usage = await session.scalar(
+        sa.select(m.UsageLog).where(m.UsageLog.operation == "transcribe")
+    )
+    assert usage is not None and usage.audio_seconds == 30
+
+
+async def test_persist_media_flags_a_failure_for_review(session):
+    from datetime import datetime
+
+    from miya.config import settings as s
+    from miya.db import models as m
+    from miya.db.enums import Direction, InteractionSource
+    from miya.userbot import main as ub
+
+    interaction = m.Interaction(
+        source=InteractionSource.telegram_userbot,
+        direction=Direction.in_,
+        tg_chat_id=-1,
+        occurred_at=datetime.now(s.tz),
+        media={"type": "voice", "processed": False},
+    )
+    session.add(interaction)
+    await session.flush()
+
+    await ub.persist_media(session, interaction, ub.MediaOutcome(failed=True))
+
+    assert interaction.needs_review is True

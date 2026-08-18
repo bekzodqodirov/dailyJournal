@@ -478,7 +478,7 @@ measured, not assumed.
 
 ## Verification
 
-293 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+302 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
