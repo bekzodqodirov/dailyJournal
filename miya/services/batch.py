@@ -211,7 +211,9 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
     client = get_client()
     try:
         batch = await client.messages.batches.retrieve(batch_id)
-    except anthropic.APIError as exc:
+    except anthropic.AnthropicError as exc:
+        # The base class, so this covers both transport failures and the SDK's
+        # own errors; either way the batch is simply read again next tick.
         log.warning("could not retrieve batch %s: %s", batch_id, exc)
         return None
 
@@ -264,9 +266,27 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
             outcome.retried += partial.retried
             outcome.failed += partial.failed
     except anthropic.APIError as exc:
-        # Whatever was applied before the error is already in the session; the
-        # remaining windows stay `submitted` and are collected next tick.
+        # Transport trouble. The batch still holds these windows' results and
+        # they are already paid for, so leave them `submitted` and re-read the
+        # same batch next tick rather than paying to extract them again.
         log.warning("streaming results of batch %s failed: %s", batch_id, exc)
+        await session.flush()
+        return outcome
+    except anthropic.AnthropicError as exc:
+        # AnthropicError is the *base* class, and the SDK raises it bare when a
+        # batch has no results_url — what a batch older than 29 days, or a
+        # canceled one, looks like. `except APIError` never caught it, so it
+        # escaped the poll, rolled back every batch applied alongside it, and
+        # re-fired every 15 minutes forever with the windows never moving.
+        #
+        # Unlike a transport error this never recovers, so the windows go
+        # through the normal ladder and end up extracted in real time.
+        log.warning("results of batch %s are unavailable: %s", batch_id, exc)
+        for window in windows.values():
+            partial = await _retry_or_fallback(session, window, "results_unavailable")
+            outcome.applied += partial.applied
+            outcome.retried += partial.retried
+            outcome.failed += partial.failed
         await session.flush()
         return outcome
 
@@ -301,7 +321,18 @@ async def collect_submitted(session: AsyncSession) -> BatchOutcome:
     )
     total = BatchOutcome()
     for batch_id in batch_ids:
-        outcome = await collect_batch(session, batch_id)
+        try:
+            outcome = await collect_batch(session, batch_id)
+        except Exception:
+            # One unreadable batch must not cost the batches already applied
+            # in this sweep — the surrounding session_scope would roll them
+            # all back together.
+            log.exception("collecting batch %s failed; rolling back only it", batch_id)
+            await session.rollback()
+            continue
+        # Each batch is its own unit of paid work: commit it before touching
+        # the next one.
+        await session.commit()
         if outcome is None:
             continue
         total.applied += outcome.applied

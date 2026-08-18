@@ -100,7 +100,23 @@ async def collect_due(
     return bundle
 
 
-async def mark_sent(session: AsyncSession, bundle: DueBundle) -> None:
-    """Record the ping only after it actually went out."""
+async def mark_sent(
+    session: AsyncSession,
+    bundle: DueBundle,
+    *,
+    rendered: dict[str, int] | None = None,
+) -> None:
+    """Record the ping only for the items that actually went out.
+
+    ``rendered`` says how many of each kind the message had room for, in the
+    same order they were collected. Logging a clipped item would suppress it
+    for 24 hours while the next sweep rebuilt the identical head — the tail
+    would never be seen at all.
+    """
+    seen: dict[str, int] = {}
     for kind, ref in bundle.keys:
+        index = seen.get(kind, 0)
+        seen[kind] = index + 1
+        if rendered is not None and index >= rendered.get(kind, 0):
+            continue
         session.add(ReminderLog(kind=kind, ref=ref))

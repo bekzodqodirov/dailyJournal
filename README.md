@@ -478,7 +478,7 @@ measured, not assumed.
 
 ## Verification
 
-305 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+310 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -515,6 +515,10 @@ too), so the suite is free and offline.
 **Reminders**
 * Quiet hours wrap midnight correctly (23:30–07:30).
 * The same item is not pinged twice within 24 hours, and returns after.
+* A ping too long for Telegram marks only the part that fitted as sent, so the
+  overflow arrives next hour instead of being suppressed for 24 hours and
+  starving forever. Events are rendered first, since a meeting inside the hour
+  gets no second chance.
 
 **API**
 * `/health` returns `ok`/200 with a database and `degraded`/503 without one;

@@ -78,7 +78,7 @@ async def reminder_job(bot: Bot) -> None:
         if bundle.is_empty():
             return
 
-        body = replies.reminder(
+        body, rendered = replies.reminder_with_counts(
             bundle.debts, bundle.promises, bundle.tasks, bundle.events
         )
         if not body:
@@ -86,8 +86,9 @@ async def reminder_job(bot: Bot) -> None:
 
         if not await notify(bot, f"⏰ <b>Eslatma</b>\n\n{body}"):
             return
-        # Recorded only after a successful send, so a failed ping is retried.
-        await reminders.mark_sent(session, bundle)
+        # Recorded only after a successful send, and only for what fit: a
+        # clipped item must come back next hour, not be silently suppressed.
+        await reminders.mark_sent(session, bundle, rendered=rendered)
 
     log.info(
         "sent reminder: %d debts, %d promises, %d tasks, %d events",

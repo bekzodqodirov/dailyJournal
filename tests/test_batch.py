@@ -409,3 +409,81 @@ async def test_an_interrupted_result_stream_never_double_applies(session, monkey
     assert second.status is WindowStatus.applied
     # One debt per window — the first window's result was not applied twice.
     assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 2
+
+
+async def test_a_batch_with_no_results_url_does_not_wedge_the_poller(
+    session, monkeypatch
+):
+    """Repro: the SDK raises AnthropicError — the BASE class, not APIError.
+
+    A batch older than 29 days (or a canceled one) still retrieves fine with
+    processing_status="ended", but has no results_url. Catching only APIError
+    let that escape collect_submitted, roll back everything applied in the
+    same poll, and re-fire every 15 minutes forever with the windows never
+    progressing.
+    """
+    window = await _window(session, text="eskirgan oyna")
+    window.attempts = settings.batch_max_attempts - 1
+    await session.flush()
+
+    stub = _StubClient()
+
+    async def _no_results(batch_id):
+        raise anthropic.AnthropicError("No `results_url` for the given batch")
+
+    stub.messages.batches.results = _no_results
+    monkeypatch.setattr(batch, "get_client", lambda: stub)
+    await batch.submit_pending(session)
+
+    async def _fake_extract(text, *, now=None):
+        return ex.ExtractionOutcome(
+            result=ex.ExtractionResult(summary="fallback"),
+            model=settings.extract_model,
+            usage=None,
+        )
+
+    monkeypatch.setattr(batch, "extract", _fake_extract)
+
+    outcome = await batch.collect_batch(session, "batch_1")
+
+    # It neither raised nor left the window stuck: the ladder took over.
+    assert outcome.applied == 1
+    assert window.status is WindowStatus.applied
+
+
+async def test_one_unreadable_batch_does_not_roll_back_a_healthy_one(
+    session, monkeypatch
+):
+    healthy = await _window(session, text="sog'lom oyna")
+    stub = _StubClient(batch_id="batch_ok")
+    monkeypatch.setattr(batch, "get_client", lambda: stub)
+    await batch.submit_pending(session)
+    stub.results = [_succeeded(healthy.custom_id, DEBT_JSON)]
+    await batch.collect_batch(session, "batch_ok")
+    await session.commit()
+
+    broken = await _window(session, text="buzilgan oyna")
+    stub.batch_id = "batch_bad"
+    await batch.submit_pending(session)
+
+    async def _explode(batch_id):
+        if batch_id == "batch_bad":
+            raise anthropic.AnthropicError("no results_url")
+        return stub.results
+
+    stub.messages.batches.results = _explode
+
+    async def _failing_extract(text, *, now=None):
+        return ex.ExtractionOutcome(error="refusal", model=settings.extract_model)
+
+    monkeypatch.setattr(batch, "extract", _failing_extract)
+    broken.attempts = settings.batch_max_attempts - 1
+    await session.flush()
+
+    await batch.collect_submitted(session)
+    await session.commit()
+
+    # The healthy batch's debt survived the broken one.
+    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 1
+    assert healthy.status is WindowStatus.applied
+    assert broken.status is WindowStatus.failed

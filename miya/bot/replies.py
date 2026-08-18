@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from miya.bot.formatting import (
     PRIORITY_LABEL,
+    TELEGRAM_LIMIT,
     bullet_list,
     clip,
     clock,
@@ -296,33 +297,77 @@ def person_report(summary: PersonSummary) -> str:
 
 def reminder(debts, promises, tasks, events) -> str:
     """Body of an hourly reminder ping. Empty string means nothing to send."""
+    body, _ = reminder_with_counts(debts, promises, tasks, events)
+    return body
+
+
+def reminder_with_counts(
+    debts, promises, tasks, events
+) -> tuple[str, dict[str, int]]:
+    """The ping body, plus how many of each kind actually fit in it.
+
+    Two things this must get right, both learned the hard way:
+
+    * **Only what is shown may be marked as sent.** The caller logs each item
+      to suppress it for 24 hours; if a clipped item were logged, the next
+      sweep would rebuild the identical head and the tail would starve
+      forever, not merely wait.
+    * **Events come first.** A debt reminder repeats tomorrow, but a meeting
+      only qualifies while it is within the hour — a clipped one is gone.
+    """
+    sections = [
+        (
+            "event",
+            "📅 <b>Yaqin uchrashuvlar</b>",
+            [f"{escape(e.title)} · {clock(e.start_at)}" for e in events],
+        ),
+        (
+            "debt",
+            "💰 <b>Qarz muddati</b>",
+            [
+                f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
+                f"{relative_day(b.earliest_due)}"
+                for b in debts
+            ],
+        ),
+        (
+            "promise",
+            "🤝 <b>Va'da muddati</b>",
+            [
+                f"{escape(person.display_name)}: {escape(p.description)} · "
+                f"{relative_day(p.due_date)}"
+                for p, person in promises
+            ],
+        ),
+        (
+            "task",
+            "✔️ <b>Vazifalar</b>",
+            [f"{escape(t.description)} · {relative_day(t.due_date)}" for t in tasks],
+        ),
+    ]
+
+    counts = {kind: 0 for kind, _, _ in sections}
+    total = {kind: len(lines) for kind, _, lines in sections}
     blocks: list[str] = []
 
-    if debts:
-        lines = [
-            f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
-            f"{relative_day(b.earliest_due)}"
-            for b in debts
-        ]
-        blocks.append("💰 <b>Qarz muddati</b>\n" + bullet_list(lines, empty="—"))
+    for kind, header, lines in sections:
+        kept: list[str] = []
+        for line in lines:
+            trial = [*blocks, header + "\n" + bullet_list([*kept, line], empty="—")]
+            # Measured, not estimated: the budget has to hold for the joined
+            # message, and a marker line may still be appended below.
+            if len("\n\n".join(trial)) > TELEGRAM_LIMIT - 60:
+                break
+            kept.append(line)
+        if kept:
+            blocks.append(header + "\n" + bullet_list(kept, empty="—"))
+            counts[kind] = len(kept)
 
-    if promises:
-        lines = [
-            f"{escape(person.display_name)}: {escape(p.description)} · "
-            f"{relative_day(p.due_date)}"
-            for p, person in promises
-        ]
-        blocks.append("🤝 <b>Va'da muddati</b>\n" + bullet_list(lines, empty="—"))
+    dropped = sum(total[k] - counts[k] for k in counts)
+    if dropped:
+        blocks.append(f"<i>… va yana {dropped} ta — keyingi eslatmada.</i>")
 
-    if tasks:
-        lines = [f"{escape(t.description)} · {relative_day(t.due_date)}" for t in tasks]
-        blocks.append("✔️ <b>Vazifalar</b>\n" + bullet_list(lines, empty="—"))
-
-    if events:
-        lines = [f"{escape(e.title)} · {clock(e.start_at)}" for e in events]
-        blocks.append("📅 <b>Yaqin uchrashuvlar</b>\n" + bullet_list(lines, empty="—"))
-
-    return clip("\n\n".join(blocks))
+    return "\n\n".join(blocks), counts
 
 
 def search_results(hits, query: str) -> str:

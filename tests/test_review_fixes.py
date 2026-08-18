@@ -564,3 +564,88 @@ async def test_search_results_are_labelled_as_other_peoples_words(session):
 
     assert payload["note"] == rag.UNTRUSTED_NOTE
     assert "results" in payload
+
+
+# --- a clipped reminder must come back, not starve ---------------------------
+
+
+def _balance(index: int):
+    from miya.services.queries import DebtBalance
+
+    return DebtBalance(
+        person=m.Person(
+            id=index, display_name=f"Qarzdor {index} " + "x" * 40, aliases=[]
+        ),
+        direction=DebtDirection.they_owe_me,
+        currency=Currency.UZS,
+        outstanding=Decimal("1000000"),
+        earliest_due=date(2026, 1, 1),
+        count=1,
+    )
+
+
+def test_only_what_fits_is_reported_as_rendered():
+    debts = [_balance(i) for i in range(60)]
+    tasks = [
+        m.Task(id=i, description=f"vazifa {i} " + "y" * 60, due_date=date(2026, 1, 1))
+        for i in range(30)
+    ]
+
+    body, counts = replies.reminder_with_counts(debts, [], tasks, [])
+
+    assert len(body) <= replies.TELEGRAM_LIMIT
+    assert counts["debt"] < 60 or counts["task"] < 30  # something had to give
+    # The counts describe the body, not the input.
+    assert body.count("Qarzdor") == counts["debt"]
+    assert "va yana" in body  # the owner is told there is more
+
+
+def test_a_meeting_is_never_the_item_that_gets_clipped():
+    """Events only qualify within the hour; a dropped one is gone for good."""
+    from datetime import datetime as dt
+
+    debts = [_balance(i) for i in range(80)]
+    events = [
+        m.Event(id=1, title="Bojxona uchrashuvi", start_at=dt.now(TZ), source="extracted")
+    ]
+
+    body, counts = replies.reminder_with_counts(debts, [], [], events)
+
+    assert counts["event"] == 1
+    assert "Bojxona uchrashuvi" in body
+
+
+async def test_clipped_items_are_not_marked_as_sent(session):
+    """Repro: everything collected was logged, so the tail starved forever."""
+    from miya.db.enums import PromiseMadeBy
+    from miya.services import reminders
+
+    person = await resolve_person(session, "Akmal")
+    interaction = await _interaction(session)
+    for index in range(40):
+        session.add(
+            m.Promise(
+                made_by=PromiseMadeBy.them,
+                person_id=person.id,
+                description=f"va'da {index} " + "z" * 70,
+                due_date=date(2026, 1, 1),
+                source_interaction_id=interaction.id,
+            )
+        )
+    await session.flush()
+
+    bundle = await reminders.collect_due(session)
+    body, rendered = replies.reminder_with_counts(
+        bundle.debts, bundle.promises, bundle.tasks, bundle.events
+    )
+    assert rendered["promise"] < len(bundle.promises)  # the body could not hold them
+
+    await reminders.mark_sent(session, bundle, rendered=rendered)
+    await session.flush()
+
+    logged = await session.scalar(sa.select(sa.func.count()).select_from(m.ReminderLog))
+    assert logged == rendered["promise"]
+
+    # The next sweep therefore offers the ones that were left out.
+    second = await reminders.collect_due(session)
+    assert len(second.promises) == len(bundle.promises) - rendered["promise"]
