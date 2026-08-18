@@ -145,6 +145,8 @@ it recorded:
 | `/reja` | Tomorrow's time-blocked plan |
 | `/chats` | Which Telegram chats the userbot reads, with per-chat toggles |
 | `/process` | Reply to a video/document/voice to process it on demand |
+| `/xarajat` | What MIYA's own API calls cost this month |
+| `/unut` | Delete a person, a chat or a date range — asks first |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
 | `/yordam` | The command list |
 
@@ -364,6 +366,23 @@ Invariants enforced by the schema and covered by tests:
 * **The Telethon session string is a credential** — it grants full access to the
   owner's Telegram account. Keep it in `.env` or an encrypted file, never in the
   repository.
+* **Nightly backups are encrypted before they touch the disk.** `pg_dump` is
+  piped straight into `age`; the plaintext exists only inside that pipe. With
+  `BACKUP_AGE_RECIPIENT` unset the job writes nothing at all — an unencrypted
+  dump of every debt and transcript is not an acceptable fallback. Backups are
+  kept for `BACKUP_RETENTION_DAYS` (14) and a failing backup pings the owner.
+
+  ```bash
+  age-keygen -o secrets/backup-key.txt   # keep the private key OFF the VPS
+  # put the printed public key in BACKUP_AGE_RECIPIENT
+  make backup                            # run one now
+  age -d -i secrets/backup-key.txt data/backups/miya-….sql.age | psql …
+  ```
+
+* **`/unut` really deletes.** It shows exactly what would go — interactions,
+  debts, promises, transactions, events, tasks, memories and media files — and
+  only acts after the owner confirms. Cascades do the work, so nothing is left
+  orphaned, and the audio and photos are unlinked from disk in the same pass.
 
 ### Documented egress
 
@@ -403,7 +422,7 @@ messages, never marks chats as read, and never bulk-downloads history — and
 | **2** | Syncthing share + folder watcher → phone-call interactions | ✅ done |
 | **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | ✅ done |
 | **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | ✅ done |
-| **5** | `/xarajat`, purge tooling, backfill, retention jobs | next |
+| **5** | `/xarajat`, `/unut` purge tooling, chat backfill, encrypted backups | ✅ done |
 
 Dependencies are added per phase rather than up front. Phase 0 installed
 FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
@@ -426,7 +445,7 @@ measured, not assumed.
 
 ## Verification
 
-250 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+273 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
 ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
 too), so the suite is free and offline.
 
@@ -498,3 +517,14 @@ too), so the suite is free and offline.
   `/tekshir`.
 * The media policy is table-tested per media type against both chat settings,
   and every document parser runs against a real file.
+
+**Cost, purge and backups (Phase 5)**
+* `/xarajat` groups real `usage_log` rows by operation and reports fractions
+  of a cent, which `money()` would have rounded away to `$0`.
+* A purge plan counts exactly what would go before anything is deleted;
+  executing removes the person, their debts and promises, every derived row,
+  and the media files — while leaving other people untouched.
+* The backup test does the full round trip where `age` and `pg_dump` exist:
+  dump → encrypt → decrypt → a dump containing `CREATE TABLE public.debts`,
+  written `0600`. A failing dump leaves no `.partial` file behind, and
+  pruning only ever touches MIYA's own timestamped backups.

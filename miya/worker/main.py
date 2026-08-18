@@ -11,6 +11,7 @@ Jobs:
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
   * batch_submit — every BATCH_FLUSH_HOURS; pending windows → Batch API
   * batch_poll   — every 15 min; applies finished batches
+  * backup       — cron at BACKUP_TIME; encrypted pg_dump, 14-day retention
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from miya.bot.formatting import clip
 from miya.config import settings
 from miya.db.session import engine, session_scope
 from miya.services import (
+    backup,
     batch,
     call_recordings,
     gcal,
@@ -181,6 +183,22 @@ async def batch_poll_job() -> None:
         )
 
 
+async def backup_job(bot: Bot) -> None:
+    """Nightly encrypted pg_dump (spec §10). Silence means it worked."""
+    result = await backup.create_backup()
+    if result.ok or result.error == "no_recipient":
+        return
+    # A backup that stopped working is worth waking the owner for — it is the
+    # only thing standing between a disk failure and losing everything.
+    try:
+        await bot.send_message(
+            settings.owner_telegram_id,
+            clip(f"⚠️ <b>Zaxira nusxa muvaffaqiyatsiz</b>\n\n<code>{result.error}</code>"),
+        )
+    except Exception:
+        log.exception("could not report the backup failure")
+
+
 async def run() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -271,6 +289,17 @@ async def run() -> None:
         batch_poll_job,
         IntervalTrigger(minutes=15),
         id="batch_poll",
+        max_instances=1,
+        coalesce=True,
+    )
+    backup_at = settings.backup_time_parsed
+    scheduler.add_job(
+        backup_job,
+        CronTrigger(
+            hour=backup_at.hour, minute=backup_at.minute, timezone=settings.timezone
+        ),
+        args=[bot],
+        id="backup",
         max_instances=1,
         coalesce=True,
     )

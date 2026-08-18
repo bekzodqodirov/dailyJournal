@@ -84,6 +84,18 @@ def money(amount: Decimal, currency: Currency) -> str:
     return f"{_trim(amount)} {label}"
 
 
+def usd(amount: Decimal) -> str:
+    """API spend, where fractions of a cent still matter (`/xarajat`).
+
+    `money()` would round $0.0034 down to "$0" and make a cost report useless,
+    so small figures keep four decimals and larger ones keep two.
+    """
+    amount = Decimal(amount)
+    if amount and abs(amount) < Decimal("0.01"):
+        return f"${amount:.4f}"
+    return f"${amount:.2f}"
+
+
 def short_date(value: date | None) -> str:
     if value is None:
         return "muddatsiz"

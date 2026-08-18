@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 .PHONY: help env up down restart logs ps health migrate revision downgrade psql \
-        bot worker userbot userbot-login shell install test lint fmt check gcal-auth
+        bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
+        backfill backup
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -61,6 +62,14 @@ userbot: ## Tail the Telegram userbot logs
 
 userbot-login: ## One-time Telethon login; prints TELETHON_SESSION for .env
 	$(COMPOSE) run --rm -it userbot python -m miya.tools.userbot_login
+
+backfill: ## Backfill one chat's history: make backfill CHAT=@akmal DAYS=7
+	$(COMPOSE) run --rm userbot python -m miya.tools.backfill "$(CHAT)" --days $${DAYS:-7}
+
+backup: ## Run the encrypted database backup now
+	$(COMPOSE) run --rm worker python -c \
+		"import asyncio; from miya.services.backup import create_backup; \
+		 print(asyncio.run(create_backup()))"
 
 gcal-auth: ## One-time Google Calendar OAuth (use with: ssh -L 8765:127.0.0.1:8765)
 	$(COMPOSE) run --rm -p 127.0.0.1:8765:8765 -v ./secrets:/app/secrets worker \

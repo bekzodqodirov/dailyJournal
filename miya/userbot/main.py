@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import sqlalchemy as sa
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, User
@@ -188,7 +189,7 @@ async def _apply_plan(
         }
 
 
-async def _counterparty(session, event, monitor: ChatMonitor):
+async def _counterparty(session, message, monitor: ChatMonitor):
     """Who this message is about: the peer in a DM, the speaker in a group.
 
     A DM stays attached to the other person in both directions so `/kim` sees
@@ -196,11 +197,11 @@ async def _counterparty(session, event, monitor: ChatMonitor):
     an outgoing one belongs to nobody (the owner spoke).
     """
     if monitor.chat_type is ChatType.private:
-        entity = await event.get_chat()
-    elif event.out:
+        entity = await message.get_chat()
+    elif message.out:
         return None
     else:
-        entity = await event.get_sender()
+        entity = await message.get_sender()
 
     if entity is None or not isinstance(entity, User):
         return None
@@ -221,24 +222,44 @@ _SUFFIX = {
 }
 
 
-async def ingest_event(client: TelegramClient, event) -> None:
-    """Store one Telegram message. Extraction is the window job's business."""
-    message = event.message
+async def already_stored(session, tg_chat_id: int, message) -> bool:
+    """Guard against re-ingesting a message (reconnect replay, or backfill).
+
+    Looked up by chat and timestamp so the existing
+    ``ix_interactions_chat_occurred`` index does the work; the message id is
+    then compared exactly.
+    """
+    occurred = message.date.astimezone(settings.tz)
+    rows = await session.scalars(
+        sa.select(Interaction.meta)
+        .where(Interaction.source == InteractionSource.telegram_userbot)
+        .where(Interaction.tg_chat_id == tg_chat_id)
+        .where(Interaction.occurred_at == occurred)
+    )
+    return any((meta or {}).get("tg_message_id") == message.id for meta in rows)
+
+
+async def ingest_message(client: TelegramClient, message) -> bool:
+    """Store one Telegram message. Extraction is the window job's business.
+
+    Takes a Telethon ``Message`` rather than an event so the live handler and
+    the explicit backfill tool share exactly one ingestion path.
+    """
     kind = kind_of(message)
     filename, size, mime = _file_info(message)
 
     async with session_scope() as session:
-        chat = await event.get_chat()
+        chat = await message.get_chat()
         monitor = await ensure_monitor(
             session,
             DialogInfo(
-                tg_chat_id=event.chat_id,
+                tg_chat_id=message.chat_id,
                 chat_type=chat_type_of(chat),
                 title=chat_title_of(chat),
             ),
         )
         if not monitor.monitor_enabled:
-            return
+            return False
 
         plan = plan_for(
             kind,
@@ -248,13 +269,16 @@ async def ingest_event(client: TelegramClient, event) -> None:
             size=size,
         )
         if plan.ignore:
-            return
+            return False
 
         text = (message.message or "").strip() or None
         if kind is MediaKind.text and not text:
-            return  # service messages (joins, pins) carry nothing to extract
+            return False  # service messages (joins, pins) carry nothing
 
-        person = await _counterparty(session, event, monitor)
+        if await already_stored(session, message.chat_id, message):
+            return False
+
+        person = await _counterparty(session, message, monitor)
         media = None
         if kind is not MediaKind.text:
             media = {
@@ -269,9 +293,9 @@ async def ingest_event(client: TelegramClient, event) -> None:
         interaction = await create_interaction(
             session,
             source=InteractionSource.telegram_userbot,
-            direction=Direction.out if event.out else Direction.in_,
+            direction=Direction.out if message.out else Direction.in_,
             person_id=person.id if person else None,
-            tg_chat_id=event.chat_id,
+            tg_chat_id=message.chat_id,
             text=text,
             occurred_at=message.date.astimezone(settings.tz),
             media=media,
@@ -282,6 +306,7 @@ async def ingest_event(client: TelegramClient, event) -> None:
                 session, client, message, interaction, plan, _SUFFIX.get(kind, ".bin")
             )
             interaction.media = {**(interaction.media or {}), "processed": True}
+    return True
 
 
 # --- dialog sync -------------------------------------------------------------
@@ -349,7 +374,7 @@ async def run() -> None:
 
         async def _on_message(event) -> None:
             try:
-                await ingest_event(client, event)
+                await ingest_message(client, event.message)
             except Exception:
                 # One bad message must never take the reader down; the next
                 # message still lands.

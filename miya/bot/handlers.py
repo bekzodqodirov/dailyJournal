@@ -12,21 +12,26 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 from miya.bot import replies
 from miya.bot.formatting import clip
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
-from miya.db.models import Person
+from miya.db.models import ChatMonitor, Person
 from miya.db.session import session_scope
 from miya.services import (
     audio,
@@ -34,6 +39,7 @@ from miya.services import (
     documents,
     memories,
     planner,
+    purge,
     queries,
     rag,
     reports,
@@ -244,6 +250,140 @@ def _page_of(callback: CallbackQuery) -> int:
                 current, _, _ = button.text.partition("/")
                 return max(0, int(current) - 1) if current.isdigit() else 0
     return 0
+
+
+@router.message(Command("xarajat"))
+async def cmd_usage(message: Message, command: CommandObject) -> None:
+    """`/xarajat` — this month by default, or `/xarajat 2026-07`."""
+    today = purge.today()
+    period = (command.args or "").strip()
+    if period:
+        try:
+            year, month = (int(p) for p in period.split("-")[:2])
+            first = date(year, month, 1)
+        except (ValueError, TypeError):
+            await _safe_answer(message, "Sana formati: <code>/xarajat 2026-07</code>")
+            return
+    else:
+        first = today.replace(day=1)
+
+    last = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    async with session_scope() as session:
+        summary = await queries.usage_summary(session, first, min(last, today))
+    await _safe_answer(message, replies.usage_report(summary))
+
+
+@router.message(Command("unut"))
+async def cmd_purge(message: Message, command: CommandObject) -> None:
+    """`/unut` — destructive, so it only ever shows a plan and asks first."""
+    argument = (command.args or "").strip()
+    if not argument:
+        await _safe_answer(message, replies.PURGE_USAGE)
+        return
+
+    async with session_scope() as session:
+        plan, payload = await _build_purge_plan(session, argument)
+        body = replies.purge_preview(plan) if plan and not plan.is_empty() else None
+
+    if body is None:
+        await _safe_answer(message, replies.PURGE_NOTHING)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🗑 Ha, o'chir", callback_data=payload),
+                InlineKeyboardButton(text="Bekor", callback_data="unut:no"),
+            ]
+        ]
+    )
+    try:
+        await message.answer(body, reply_markup=keyboard)
+    except Exception:
+        log.exception("could not send the purge confirmation")
+
+
+async def _build_purge_plan(session, argument: str):
+    """Parse `/unut` arguments into a plan plus its confirm-callback payload.
+
+    The payload re-derives the plan on confirmation instead of caching it, so a
+    bot restart between the preview and the button press can never execute a
+    stale, wider purge than the one the owner saw.
+    """
+    lowered = argument.lower()
+
+    if lowered.startswith("chat "):
+        title = argument[5:].strip()
+        monitor = await session.scalar(
+            sa.select(ChatMonitor).where(ChatMonitor.title.ilike(f"%{title}%")).limit(1)
+        )
+        if monitor is None and title.lstrip("-").isdigit():
+            monitor = await session.scalar(
+                sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == int(title))
+            )
+        if monitor is None:
+            return None, ""
+        return (
+            await purge.plan_chat(session, monitor.tg_chat_id),
+            f"unut:c:{monitor.tg_chat_id}",
+        )
+
+    span = purge.parse_range(argument)
+    if span is not None:
+        start, end = span
+        return (
+            await purge.plan_range(session, start, end),
+            f"unut:d:{start.isoformat()}:{end.isoformat()}",
+        )
+
+    people = list(await session.scalars(sa.select(Person)))
+    person, score = best_match(argument, people)
+    if person is None or score < 70:
+        return None, ""
+    return await purge.plan_person(session, person), f"unut:p:{person.id}"
+
+
+@router.callback_query(F.data.startswith("unut:"))
+async def on_purge_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else "no"
+
+    if action == "no":
+        await _edit_callback(callback, replies.PURGE_CANCELLED)
+        return
+
+    async with session_scope() as session:
+        plan = None
+        if action == "p" and len(parts) == 3:
+            person = await session.get(Person, int(parts[2]))
+            if person is not None:
+                plan = await purge.plan_person(session, person)
+        elif action == "c" and len(parts) == 3:
+            plan = await purge.plan_chat(session, int(parts[2]))
+        elif action == "d" and len(parts) == 4:
+            plan = await purge.plan_range(
+                session, date.fromisoformat(parts[2]), date.fromisoformat(parts[3])
+            )
+
+        if plan is None:
+            body = replies.PURGE_EXPIRED
+        else:
+            result = await purge.execute(session, plan)
+            body = replies.purge_done(plan, result)
+
+    await _edit_callback(callback, body)
+
+
+async def _edit_callback(callback: CallbackQuery, text: str) -> None:
+    """Replace a confirmation prompt with its outcome; the buttons go away."""
+    try:
+        await callback.message.edit_text(text, reply_markup=None)
+    except Exception:
+        log.debug("could not edit the callback message", exc_info=True)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
 
 
 @router.message(Command("kim"))

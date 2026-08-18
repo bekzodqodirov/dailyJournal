@@ -13,6 +13,7 @@ from miya.bot.formatting import (
     money,
     relative_day,
     short_date,
+    usd,
 )
 from miya.db.enums import DebtDirection, PromiseMadeBy
 from miya.services.persistence import Applied
@@ -53,6 +54,8 @@ raqamlar bilan javob beraman.
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
 /process — javob yozilgan media'ni qayta ishlash
+/xarajat — MIYA'ning API xarajati
+/unut — ma'lumotni butunlay o'chirish
 /tekshir — qayta ishlanmagan yozuvlar
 /yordam — shu ro'yxat
 """
@@ -329,6 +332,97 @@ SEARCH_UNAVAILABLE = (
     "⚠️ Qidiruv hozircha ishlamayapti (embedding xizmati tayyor emas) — "
     "birozdan keyin qayta urinib ko'ring."
 )
+
+
+OPERATION_LABEL = {
+    "extract": "xabarlardan ajratish",
+    "extract_window": "telegram suhbatlari (batch)",
+    "extract_window_fallback": "telegram suhbatlari (qayta)",
+    "transcribe": "ovozni matnga o'girish",
+    "vision": "rasmlarni o'qish",
+    "report": "kunlik hisobot",
+    "planner": "reja tuzish",
+    "rag": "savollarga javob",
+}
+
+
+def usage_report(summary) -> str:
+    """`/xarajat`: what MIYA itself cost, from usage_log (spec §9)."""
+    if not summary.rows:
+        return "💳 Bu davrda API xarajati yozilmagan."
+
+    lines = []
+    for row in summary.rows[:12]:
+        label = OPERATION_LABEL.get(row.operation, row.operation or row.provider)
+        detail = f"{row.calls} marta"
+        if row.audio_seconds:
+            detail += f" · {int(row.audio_seconds) // 60} daqiqa"
+        lines.append(f"{escape(label)}: {usd(row.cost_usd)} ({detail})")
+
+    parts = [
+        f"💳 <b>MIYA xarajati</b> · {full_date(summary.date_from)} — "
+        f"{full_date(summary.date_to)}",
+        bullet_list(lines, empty="—"),
+        f"<b>Jami: {usd(summary.total_usd)}</b>\nBugun: {usd(summary.today_usd)}",
+    ]
+    if summary.cached_share:
+        parts.append(f"<i>Keshdan o'qilgan: {summary.cached_share * 100:.0f}%</i>")
+    return clip("\n\n".join(parts))
+
+
+PURGE_USAGE = (
+    "🗑 <b>/unut</b> — ma'lumotni butunlay o'chiradi.\n\n"
+    "<code>/unut Akmal</code> — odam va u bilan bog'liq hamma narsa\n"
+    "<code>/unut chat GZ logistika</code> — bitta chat tarixi\n"
+    "<code>/unut 2026-08-01..2026-08-15</code> — sana oralig'i\n\n"
+    "<i>O'chirishdan oldin nima yo'qolishini ko'rsataman.</i>"
+)
+
+PURGE_NOTHING = "✅ Bu bo'yicha o'chiradigan narsa topilmadi."
+PURGE_CANCELLED = "Bekor qilindi — hech narsa o'chirilmadi."
+PURGE_EXPIRED = "So'rov eskirdi. <code>/unut</code> ni qaytadan yozing."
+
+_PURGE_KIND = {
+    "person": "Odam",
+    "chat": "Chat",
+    "range": "Sana oralig'i",
+}
+
+_COUNT_LABEL = {
+    "interactions": "yozuv",
+    "debts": "qarz",
+    "promises": "va'da",
+    "transactions": "pul harakati",
+    "events": "uchrashuv",
+    "tasks": "vazifa",
+    "memories": "xotira",
+}
+
+
+def purge_preview(plan) -> str:
+    """What `/unut` is about to delete — shown before anything is touched."""
+    lines = [
+        f"{_COUNT_LABEL[key]}: {count} ta"
+        for key, count in plan.counts.items()
+        if count and key in _COUNT_LABEL
+    ]
+    if plan.files:
+        lines.append(f"media fayl: {len(plan.files)} ta")
+
+    return clip(
+        f"⚠️ <b>O'chirishni tasdiqlang</b>\n"
+        f"{_PURGE_KIND.get(plan.kind, plan.kind)}: <b>{escape(plan.label)}</b>\n\n"
+        + bullet_list(lines, empty="—")
+        + "\n\n<i>Bu amalni ortga qaytarib bo'lmaydi.</i>"
+    )
+
+
+def purge_done(plan, result) -> str:
+    tail = f", {result.files_deleted} ta fayl" if result.files_deleted else ""
+    return (
+        f"🗑 <b>{escape(plan.label)}</b> o'chirildi: "
+        f"{result.interactions} ta yozuv{tail}."
+    )
 
 
 SOURCE_LABEL = {

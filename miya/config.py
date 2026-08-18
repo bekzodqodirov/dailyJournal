@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     call_recordings_dir: str = "/data/call_recordings"
     audio_retention_days: int = 90
 
+    # --- Backups (spec §10) -------------------------------------------------
+    backup_dir: str = "/data/backups"
+    backup_retention_days: int = 14
+    # age public key (age1…). Without it the backup job does nothing rather
+    # than writing an unencrypted dump of every debt and transcript to disk.
+    backup_age_recipient: str = ""
+    backup_time: str = "03:30"
+
     # --- Internal API -------------------------------------------------------
     api_bearer_token: str = ""
     api_host: str = "127.0.0.1"
@@ -103,7 +111,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     debug: bool = Field(default=False)
 
-    @field_validator("report_time")
+    @field_validator("report_time", "backup_time")
     @classmethod
     def _validate_report_time(cls, v: str) -> str:
         _parse_hhmm(v)
@@ -133,6 +141,10 @@ class Settings(BaseSettings):
     @property
     def report_time_parsed(self) -> time:
         return _parse_hhmm(self.report_time)
+
+    @property
+    def backup_time_parsed(self) -> time:
+        return _parse_hhmm(self.backup_time)
 
     @property
     def quiet_hours_parsed(self) -> tuple[time, time]:

@@ -25,6 +25,7 @@ from miya.db.models import (
     Promise,
     Task,
     Transaction,
+    UsageLog,
 )
 
 
@@ -383,6 +384,88 @@ async def recent_interactions(
     if person_id is not None:
         stmt = stmt.where(Interaction.person_id == person_id)
     return list(await session.scalars(stmt))
+
+
+@dataclass(slots=True)
+class UsageRow:
+    provider: str
+    model: str | None
+    operation: str | None
+    calls: int
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int
+    audio_seconds: Decimal
+    cost_usd: Decimal
+
+
+@dataclass(slots=True)
+class UsageSummary:
+    date_from: date
+    date_to: date  # inclusive
+    rows: list[UsageRow] = field(default_factory=list)
+    total_usd: Decimal = Decimal("0")
+    today_usd: Decimal = Decimal("0")
+
+    @property
+    def cached_share(self) -> float:
+        """Fraction of input tokens served from the prompt cache (spec §9)."""
+        fresh = sum(r.input_tokens for r in self.rows)
+        cached = sum(r.cache_read_tokens for r in self.rows)
+        total = fresh + cached
+        return cached / total if total else 0.0
+
+
+async def usage_summary(
+    session: AsyncSession, date_from: date, date_to: date
+) -> UsageSummary:
+    """What MIYA itself cost over a date range (`/xarajat`)."""
+    start, _ = day_bounds(date_from)
+    _, end = day_bounds(date_to)
+    summary = UsageSummary(date_from=date_from, date_to=date_to)
+
+    rows = await session.execute(
+        sa.select(
+            UsageLog.provider,
+            UsageLog.model,
+            UsageLog.operation,
+            sa.func.count(UsageLog.id),
+            sa.func.coalesce(sa.func.sum(UsageLog.input_tokens), 0),
+            sa.func.coalesce(sa.func.sum(UsageLog.output_tokens), 0),
+            sa.func.coalesce(sa.func.sum(UsageLog.cache_read_tokens), 0),
+            sa.func.coalesce(sa.func.sum(UsageLog.audio_seconds), 0),
+            sa.func.coalesce(sa.func.sum(UsageLog.cost_usd), 0).label("cost"),
+        )
+        .where(UsageLog.created_at >= start, UsageLog.created_at < end)
+        .group_by(UsageLog.provider, UsageLog.model, UsageLog.operation)
+        .order_by(sa.desc("cost"))
+    )
+    for row in rows.all():
+        summary.rows.append(
+            UsageRow(
+                provider=row[0],
+                model=row[1],
+                operation=row[2],
+                calls=row[3],
+                input_tokens=row[4],
+                output_tokens=row[5],
+                cache_read_tokens=row[6],
+                audio_seconds=Decimal(row[7]),
+                cost_usd=Decimal(row[8]),
+            )
+        )
+    summary.total_usd = sum((r.cost_usd for r in summary.rows), Decimal("0"))
+
+    today_start, today_end = day_bounds(datetime.now(settings.tz).date())
+    summary.today_usd = Decimal(
+        await session.scalar(
+            sa.select(sa.func.coalesce(sa.func.sum(UsageLog.cost_usd), 0)).where(
+                UsageLog.created_at >= today_start, UsageLog.created_at < today_end
+            )
+        )
+        or 0
+    )
+    return summary
 
 
 async def flagged_interactions(

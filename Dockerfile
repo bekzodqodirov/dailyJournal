@@ -7,9 +7,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# ffmpeg: video-note / voice audio extraction (Phase 1+). tzdata: Asia/Tashkent.
+# ffmpeg: video-note / voice audio extraction. tzdata: Asia/Tashkent.
+# postgresql-client: pg_dump for the nightly backup. age: encrypts that dump
+# before it touches the disk (spec §10).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata curl \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg tzdata curl postgresql-client age \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -21,7 +24,7 @@ COPY miya ./miya
 
 # Run as a non-root user; the app never needs to write to its own code.
 RUN useradd --create-home --uid 10001 miya \
-    && mkdir -p /data/call_recordings \
+    && mkdir -p /data/call_recordings /data/backups \
     && chown -R miya:miya /data
 USER miya
 
