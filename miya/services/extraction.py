@@ -11,10 +11,12 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Literal
 
 import anthropic
-from pydantic import BaseModel, Field, field_validator
+from anthropic.lib._parse._transform import transform_schema
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator
 
 from miya.config import settings
 from miya.services.prompts import EXTRACTION_SYSTEM_PROMPT
@@ -197,14 +199,12 @@ def build_user_content(text: str, *, now: datetime) -> str:
     )
 
 
-async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcome:
-    """Run one extraction. Never raises — failures come back as `error`."""
-    if not text or not text.strip():
-        return ExtractionOutcome(result=ExtractionResult(), model=settings.extract_model)
+MAX_EXTRACTION_TOKENS = 4096
 
-    now = now or datetime.now(settings.tz)
-    client = get_client()
-    system = [
+
+def extraction_system_block() -> list[dict]:
+    """The cached system block shared by the real-time and batch paths."""
+    return [
         {
             "type": "text",
             "text": EXTRACTION_SYSTEM_PROMPT,
@@ -213,6 +213,48 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
             "cache_control": {"type": "ephemeral"},
         }
     ]
+
+
+@lru_cache(maxsize=1)
+def extraction_output_config() -> dict:
+    """Structured-output config for ``ExtractionResult``.
+
+    ``messages.parse`` builds this internally from ``output_format``; the Batch
+    API takes raw params, so the batch path builds the identical object here
+    rather than hand-writing a second copy of the schema.
+    """
+    schema = TypeAdapter(ExtractionResult).json_schema()
+    return {"format": {"type": "json_schema", "schema": transform_schema(schema)}}
+
+
+def build_request_params(text: str, *, now: datetime) -> dict:
+    """One extraction request, in Messages API shape (used by the batch path)."""
+    return {
+        "model": settings.extract_model,
+        "max_tokens": MAX_EXTRACTION_TOKENS,
+        "system": extraction_system_block(),
+        "messages": [{"role": "user", "content": build_user_content(text, now=now)}],
+        "output_config": extraction_output_config(),
+    }
+
+
+def parse_extraction_json(text: str) -> ExtractionResult | None:
+    """Validate a batch result's JSON body. None means it was not usable."""
+    try:
+        return ExtractionResult.model_validate_json(text)
+    except ValidationError as exc:
+        log.warning("batch extraction returned an invalid object: %s", exc)
+        return None
+
+
+async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcome:
+    """Run one extraction. Never raises — failures come back as `error`."""
+    if not text or not text.strip():
+        return ExtractionOutcome(result=ExtractionResult(), model=settings.extract_model)
+
+    now = now or datetime.now(settings.tz)
+    client = get_client()
+    system = extraction_system_block()
     messages = [{"role": "user", "content": build_user_content(text, now=now)}]
 
     last_error: str | None = None
@@ -229,7 +271,7 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
         try:
             response = await client.messages.parse(
                 model=settings.extract_model,
-                max_tokens=4096,
+                max_tokens=MAX_EXTRACTION_TOKENS,
                 system=system,
                 messages=messages,
                 output_format=ExtractionResult,

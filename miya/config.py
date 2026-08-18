@@ -66,6 +66,17 @@ class Settings(BaseSettings):
     telethon_api_hash: str = ""
     telethon_session: str = ""
 
+    # --- Userbot conversation windows (spec §7B) ----------------------------
+    window_idle_minutes: int = 30
+    window_max_messages: int = 25
+    window_max_chars: int = 4000
+    # A window whose batch keeps failing falls back to real-time extraction.
+    batch_max_attempts: int = 3
+
+    # --- Documents (spec §6) ------------------------------------------------
+    doc_max_bytes: int = 20 * 1024 * 1024
+    doc_max_chars: int = 15_000
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

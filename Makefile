@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 .PHONY: help env up down restart logs ps health migrate revision downgrade psql \
-        bot worker shell install test lint fmt check gcal-auth
+        bot worker userbot userbot-login shell install test lint fmt check gcal-auth
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -14,7 +14,7 @@ env: ## Create .env from .env.example if it does not exist
 up: env ## Build and start everything, then run migrations
 	$(COMPOSE) up -d --build db api
 	$(MAKE) migrate
-	$(COMPOSE) up -d --build bot worker
+	$(COMPOSE) up -d --build bot worker userbot
 	@echo "API: http://127.0.0.1:$${API_PORT:-8000}/health"
 
 down: ## Stop everything (volumes are kept)
@@ -55,6 +55,12 @@ worker: ## Tail the scheduler logs
 
 shell: ## Shell into the api container
 	$(COMPOSE) run --rm api bash
+
+userbot: ## Tail the Telegram userbot logs
+	$(COMPOSE) logs -f --tail=100 userbot
+
+userbot-login: ## One-time Telethon login; prints TELETHON_SESSION for .env
+	$(COMPOSE) run --rm -it userbot python -m miya.tools.userbot_login
 
 gcal-auth: ## One-time Google Calendar OAuth (use with: ssh -L 8765:127.0.0.1:8765)
 	$(COMPOSE) run --rm -p 127.0.0.1:8765:8765 -v ./secrets:/app/secrets worker \

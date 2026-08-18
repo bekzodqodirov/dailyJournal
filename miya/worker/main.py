@@ -8,6 +8,9 @@ Jobs:
   * daily_report — cron at REPORT_TIME; composes and sends the day's report
   * gcal_pull    — every GCAL_PULL_MINUTES; Google → events (when authed)
   * gcal_push    — every 5 min; extracted events → Google (when authed)
+  * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
+  * batch_submit — every BATCH_FLUSH_HOURS; pending windows → Batch API
+  * batch_poll   — every 15 min; applies finished batches
 """
 
 from __future__ import annotations
@@ -28,7 +31,15 @@ from miya.bot import replies
 from miya.bot.formatting import clip
 from miya.config import settings
 from miya.db.session import engine, session_scope
-from miya.services import call_recordings, gcal, memories, reminders, reports
+from miya.services import (
+    batch,
+    call_recordings,
+    gcal,
+    memories,
+    reminders,
+    reports,
+    windows,
+)
 from miya.services.embeddings import EmbeddingError, get_embedder
 
 log = logging.getLogger(__name__)
@@ -145,6 +156,31 @@ async def gcal_push_job() -> None:
         log.info("gcal push: %d events created in Google Calendar", pushed)
 
 
+async def window_job() -> None:
+    """Group the userbot's loose messages into extractable conversations."""
+    async with session_scope() as session:
+        flushed = await windows.flush_ready_windows(session)
+    if flushed:
+        log.info("window flush produced %d window(s)", len(flushed))
+
+
+async def batch_submit_job() -> None:
+    async with session_scope() as session:
+        await batch.submit_pending(session)
+
+
+async def batch_poll_job() -> None:
+    async with session_scope() as session:
+        outcome = await batch.collect_submitted(session)
+    if outcome.applied or outcome.failed:
+        log.info(
+            "batch poll: %d applied, %d retried, %d failed",
+            outcome.applied,
+            outcome.retried,
+            outcome.failed,
+        )
+
+
 async def run() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -212,6 +248,29 @@ async def run() -> None:
         gcal_push_job,
         IntervalTrigger(minutes=5),
         id="gcal_push",
+        max_instances=1,
+        coalesce=True,
+    )
+    # Userbot pipeline. These jobs are harmless with the userbot switched off:
+    # with no messages there is nothing to window and nothing to submit.
+    scheduler.add_job(
+        window_job,
+        IntervalTrigger(minutes=5),
+        id="windows",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        batch_submit_job,
+        IntervalTrigger(hours=settings.batch_flush_hours),
+        id="batch_submit",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        batch_poll_job,
+        IntervalTrigger(minutes=15),
+        id="batch_poll",
         max_instances=1,
         coalesce=True,
     )

@@ -51,9 +51,39 @@ raqamlar bilan javob beraman.
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — kunlik hisobot
 /reja — ertangi reja
+/chats — qaysi Telegram chatlar o'qilishi
+/process — javob yozilgan media'ni qayta ishlash
 /tekshir — qayta ishlanmagan yozuvlar
 /yordam — shu ro'yxat
 """
+
+CHATS_HEADER = (
+    "💬 <b>Kuzatilayotgan chatlar</b>\n"
+    "<i>Tugmalar: chat nomi — o'qishni yoqadi/o'chiradi, "
+    "👁 — rasmlarni tahlil qilish, 📄 — hujjatlarni o'qish.</i>"
+)
+
+CHATS_EMPTY = (
+    "💬 Hozircha chat ro'yxati bo'sh — userbot ishga tushganda "
+    "chatlar avtomatik qo'shiladi."
+)
+
+PROCESS_NO_TARGET = (
+    "Qayta ishlash uchun kerakli media xabarga <b>javob</b> qilib "
+    "<code>/process</code> deb yozing."
+)
+
+PROCESS_NO_MEDIA = "Bu xabarda qayta ishlanadigan media yo'q."
+
+VIDEO_STORED_HINT = (
+    "🎬 Video saqlandi. Ichidagi gaplarni yozib olishim uchun shu xabarga "
+    "javob qilib <code>/process</code> deb yozing."
+)
+
+DOCUMENT_FAILED_HINT = (
+    "⚠️ Hujjatni o'qib bo'lmadi (formati qo'llab-quvvatlanmaydi yoki himoyalangan). "
+    "Fayl saqlandi — /tekshir ro'yxatida turadi."
+)
 
 
 def person_not_found(name: str) -> str:

@@ -93,6 +93,15 @@ class TaskStatus(str, enum.Enum):
     dropped = "dropped"
 
 
+class WindowStatus(str, enum.Enum):
+    """Lifecycle of one userbot conversation window (spec §7B)."""
+
+    pending = "pending"  # flushed from messages, not yet sent for extraction
+    submitted = "submitted"  # part of an in-flight Batch API job
+    applied = "applied"  # extraction landed in the database
+    failed = "failed"  # gave up after batch_max_attempts; needs_review is set
+
+
 # Names of the PostgreSQL types. Kept here so models and migrations agree.
 CURRENCY_ENUM = "currency"
 INTERACTION_SOURCE_ENUM = "interaction_source"
@@ -107,3 +116,4 @@ EVENT_SOURCE_ENUM = "event_source"
 EVENT_STATUS_ENUM = "event_status"
 TASK_PRIORITY_ENUM = "task_priority"
 TASK_STATUS_ENUM = "task_status"
+WINDOW_STATUS_ENUM = "window_status"

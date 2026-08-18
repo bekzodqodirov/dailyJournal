@@ -36,9 +36,9 @@ Telegram reader are Phases 3 and 4.
 └────────────────────────────┬────────────────────────────────────────┘
                              ▼
 ┌──────────── STORAGE: PostgreSQL 16 + pgvector ──────────────────────┐
-│ people · chat_monitors · interactions · debts · debt_payments ·     │
-│ promises · transactions · events · tasks · memories · daily_reports │
-│ · usage_log                                                         │
+│ people · chat_monitors · interactions · conversation_windows ·      │
+│ debts · debt_payments · promises · transactions · events · tasks ·  │
+│ memories · daily_reports · usage_log · reminder_log                 │
 └────────────────────────────┬────────────────────────────────────────┘
                              ▼
 ┌──────────── ACT (via the assistant bot) ────────────────────────────┐
@@ -143,6 +143,8 @@ it recorded:
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
 | `/hisobot` | Generate and send today's report right now |
 | `/reja` | Tomorrow's time-blocked plan |
+| `/chats` | Which Telegram chats the userbot reads, with per-chat toggles |
+| `/process` | Reply to a video/document/voice to process it on demand |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
 | `/yordam` | The command list |
 
@@ -269,6 +271,57 @@ quiet no-ops.
 
 ---
 
+## The Telegram userbot
+
+The userbot reads the owner's **personal** Telegram account with Telethon so
+that business conversations become debts, promises and facts without anyone
+re-typing them. It is passive by construction:
+
+* It never sends, edits, deletes, forwards or marks anything as read. A test
+  parses the package and fails the build if a writing call ever appears.
+* It downloads no history. Only messages that arrive after it starts are read;
+  the dialog list is used for chat titles only.
+* `USERBOT_ENABLED=false` turns the whole thing off in one flag.
+* The Telethon session string is a **full credential** for the account. Keep it
+  in `.env`, and revoke it from Telegram → Settings → Devices if it leaks.
+
+Automating a personal account technically violates Telegram's Terms of
+Service. The design above is what keeps the risk minimal, but the decision to
+run it is the owner's.
+
+**Setup**
+
+```bash
+# 1. Get api_id / api_hash from https://my.telegram.org → API development tools
+# 2. Log in once (asks for phone, code, 2FA password):
+make userbot-login          # prints TELETHON_SESSION=… for .env
+# 3. Restart and pick which chats are read:
+make up && make userbot     # then send /chats to the assistant bot
+```
+
+`/chats` lists every known chat with three toggles: read this chat, run vision
+on its photos, read its documents. Private chats start on, groups and channels
+start off — exactly the spec's default, and the same screen doubles as the DM
+exclude list.
+
+**From messages to facts.** Each monitored message is stored on its own, then a
+worker job groups a chat's messages into a **conversation window** — flushed
+after 30 minutes of silence, 25 messages, or 4,000 characters, whichever comes
+first. Windows are rendered as `[ME]` / `[THEM (Name)]` transcripts and
+extracted through the **Message Batches API at half price**, which is why they
+are not instant: a window submitted at 14:00 typically lands within the hour.
+Buffering happens in the database, so a restart never loses a message, and a
+window that keeps failing in batches is retried at full price rather than lost.
+
+**Media**, per chat settings: voice messages and video notes are always
+transcribed (ffmpeg pulls the audio out of a video note first); photos are only
+sent to vision where `vision_enabled` is on; documents (`pdf`, `xlsx`, `docx`,
+`txt`, `csv`) are parsed **locally on the VPS** and capped at 15,000
+characters; videos are stored but not processed until the owner replies
+`/process`; stickers and GIFs are dropped entirely.
+
+---
+
 ## Data model
 
 Thirteen tables (`miya/db/models.py`, migrations under `alembic/versions/`):
@@ -334,7 +387,7 @@ Recording your own calls for personal use is generally acceptable, but rules on
 the other party's consent vary by jurisdiction. Complying with the law where the
 owner and the other party are located is the owner's responsibility.
 
-The Telegram userbot (Phase 4) automates a personal account, which technically
+The Telegram userbot automates a personal account, which technically
 violates Telegram's Terms of Service. It stays strictly passive — it never sends
 messages, never marks chats as read, and never bulk-downloads history — and
 `USERBOT_ENABLED=false` disables it entirely.
@@ -349,13 +402,15 @@ messages, never marks chats as read, and never bulk-downloads history — and
 | **1** | Assistant bot, Scribe, Haiku extraction, person resolution, `/qarz` `/vada` `/bugun` `/kim`, reminders | ✅ done |
 | **2** | Syncthing share + folder watcher → phone-call interactions | ✅ done |
 | **3** | bge-m3 memories, RAG chat (SQL-first for money), daily report, planner, Google Calendar | ✅ done |
-| **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | next |
-| **5** | `/xarajat`, purge tooling, backfill, retention jobs | |
+| **4** | Telethon userbot, `/chats`, conversation windowing, media policy, Batch API | ✅ done |
+| **5** | `/xarajat`, purge tooling, backfill, retention jobs | next |
 
 Dependencies are added per phase rather than up front. Phase 0 installed
 FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
 `anthropic`, `aiogram` and `rapidfuzz`; Phase 3 added `sentence-transformers`
-(and with it torch, CPU-only) plus the Google Calendar client libraries.
+(and with it torch, CPU-only) plus the Google Calendar client libraries; Phase
+4 added `Telethon` and the document parsers (`pdfplumber`, `openpyxl`,
+`python-docx`).
 
 ---
 
@@ -371,9 +426,9 @@ measured, not assumed.
 
 ## Verification
 
-185 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
-ElevenLabs and Google clients are stubbed throughout (the embedder too), so
-the suite is free and offline.
+250 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
+ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
+too), so the suite is free and offline.
 
 **Schema and migrations**
 * `upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly, and
@@ -427,3 +482,19 @@ the suite is free and offline.
   row in place, and a pushed event is never re-imported as a duplicate.
 * Pushes carry the `[MIYA]` marker and Tashkent wall-clock times, skip
   date-only and past events, and a failed insert stays queued for retry.
+
+**Userbot, windows and batches (Phase 4)**
+* The userbot package is parsed by a test that fails if any Telegram-writing
+  call (`send_message`, `send_read_acknowledge`, `iter_messages`, …) appears.
+* `USERBOT_ENABLED=false` returns before a client is even constructed; a
+  missing session exits instead of prompting on stdin.
+* Each of the three window triggers is exercised separately, a long backlog
+  becomes several windows in one pass, and a claimed message is never
+  windowed twice.
+* Batch results land debts through a synthetic window interaction at half
+  price; an errored, expired, missing or unparseable result is retried, and
+  only after `BATCH_MAX_ATTEMPTS` does it fall back to a real-time call — a
+  window that fails everywhere still keeps its text and shows up in
+  `/tekshir`.
+* The media policy is table-tested per media type against both chat settings,
+  and every document parser runs against a real file.

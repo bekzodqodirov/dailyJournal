@@ -76,6 +76,23 @@ services:
       - ./secrets:/app/secrets
     command: ["python", "-m", "miya.worker.main"]
 
+  userbot:
+    build: .
+    # Passive Telegram reader on the owner's personal account (spec §7B).
+    # It exits cleanly when USERBOT_ENABLED=false, so `no` keeps it off rather
+    # than looping a container that is meant to stay down.
+    restart: on-failure:5
+    env_file: .env
+    environment:
+      EMBED_SERVICE_URL: http://api:8000
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./secrets:/app/secrets:ro
+    command: ["python", "-m", "miya.userbot.main"]
+
   syncthing:
     image: syncthing/syncthing:1
     restart: unless-stopped

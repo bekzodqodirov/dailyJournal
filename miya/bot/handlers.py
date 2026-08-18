@@ -19,15 +19,25 @@ import sqlalchemy as sa
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message
 
 from miya.bot import replies
 from miya.bot.formatting import clip
+from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Person
 from miya.db.session import session_scope
-from miya.services import memories, planner, queries, rag, reports
+from miya.services import (
+    audio,
+    chats,
+    documents,
+    memories,
+    planner,
+    queries,
+    rag,
+    reports,
+)
 from miya.services.embeddings import EmbeddingError, get_embedder
 from miya.services.ingest import (
     create_interaction,
@@ -48,6 +58,8 @@ def is_owner(user_id: int | None) -> bool:
 
 router = Router(name="assistant")
 router.message.filter(F.from_user.id.func(is_owner))
+# Buttons are as privileged as commands — `/chats` toggles what gets read.
+router.callback_query.filter(F.from_user.id.func(is_owner))
 
 
 def _media_path(suffix: str) -> Path:
@@ -167,6 +179,71 @@ async def cmd_plan(message: Message) -> None:
     async with session_scope() as session:
         content = await planner.plan_tomorrow(session)
     await _safe_answer(message, clip(f"📅 <b>Ertangi reja</b>\n\n{content}"))
+
+
+@router.message(Command("chats"))
+async def cmd_chats(message: Message) -> None:
+    async with session_scope() as session:
+        monitors, total = await chats.list_monitors(session, offset=0, limit=PAGE_SIZE)
+    if not monitors:
+        await _safe_answer(message, replies.CHATS_EMPTY)
+        return
+    page = ChatsPage(monitors=monitors, page=0, total=total)
+    try:
+        await message.answer(replies.CHATS_HEADER, reply_markup=chats_keyboard(page))
+    except Exception:
+        log.exception("could not send the chat list")
+
+
+@router.callback_query(F.data.startswith("ch:"))
+async def on_chats_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    page_index = 0
+    notice = None
+
+    if action == "t" and len(parts) == 4:
+        field = FIELD_CODES.get(parts[3])
+        if field is None:
+            await callback.answer()
+            return
+        async with session_scope() as session:
+            monitor = await chats.toggle(session, int(parts[2]), field)
+            enabled = bool(monitor and getattr(monitor, field))
+            notice = "✅ yoqildi" if enabled else "❌ o'chirildi"
+        page_index = _page_of(callback)
+    elif action == "p" and len(parts) == 3:
+        page_index = int(parts[2])
+    else:  # "noop" — the page counter in the middle of the nav row
+        await callback.answer()
+        return
+
+    async with session_scope() as session:
+        monitors, total = await chats.list_monitors(
+            session, offset=page_index * PAGE_SIZE, limit=PAGE_SIZE
+        )
+    page = ChatsPage(monitors=monitors, page=page_index, total=total)
+    try:
+        await callback.message.edit_text(
+            replies.CHATS_HEADER, reply_markup=chats_keyboard(page)
+        )
+    except Exception:
+        # Telegram rejects an edit that changes nothing; the toggle still
+        # landed, so this is a cosmetic failure only.
+        log.debug("chat list edit failed", exc_info=True)
+    await callback.answer(notice or "")
+
+
+def _page_of(callback: CallbackQuery) -> int:
+    """Which page the pressed keyboard was showing, so a toggle stays put."""
+    markup = callback.message.reply_markup if callback.message else None
+    for row in markup.inline_keyboard if markup else []:
+        for button in row:
+            data = button.callback_data or ""
+            if data == "ch:noop":
+                current, _, _ = button.text.partition("/")
+                return max(0, int(current) - 1) if current.isdigit() else 0
+    return 0
 
 
 @router.message(Command("kim"))
@@ -312,12 +389,183 @@ async def on_photo(message: Message, bot: Bot) -> None:
     await _safe_answer(message, reply)
 
 
-@router.message(F.video_note | F.video | F.document | F.sticker)
-async def on_unsupported(message: Message) -> None:
-    await _safe_answer(
-        message,
-        "📎 Bu turdagi fayl hozircha qo'llab-quvvatlanmaydi — "
-        "keyingi bosqichda qo'shiladi.",
+@router.message(F.document)
+async def on_document(message: Message, bot: Bot) -> None:
+    await _typing(message)
+    document = message.document
+    suffix = Path(document.file_name or "").suffix or ".bin"
+    path = _media_path(suffix)
+    if not await _download(bot, message, document, path):
+        return
+
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            text=message.caption,
+            occurred_at=message.date.astimezone(settings.tz),
+            media={
+                "type": "document",
+                "path": str(path),
+                "filename": document.file_name,
+                "mime": document.mime_type,
+                "size": document.file_size,
+                "caption": message.caption,
+                "processed": False,
+            },
+        )
+        parsed = await documents.read_document_async(path)
+        if parsed is None and not message.caption:
+            interaction.needs_review = True
+            reply = replies.DOCUMENT_FAILED_HINT
+        else:
+            if parsed is not None:
+                interaction.transcript = parsed.text
+                interaction.meta = {
+                    **(interaction.meta or {}),
+                    "document": {
+                        "truncated": parsed.truncated,
+                        "detail": parsed.detail,
+                    },
+                }
+            interaction.media = {**(interaction.media or {}), "processed": True}
+            result = await process_interaction(session, interaction)
+            reply = (
+                replies.confirmation(result.applied)
+                if result.ok
+                else replies.FAILED_EXTRACTION_HINT
+            )
+    await _safe_answer(message, reply)
+
+
+@router.message(F.video | F.video_note)
+async def on_video(message: Message, bot: Bot) -> None:
+    """Videos are stored, not transcribed — `/process` opts into the cost."""
+    media = message.video or message.video_note
+    path = _media_path(".mp4")
+    if not await _download(bot, message, media, path):
+        return
+
+    async with session_scope() as session:
+        await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            text=message.caption,
+            occurred_at=message.date.astimezone(settings.tz),
+            media={
+                "type": "video",
+                "path": str(path),
+                "size": media.file_size,
+                "duration": getattr(media, "duration", None),
+                "caption": message.caption,
+                "processed": False,
+            },
+            meta={"tg_message_id": message.message_id},
+        )
+    await _safe_answer(message, replies.VIDEO_STORED_HINT)
+
+
+@router.message(F.sticker)
+async def on_sticker(message: Message) -> None:
+    """Stickers carry nothing to extract (spec §6) — silently ignored."""
+
+
+@router.message(Command("process"))
+async def cmd_process(message: Message, bot: Bot) -> None:
+    """On-demand processing of a replied-to media message (spec §6, §7A)."""
+    target = message.reply_to_message
+    if target is None:
+        await _safe_answer(message, replies.PROCESS_NO_TARGET)
+        return
+
+    media = (
+        target.video
+        or target.video_note
+        or target.voice
+        or target.audio
+        or target.document
+        or (target.photo[-1] if target.photo else None)
+    )
+    if media is None:
+        await _safe_answer(message, replies.PROCESS_NO_MEDIA)
+        return
+
+    await _typing(message)
+    is_video = bool(target.video or target.video_note)
+    is_audio = bool(target.voice or target.audio)
+    is_photo = bool(target.photo)
+    suffix = Path(getattr(media, "file_name", "") or "").suffix
+    if not suffix:
+        suffix = (
+            ".mp4" if is_video else ".jpg" if is_photo else ".ogg" if is_audio else ".bin"
+        )
+
+    path = _media_path(suffix)
+    if not await _download(bot, message, media, path):
+        return
+
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            text=target.caption,
+            occurred_at=target.date.astimezone(settings.tz),
+            media={
+                "type": "video" if is_video else "photo" if is_photo else "file",
+                "path": str(path),
+                "filename": getattr(media, "file_name", None),
+                "caption": target.caption,
+                "processed": False,
+            },
+            meta={"tg_message_id": target.message_id, "on_demand": True},
+        )
+        reply = await _process_on_demand(
+            session,
+            interaction,
+            path,
+            is_video=is_video,
+            is_audio=is_audio,
+            is_photo=is_photo,
+        )
+    await _safe_answer(message, reply)
+
+
+async def _process_on_demand(
+    session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
+) -> str:
+    """Run the right pipeline for one explicitly requested media file."""
+    if is_video:
+        audio_path = path.with_suffix(".mp3")
+        if not await audio.extract_audio(path, audio_path):
+            interaction.needs_review = True
+            return replies.TRANSCRIPTION_FAILED_HINT
+        interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
+        if await transcribe_into(session, interaction, audio_path) is None:
+            return replies.TRANSCRIPTION_FAILED_HINT
+    elif is_audio:
+        if await transcribe_into(session, interaction, path) is None:
+            return replies.TRANSCRIPTION_FAILED_HINT
+    elif is_photo:
+        described = await describe_into(session, interaction, path)
+        if described is None and not interaction.raw_text:
+            return replies.PHOTO_FAILED_HINT
+    else:
+        parsed = await documents.read_document_async(path)
+        if parsed is None and not interaction.raw_text:
+            interaction.needs_review = True
+            return replies.DOCUMENT_FAILED_HINT
+        if parsed is not None:
+            interaction.transcript = parsed.text
+
+    interaction.media = {**(interaction.media or {}), "processed": True}
+    result = await process_interaction(session, interaction)
+    return (
+        replies.confirmation(result.applied)
+        if result.ok
+        else replies.FAILED_EXTRACTION_HINT
     )
 
 

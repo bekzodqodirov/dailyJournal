@@ -36,6 +36,7 @@ EVENT_SOURCE = pg_enum(e.EventSource, e.EVENT_SOURCE_ENUM)
 EVENT_STATUS = pg_enum(e.EventStatus, e.EVENT_STATUS_ENUM)
 TASK_PRIORITY = pg_enum(e.TaskPriority, e.TASK_PRIORITY_ENUM)
 TASK_STATUS = pg_enum(e.TaskStatus, e.TASK_STATUS_ENUM)
+WINDOW_STATUS = pg_enum(e.WindowStatus, e.WINDOW_STATUS_ENUM)
 
 
 class Person(Base):
@@ -84,6 +85,47 @@ class ChatMonitor(Base):
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
+class ConversationWindow(Base):
+    """A flushed slice of one chat's conversation, extracted as a unit (spec §7B).
+
+    The userbot stores each message as its own interaction; a window groups the
+    consecutive ones and is what actually goes to the extractor, so a debt
+    mentioned across three messages is understood as one fact. Extraction runs
+    through the Batch API (half price), hence the explicit lifecycle.
+    """
+
+    __tablename__ = "conversation_windows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tg_chat_id: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    ended_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
+    message_count: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    char_count: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    # The rendered [ME] / [THEM (Name)] transcript handed to the extractor.
+    text: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    status: Mapped[e.WindowStatus] = mapped_column(
+        WINDOW_STATUS, nullable=False, server_default=e.WindowStatus.pending.value
+    )
+    # Anthropic Message Batches identifiers: the job, and this window's slot.
+    batch_id: Mapped[str | None] = mapped_column(sa.Text)
+    custom_id: Mapped[str] = mapped_column(sa.Text, unique=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
+    submitted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    applied_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.Index("ix_conversation_windows_status", "status", "created_at"),
+        sa.Index("ix_conversation_windows_batch", "batch_id"),
+    )
+
+
 class Interaction(Base):
     """Every input lands here first, before extraction."""
 
@@ -118,6 +160,12 @@ class Interaction(Base):
     )
     created_at: Mapped[datetime] = created_at_column()
 
+    # Set once a userbot message has been claimed by a conversation window;
+    # the window owns extraction for every message it contains (spec §7B).
+    window_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("conversation_windows.id", ondelete="SET NULL")
+    )
+
     person: Mapped[Person | None] = relationship(lazy="raise")
 
     __table_args__ = (
@@ -128,6 +176,14 @@ class Interaction(Base):
             "ix_interactions_unprocessed",
             "created_at",
             postgresql_where=sa.text("processed = false"),
+        ),
+        # The window flush job asks "which userbot messages are unclaimed?"
+        # every few minutes; keep that off a sequential scan.
+        sa.Index(
+            "ix_interactions_unwindowed",
+            "tg_chat_id",
+            "occurred_at",
+            postgresql_where=sa.text("window_id IS NULL AND source = 'telegram_userbot'"),
         ),
         # Call-recording dedupe: hash lookups happen once a minute (spec §7C).
         sa.Index(

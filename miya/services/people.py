@@ -96,6 +96,12 @@ async def resolve_person(
             sa.select(Person).where(Person.telegram_id == telegram_id)
         )
         if existing is not None:
+            # Usernames change and phone numbers appear later; keep the row
+            # current without ever overwriting what the owner typed himself.
+            if telegram_username and existing.telegram_username != telegram_username:
+                existing.telegram_username = telegram_username
+            if phone and not existing.phone:
+                existing.phone = phone
             return existing
 
     name = (name or "").strip()
