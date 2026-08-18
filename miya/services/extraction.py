@@ -86,6 +86,11 @@ class ExtractedSettlement(BaseModel):
     amount: float
     currency: CurrencyCode = "UZS"
     note: str = ""
+    # Which side was repaid. The owner can have open debts in both directions
+    # with the same person, and paying down the wrong one silently inverts his
+    # books — so this is asked for explicitly, and left null when the text
+    # genuinely does not say (the persistence layer then refuses to guess).
+    direction: Literal["they_owe_me", "i_owe_them"] | None = None
 
 
 class ExtractedPromise(BaseModel):

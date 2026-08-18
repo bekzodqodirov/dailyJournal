@@ -217,3 +217,122 @@ async def test_scribe_garbage_body_raises_transcription_error(monkeypatch, tmp_p
 
     with pytest.raises(TranscriptionError):
         await scribe.transcribe(audio)
+
+
+# --- settlement direction (a repayment has a side) ---------------------------
+
+
+async def _two_sided_debts(session):
+    """The owner and Akmal owe each other — routine with a regular supplier."""
+    person = await resolve_person(session, "Akmal")
+    interaction = await _interaction(session)
+    i_owe = m.Debt(
+        direction=DebtDirection.i_owe_them,
+        person_id=person.id,
+        amount=Decimal("3000000"),
+        currency=Currency.UZS,
+        due_date=date(2026, 8, 20),  # due sooner, so it sorts first
+        source_interaction_id=interaction.id,
+    )
+    they_owe = m.Debt(
+        direction=DebtDirection.they_owe_me,
+        person_id=person.id,
+        amount=Decimal("5000000"),
+        currency=Currency.UZS,
+        due_date=date(2026, 9, 25),
+        source_interaction_id=interaction.id,
+    )
+    session.add_all([i_owe, they_owe])
+    await session.flush()
+    return person, i_owe, they_owe
+
+
+async def test_a_repayment_settles_the_side_it_was_made_on(session):
+    """Repro: "Akmal 5 mln qaytardi" used to settle the owner's OWN debt."""
+    _, i_owe, they_owe = await _two_sided_debts(session)
+
+    await apply_extraction(
+        session,
+        await _interaction(session),
+        ex.ExtractionResult(
+            debt_settlements=[
+                ex.ExtractedSettlement(
+                    person="Akmal",
+                    amount=5_000_000,
+                    currency="UZS",
+                    direction="they_owe_me",
+                )
+            ]
+        ),
+    )
+    await session.flush()
+
+    assert they_owe.status is DebtStatus.settled
+    assert i_owe.status is DebtStatus.open  # the owner's own debt is untouched
+
+
+async def test_the_owner_paying_back_settles_his_own_debt(session):
+    _, i_owe, they_owe = await _two_sided_debts(session)
+
+    await apply_extraction(
+        session,
+        await _interaction(session),
+        ex.ExtractionResult(
+            debt_settlements=[
+                ex.ExtractedSettlement(
+                    person="Akmal",
+                    amount=3_000_000,
+                    currency="UZS",
+                    direction="i_owe_them",
+                )
+            ]
+        ),
+    )
+    await session.flush()
+
+    assert i_owe.status is DebtStatus.settled
+    assert they_owe.status is DebtStatus.open
+
+
+async def test_an_ambiguous_repayment_pays_nothing_and_asks(session):
+    """With both sides open and no direction, guessing would invert the books."""
+    _, i_owe, they_owe = await _two_sided_debts(session)
+
+    applied = await apply_extraction(
+        session,
+        await _interaction(session),
+        ex.ExtractionResult(
+            debt_settlements=[
+                ex.ExtractedSettlement(person="Akmal", amount=5_000_000, currency="UZS")
+            ]
+        ),
+    )
+    await session.flush()
+
+    assert i_owe.status is DebtStatus.open
+    assert they_owe.status is DebtStatus.open
+    assert applied.settlements == []
+    assert applied.ambiguous_settlements == [
+        ("Akmal", Decimal("5000000.00"), Currency.UZS)
+    ]
+    body = replies.confirmation(applied)
+    assert "kim to'laganini yozing" in body
+
+
+async def test_a_one_sided_repayment_still_needs_no_direction(session):
+    """Only one side open: the direction is not in doubt, so it just applies."""
+    person, debt = await _open_debt(session, amount="4000000")
+
+    applied = await apply_extraction(
+        session,
+        await _interaction(session),
+        ex.ExtractionResult(
+            debt_settlements=[
+                ex.ExtractedSettlement(person="Akmal", amount=4_000_000, currency="UZS")
+            ]
+        ),
+    )
+    await session.flush()
+
+    assert debt.status is DebtStatus.settled
+    assert applied.ambiguous_settlements == []

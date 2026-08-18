@@ -356,3 +356,56 @@ async def test_collect_submitted_walks_every_in_flight_batch(session, monkeypatc
     assert outcome.applied == 2
     assert first.status is WindowStatus.applied
     assert second.status is WindowStatus.applied
+
+
+async def test_an_interrupted_result_stream_never_double_applies(session, monkeypatch):
+    """A results stream that dies mid-way must not re-extract what landed.
+
+    The next poll replays the batch from the beginning; without filtering to
+    still-submitted windows, every debt in the already-applied ones would be
+    written a second time. Reproduced live before the fix (3 debts for 2
+    windows).
+    """
+    first = await _window(session, text="birinchi oyna")
+    second = await _window(session, text="ikkinchi oyna")
+
+    class _Flaky(_StubClient):
+        def __init__(self):
+            super().__init__()
+            self.fail_after: int | None = None
+
+    stub = _Flaky()
+
+    async def _results(batch_id):
+        entries, fail_after = stub.results, stub.fail_after
+
+        async def _gen():
+            for index, entry in enumerate(entries):
+                if fail_after is not None and index >= fail_after:
+                    raise _api_error()
+                yield entry
+
+        return _gen()
+
+    stub.messages.batches.results = _results
+    monkeypatch.setattr(batch, "get_client", lambda: stub)
+    await batch.submit_pending(session)
+
+    stub.results = [
+        _succeeded(first.custom_id, DEBT_JSON),
+        _succeeded(second.custom_id, DEBT_JSON),
+    ]
+    stub.fail_after = 1  # the stream dies right after the first result
+
+    await batch.collect_batch(session, "batch_1")
+    assert first.status is WindowStatus.applied
+    assert second.status is WindowStatus.submitted
+    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 1
+
+    stub.fail_after = None  # next poll tick: the stream works
+    await batch.collect_submitted(session)
+    await session.commit()
+
+    assert second.status is WindowStatus.applied
+    # One debt per window — the first window's result was not applied twice.
+    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 2

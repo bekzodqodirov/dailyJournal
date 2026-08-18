@@ -46,6 +46,10 @@ class Applied:
     unmatched_settlements: list[tuple[str, Decimal, Currency]] = field(
         default_factory=list
     )
+    # Repayments that could have gone either way; the owner has to say which.
+    ambiguous_settlements: list[tuple[str, Decimal, Currency]] = field(
+        default_factory=list
+    )
     promises: list[Promise] = field(default_factory=list)
     transactions: list[Transaction] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
@@ -58,6 +62,7 @@ class Applied:
                 self.debts,
                 self.settlements,
                 self.unmatched_settlements,
+                self.ambiguous_settlements,
                 self.promises,
                 self.transactions,
                 self.events,
@@ -73,11 +78,18 @@ async def _apply_settlement(
     currency: Currency,
     note: str,
     applied: Applied,
+    direction: DebtDirection | None = None,
 ) -> None:
     """Pay down this person's open debts in that currency, oldest due date first.
 
     A repayment larger than the outstanding balance is recorded in full against
     the last debt rather than dropped — the owner said it happened.
+
+    Direction matters: the owner routinely has open debts in *both* directions
+    with the same supplier, and paying the wrong side inverts his books. When
+    the extraction did not say which side was repaid and both sides are open,
+    nothing is paid and the owner is asked — a wrong number is worse than a
+    missing one.
     """
     # The session runs with autoflush=False, so without this flush a second
     # settlement in the same extraction would not see the first one's payment
@@ -92,6 +104,18 @@ async def _apply_settlement(
             .order_by(Debt.due_date.nulls_last(), Debt.created_at)
         )
     )
+    if direction is not None:
+        debts = [d for d in debts if d.direction is direction]
+    elif len({d.direction for d in debts}) > 1:
+        applied.ambiguous_settlements.append((person.display_name, amount, currency))
+        log.warning(
+            "settlement of %s %s for %s is ambiguous: open debts run both ways",
+            amount,
+            currency.value,
+            person.display_name,
+        )
+        return
+
     if not debts:
         applied.unmatched_settlements.append((person.display_name, amount, currency))
         return
@@ -170,7 +194,13 @@ async def apply_extraction(
         if person is None:
             continue
         await _apply_settlement(
-            session, person, amount, Currency(item.currency), item.note, applied
+            session,
+            person,
+            amount,
+            Currency(item.currency),
+            item.note,
+            applied,
+            DebtDirection(item.direction) if item.direction else None,
         )
 
     for item in result.promises:

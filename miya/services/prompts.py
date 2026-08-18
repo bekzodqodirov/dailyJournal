@@ -22,6 +22,10 @@ Rules:
   $/dollar→USD, ¥/юань/yuan→CNY, вон/won→KRW, руб→RUB; default UZS.
 - Debt direction: owner GAVE/lent → they_owe_me; owner TOOK/borrowed → i_owe_them.
   A repayment goes in debt_settlements, not debts.
+- Settlement direction: which debt was repaid. Someone paying the owner back
+  ("Akmal qaytardi/berdi/o'tkazdi", "он вернул") → they_owe_me. The owner
+  paying someone back ("men qaytardim/to'ladim", "я вернул") → i_owe_them.
+  If the text truly does not say who paid whom, leave it null — do not guess.
 - Promises: "Men ... qilaman/beraman" → made_by=me. "U ... qiladi/va'da berdi" → them.
 - Dates: resolve relative dates ("ertaga", "завтра", "indinga", "next Monday")
   against CURRENT_DATE. Output ISO. Unknown → null.

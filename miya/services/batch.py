@@ -219,10 +219,17 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
         log.debug("batch %s still %s", batch_id, batch.processing_status)
         return None
 
+    # Only windows still awaiting their result. A result stream that dies
+    # half way leaves some windows applied and the rest submitted, and the
+    # next poll replays the stream from the beginning — without this filter
+    # the already-applied ones would be extracted and persisted a second
+    # time, duplicating every debt in them.
     windows = {
         w.custom_id: w
         for w in await session.scalars(
-            sa.select(ConversationWindow).where(ConversationWindow.batch_id == batch_id)
+            sa.select(ConversationWindow)
+            .where(ConversationWindow.batch_id == batch_id)
+            .where(ConversationWindow.status == WindowStatus.submitted)
         )
     }
     if not windows:

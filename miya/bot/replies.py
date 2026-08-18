@@ -120,6 +120,15 @@ def confirmation(applied: Applied) -> str:
             f"lekin unga mos ochiq qarz topilmadi"
         )
 
+    for name, amount, currency in applied.ambiguous_settlements:
+        # Both sides are open with this person, so guessing would silently
+        # invert the books. Ask instead.
+        lines.append(
+            f"❓ {escape(name)} bilan {money(amount, currency)} to'lov: "
+            f"ikkalangizning ham ochiq qarzingiz bor — kim to'laganini yozing "
+            f"(masalan: «{escape(name)} menga {money(amount, currency)} qaytardi»)"
+        )
+
     for promise in applied.promises:
         who = "Men" if promise.made_by is PromiseMadeBy.me else "U"
         tail = f" ({short_date(promise.due_date)})" if promise.due_date else ""
