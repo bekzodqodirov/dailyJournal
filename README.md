@@ -7,12 +7,14 @@ reports back in Uzbek.
 
 Owner-facing language is Uzbek. Code, comments and commits are English.
 
-**Status: Phase 2 complete.** The assistant bot captures text, voice and photos;
-call recordings sync in from the phone via Syncthing and are transcribed and
-extracted like everything else; debts, promises, transactions, events and tasks
-are persisted and queryable; due reminders go out hourly; audio past the
-retention window is deleted nightly. The RAG/report layer and the passive
-Telegram reader are Phases 3 and 4.
+**Status: all five phases complete.** The assistant bot captures text, voice,
+photos and documents; call recordings sync in from the phone via Syncthing; a
+passive Telegram userbot reads whichever chats the owner whitelists. Everything
+is transcribed, extracted and persisted as debts, promises, transactions,
+events, tasks and searchable memories. Questions are answered with figures
+straight from SQL, a report and tomorrow's plan arrive every evening, reminders
+go out hourly, calendar events sync both ways, and the database is backed up
+encrypted every night.
 
 ---
 
@@ -72,14 +74,17 @@ unrestricted.
 
 | Target | What it does |
 |---|---|
-| `make up` | Build and start db, api, bot and worker, then migrate |
+| `make up` | Build and start db, api, bot, worker and userbot, then migrate |
 | `make down` | Stop everything (the database volume is kept) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
 | `make psql` | Open a psql shell |
 | `make logs` / `make ps` | Tail logs / show container status |
-| `make bot` / `make worker` | Tail the assistant bot / scheduler logs |
+| `make bot` / `make worker` / `make userbot` | Tail each process's logs |
+| `make userbot-login` | One-time Telethon login (prints `TELETHON_SESSION`) |
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
+| `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
+| `make backup` | Run the encrypted database backup now |
 | `make test` / `make lint` / `make fmt` | Local dev loop |
 
 On first start the api container downloads the bge-m3 embedding model (~2 GB,
@@ -107,7 +112,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | Key | Notes |
 |---|---|
 | `DATABASE_URL` | Must match `POSTGRES_*`; driver is `postgresql+psycopg` |
-| `ANTHROPIC_API_KEY` | Required from Phase 1 |
+| `ANTHROPIC_API_KEY` | Required — extraction, reports and answers all use it |
 | `EXTRACT_MODEL` | `claude-haiku-4-5` — the extraction engine |
 | `REASON_MODEL` | `claude-sonnet-5` — daily report, planner, RAG answers |
 | `ELEVENLABS_API_KEY` | Scribe transcription (uz/ru) |
@@ -186,8 +191,8 @@ day's money, people, debts, completions and tomorrow's plan.
    When the text genuinely does not say who paid whom and both sides are open,
    nothing is paid — MIYA asks instead, because a wrong balance is worse than
    a missing one.
-6. Facts are stored in `memories` without an embedding; Phase 3 backfills them
-   with bge-m3.
+6. Facts are stored in `memories` without an embedding; a worker job backfills
+   them with bge-m3 within a couple of minutes.
 
 > **Prompt caching does not engage yet.** Claude Haiku 4.5 has a 4096-token
 > minimum cacheable prefix and the extraction system prompt is roughly 400
@@ -228,7 +233,7 @@ name is matched against `people.phone` on the last 9 digits, so `+998 90
 pipeline as a voice note: Scribe transcript → Haiku extraction → rows. When a
 call produces something concrete (a debt, a promise, a transaction) the bot
 sends a short summary; routine calls land silently and appear in the daily
-report (Phase 3).
+report.
 
 A transcription failure marks the interaction `needs_review` and keeps the hash
 row, so a broken file is not retried (and re-billed) every minute. The nightly
