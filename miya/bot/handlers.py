@@ -403,6 +403,114 @@ async def cmd_person(message: Message, command: CommandObject) -> None:
     await _safe_answer(message, body)
 
 
+@router.message(Command("process"))
+async def cmd_process(message: Message, bot: Bot) -> None:
+    """On-demand processing of a media message (spec §6, §7A).
+
+    Works both ways the owner would reach for it: replying `/process` to a
+    forwarded video, or sending the video with `/process` as its caption.
+    """
+    target = message.reply_to_message or message
+    if target is message and not (
+        message.video
+        or message.video_note
+        or message.voice
+        or message.audio
+        or message.document
+        or message.photo
+    ):
+        await _safe_answer(message, replies.PROCESS_NO_TARGET)
+        return
+
+    media = (
+        target.video
+        or target.video_note
+        or target.voice
+        or target.audio
+        or target.document
+        or (target.photo[-1] if target.photo else None)
+    )
+    if media is None:
+        await _safe_answer(message, replies.PROCESS_NO_MEDIA)
+        return
+
+    await _typing(message)
+    is_video = bool(target.video or target.video_note)
+    is_audio = bool(target.voice or target.audio)
+    is_photo = bool(target.photo)
+    suffix = Path(getattr(media, "file_name", "") or "").suffix
+    if not suffix:
+        suffix = (
+            ".mp4" if is_video else ".jpg" if is_photo else ".ogg" if is_audio else ".bin"
+        )
+
+    path = _media_path(suffix)
+    if not await _download(bot, message, media, path):
+        return
+
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            text=target.caption,
+            occurred_at=target.date.astimezone(settings.tz),
+            media={
+                "type": "video" if is_video else "photo" if is_photo else "file",
+                "path": str(path),
+                "filename": getattr(media, "file_name", None),
+                "caption": target.caption,
+                "processed": False,
+            },
+            meta={"tg_message_id": target.message_id, "on_demand": True},
+        )
+        reply = await _process_on_demand(
+            session,
+            interaction,
+            path,
+            is_video=is_video,
+            is_audio=is_audio,
+            is_photo=is_photo,
+        )
+    await _safe_answer(message, reply)
+
+
+async def _process_on_demand(
+    session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
+) -> str:
+    """Run the right pipeline for one explicitly requested media file."""
+    if is_video:
+        audio_path = path.with_suffix(".mp3")
+        if not await audio.extract_audio(path, audio_path):
+            interaction.needs_review = True
+            return replies.TRANSCRIPTION_FAILED_HINT
+        interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
+        if await transcribe_into(session, interaction, audio_path) is None:
+            return replies.TRANSCRIPTION_FAILED_HINT
+    elif is_audio:
+        if await transcribe_into(session, interaction, path) is None:
+            return replies.TRANSCRIPTION_FAILED_HINT
+    elif is_photo:
+        described = await describe_into(session, interaction, path)
+        if described is None and not interaction.raw_text:
+            return replies.PHOTO_FAILED_HINT
+    else:
+        parsed = await documents.read_document_async(path)
+        if parsed is None and not interaction.raw_text:
+            interaction.needs_review = True
+            return replies.DOCUMENT_FAILED_HINT
+        if parsed is not None:
+            interaction.transcript = parsed.text
+
+    interaction.media = {**(interaction.media or {}), "processed": True}
+    result = await process_interaction(session, interaction)
+    return (
+        replies.confirmation(result.applied)
+        if result.ok
+        else replies.FAILED_EXTRACTION_HINT
+    )
+
+
 # --- content ----------------------------------------------------------------
 
 
@@ -610,103 +718,6 @@ async def on_video(message: Message, bot: Bot) -> None:
 @router.message(F.sticker)
 async def on_sticker(message: Message) -> None:
     """Stickers carry nothing to extract (spec §6) — silently ignored."""
-
-
-@router.message(Command("process"))
-async def cmd_process(message: Message, bot: Bot) -> None:
-    """On-demand processing of a replied-to media message (spec §6, §7A)."""
-    target = message.reply_to_message
-    if target is None:
-        await _safe_answer(message, replies.PROCESS_NO_TARGET)
-        return
-
-    media = (
-        target.video
-        or target.video_note
-        or target.voice
-        or target.audio
-        or target.document
-        or (target.photo[-1] if target.photo else None)
-    )
-    if media is None:
-        await _safe_answer(message, replies.PROCESS_NO_MEDIA)
-        return
-
-    await _typing(message)
-    is_video = bool(target.video or target.video_note)
-    is_audio = bool(target.voice or target.audio)
-    is_photo = bool(target.photo)
-    suffix = Path(getattr(media, "file_name", "") or "").suffix
-    if not suffix:
-        suffix = (
-            ".mp4" if is_video else ".jpg" if is_photo else ".ogg" if is_audio else ".bin"
-        )
-
-    path = _media_path(suffix)
-    if not await _download(bot, message, media, path):
-        return
-
-    async with session_scope() as session:
-        interaction = await create_interaction(
-            session,
-            source=InteractionSource.assistant_bot,
-            direction=Direction.in_,
-            text=target.caption,
-            occurred_at=target.date.astimezone(settings.tz),
-            media={
-                "type": "video" if is_video else "photo" if is_photo else "file",
-                "path": str(path),
-                "filename": getattr(media, "file_name", None),
-                "caption": target.caption,
-                "processed": False,
-            },
-            meta={"tg_message_id": target.message_id, "on_demand": True},
-        )
-        reply = await _process_on_demand(
-            session,
-            interaction,
-            path,
-            is_video=is_video,
-            is_audio=is_audio,
-            is_photo=is_photo,
-        )
-    await _safe_answer(message, reply)
-
-
-async def _process_on_demand(
-    session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
-) -> str:
-    """Run the right pipeline for one explicitly requested media file."""
-    if is_video:
-        audio_path = path.with_suffix(".mp3")
-        if not await audio.extract_audio(path, audio_path):
-            interaction.needs_review = True
-            return replies.TRANSCRIPTION_FAILED_HINT
-        interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
-        if await transcribe_into(session, interaction, audio_path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
-    elif is_audio:
-        if await transcribe_into(session, interaction, path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
-    elif is_photo:
-        described = await describe_into(session, interaction, path)
-        if described is None and not interaction.raw_text:
-            return replies.PHOTO_FAILED_HINT
-    else:
-        parsed = await documents.read_document_async(path)
-        if parsed is None and not interaction.raw_text:
-            interaction.needs_review = True
-            return replies.DOCUMENT_FAILED_HINT
-        if parsed is not None:
-            interaction.transcript = parsed.text
-
-    interaction.media = {**(interaction.media or {}), "processed": True}
-    result = await process_interaction(session, interaction)
-    return (
-        replies.confirmation(result.applied)
-        if result.ok
-        else replies.FAILED_EXTRACTION_HINT
-    )
 
 
 def build_reject_router() -> Router:
