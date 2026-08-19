@@ -192,9 +192,7 @@ async def fetch_media(
     return outcome
 
 
-async def persist_media(
-    session, interaction: Interaction, outcome: MediaOutcome
-) -> None:
+async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
     """Write what `fetch_media` produced. Short, and inside one transaction."""
     media = dict(interaction.media or {})
     if outcome.skip_reason:

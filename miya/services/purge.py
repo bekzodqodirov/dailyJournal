@@ -137,9 +137,7 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
     # Windows attributed to this person even if their messages were already
     # purged: the window still holds the rendered transcript verbatim.
     person_windows = await session.scalars(
-        sa.select(ConversationWindow.id).where(
-            ConversationWindow.person_id == person.id
-        )
+        sa.select(ConversationWindow.id).where(ConversationWindow.person_id == person.id)
     )
     plan.window_ids = sorted({*plan.window_ids, *person_windows})
     # Debts and promises hang off the person too, not only off an interaction.

@@ -301,9 +301,7 @@ def reminder(debts, promises, tasks, events) -> str:
     return body
 
 
-def reminder_with_counts(
-    debts, promises, tasks, events
-) -> tuple[str, dict[str, int]]:
+def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str, int]]:
     """The ping body, plus how many of each kind actually fit in it.
 
     Two things this must get right, both learned the hard way:

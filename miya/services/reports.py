@@ -126,9 +126,7 @@ def render_data_block(data: ReportData) -> str:
         )
         due_lines += 1
     for p, person in data.due.get("promises", []):
-        lines.append(
-            f"- va'da: {escape(person.display_name)} — {escape(p.description)}"
-        )
+        lines.append(f"- va'da: {escape(person.display_name)} — {escape(p.description)}")
         due_lines += 1
     for t in data.due.get("tasks", []):
         lines.append(f"- vazifa: {escape(t.description)} (muddat: {t.due_date})")
