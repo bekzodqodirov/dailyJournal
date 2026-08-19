@@ -398,16 +398,20 @@ async def test_an_interrupted_result_stream_never_double_applies(session, monkey
     stub.fail_after = 1  # the stream dies right after the first result
 
     await batch.collect_batch(session, "batch_1")
-    assert first.status is WindowStatus.applied
+    # The stream is drained *before* anything is applied (so the person
+    # advisory lock is never held across network reads): a dead stream
+    # therefore applies nothing and both windows stay safely submitted.
+    assert first.status is WindowStatus.submitted
     assert second.status is WindowStatus.submitted
-    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 1
+    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 0
 
     stub.fail_after = None  # next poll tick: the stream works
     await batch.collect_submitted(session)
     await session.commit()
 
+    assert first.status is WindowStatus.applied
     assert second.status is WindowStatus.applied
-    # One debt per window — the first window's result was not applied twice.
+    # One debt per window — nothing was applied twice across the two polls.
     assert await session.scalar(sa.select(sa.func.count()).select_from(m.Debt)) == 2
 
 

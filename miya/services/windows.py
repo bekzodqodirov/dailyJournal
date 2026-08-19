@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 MEDIA_PLACEHOLDER = {
     "voice": "[ovozli xabar]",
+    "audio": "[audio fayl]",
     "video_note": "[video xabar]",
     "photo": "[rasm]",
     "video": "[video]",
@@ -101,7 +102,25 @@ def _slice_to_flush(
     return None
 
 
-async def _unclaimed_by_chat(session: AsyncSession) -> dict[int, list[Interaction]]:
+async def _unclaimed_by_chat(
+    session: AsyncSession, *, now: datetime | None = None
+) -> dict[int, list[Interaction]]:
+    now = now or datetime.now(settings.tz)
+    # Media ingestion is two transactions: the row commits first, Scribe or
+    # vision runs with nothing held, and the transcript lands later. If a busy
+    # chat trips the count/char trigger in between, the window would bake the
+    # "[ovozli xabar]" placeholder in and the transcript — arriving moments
+    # later — would never be extracted. So a message whose media is still
+    # unprocessed waits. The one-hour cutoff keeps a crash mid-download (media
+    # stuck unprocessed forever) from wedging that message out of every future
+    # window.
+    # NB: the ORM stores a missing media dict as JSON null, not SQL NULL, so
+    # `media IS NULL` never matches — IS DISTINCT FROM handles the JSON-null,
+    # absent-key and boolean cases in one expression.
+    media_settled = sa.or_(
+        Interaction.media["processed"].astext.is_distinct_from("false"),
+        Interaction.occurred_at < now - timedelta(hours=1),
+    )
     rows = list(
         await session.scalars(
             sa.select(Interaction)
@@ -115,6 +134,7 @@ async def _unclaimed_by_chat(session: AsyncSession) -> dict[int, list[Interactio
             # re-billed, and would resurrect the very rows the owner deleted.
             .where(Interaction.processed.is_(False))
             .where(Interaction.tg_chat_id.isnot(None))
+            .where(media_settled)
             .order_by(Interaction.tg_chat_id, Interaction.occurred_at, Interaction.id)
         )
     )
@@ -143,7 +163,7 @@ async def flush_ready_windows(
     now = now or datetime.now(settings.tz)
     created: list[ConversationWindow] = []
 
-    for tg_chat_id, backlog in (await _unclaimed_by_chat(session)).items():
+    for tg_chat_id, backlog in (await _unclaimed_by_chat(session, now=now)).items():
         names = await _person_names(session, backlog)
         remaining = backlog
         # A long backlog (userbot was down, or a busy group) yields several

@@ -282,6 +282,21 @@ async def apply_extraction(
         )
         applied.facts += 1
 
+    # Spec §5: facts *and* the summary go to memories. Without this, a
+    # conversation that produced no discrete facts is unreachable by /qidir
+    # once it ages out of the recent-interactions window.
+    summary_text = (result.summary or "").strip()
+    if summary_text and summary_text not in {f.strip() for f in result.facts}:
+        session.add(
+            Memory(
+                content=summary_text,
+                embedding=None,
+                occurred_at=occurred,
+                tags=result.tags or [],
+                source_interaction_id=interaction.id,
+            )
+        )
+
     interaction.processed = True
     await session.flush()
     return applied

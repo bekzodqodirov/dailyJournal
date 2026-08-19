@@ -139,7 +139,9 @@ async def process_interaction(
         interaction.processed = True
         return IngestResult(interaction=interaction, applied=Applied())
 
-    outcome = await extract(text)
+    # The recording's own moment, not "now": a backfilled call from last
+    # Tuesday must resolve "ertaga" against last Tuesday.
+    outcome = await extract(text, now=interaction.occurred_at)
     if outcome.usage is not None:
         await usage_service.record_anthropic_usage(
             session,

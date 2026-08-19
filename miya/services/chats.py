@@ -31,10 +31,23 @@ class DialogInfo:
     tg_chat_id: int
     chat_type: ChatType
     title: str | None
+    is_bot: bool = False
 
 
-def default_monitor_enabled(chat_type: ChatType) -> bool:
-    return chat_type is ChatType.private
+# Telegram's own service account: login codes and 2FA notifications arrive
+# here. That text must never be stored or sent to an extraction API.
+TELEGRAM_SERVICE_ID = 777000
+
+
+def default_monitor_enabled(dialog: DialogInfo) -> bool:
+    """Private chats are on by default (spec §6) — except bots and Telegram's
+    service chat. A bot DM is not a business conversation (and MIYA's own
+    assistant bot would be re-ingested and double-extracted); the service chat
+    carries login codes. The owner can still enable a bot chat from /chats.
+    """
+    if dialog.tg_chat_id == TELEGRAM_SERVICE_ID or dialog.is_bot:
+        return False
+    return dialog.chat_type is ChatType.private
 
 
 async def sync_dialogs(
@@ -62,7 +75,7 @@ async def sync_dialogs(
                     tg_chat_id=dialog.tg_chat_id,
                     chat_type=dialog.chat_type,
                     title=dialog.title,
-                    monitor_enabled=default_monitor_enabled(dialog.chat_type),
+                    monitor_enabled=default_monitor_enabled(dialog),
                     vision_enabled=False,
                     docs_enabled=True,
                 )
@@ -104,7 +117,7 @@ async def ensure_monitor(session: AsyncSession, dialog: DialogInfo) -> ChatMonit
             tg_chat_id=dialog.tg_chat_id,
             chat_type=dialog.chat_type,
             title=dialog.title,
-            monitor_enabled=default_monitor_enabled(dialog.chat_type),
+            monitor_enabled=default_monitor_enabled(dialog),
             vision_enabled=False,
             docs_enabled=True,
         )

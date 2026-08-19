@@ -153,9 +153,17 @@ async def ingest_recording(session: AsyncSession, path: Path) -> IngestResult | 
         return None
 
     parsed = parse_filename(path)
-    occurred_at = parsed.recorded_at or datetime.fromtimestamp(
-        path.stat().st_mtime, tz=settings.tz
-    )
+    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=settings.tz)
+    occurred_at = parsed.recorded_at or mtime
+    # Samsung stamps the filename in the *phone's* local time. On a China trip
+    # that is UTC+8 while we pin it to Tashkent (UTC+5) — three hours off,
+    # sometimes across a report-day boundary. The file's mtime is absolute
+    # (Syncthing preserves it), so when the two disagree by more than a long
+    # call could explain, the mtime wins.
+    if parsed.recorded_at is not None:
+        drift = abs((mtime - parsed.recorded_at).total_seconds())
+        if drift > 90 * 60:
+            occurred_at = mtime
 
     person = None
     if parsed.phone:
@@ -244,16 +252,31 @@ async def protected_audio_paths(session: AsyncSession) -> set[str]:
     return {p for p in rows if p}
 
 
+async def _ingested_audio_paths(session: AsyncSession) -> set[str]:
+    """Every audio path the database has a row for (any source)."""
+    rows = await session.execute(
+        sa.select(
+            Interaction.media["path"].astext,
+            Interaction.media["audio_path"].astext,
+        ).where(Interaction.media.isnot(None))
+    )
+    return {p for row in rows for p in row if p}
+
+
 async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None) -> int:
     """Delete audio older than AUDIO_RETENTION_DAYS from both media folders.
 
     Only files are removed — interactions and transcripts stay, and audio that
-    is still the sole copy of unreviewed data is skipped. Returns the number
-    of files deleted.
+    is still the sole copy of unreviewed data is skipped. So is any file the
+    database has never ingested: the first Syncthing sync can deliver months
+    of historical recordings whose mtimes are already past retention, and
+    deleting them before the scan job has worked through the backlog would
+    destroy the archive unheard. Returns the number of files deleted.
     """
     now_ts = (now or datetime.now(settings.tz)).timestamp()
     cutoff = now_ts - settings.audio_retention_days * 86400
     protected = await protected_audio_paths(session)
+    ingested = await _ingested_audio_paths(session)
     deleted = 0
     for directory in (Path(settings.call_recordings_dir), settings.media_dir):
         if not directory.is_dir():
@@ -261,7 +284,7 @@ async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None)
         for path in directory.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in AUDIO_SUFFIXES:
                 continue
-            if str(path) in protected:
+            if str(path) in protected or str(path) not in ingested:
                 continue
             try:
                 if path.stat().st_mtime < cutoff:

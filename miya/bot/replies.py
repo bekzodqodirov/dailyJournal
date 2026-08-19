@@ -84,6 +84,16 @@ VIDEO_STORED_HINT = (
     "javob qilib <code>/process</code> deb yozing."
 )
 
+FILE_TOO_BIG_HINT = (
+    "⚠️ Fayl 20 MB dan katta — Telegram bot orqali yuklab olib bo'lmaydi. "
+    "Kichikroq qilib yuboring yoki matnini yozib yuboring."
+)
+
+UNSUPPORTED_HINT = (
+    "🤷 Bu turdagi xabarni hali tushunmayman — u yozib olinmadi. "
+    "Matn, ovoz, rasm, hujjat yoki video yuboring."
+)
+
 DOCUMENT_FAILED_HINT = (
     "⚠️ Hujjatni o'qib bo'lmadi (formati qo'llab-quvvatlanmaydi yoki himoyalangan). "
     "Fayl saqlandi — /tekshir ro'yxatida turadi."
@@ -499,7 +509,7 @@ def review_report(interactions, total: int) -> str:
         if len(preview) > 60:
             preview = preview[:60] + "…"
         detail = f" — {escape(preview)}" if preview else ""
-        filename = (it.meta or {}).get("filename")
+        filename = (it.meta or {}).get("filename") or (it.media or {}).get("filename")
         if not preview and filename:
             detail = f" — {escape(filename)}"
         lines.append(

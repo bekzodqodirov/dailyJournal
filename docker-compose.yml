@@ -1,9 +1,17 @@
 name: miya
 
+# A VPS that runs for a year must not fill its disk with container logs.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-miya}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
@@ -27,18 +35,23 @@ services:
   init:
     build: .
     user: root
+    logging: *default-logging
     volumes:
       - ./data:/data
+      # Writable secrets: the Google token file is rewritten on OAuth refresh,
+      # and a root-owned ./secrets from `git clone` would break that.
+      - ./secrets:/secrets
     command:
       - sh
       - -c
       - mkdir -p /data/call_recordings /data/bot_media /data/backups
-        && chown -R 10001:10001 /data
+        && chown -R 10001:10001 /data /secrets
     restart: "no"
 
   api:
     build: .
     restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     depends_on:
       db:
@@ -48,8 +61,9 @@ services:
     volumes:
       - ./data:/data
       - ./secrets:/app/secrets:ro
-      # bge-m3 weights (~2 GB) download once and survive rebuilds.
-      - hf_cache:/root/.cache/huggingface
+      # bge-m3 weights (~2 GB) download once and survive rebuilds. Mounted at
+      # the *miya* user's cache — the process does not run as root.
+      - hf_cache:/home/miya/.cache/huggingface
     # Localhost only — the API is not exposed publicly (spec §10).
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
@@ -62,7 +76,10 @@ services:
 
   bot:
     build: .
-    restart: on-failure:5
+    # unless-stopped, not on-failure: on-failure containers are NOT restored
+    # after a VPS reboot — the owner's only interface would silently stay down.
+    restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     environment:
       # Only the api container holds the embedding model in RAM.
@@ -81,7 +98,8 @@ services:
 
   worker:
     build: .
-    restart: on-failure:5
+    restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     environment:
       EMBED_SERVICE_URL: http://api:8000
@@ -101,9 +119,10 @@ services:
   userbot:
     build: .
     # Passive Telegram reader on the owner's personal account (spec §7B).
-    # It exits cleanly when USERBOT_ENABLED=false, so `no` keeps it off rather
-    # than looping a container that is meant to stay down.
-    restart: on-failure:5
+    # With USERBOT_ENABLED=false the process idles instead of exiting, so
+    # unless-stopped is safe and the reader survives a VPS reboot.
+    restart: unless-stopped
+    logging: *default-logging
     env_file: .env
     environment:
       EMBED_SERVICE_URL: http://api:8000
@@ -120,10 +139,13 @@ services:
   syncthing:
     image: syncthing/syncthing:1
     restart: unless-stopped
+    logging: *default-logging
     hostname: miya-vps
     environment:
-      PUID: "1000"
-      PGID: "1000"
+      # Same uid as the app containers: init chowns ./data to 10001, and a
+      # mismatched Syncthing user could not write a single incoming recording.
+      PUID: "10001"
+      PGID: "10001"
       TZ: ${TIMEZONE:-Asia/Tashkent}
     volumes:
       - syncthing_config:/var/syncthing/config

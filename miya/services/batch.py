@@ -239,32 +239,12 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
 
     outcome = BatchOutcome()
     try:
+        # Drain the stream *before* touching the database. Applying a window
+        # takes the person-resolution advisory lock, and a lock held while the
+        # network dribbles the rest of the stream in would block the bot and
+        # the call-scan from creating people for the whole download.
         results = await client.messages.batches.results(batch_id)
-        async for entry in results:
-            window = windows.pop(entry.custom_id, None)
-            if window is None:
-                continue
-            kind = entry.result.type
-            if kind != "succeeded":
-                partial = await _retry_or_fallback(session, window, kind)
-            else:
-                message = entry.result.message
-                await usage_service.record_anthropic_usage(
-                    session,
-                    model=settings.extract_model,
-                    operation="extract_window",
-                    usage=message.usage,
-                    batch=True,
-                )
-                parsed = parse_extraction_json(_result_text(message))
-                if parsed is None:
-                    partial = await _retry_or_fallback(session, window, "invalid_json")
-                else:
-                    await _apply_result(session, window, parsed)
-                    partial = BatchOutcome(applied=1)
-            outcome.applied += partial.applied
-            outcome.retried += partial.retried
-            outcome.failed += partial.failed
+        entries = [entry async for entry in results]
     except anthropic.APIError as exc:
         # Transport trouble. The batch still holds these windows' results and
         # they are already paid for, so leave them `submitted` and re-read the
@@ -289,6 +269,32 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
             outcome.failed += partial.failed
         await session.flush()
         return outcome
+
+    for entry in entries:
+        window = windows.pop(entry.custom_id, None)
+        if window is None:
+            continue
+        kind = entry.result.type
+        if kind != "succeeded":
+            partial = await _retry_or_fallback(session, window, kind)
+        else:
+            message = entry.result.message
+            await usage_service.record_anthropic_usage(
+                session,
+                model=settings.extract_model,
+                operation="extract_window",
+                usage=message.usage,
+                batch=True,
+            )
+            parsed = parse_extraction_json(_result_text(message))
+            if parsed is None:
+                partial = await _retry_or_fallback(session, window, "invalid_json")
+            else:
+                await _apply_result(session, window, parsed)
+                partial = BatchOutcome(applied=1)
+        outcome.applied += partial.applied
+        outcome.retried += partial.retried
+        outcome.failed += partial.failed
 
     # Results are only ever missing if the API omitted a request we sent —
     # treat that like any other failure rather than leaving the window stuck.

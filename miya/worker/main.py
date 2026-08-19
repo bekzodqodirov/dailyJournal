@@ -20,7 +20,9 @@ import asyncio
 import logging
 import signal
 import sys
+from datetime import datetime
 
+import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -31,6 +33,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import replies
 from miya.bot.formatting import clip, escape
 from miya.config import settings
+from miya.db.models import DailyReport
 from miya.db.session import engine, session_scope
 from miya.services import (
     backup,
@@ -207,6 +210,46 @@ async def backup_job(bot: Bot) -> None:
     )
 
 
+async def catch_up(bot: Bot) -> None:
+    """Run anything the scheduler missed while the worker was down.
+
+    The jobstore is in memory, so a deploy or a VPS reboot spanning 19:00
+    silently loses that day's report, and one spanning BACKUP_TIME loses a
+    nightly backup. Both are cheap to detect on startup and worth recovering:
+    the report is the owner's evening ritual, and the backup is the only thing
+    between a disk failure and losing everything.
+    """
+    now = datetime.now(settings.tz)
+    today = now.date()
+
+    if now.time() >= settings.report_time_parsed:
+        async with session_scope() as session:
+            existing = await session.scalar(
+                sa.select(DailyReport.id).where(DailyReport.report_date == today)
+            )
+        if existing is None:
+            log.info("catch-up: today's report was missed — generating now")
+            try:
+                await report_job(bot)
+            except Exception:
+                log.exception("catch-up report failed")
+
+    if settings.backup_age_recipient:
+        newest = max(
+            (
+                p.stat().st_mtime
+                for p in backup.backup_dir().glob(f"*{backup.BACKUP_SUFFIX}")
+            ),
+            default=0.0,
+        )
+        if now.timestamp() - newest > 25 * 3600:
+            log.info("catch-up: last backup is older than a day — running one now")
+            try:
+                await backup_job(bot)
+            except Exception:
+                log.exception("catch-up backup failed")
+
+
 async def run() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
@@ -216,6 +259,10 @@ async def run() -> None:
         raise SystemExit(
             "ASSISTANT_BOT_TOKEN and OWNER_TELEGRAM_ID must be set for the worker"
         )
+    if not settings.anthropic_api_key:
+        log.warning("ANTHROPIC_API_KEY is empty — extraction and reports degrade")
+    if not settings.elevenlabs_api_key:
+        log.warning("ELEVENLABS_API_KEY is empty — call transcription will fail")
 
     bot = Bot(
         token=settings.assistant_bot_token,
@@ -229,6 +276,7 @@ async def run() -> None:
         id="reminders",
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=3600,
     )
     scheduler.add_job(
         call_scan_job,
@@ -244,6 +292,7 @@ async def run() -> None:
         id="retention",
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=3600,
     )
     scheduler.add_job(
         embed_job,
@@ -262,6 +311,7 @@ async def run() -> None:
         id="daily_report",
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=3600,
     )
     scheduler.add_job(
         gcal_pull_job,
@@ -310,9 +360,11 @@ async def run() -> None:
         id="backup",
         max_instances=1,
         coalesce=True,
+        misfire_grace_time=3600,
     )
     scheduler.start()
     log.info("worker started (tz=%s); jobs: %s", settings.timezone, scheduler.get_jobs())
+    await catch_up(bot)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

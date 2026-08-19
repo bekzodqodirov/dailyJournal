@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya import __version__
 from miya.api.deps import require_token
 from miya.config import settings
-from miya.db.enums import Currency, DebtDirection, DebtStatus
+from miya.db.enums import Currency, DebtDirection, DebtStatus, PromiseStatus
 from miya.db.models import Debt, DebtPayment, Person
 from miya.db.session import engine, get_session
 from miya.services import planner, queries, rag, reports
@@ -152,9 +152,43 @@ async def list_debts(
     session: SessionDep,
     direction: DebtDirection | None = None,
     person_id: int | None = None,
+    status: str = "open",
 ) -> dict[str, Any]:
-    balances = await queries.open_debts(session, direction=direction, person_id=person_id)
-    return {"debts": [_balance_json(b) for b in balances]}
+    """`status=open` (default) returns outstanding balances; `settled`, the
+    closed debts themselves (spec §11's `?status=` filter)."""
+    if status == "open":
+        balances = await queries.open_debts(
+            session, direction=direction, person_id=person_id
+        )
+        return {"debts": [_balance_json(b) for b in balances]}
+    if status != "settled":
+        raise HTTPException(status_code=422, detail="status must be open|settled")
+    stmt = (
+        sa.select(Debt, Person)
+        .join(Person, Person.id == Debt.person_id)
+        .where(Debt.status == DebtStatus.settled)
+        .order_by(Debt.settled_at.desc().nulls_last())
+        .limit(100)
+    )
+    if direction is not None:
+        stmt = stmt.where(Debt.direction == direction)
+    if person_id is not None:
+        stmt = stmt.where(Debt.person_id == person_id)
+    rows = (await session.execute(stmt)).all()
+    return {
+        "debts": [
+            {
+                "id": debt.id,
+                "person_id": person.id,
+                "person": person.display_name,
+                "direction": debt.direction.value,
+                "currency": debt.currency.value,
+                "amount": str(debt.amount),
+                "settled_at": debt.settled_at.isoformat() if debt.settled_at else None,
+            }
+            for debt, person in rows
+        ]
+    }
 
 
 class SettleRequest(BaseModel):
@@ -207,9 +241,11 @@ async def settle_debt(
 
 @api.get("/promises", tags=["promises"])
 async def list_promises(
-    session: SessionDep, person_id: int | None = None
+    session: SessionDep,
+    person_id: int | None = None,
+    status: PromiseStatus = PromiseStatus.open,
 ) -> dict[str, Any]:
-    items = await queries.open_promises(session, person_id=person_id)
+    items = await queries.promises_by_status(session, status=status, person_id=person_id)
     return {
         "promises": [
             {

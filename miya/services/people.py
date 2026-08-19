@@ -123,6 +123,15 @@ async def resolve_person(
     )
 
     people = list(await session.scalars(sa.select(Person)))
+    # Two distinct Telegram accounts are two distinct people, whatever their
+    # names look like. When the incoming message carries a telegram_id, any
+    # candidate already bound to a *different* telegram_id must not fuzzy-merge
+    # — "Akmal (supplier)" and a new "Akmal K" contact would otherwise become
+    # one row and every debt of both would land on the first.
+    if telegram_id is not None:
+        people = [
+            p for p in people if p.telegram_id is None or p.telegram_id == telegram_id
+        ]
     person, score = best_match(name, people)
 
     if person is not None and score >= MATCH_THRESHOLD:

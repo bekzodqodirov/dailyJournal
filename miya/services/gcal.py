@@ -147,12 +147,15 @@ async def pull(
         now, now + timedelta(days=days or settings.gcal_days_ahead)
     )
 
+    window_end = now + timedelta(days=days or settings.gcal_days_ahead)
+    seen_ids: set[str] = set()
     changed = 0
     for item in items:
         gcal_id = item.get("id")
         start_at = _parse_gcal_time(item.get("start"))
         if not gcal_id or start_at is None:
             continue
+        seen_ids.add(gcal_id)
         title = (item.get("summary") or "").strip() or "(nomsiz)"
         end_at = _parse_gcal_time(item.get("end"))
         location = (item.get("location") or "").strip() or None
@@ -198,6 +201,22 @@ async def pull(
                 setattr(event, attr, value)
                 dirty = True
         if dirty:
+            changed += 1
+
+    # An event the owner deletes in Google simply vanishes from the listing
+    # (the default list call excludes cancelled instances), so a pulled row
+    # absent from the response is a deletion. Without this, the planner and
+    # the 60-minute reminder keep resurrecting meetings that no longer exist.
+    stale = await session.scalars(
+        sa.select(Event)
+        .where(Event.source == EventSource.gcal)
+        .where(Event.status == EventStatus.planned)
+        .where(Event.start_at >= now, Event.start_at < window_end)
+        .where(Event.gcal_event_id.isnot(None))
+    )
+    for event in stale:
+        if event.gcal_event_id not in seen_ids:
+            event.status = EventStatus.cancelled
             changed += 1
 
     await session.flush()

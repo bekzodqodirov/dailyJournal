@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 from miya.config import settings
 from miya.db import models as m
-from miya.db.enums import InteractionSource
+from miya.db.enums import Direction, InteractionSource
 from miya.services import call_recordings as cr
 from miya.services import extraction as ex
 from miya.services import ingest
@@ -152,6 +152,9 @@ async def test_a_recording_becomes_a_phone_call_interaction(
         )
     )
     path = _write_audio(recordings_dir, "Call recording Akmal aka_250817_143025.m4a")
+    # mtime agrees with the filename stamp, so the stamp is trusted.
+    stamped = datetime(2025, 8, 17, 14, 30, 25, tzinfo=TZ).timestamp()
+    os.utime(path, (stamped, stamped))
 
     results = await cr.scan_directory(session)
     await session.commit()
@@ -288,6 +291,20 @@ async def test_retention_deletes_only_old_audio(
     new_call = _write_audio(recordings_dir, "new_250817_120000.m4a", age_seconds=86400)
     old_voice = _write_audio(media_dir, "note.ogg", age_seconds=91 * 86400)
     transcriptless = _write_audio(recordings_dir, "keep.txt", age_seconds=91 * 86400)
+
+    # Retention only touches files the database knows about — a file that was
+    # never ingested might be un-scanned history and must survive.
+    for f in (old_call, new_call, old_voice):
+        session.add(
+            m.Interaction(
+                source=InteractionSource.phone_call,
+                direction=Direction.na,
+                occurred_at=datetime.now(TZ),
+                processed=True,
+                media={"type": "call_recording", "path": str(f), "processed": True},
+            )
+        )
+    await session.flush()
 
     deleted = await cr.purge_old_audio(session)
 

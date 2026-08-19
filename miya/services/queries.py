@@ -49,6 +49,7 @@ class DaySummary:
     new_debts: list[Debt] = field(default_factory=list)
     new_promises: list[Promise] = field(default_factory=list)
     interactions: int = 0
+    biggest: list[Transaction] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -120,16 +121,61 @@ async def open_debts(
 async def open_promises(
     session: AsyncSession, *, person_id: int | None = None, limit: int = 50
 ) -> list[tuple[Promise, Person]]:
+    return await promises_by_status(
+        session, status=PromiseStatus.open, person_id=person_id, limit=limit
+    )
+
+
+async def promises_by_status(
+    session: AsyncSession,
+    *,
+    status: PromiseStatus,
+    person_id: int | None = None,
+    limit: int = 50,
+) -> list[tuple[Promise, Person]]:
     stmt = (
         sa.select(Promise, Person)
         .join(Person, Person.id == Promise.person_id)
-        .where(Promise.status == PromiseStatus.open)
+        .where(Promise.status == status)
         .order_by(Promise.due_date.nulls_last(), Promise.created_at)
         .limit(limit)
     )
     if person_id is not None:
         stmt = stmt.where(Promise.person_id == person_id)
     return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+
+
+async def _top_expenses(
+    session: AsyncSession, start: datetime, end: datetime, *, per_currency: int = 3
+) -> list[Transaction]:
+    """Largest expenses ranked *within* each currency.
+
+    A raw `ORDER BY amount` across currencies is meaningless — 200,000 UZS
+    would outrank a $10,000 supplier payment. Ranking per currency keeps every
+    currency's real top spenders in the list.
+    """
+    ranked = (
+        sa.select(
+            Transaction.id,
+            sa.func.row_number()
+            .over(
+                partition_by=Transaction.currency,
+                order_by=Transaction.amount.desc(),
+            )
+            .label("rank"),
+        )
+        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(Transaction.type == "expense")
+        .subquery()
+    )
+    return list(
+        await session.scalars(
+            sa.select(Transaction)
+            .join(ranked, ranked.c.id == Transaction.id)
+            .where(ranked.c.rank <= per_currency)
+            .order_by(Transaction.currency, Transaction.amount.desc())
+        )
+    )
 
 
 async def day_summary(session: AsyncSession, day: date | None = None) -> DaySummary:
@@ -191,6 +237,7 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
             Interaction.occurred_at >= start, Interaction.occurred_at < end
         )
     )
+    summary.biggest = await _top_expenses(session, start, end)
     return summary
 
 
@@ -299,15 +346,7 @@ async def spending_summary(
     )
     summary.by_category = [(c, cur, total) for c, cur, total in categories.all()]
 
-    summary.biggest = list(
-        await session.scalars(
-            sa.select(Transaction)
-            .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
-            .where(Transaction.type == "expense")
-            .order_by(Transaction.amount.desc())
-            .limit(5)
-        )
-    )
+    summary.biggest = await _top_expenses(session, start, end)
     return summary
 
 

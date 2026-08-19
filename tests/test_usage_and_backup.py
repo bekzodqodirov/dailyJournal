@@ -137,11 +137,23 @@ async def test_a_failing_dump_leaves_no_half_written_backup(monkeypatch, tmp_pat
     assert not list(tmp_path.glob("*.partial"))
 
 
-def test_the_dsn_drops_the_sqlalchemy_driver(monkeypatch):
+def test_the_dsn_drops_the_driver_and_hides_the_password(monkeypatch):
+    """The password must reach pg_dump via PGPASSWORD, never argv —
+    /proc/*/cmdline is world-readable."""
     monkeypatch.setattr(
         settings, "database_url", "postgresql+psycopg://miya:pw@db:5432/miya"
     )
-    assert backup._dsn() == "postgresql://miya:pw@db:5432/miya"
+    dsn, env = backup._dsn_and_env()
+    assert dsn == "postgresql://miya@db:5432/miya"
+    assert "pw" not in dsn
+    assert env["PGPASSWORD"] == "pw"
+
+
+def test_a_passwordless_dsn_passes_through_unchanged(monkeypatch):
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg://db:5432/miya")
+    dsn, env = backup._dsn_and_env()
+    assert dsn == "postgresql://db:5432/miya"
+    assert "PGPASSWORD" not in env or env.get("PGPASSWORD") is None
 
 
 def test_pruning_keeps_the_retention_window(monkeypatch, tmp_path):

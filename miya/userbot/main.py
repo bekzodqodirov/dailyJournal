@@ -8,7 +8,7 @@ monitored chats, and stores each one as an interaction. Extraction happens
 later, per conversation window, in the worker (spec §7B).
 
 Safety properties, all deliberate:
-  * ``USERBOT_ENABLED=false`` exits immediately — one flag disables it.
+  * ``USERBOT_ENABLED=false`` idles without connecting — one flag disables it.
   * An unauthorised session exits with an error instead of prompting for a
     phone number on stdin, which in a container would hang forever.
   * No history is downloaded on start: only messages that arrive from now on.
@@ -95,8 +95,10 @@ def kind_of(message: object) -> MediaKind:
     """Classify a Telethon message into the media-policy vocabulary."""
     if getattr(message, "sticker", None) or getattr(message, "gif", None):
         return MediaKind.sticker
-    if getattr(message, "voice", None) or getattr(message, "audio", None):
+    if getattr(message, "voice", None):
         return MediaKind.voice
+    if getattr(message, "audio", None):
+        return MediaKind.audio
     if getattr(message, "video_note", None):
         return MediaKind.video_note
     if getattr(message, "photo", None):
@@ -279,6 +281,7 @@ async def _counterparty(session, message, monitor: ChatMonitor):
 
 _SUFFIX = {
     MediaKind.voice: ".ogg",
+    MediaKind.audio: ".mp3",
     MediaKind.video_note: ".mp4",
     MediaKind.photo: ".jpg",
     MediaKind.video: ".mp4",
@@ -337,6 +340,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 tg_chat_id=message.chat_id,
                 chat_type=chat_type_of(chat),
                 title=chat_title_of(chat),
+                is_bot=bool(getattr(chat, "bot", False)),
             ),
         )
         if not monitor.monitor_enabled:
@@ -412,6 +416,7 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
                 tg_chat_id=dialog.id,
                 chat_type=chat_type_of(entity),
                 title=chat_title_of(entity),
+                is_bot=bool(getattr(entity, "bot", False)),
             )
         )
     async with session_scope() as session:
@@ -425,13 +430,21 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
 # --- process -----------------------------------------------------------------
 
 
+async def _idle_forever() -> None:  # pragma: no cover - patched in tests
+    await asyncio.Event().wait()
+
+
 async def run() -> None:
     logging.basicConfig(
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
     if not settings.userbot_enabled:
+        # Idle instead of exiting: the container uses `restart:
+        # unless-stopped` (so it survives a VPS reboot), and a clean exit here
+        # would make Docker restart it in a tight loop forever.
         log.warning("USERBOT_ENABLED=false — the passive reader stays off")
+        await _idle_forever()
         return
     if not (
         settings.telethon_api_id
@@ -450,7 +463,18 @@ async def run() -> None:
     )
     # connect(), not start(): start() would prompt for a phone number on stdin
     # if the session were invalid, which in a container never returns.
-    await client.connect()
+    # Retried with backoff: a container often comes up before the network
+    # does, and one failed connect must not burn a restart-policy attempt.
+    for attempt in range(5):
+        try:
+            await client.connect()
+            break
+        except (OSError, ConnectionError) as exc:
+            wait = 2**attempt * 5
+            log.warning("connect failed (%s); retrying in %ds", exc, wait)
+            await asyncio.sleep(wait)
+    else:
+        raise SystemExit("could not reach Telegram after 5 attempts")
     try:
         if not await client.is_user_authorized():
             raise SystemExit(

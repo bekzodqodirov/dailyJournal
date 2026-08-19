@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     doc_max_bytes: int = 20 * 1024 * 1024
     doc_max_chars: int = 15_000
 
+    # --- Audio files (spec §6) ----------------------------------------------
+    # Cap for *audio files* (music, podcasts) shared into monitored chats.
+    # Voice notes are always transcribed; a shared 200 MB podcast would burn
+    # bandwidth and Scribe minutes on content that is rarely business.
+    audio_max_bytes: int = 30 * 1024 * 1024
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"
@@ -98,7 +104,6 @@ class Settings(BaseSettings):
 
     # --- Internal API -------------------------------------------------------
     api_bearer_token: str = ""
-    api_host: str = "127.0.0.1"
     api_port: int = 8000
 
     # --- Scheduling ---------------------------------------------------------

@@ -343,6 +343,7 @@ async def _run_tool(
                     }
                     for p in summary.open_promises
                 ],
+                "last_interactions_note": UNTRUSTED_NOTE,
                 "last_interactions": _jsonable(summary.last_interactions),
                 "total_interactions": summary.total_interactions,
             }
@@ -440,7 +441,13 @@ async def _run_tool(
             log.warning("search_memories failed: %s", exc)
             return _dumps({"error": "semantic search is not available right now"})
         return _dumps(
-            [{**_jsonable(h.memory), "similarity": round(h.similarity, 3)} for h in hits]
+            {
+                "note": UNTRUSTED_NOTE,
+                "results": [
+                    {**_jsonable(h.memory), "similarity": round(h.similarity, 3)}
+                    for h in hits
+                ],
+            }
         )
 
     if name == "recent_interactions":

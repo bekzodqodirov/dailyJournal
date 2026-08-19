@@ -8,11 +8,23 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # ffmpeg: video-note / voice audio extraction. tzdata: Asia/Tashkent.
-# postgresql-client: pg_dump for the nightly backup. age: encrypts that dump
-# before it touches the disk (spec §10).
+# age: encrypts the nightly dump before it touches the disk (spec §10).
+# postgresql-client-16 comes from PGDG, pinned to the server's major:
+# Debian's own postgresql-client is v15 here, and pg_dump refuses to dump
+# from a *newer* server — the stock package would fail every nightly backup
+# against the pgvector/pg16 container.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg tzdata curl postgresql-client age \
+        ffmpeg tzdata curl ca-certificates age \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && . /etc/os-release \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc]" \
+        "https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
@@ -23,9 +35,14 @@ COPY alembic ./alembic
 COPY miya ./miya
 
 # Run as a non-root user; the app never needs to write to its own code.
+# The huggingface cache dir must exist *in the image*, owned by miya, so the
+# named volume mounted there inherits that ownership — otherwise Docker
+# creates it root-owned and the bge-m3 download fails (or, mounted at
+# /root/.cache, is simply never used and ~2 GB re-downloads every rebuild).
 RUN useradd --create-home --uid 10001 miya \
     && mkdir -p /data/call_recordings /data/backups \
-    && chown -R miya:miya /data
+        /home/miya/.cache/huggingface \
+    && chown -R miya:miya /data /home/miya/.cache
 USER miya
 
 EXPOSE 8000

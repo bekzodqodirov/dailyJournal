@@ -34,7 +34,12 @@ def main() -> int:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_json), GCAL_SCOPES)
     credentials = flow.run_local_server(
-        host="127.0.0.1",
+        # host feeds the redirect URI (the owner's browser must hit
+        # localhost); bind_addr is the actual listening socket. Binding
+        # container-loopback would make Docker's published port unreachable —
+        # the consent redirect would spin forever.
+        host="localhost",
+        bind_addr="0.0.0.0",
         port=8765,
         open_browser=False,
         authorization_prompt_message=(

@@ -14,7 +14,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import anthropic
-import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.bot.formatting import escape
@@ -100,6 +100,11 @@ def render_data_block(data: ReportData) -> str:
             lines.append(f"- chiqim: {format_money(total, cur)}")
         for category, cur, total in s.by_category:
             lines.append(f"- {escape(category)}: {format_money(total, cur)}")
+        if s.biggest:
+            lines.append("- eng katta xarajatlar:")
+            for txn in s.biggest:
+                what = escape(txn.description or txn.category or "?")
+                lines.append(f"  • {format_money(txn.amount, txn.currency)} — {what}")
     else:
         lines.append("- bugun pul harakati yozilmadi")
 
@@ -194,17 +199,16 @@ async def generate_report(session: AsyncSession, day: date | None = None) -> str
 
     content = content or data_block
 
-    existing = await session.scalar(
-        sa.select(DailyReport).where(DailyReport.report_date == day)
-    )
-    if existing is None:
-        session.add(
-            DailyReport(report_date=day, content=content, stats=_stats_json(data))
+    # /hisobot can be called repeatedly, and the worker cron can race a manual
+    # /hisobot on the same date — an upsert makes last-writer-wins instead of
+    # a unique-violation that would cost one of them its report.
+    await session.execute(
+        insert(DailyReport)
+        .values(report_date=day, content=content, stats=_stats_json(data))
+        .on_conflict_do_update(
+            index_elements=[DailyReport.report_date],
+            set_={"content": content, "stats": _stats_json(data)},
         )
-    else:
-        # /hisobot can be called repeatedly; the evening cron also overwrites
-        # an earlier manual run with the full day's picture.
-        existing.content = content
-        existing.stats = _stats_json(data)
+    )
     await session.flush()
     return content

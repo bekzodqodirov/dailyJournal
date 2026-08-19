@@ -214,8 +214,11 @@ end-to-end encrypted sync; no cloud in between.
 1. `make up` starts the `syncthing` container. Open its UI over an SSH tunnel:
    `ssh -L 8384:127.0.0.1:8384 vps` → http://127.0.0.1:8384. Set a UI password
    immediately (Actions → Settings → GUI).
-2. Install the Syncthing app on the phone, add the VPS as a remote device
+2. Install Syncthing on the phone and add the VPS as a remote device
    (Actions → Show ID on the VPS side; scan the QR from the phone).
+   ⚠️ The original Syncthing Android app was discontinued in late 2024 — use
+   the maintained community fork **Syncthing-Fork** (F-Droid, or Google Play
+   where available).
 3. On the phone, share the call-recordings folder (on Samsung usually
    `Internal storage/Recordings/Call`) with the VPS device.
 4. Accept the share in the VPS UI and point it at `/var/syncthing/call_recordings`,

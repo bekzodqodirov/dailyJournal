@@ -27,6 +27,7 @@ from miya.services import documents
 class MediaKind(str, enum.Enum):
     text = "text"
     voice = "voice"
+    audio = "audio"
     video_note = "video_note"
     photo = "photo"
     video = "video"
@@ -63,6 +64,14 @@ def plan_for(
         return MediaPlan(kind=kind, ignore=True)
 
     if kind is MediaKind.voice:
+        return MediaPlan(kind=kind, download=True, transcribe=True)
+
+    if kind is MediaKind.audio:
+        # An audio *file* (music, a podcast) is not a voice note: transcribing
+        # a shared 3-hour mix would cost real Scribe money for nothing. Small
+        # files still go through — forwarded call recordings arrive this way.
+        if size is not None and size > settings.audio_max_bytes:
+            return MediaPlan(kind=kind, skip_reason="too_large")
         return MediaPlan(kind=kind, download=True, transcribe=True)
 
     if kind is MediaKind.video_note:

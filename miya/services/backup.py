@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from miya.config import settings
 
@@ -40,9 +41,24 @@ class BackupResult:
         return self.error is None and self.path is not None
 
 
-def _dsn() -> str:
-    """SQLAlchemy URL → libpq URL (pg_dump does not know the driver suffix)."""
-    return re.sub(r"^postgresql\+\w+://", "postgresql://", settings.database_url)
+def _dsn_and_env() -> tuple[str, dict[str, str]]:
+    """SQLAlchemy URL → libpq URL plus environment for pg_dump.
+
+    The password travels via PGPASSWORD, never argv: `/proc/*/cmdline` is
+    world-readable, so a DSN with the password inline would show the database
+    credentials to every process on the host for the duration of the dump.
+    """
+    url = re.sub(r"^postgresql\+\w+://", "postgresql://", settings.database_url)
+    parsed = urlsplit(url)
+    env = dict(os.environ)
+    if parsed.password:
+        env["PGPASSWORD"] = unquote(parsed.password)
+        host = parsed.hostname or ""
+        netloc = (f"{parsed.username}@" if parsed.username else "") + host
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        url = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
+    return url, env
 
 
 def backup_dir() -> Path:
@@ -84,15 +100,17 @@ async def create_backup(*, now: datetime | None = None) -> BackupResult:
     #
     # A real OS pipe, not `dump.stdout`: asyncio hands back a StreamReader,
     # which has no file descriptor to give the second process.
+    dsn, dump_env = _dsn_and_env()
     read_fd, write_fd = os.pipe()
     try:
         dump = await asyncio.create_subprocess_exec(
             "pg_dump",
             "--no-owner",
             "--no-privileges",
-            _dsn(),
+            dsn,
             stdout=write_fd,
             stderr=asyncio.subprocess.PIPE,
+            env=dump_env,
         )
         encrypt = await asyncio.create_subprocess_exec(
             "age",

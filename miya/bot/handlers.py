@@ -98,8 +98,17 @@ async def _typing(message: Message) -> None:
         log.debug("send_chat_action failed", exc_info=True)
 
 
+# Telegram's Bot API refuses to serve files above 20 MB — retrying can never
+# succeed, so the owner deserves an honest message instead of "try again".
+TG_BOT_MAX_DOWNLOAD = 20 * 1024 * 1024
+
+
 async def _download(bot: Bot, message: Message, media, path: Path) -> bool:
     """Fetch a file from Telegram; on failure tell the owner instead of dying."""
+    size = getattr(media, "file_size", None)
+    if size and size > TG_BOT_MAX_DOWNLOAD:
+        await _safe_answer(message, replies.FILE_TOO_BIG_HINT)
+        return False
     try:
         await bot.download(media, destination=path)
         return True
@@ -687,10 +696,52 @@ async def on_document(message: Message, bot: Bot) -> None:
     await _safe_answer(message, reply)
 
 
-@router.message(F.video | F.video_note)
+@router.message(F.video_note)
+async def on_video_note(message: Message, bot: Bot) -> None:
+    """A video note is a voice note with a face — transcribed always (spec §6)."""
+    await _typing(message)
+    path = _media_path(".mp4")
+    if not await _download(bot, message, message.video_note, path):
+        return
+
+    audio_path = path.with_suffix(".mp3")
+    if not await audio.extract_audio(path, audio_path):
+        await _safe_answer(message, replies.TRANSCRIPTION_FAILED_HINT)
+        return
+
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            occurred_at=message.date.astimezone(settings.tz),
+            media={
+                "type": "video_note",
+                "path": str(path),
+                "audio_path": str(audio_path),
+                "size": message.video_note.file_size,
+                "duration": getattr(message.video_note, "duration", None),
+                "processed": False,
+            },
+        )
+        text = await transcribe_into(session, interaction, audio_path)
+        if text is None:
+            reply = replies.TRANSCRIPTION_FAILED_HINT
+        else:
+            interaction.media = {**(interaction.media or {}), "processed": True}
+            result = await process_interaction(session, interaction)
+            reply = (
+                replies.confirmation(result.applied)
+                if result.ok
+                else replies.FAILED_EXTRACTION_HINT
+            )
+    await _safe_answer(message, reply)
+
+
+@router.message(F.video)
 async def on_video(message: Message, bot: Bot) -> None:
     """Videos are stored, not transcribed — `/process` opts into the cost."""
-    media = message.video or message.video_note
+    media = message.video
     path = _media_path(".mp4")
     if not await _download(bot, message, media, path):
         return
@@ -718,6 +769,14 @@ async def on_video(message: Message, bot: Bot) -> None:
 @router.message(F.sticker)
 async def on_sticker(message: Message) -> None:
     """Stickers carry nothing to extract (spec §6) — silently ignored."""
+
+
+@router.message()
+async def on_unsupported(message: Message) -> None:
+    """The owner sent something no handler takes (a contact, a location, a
+    poll). Silence would look like MIYA recorded it — say plainly it did not.
+    """
+    await _safe_answer(message, replies.UNSUPPORTED_HINT)
 
 
 def build_reject_router() -> Router:
