@@ -32,6 +32,11 @@ services:
   # bind-mount root-owned while every app container runs as uid 10001 — the
   # first voice note would fail to save and the backup job would crash. This
   # runs once, as root, before anything else starts.
+  # Creates the bind-mount directories and hands them to uid 10001 before any
+  # app container starts. The chown is best-effort: on Linux it is what makes
+  # those mounts writable, but on Docker Desktop (Windows, macOS) the mount is
+  # already permissive and chown can fail outright. Every app service waits on
+  # this one *completing successfully*, so it must not fail hard.
   init:
     build: .
     user: root
@@ -44,8 +49,10 @@ services:
     command:
       - sh
       - -c
-      - mkdir -p /data/call_recordings /data/bot_media /data/backups
-        && chown -R 10001:10001 /data /secrets
+      - >-
+        mkdir -p /data/call_recordings /data/bot_media /data/backups &&
+        { chown -R 10001:10001 /data /secrets ||
+          echo "chown skipped - the host mount manages its own permissions"; }
     restart: "no"
 
   api:
