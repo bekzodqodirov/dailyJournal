@@ -1,0 +1,165 @@
+name: miya
+
+# A VPS that runs for a year must not fill its disk with container logs.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    logging: *default-logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-miya}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-miya}
+      TZ: ${TIMEZONE:-Asia/Tashkent}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    # Localhost only — Postgres is never reachable from outside the VPS.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miya} -d ${POSTGRES_DB:-miya}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # A fresh clone has no ./data (it is gitignored), so Docker creates the
+  # bind-mount root-owned while every app container runs as uid 10001 — the
+  # first voice note would fail to save and the backup job would crash. This
+  # runs once, as root, before anything else starts.
+  init:
+    build: .
+    user: root
+    logging: *default-logging
+    volumes:
+      - ./data:/data
+      # Writable secrets: the Google token file is rewritten on OAuth refresh,
+      # and a root-owned ./secrets from `git clone` would break that.
+      - ./secrets:/secrets
+    command:
+      - sh
+      - -c
+      - mkdir -p /data/call_recordings /data/bot_media /data/backups
+        && chown -R 10001:10001 /data /secrets
+    restart: "no"
+
+  api:
+    build: .
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/data
+      - ./secrets:/app/secrets:ro
+      # bge-m3 weights (~2 GB) download once and survive rebuilds. Mounted at
+      # the *miya* user's cache — the process does not run as root.
+      - hf_cache:/home/miya/.cache/huggingface
+    # Localhost only — the API is not exposed publicly (spec §10).
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  bot:
+    build: .
+    # unless-stopped, not on-failure: on-failure containers are NOT restored
+    # after a VPS reboot — the owner's only interface would silently stay down.
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    environment:
+      # Only the api container holds the embedding model in RAM.
+      EMBED_SERVICE_URL: http://api:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    volumes:
+      - ./data:/data
+      - ./secrets:/app/secrets:ro
+    command: ["python", "-m", "miya.bot.main"]
+
+  worker:
+    build: .
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    environment:
+      EMBED_SERVICE_URL: http://api:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    volumes:
+      - ./data:/data
+      # Writable: the Google token file is rewritten on OAuth refresh.
+      - ./secrets:/app/secrets
+    command: ["python", "-m", "miya.worker.main"]
+
+  userbot:
+    build: .
+    # Passive Telegram reader on the owner's personal account (spec §7B).
+    # With USERBOT_ENABLED=false the process idles instead of exiting, so
+    # unless-stopped is safe and the reader survives a VPS reboot.
+    restart: unless-stopped
+    logging: *default-logging
+    env_file: .env
+    environment:
+      EMBED_SERVICE_URL: http://api:8000
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/data
+      - ./secrets:/app/secrets:ro
+    command: ["python", "-m", "miya.userbot.main"]
+
+  syncthing:
+    image: syncthing/syncthing:1
+    restart: unless-stopped
+    logging: *default-logging
+    hostname: miya-vps
+    environment:
+      # Same uid as the app containers: init chowns ./data to 10001, and a
+      # mismatched Syncthing user could not write a single incoming recording.
+      PUID: "10001"
+      PGID: "10001"
+      TZ: ${TIMEZONE:-Asia/Tashkent}
+    volumes:
+      - syncthing_config:/var/syncthing/config
+      - ./data/call_recordings:/var/syncthing/call_recordings
+    ports:
+      # Web UI: localhost only — reach it over an SSH tunnel.
+      - "127.0.0.1:8384:8384"
+      # Sync protocol + discovery: must be public for the phone to connect.
+      # Device-authenticated; see README "Syncthing" for the pairing steps.
+      - "22000:22000/tcp"
+      - "22000:22000/udp"
+      - "21027:21027/udp"
+
+volumes:
+  db_data:
+  syncthing_config:
+  hf_cache:
