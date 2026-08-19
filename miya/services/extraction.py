@@ -28,7 +28,29 @@ CurrencyCode = Literal["UZS", "USD", "CNY", "KRW", "RUB"]
 _client: anthropic.AsyncAnthropic | None = None
 
 
+class AnthropicUnavailable(RuntimeError):
+    """Anthropic cannot be called at all — typically no API key configured."""
+
+
+# What every caller must treat as "the model is not reachable right now" and
+# fall back from. AnthropicError is the SDK's *base* class, so this covers
+# transport failures, HTTP errors and the SDK's own bare errors alike.
+API_FAILURES = (anthropic.AnthropicError, AnthropicUnavailable)
+
+
 def get_client() -> anthropic.AsyncAnthropic:
+    """The shared Anthropic client.
+
+    Raises `AnthropicUnavailable` when no key is configured. That check lives
+    here rather than at each call site because the SDK's own failure is a bare
+    ``TypeError`` raised deep inside header building — which none of the
+    fallback paths expect. A blank or mistyped ANTHROPIC_API_KEY therefore
+    took the daily report down entirely instead of degrading to its
+    deterministic data block. Failing here, with a type every caller already
+    handles, turns a misconfiguration into the same branch as an outage.
+    """
+    if not settings.anthropic_api_key.strip():
+        raise AnthropicUnavailable("ANTHROPIC_API_KEY is not set")
     global _client
     if _client is None:
         _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
@@ -322,7 +344,7 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
                 messages=messages,
                 output_format=ExtractionResult,
             )
-        except anthropic.APIError as exc:
+        except API_FAILURES as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             log.warning("extraction attempt %d failed: %s", attempt, last_error)
             continue
