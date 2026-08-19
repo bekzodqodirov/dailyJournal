@@ -1,9 +1,15 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
+# PIP_DEFAULT_TIMEOUT: pip's default 15-second socket timeout gives up on a
+# slow link in the middle of a wheel, and several of these are hundreds of
+# megabytes. PIP_RETRIES then makes a dropped connection resume rather than
+# fail the whole build.
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
-    TZ=Asia/Tashkent
+    TZ=Asia/Tashkent \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
 
 WORKDIR /app
 
@@ -44,7 +50,28 @@ RUN set -eu; \
     pg_dump --version
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+
+# torch comes first, from PyTorch's CPU index. The default PyPI wheel for
+# Linux is the CUDA build: 527 MB of torch plus ~800 MB of nvidia-* runtime
+# libraries that a CPU-only host will never load. Installing the CPU build
+# first means sentence-transformers finds torch already satisfied and never
+# reaches for the CUDA one — about 1.1 GB less to download.
+#
+# Non-fatal on purpose: if that index is unreachable, requirements.txt below
+# still installs a working (merely fatter) torch rather than failing the build.
+#
+# The cache mount is what makes a slow connection survivable: a build that
+# dies half way keeps every wheel it already fetched, so the retry resumes
+# instead of starting over. It is also why PIP_NO_CACHE_DIR is not set.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install \
+        --index-url https://download.pytorch.org/whl/cpu \
+        --extra-index-url https://pypi.org/simple \
+        torch \
+    || echo "CPU torch index unreachable - falling back to the default wheel" >&2
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 COPY alembic.ini ./
 COPY alembic ./alembic
