@@ -705,11 +705,11 @@ async def on_video_note(message: Message, bot: Bot) -> None:
         return
 
     audio_path = path.with_suffix(".mp3")
-    if not await audio.extract_audio(path, audio_path):
-        await _safe_answer(message, replies.TRANSCRIPTION_FAILED_HINT)
-        return
-
     async with session_scope() as session:
+        # The row is created *before* ffmpeg runs. A failed audio extraction
+        # must still leave a needs_review interaction the owner can find in
+        # /tekshir — returning early here would drop the message entirely
+        # while telling him it had been saved.
         interaction = await create_interaction(
             session,
             source=InteractionSource.assistant_bot,
@@ -718,23 +718,31 @@ async def on_video_note(message: Message, bot: Bot) -> None:
             media={
                 "type": "video_note",
                 "path": str(path),
-                "audio_path": str(audio_path),
                 "size": message.video_note.file_size,
                 "duration": getattr(message.video_note, "duration", None),
                 "processed": False,
             },
         )
-        text = await transcribe_into(session, interaction, audio_path)
-        if text is None:
+        if not await audio.extract_audio(path, audio_path):
+            interaction.needs_review = True
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
-            interaction.media = {**(interaction.media or {}), "processed": True}
-            result = await process_interaction(session, interaction)
-            reply = (
-                replies.confirmation(result.applied)
-                if result.ok
-                else replies.FAILED_EXTRACTION_HINT
-            )
+            interaction.media = {
+                **(interaction.media or {}),
+                "audio_path": str(audio_path),
+            }
+            text = await transcribe_into(session, interaction, audio_path)
+            if text is None:
+                reply = replies.TRANSCRIPTION_FAILED_HINT
+            else:
+                interaction.media = {**(interaction.media or {}), "processed": True}
+                result = await process_interaction(session, interaction)
+                reply = (
+                    replies.confirmation(result.applied)
+                    if result.ok
+                    else replies.FAILED_EXTRACTION_HINT
+                )
+    # Replied only after the commit, like every other handler here.
     await _safe_answer(message, reply)
 
 
@@ -774,8 +782,14 @@ async def on_sticker(message: Message) -> None:
 @router.message()
 async def on_unsupported(message: Message) -> None:
     """The owner sent something no handler takes (a contact, a location, a
-    poll). Silence would look like MIYA recorded it — say plainly it did not.
+    poll, a mistyped command). Silence would look like MIYA recorded it — say
+    plainly it did not.
     """
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        # A typo'd command must not be reported as an unsupported *media type*.
+        await _safe_answer(message, replies.UNKNOWN_COMMAND_HINT)
+        return
     await _safe_answer(message, replies.UNSUPPORTED_HINT)
 
 

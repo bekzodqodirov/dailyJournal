@@ -89,6 +89,10 @@ FILE_TOO_BIG_HINT = (
     "Kichikroq qilib yuboring yoki matnini yozib yuboring."
 )
 
+UNKNOWN_COMMAND_HINT = (
+    "🤷 Bunday buyruq yo'q. Mavjudlarini ko'rish uchun /yordam deb yozing."
+)
+
 UNSUPPORTED_HINT = (
     "🤷 Bu turdagi xabarni hali tushunmayman — u yozib olinmadi. "
     "Matn, ovoz, rasm, hujjat yoki video yuboring."

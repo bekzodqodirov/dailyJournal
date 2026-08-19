@@ -143,19 +143,38 @@ async def pull(
 ) -> int:
     """Sync the next N days of Google events into `events`. Returns changed rows."""
     now = datetime.now(settings.tz)
-    items = await api.list_events(
-        now, now + timedelta(days=days or settings.gcal_days_ahead)
-    )
-
     window_end = now + timedelta(days=days or settings.gcal_days_ahead)
+
+    # Snapshot the candidates *before* the API call. Anything that gains a
+    # gcal_event_id while the request is in flight (gcal_push runs every five
+    # minutes) is therefore not a deletion candidate — otherwise a freshly
+    # pushed meeting, absent from a response that predates it, would be
+    # cancelled seconds after being created.
+    known_before = {
+        gid
+        for gid in await session.scalars(
+            sa.select(Event.gcal_event_id)
+            .where(Event.gcal_event_id.isnot(None))
+            .where(Event.status == EventStatus.planned)
+            .where(Event.start_at >= now, Event.start_at < window_end)
+        )
+        if gid
+    }
+
+    items = await api.list_events(now, window_end)
+
     seen_ids: set[str] = set()
     changed = 0
     for item in items:
         gcal_id = item.get("id")
-        start_at = _parse_gcal_time(item.get("start"))
-        if not gcal_id or start_at is None:
+        if not gcal_id:
             continue
+        # Recorded before the start-time check: an event Google still holds is
+        # not a deletion just because MIYA could not parse its start.
         seen_ids.add(gcal_id)
+        start_at = _parse_gcal_time(item.get("start"))
+        if start_at is None:
+            continue
         title = (item.get("summary") or "").strip() or "(nomsiz)"
         end_at = _parse_gcal_time(item.get("end"))
         location = (item.get("location") or "").strip() or None
@@ -204,18 +223,19 @@ async def pull(
             changed += 1
 
     # An event the owner deletes in Google simply vanishes from the listing
-    # (the default list call excludes cancelled instances), so a pulled row
-    # absent from the response is a deletion. Without this, the planner and
-    # the 60-minute reminder keep resurrecting meetings that no longer exist.
-    stale = await session.scalars(
-        sa.select(Event)
-        .where(Event.source == EventSource.gcal)
-        .where(Event.status == EventStatus.planned)
-        .where(Event.start_at >= now, Event.start_at < window_end)
-        .where(Event.gcal_event_id.isnot(None))
-    )
-    for event in stale:
-        if event.gcal_event_id not in seen_ids:
+    # (the default list call excludes cancelled instances), so a row that was
+    # in Google before this request and is missing from the response is a
+    # deletion. Without this, the planner and the 60-minute reminder keep
+    # resurrecting meetings that no longer exist. Events MIYA pushed itself
+    # count too: they live in the same calendar and are deleted the same way.
+    missing = known_before - seen_ids
+    if missing:
+        stale = await session.scalars(
+            sa.select(Event)
+            .where(Event.gcal_event_id.in_(missing))
+            .where(Event.status == EventStatus.planned)
+        )
+        for event in stale:
             event.status = EventStatus.cancelled
             changed += 1
 

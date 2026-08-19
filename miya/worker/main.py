@@ -20,7 +20,7 @@ import asyncio
 import logging
 import signal
 import sys
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 
 import sqlalchemy as sa
 from aiogram import Bot
@@ -210,6 +210,46 @@ async def backup_job(bot: Bot) -> None:
     )
 
 
+def _last_scheduled(at: time, now: datetime) -> datetime:
+    """The most recent moment `at` has already passed (today, else yesterday)."""
+    todays = datetime.combine(now.date(), at, tzinfo=settings.tz)
+    return todays if todays <= now else todays - timedelta(days=1)
+
+
+async def _missed_report_day(now: datetime) -> date | None:
+    """The day whose evening report never went out, if there is one.
+
+    A report row alone does not prove the evening report ran: `/hisobot` at
+    lunchtime writes one for the same date. The row must have been *created*
+    after that day's REPORT_TIME to count.
+    """
+    due = _last_scheduled(settings.report_time_parsed, now)
+    day = due.date()
+    async with session_scope() as session:
+        created_at = await session.scalar(
+            sa.select(DailyReport.created_at).where(DailyReport.report_date == day)
+        )
+    if created_at is not None and created_at.astimezone(settings.tz) >= due:
+        return None
+    return day
+
+
+async def _backup_is_missing(now: datetime) -> bool:
+    """True when no backup exists from after the last scheduled backup time.
+
+    An absolute "older than 25 hours" test misses the common case: the VPS is
+    down at 03:30 and comes back at 04:00, when yesterday's backup is only
+    24.5 hours old — so the run would be skipped and the gap would stretch to
+    48 hours.
+    """
+    due = _last_scheduled(settings.backup_time_parsed, now)
+    newest = max(
+        (p.stat().st_mtime for p in backup.backup_dir().glob(f"*{backup.BACKUP_SUFFIX}")),
+        default=0.0,
+    )
+    return newest < due.timestamp()
+
+
 async def catch_up(bot: Bot) -> None:
     """Run anything the scheduler missed while the worker was down.
 
@@ -218,32 +258,37 @@ async def catch_up(bot: Bot) -> None:
     nightly backup. Both are cheap to detect on startup and worth recovering:
     the report is the owner's evening ritual, and the backup is the only thing
     between a disk failure and losing everything.
+
+    Every branch is guarded. This runs before the worker settles into its
+    scheduling loop, and a startup path that can raise is a crash loop under
+    `restart: unless-stopped`.
     """
     now = datetime.now(settings.tz)
-    today = now.date()
 
-    if now.time() >= settings.report_time_parsed:
-        async with session_scope() as session:
-            existing = await session.scalar(
-                sa.select(DailyReport.id).where(DailyReport.report_date == today)
-            )
-        if existing is None:
-            log.info("catch-up: today's report was missed — generating now")
-            try:
-                await report_job(bot)
-            except Exception:
-                log.exception("catch-up report failed")
+    try:
+        day = await _missed_report_day(now)
+    except Exception:
+        log.exception("catch-up could not check for a missed report")
+        day = None
+    if day is not None:
+        # Uses the day, not "today": an outage from 18:00 to the next morning
+        # loses *yesterday's* report, which is exactly the case worth saving.
+        log.info("catch-up: the report for %s was missed — generating now", day)
+        try:
+            async with session_scope() as session:
+                content = await reports.generate_report(session, day)
+            await notify(bot, f"📊 <b>Kunlik hisobot</b> ({day})\n\n{content}")
+        except Exception:
+            log.exception("catch-up report failed")
 
     if settings.backup_age_recipient:
-        newest = max(
-            (
-                p.stat().st_mtime
-                for p in backup.backup_dir().glob(f"*{backup.BACKUP_SUFFIX}")
-            ),
-            default=0.0,
-        )
-        if now.timestamp() - newest > 25 * 3600:
-            log.info("catch-up: last backup is older than a day — running one now")
+        try:
+            missing = await _backup_is_missing(now)
+        except OSError:
+            log.exception("catch-up could not read the backup directory")
+            missing = False
+        if missing:
+            log.info("catch-up: no backup since the last scheduled time — running one")
             try:
                 await backup_job(bot)
             except Exception:
@@ -364,7 +409,11 @@ async def run() -> None:
     )
     scheduler.start()
     log.info("worker started (tz=%s); jobs: %s", settings.timezone, scheduler.get_jobs())
-    await catch_up(bot)
+    # Never fatal: the worker's whole job is to keep running.
+    try:
+        await catch_up(bot)
+    except Exception:
+        log.exception("startup catch-up failed; the scheduler carries on")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

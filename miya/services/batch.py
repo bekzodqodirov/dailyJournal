@@ -249,7 +249,28 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
         # Transport trouble. The batch still holds these windows' results and
         # they are already paid for, so leave them `submitted` and re-read the
         # same batch next tick rather than paying to extract them again.
+        #
+        # But not forever: a stream that fails on every poll would otherwise
+        # wedge these windows in `submitted` for good. After the same number
+        # of attempts the rest of the ladder allows, they go through it and
+        # end up extracted in real time.
         log.warning("streaming results of batch %s failed: %s", batch_id, exc)
+        for window in windows.values():
+            # Counted against the same ladder the rest of the failure modes
+            # use. Below the cap the window simply stays submitted and the
+            # next poll re-reads the batch — the results are already paid for.
+            # At the cap it goes through the ladder and ends up extracted in
+            # real time, so a permanently unreadable stream cannot wedge a
+            # conversation in `submitted` for good.
+            window.attempts += 1
+            if window.attempts >= settings.batch_max_attempts:
+                # _retry_or_fallback bumps attempts itself; undo this one so
+                # the cap means the same number of tries here as everywhere.
+                window.attempts -= 1
+                partial = await _retry_or_fallback(session, window, "stream_unreadable")
+                outcome.applied += partial.applied
+                outcome.retried += partial.retried
+                outcome.failed += partial.failed
         await session.flush()
         return outcome
     except anthropic.AnthropicError as exc:

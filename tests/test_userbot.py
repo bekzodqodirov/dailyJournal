@@ -64,13 +64,18 @@ def test_the_kill_switch_stops_the_process_before_it_connects(monkeypatch):
 
     monkeypatch.setattr(userbot, "TelegramClient", _explode)
 
-    async def _no_idle():
-        return None
+    idled = []
 
-    # With the switch off the real process idles forever (it must not exit,
-    # or Docker would restart-loop it); the test just needs it to return.
+    async def _no_idle():
+        idled.append(True)
+
+    # With the switch off the process must IDLE, not exit: the container is
+    # `restart: unless-stopped`, so a clean exit would make Docker restart it
+    # in a tight loop forever. Asserting the idle actually happened is the
+    # point — a stub that merely lets run() return would pass either way.
     monkeypatch.setattr(userbot, "_idle_forever", _no_idle)
     asyncio.run(userbot.run())
+    assert idled, "the kill switch must idle the process, not let it exit"
 
 
 def test_missing_credentials_fail_loudly_instead_of_prompting(monkeypatch):

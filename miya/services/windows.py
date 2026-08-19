@@ -106,21 +106,6 @@ async def _unclaimed_by_chat(
     session: AsyncSession, *, now: datetime | None = None
 ) -> dict[int, list[Interaction]]:
     now = now or datetime.now(settings.tz)
-    # Media ingestion is two transactions: the row commits first, Scribe or
-    # vision runs with nothing held, and the transcript lands later. If a busy
-    # chat trips the count/char trigger in between, the window would bake the
-    # "[ovozli xabar]" placeholder in and the transcript — arriving moments
-    # later — would never be extracted. So a message whose media is still
-    # unprocessed waits. The one-hour cutoff keeps a crash mid-download (media
-    # stuck unprocessed forever) from wedging that message out of every future
-    # window.
-    # NB: the ORM stores a missing media dict as JSON null, not SQL NULL, so
-    # `media IS NULL` never matches — IS DISTINCT FROM handles the JSON-null,
-    # absent-key and boolean cases in one expression.
-    media_settled = sa.or_(
-        Interaction.media["processed"].astext.is_distinct_from("false"),
-        Interaction.occurred_at < now - timedelta(hours=1),
-    )
     rows = list(
         await session.scalars(
             sa.select(Interaction)
@@ -134,14 +119,44 @@ async def _unclaimed_by_chat(
             # re-billed, and would resurrect the very rows the owner deleted.
             .where(Interaction.processed.is_(False))
             .where(Interaction.tg_chat_id.isnot(None))
-            .where(media_settled)
             .order_by(Interaction.tg_chat_id, Interaction.occurred_at, Interaction.id)
         )
     )
     grouped: dict[int, list[Interaction]] = {}
     for row in rows:
         grouped.setdefault(row.tg_chat_id, []).append(row)
-    return grouped
+    # Media ingestion is two transactions: the row commits first, Scribe or
+    # vision runs with nothing held, and the transcript lands later. A window
+    # built while that is in flight would bake the "[ovozli xabar]"
+    # placeholder in, and the transcript — arriving moments later — would
+    # never be extracted. So each chat's backlog is *truncated* at its first
+    # unsettled message rather than having it filtered out: skipping it would
+    # window the messages on either side together and leave the voice note to
+    # form a stray window of its own, out of order and stripped of context.
+    return {
+        chat_id: kept
+        for chat_id, backlog in grouped.items()
+        if (kept := _settled_prefix(backlog, now=now))
+    }
+
+
+def _pending_media(interaction: Interaction) -> bool:
+    """True while a message's transcript/vision result has not landed yet."""
+    media = interaction.media
+    return isinstance(media, dict) and media.get("processed") is False
+
+
+def _settled_prefix(backlog: list[Interaction], *, now: datetime) -> list[Interaction]:
+    """The leading run of messages whose media is done being processed.
+
+    The one-hour cutoff keeps a crash mid-download (media stuck unprocessed
+    forever) from wedging the chat out of every future window.
+    """
+    cutoff = now - timedelta(hours=1)
+    for index, interaction in enumerate(backlog):
+        if _pending_media(interaction) and interaction.occurred_at > cutoff:
+            return backlog[:index]
+    return backlog
 
 
 async def _person_names(

@@ -289,13 +289,15 @@ _SUFFIX = {
 
 
 def _suffix_for(kind: MediaKind, filename: str | None) -> str:
-    """Where a download lands. Documents keep their real extension.
+    """Where a download lands. Documents and audio keep their real extension.
 
     documents.read_document() dispatches on the suffix, so a `.bin` path made
     every invoice and packing list in every monitored chat unreadable — the
-    text was dropped with nothing flagged.
+    text was dropped with nothing flagged. Audio files are the same story one
+    layer down: a shared `.m4a` saved as `.mp3` is handed to Scribe with a
+    content type that does not match its bytes.
     """
-    if kind is MediaKind.document and filename:
+    if kind in (MediaKind.document, MediaKind.audio) and filename:
         suffix = Path(filename).suffix
         if suffix:
             return suffix
