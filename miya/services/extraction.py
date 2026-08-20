@@ -1,14 +1,18 @@
 """Claude Haiku extraction: raw text in, validated structured facts out (spec §5).
 
-The response shape is enforced by the API through structured outputs, so a
-malformed payload is not a normal outcome. The retry and the ``needs_review``
-fallback below cover what structured outputs cannot: transport errors, refusals,
-and truncation.
+The response shape is normally enforced by the API through structured outputs.
+That can fail on the server before the model is ever sampled — a schema this
+size can exceed the grammar compiler's time budget — so there is a second,
+prompted-JSON path that carries the schema in the system block instead. The
+retry and the ``needs_review`` fallback cover the rest: transport errors,
+refusals, and truncation.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -229,12 +233,64 @@ def build_user_content(text: str, *, now: datetime) -> str:
 MAX_EXTRACTION_TOKENS = 4096
 
 
-def extraction_system_block() -> list[dict]:
-    """The cached system block shared by the real-time and batch paths."""
+# Set once the API tells us it cannot compile this schema into a sampling
+# grammar ("Grammar compilation timed out"). That is a server-side failure
+# decided before the model runs, so retrying the identical request cannot
+# help and every later extraction would pay the same latency to fail the same
+# way. Remembering it turns a hard failure into one degraded-but-working
+# request. It is deliberately not reset: a process restart re-enables
+# structured outputs, which is the right cadence for a platform-side limit.
+_structured_output_unusable = False
+
+
+def structured_output_available() -> bool:
+    return not _structured_output_unusable
+
+
+def note_grammar_failure(exc: Exception) -> None:
+    global _structured_output_unusable
+    if not _structured_output_unusable:
+        log.warning(
+            "structured outputs unavailable for this schema (%s); "
+            "falling back to prompted JSON for the rest of this process",
+            exc,
+        )
+    _structured_output_unusable = True
+
+
+def is_grammar_failure(exc: Exception) -> bool:
+    """Did the server refuse the *schema* rather than the request?"""
+    return isinstance(exc, anthropic.BadRequestError) and "grammar" in str(exc).lower()
+
+
+@lru_cache(maxsize=1)
+def _schema_instructions() -> str:
+    """The schema as prompt text, for when the grammar path is unavailable.
+
+    Generated from the same model the structured path uses, so the two can
+    never drift apart.
+    """
+    schema = TypeAdapter(ExtractionResult).json_schema()
+    return (
+        "\n\nReturn a JSON object valid against this JSON Schema. "
+        "Emit the object only — no prose, no markdown fences.\n"
+        + json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def extraction_system_block(*, with_schema: bool = False) -> list[dict]:
+    """The cached system block shared by the real-time and batch paths.
+
+    ``with_schema`` appends the JSON Schema for the prompted fallback. Both
+    variants stay byte-stable, so each keeps its own cache entry.
+    """
+    text = EXTRACTION_SYSTEM_PROMPT
+    if with_schema:
+        text += _schema_instructions()
     return [
         {
             "type": "text",
-            "text": EXTRACTION_SYSTEM_PROMPT,
+            "text": text,
             # Engages once the cached prefix clears the model's minimum (4096
             # tokens on Haiku 4.5); harmless and forward-looking below that.
             "cache_control": {"type": "ephemeral"},
@@ -255,22 +311,35 @@ def extraction_output_config() -> dict:
 
 
 def build_request_params(text: str, *, now: datetime) -> dict:
-    """One extraction request, in Messages API shape (used by the batch path)."""
-    return {
+    """One extraction request, in Messages API shape (used by the batch path).
+
+    The batch path reads its results with ``parse_extraction_json`` either way,
+    so dropping ``output_config`` once the grammar is known to be uncompilable
+    costs nothing and keeps a whole batch from failing on a schema the server
+    has already rejected.
+    """
+    structured = structured_output_available()
+    params = {
         "model": settings.extract_model,
         "max_tokens": MAX_EXTRACTION_TOKENS,
-        "system": extraction_system_block(),
+        "system": extraction_system_block(with_schema=not structured),
         "messages": [{"role": "user", "content": build_user_content(text, now=now)}],
-        "output_config": extraction_output_config(),
     }
+    if structured:
+        params["output_config"] = extraction_output_config()
+    return params
 
 
 def parse_extraction_json(text: str) -> ExtractionResult | None:
-    """Validate a batch result's JSON body. None means it was not usable."""
+    """Validate a model-written JSON body. None means it was not usable.
+
+    Used by the batch path and by the prompted-JSON fallback — anywhere the
+    API did not already constrain the output to the schema.
+    """
     try:
         return ExtractionResult.model_validate_json(text)
     except ValidationError as exc:
-        log.warning("batch extraction returned an invalid object: %s", exc)
+        log.warning("extraction returned an invalid object: %s", exc)
         return None
 
 
@@ -314,14 +383,71 @@ class UsageTally:
         return self if self.calls else None
 
 
+@dataclass(slots=True)
+class _Attempt:
+    """One request's outcome, normalised across the two response shapes."""
+
+    usage: object
+    stop_reason: str | None
+    parsed: ExtractionResult | None
+
+
+def _text_of(response) -> str:
+    return "".join(
+        block.text for block in response.content if getattr(block, "type", "") == "text"
+    )
+
+
+async def _one_attempt(client, messages: list[dict]) -> _Attempt:
+    """Ask once, by whichever route is currently usable.
+
+    Prefers structured outputs. If the server rejects the *schema* rather than
+    the request, it retries the same turn as prompted JSON and remembers the
+    rejection, so this costs one wasted call per process rather than one per
+    message.
+    """
+    if structured_output_available():
+        try:
+            response = await client.messages.parse(
+                model=settings.extract_model,
+                max_tokens=MAX_EXTRACTION_TOKENS,
+                system=extraction_system_block(),
+                messages=messages,
+                output_format=ExtractionResult,
+            )
+        except API_FAILURES as exc:
+            if not is_grammar_failure(exc):
+                raise
+            note_grammar_failure(exc)
+        else:
+            return _Attempt(response.usage, response.stop_reason, response.parsed_output)
+
+    response = await client.messages.create(
+        model=settings.extract_model,
+        max_tokens=MAX_EXTRACTION_TOKENS,
+        system=extraction_system_block(with_schema=True),
+        messages=messages,
+    )
+    return _Attempt(
+        response.usage, response.stop_reason, parse_extraction_json(_text_of(response))
+    )
+
+
 async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcome:
     """Run one extraction. Never raises — failures come back as `error`."""
     if not text or not text.strip():
         return ExtractionOutcome(result=ExtractionResult(), model=settings.extract_model)
 
     now = now or datetime.now(settings.tz)
-    client = get_client()
-    system = extraction_system_block()
+    try:
+        client = get_client()
+    except API_FAILURES as exc:
+        # Documented above as never raising, and every caller relies on that to
+        # reach its needs_review fallback — so an unconfigured key has to come
+        # back as an outcome, not as an exception thrown past them.
+        return ExtractionOutcome(
+            error=f"{type(exc).__name__}: {exc}", model=settings.extract_model
+        )
     messages = [{"role": "user", "content": build_user_content(text, now=now)}]
 
     tally = UsageTally()
@@ -337,34 +463,28 @@ async def extract(text: str, *, now: datetime | None = None) -> ExtractionOutcom
                 },
             ]
         try:
-            response = await client.messages.parse(
-                model=settings.extract_model,
-                max_tokens=MAX_EXTRACTION_TOKENS,
-                system=system,
-                messages=messages,
-                output_format=ExtractionResult,
-            )
+            got = await _one_attempt(client, messages)
         except API_FAILURES as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             log.warning("extraction attempt %d failed: %s", attempt, last_error)
             continue
 
-        tally.add(response.usage)
+        tally.add(got.usage)
 
-        if response.stop_reason == "refusal":
+        if got.stop_reason == "refusal":
             return ExtractionOutcome(
                 error="refusal", model=settings.extract_model, usage=tally.or_none()
             )
-        if response.stop_reason == "max_tokens":
+        if got.stop_reason == "max_tokens":
             last_error = "max_tokens: extraction truncated"
             log.warning("extraction attempt %d hit max_tokens", attempt)
             continue
-        if response.parsed_output is None:
+        if got.parsed is None:
             last_error = "schema validation returned no object"
             continue
 
         return ExtractionOutcome(
-            result=response.parsed_output,
+            result=got.parsed,
             model=settings.extract_model,
             usage=tally.or_none(),
         )
