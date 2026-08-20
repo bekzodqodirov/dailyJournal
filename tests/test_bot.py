@@ -212,3 +212,54 @@ def test_reminder_body_lists_what_is_due():
 @pytest.mark.parametrize("body", [replies.HELP, replies.FAILED_EXTRACTION_HINT])
 def test_static_owner_text_is_uzbek(body):
     assert any(word in body for word in ("qarz", "Yozib", "buyruq", "ma'lumot"))
+
+
+# --- startup: the backlog is data, not noise --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_polling_keeps_updates_queued_while_the_bot_was_down(monkeypatch):
+    """A restart must not discard what the owner sent meanwhile.
+
+    Container restarts are routine (rebuild, crash, VPS reboot) and a message
+    sent during one exists nowhere else — dropping it would silently lose a
+    debt or a promise, which is the one thing this system must never do.
+    """
+    from miya.bot import main as bot_main
+
+    seen: dict = {}
+
+    class _Me:
+        username = "miya_test_bot"
+
+    class _Session:
+        async def close(self):
+            pass
+
+    class _Bot:
+        session = _Session()
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def get_me(self):
+            return _Me()
+
+    class _Dispatcher:
+        async def start_polling(self, bot, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(bot_main, "Bot", _Bot)
+    monkeypatch.setattr(bot_main, "build_dispatcher", lambda: _Dispatcher())
+
+    class _Engine:
+        async def dispose(self):
+            pass
+
+    monkeypatch.setattr(bot_main, "engine", _Engine())
+    monkeypatch.setattr(settings, "assistant_bot_token", "test-token")
+    monkeypatch.setattr(settings, "owner_telegram_id", 4242)
+
+    await bot_main.run()
+
+    assert seen.get("drop_pending_updates") is False
