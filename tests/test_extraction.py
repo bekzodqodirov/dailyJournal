@@ -347,3 +347,43 @@ async def test_a_missing_api_key_comes_back_as_an_outcome_not_an_exception(monke
 
     assert not outcome.ok
     assert "AnthropicUnavailable" in outcome.error
+
+
+# --- what the model actually returns without a grammar ----------------------
+
+
+@pytest.mark.parametrize(
+    "wrapping",
+    [
+        '```json\n{"summary":"Akmalga 5 mln"}\n```',
+        '```\n{"summary":"Akmalga 5 mln"}\n```',
+        '```JSON\n{"summary":"Akmalga 5 mln"}```',
+        'Mana natija:\n{"summary":"Akmalga 5 mln"}',
+        '{"summary":"Akmalga 5 mln"}',
+        '  {"summary":"Akmalga 5 mln"}  ',
+    ],
+)
+def test_json_survives_the_wrapping_models_add(wrapping):
+    """Without a grammar the model fences its JSON however plainly it is asked not to."""
+    result = ex.parse_extraction_json(wrapping)
+    assert result is not None
+    assert result.summary == "Akmalga 5 mln"
+
+
+@pytest.mark.parametrize("body", ["sorry, I cannot", "", "{not json at all}"])
+def test_unwrapping_never_rescues_a_genuinely_bad_object(body):
+    """Only presentation is forgiven; the object still has to validate."""
+    assert ex.parse_extraction_json(body) is None
+
+
+async def test_a_fenced_fallback_reply_still_produces_a_debt(stub):
+    fenced = (
+        '```json\n{"summary":"Akmalga 5 mln berildi","debts":'
+        '[{"direction":"they_owe_me","person":"Akmal","amount":5000000}]}\n```'
+    )
+    stub([_grammar_timeout()], created=[_text_response(fenced)])
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert outcome.ok, outcome.error
+    assert outcome.result.debts[0].person == "Akmal"

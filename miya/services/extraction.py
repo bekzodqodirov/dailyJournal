@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
@@ -330,6 +331,28 @@ def build_request_params(text: str, *, now: datetime) -> dict:
     return params
 
 
+# A fenced block, with or without a language tag. Models wrap JSON in one
+# routinely, however plainly the prompt asks them not to.
+_FENCED = re.compile(r"\A\s*```[^\n]*\n(?P<body>.*?)\n?```\s*\Z", re.DOTALL)
+
+
+def json_payload(text: str) -> str:
+    """The JSON object inside whatever the model wrapped it in.
+
+    Only unwrapping, never repair: the result still has to validate against
+    the schema, so a genuinely malformed object fails exactly as before. This
+    just stops presentation — a ```json fence, a sentence before the brace —
+    from costing a whole extraction.
+    """
+    fenced = _FENCED.match(text)
+    if fenced:
+        return fenced.group("body")
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return text[start : end + 1]
+    return text
+
+
 def parse_extraction_json(text: str) -> ExtractionResult | None:
     """Validate a model-written JSON body. None means it was not usable.
 
@@ -337,7 +360,7 @@ def parse_extraction_json(text: str) -> ExtractionResult | None:
     API did not already constrain the output to the schema.
     """
     try:
-        return ExtractionResult.model_validate_json(text)
+        return ExtractionResult.model_validate_json(json_payload(text))
     except ValidationError as exc:
         log.warning("extraction returned an invalid object: %s", exc)
         return None

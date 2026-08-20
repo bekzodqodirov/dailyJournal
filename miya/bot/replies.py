@@ -58,6 +58,7 @@ raqamlar bilan javob beraman.
 /xarajat — MIYA'ning API xarajati
 /unut — ma'lumotni butunlay o'chirish
 /tekshir — qayta ishlanmagan yozuvlar
+/qayta — ularni qaytadan ajratishga urinish
 /yordam — shu ro'yxat
 """
 
@@ -102,6 +103,21 @@ DOCUMENT_FAILED_HINT = (
     "⚠️ Hujjatni o'qib bo'lmadi (formati qo'llab-quvvatlanmaydi yoki himoyalangan). "
     "Fayl saqlandi — /tekshir ro'yxatida turadi."
 )
+
+
+RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."
+
+
+def retry_report(rescued: int, still_failing: int) -> str:
+    """`/qayta`: what a second extraction pass managed to rescue."""
+    if not rescued and not still_failing:
+        return RETRY_NOTHING_TO_DO
+    lines = [f"🔁 <b>{rescued + still_failing} ta yozuv qayta ishlandi</b>"]
+    if rescued:
+        lines.append(f"✅ {rescued} tasi ajratildi")
+    if still_failing:
+        lines.append(f"⚠️ {still_failing} tasi yana bo'lmadi — /tekshir ro'yxatida qoladi")
+    return "\n".join(lines)
 
 
 def person_not_found(name: str) -> str:
