@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-import anthropic
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +21,7 @@ from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
 from miya.services import planner, queries
-from miya.services.extraction import get_client
+from miya.services.extraction import API_FAILURES, get_client
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -194,7 +193,7 @@ async def generate_report(session: AsyncSession, day: date | None = None) -> str
             usage=response.usage,
         )
         content = "\n".join(b.text for b in response.content if b.type == "text").strip()
-    except anthropic.APIError as exc:
+    except API_FAILURES as exc:
         log.warning("report call failed, storing the raw data block: %s", exc)
 
     content = content or data_block

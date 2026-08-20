@@ -517,3 +517,29 @@ async def flagged_interactions(
         await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
     )
     return rows, total or 0
+
+
+async def retryable_interactions(
+    session: AsyncSession, *, limit: int = 50
+) -> list[Interaction]:
+    """Flagged interactions that another extraction attempt could still rescue.
+
+    Only rows that already hold text: a voice note whose transcription failed
+    has nothing to re-extract from, and re-running it would spend money to
+    fail again in exactly the same way.
+
+    Oldest first, so a backlog is rebuilt in the order the owner lived it.
+    """
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(
+            sa.or_(
+                sa.func.length(sa.func.coalesce(Interaction.raw_text, "")) > 0,
+                sa.func.length(sa.func.coalesce(Interaction.transcript, "")) > 0,
+            )
+        )
+        .order_by(Interaction.occurred_at)
+        .limit(limit)
+    )
+    return list(await session.scalars(stmt))

@@ -372,3 +372,58 @@ async def test_catch_up_never_takes_the_worker_down(monkeypatch):
 
     # Must return, not raise.
     await worker.catch_up(bot=None)
+
+
+# --- a blank API key degrades, it does not explode ---------------------------
+
+
+def test_an_empty_api_key_raises_a_type_every_caller_already_handles(monkeypatch):
+    """The SDK's own failure for a blank key is a bare TypeError raised deep
+    inside header building, which no fallback path expects.
+
+    Found by running the worker for real: a blank ANTHROPIC_API_KEY took the
+    whole daily report down instead of degrading to its data block.
+    """
+    from miya.services import extraction
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "   ")
+    monkeypatch.setattr(extraction, "_client", None)
+
+    try:
+        extraction.get_client()
+    except extraction.AnthropicUnavailable:
+        pass
+    else:  # pragma: no cover - the guard is the point of the test
+        raise AssertionError("a blank key must fail before the SDK is reached")
+
+    # And it is a member of the tuple every fallback catches.
+    assert isinstance(extraction.AnthropicUnavailable("x"), extraction.API_FAILURES)
+
+
+async def test_the_daily_report_still_arrives_without_an_api_key(session, monkeypatch):
+    """No key means the deterministic data block *is* the report — never nothing."""
+    from miya.services import extraction, reports
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(extraction, "_client", None)
+
+    content = await reports.generate_report(session)
+    await session.flush()
+
+    assert "HISOBOT KUNI" in content
+    stored = await session.scalar(
+        sa.select(m.DailyReport.content).where(
+            m.DailyReport.report_date == datetime.now(TZ).date()
+        )
+    )
+    assert stored == content
+
+
+async def test_the_planner_still_answers_without_an_api_key(session, monkeypatch):
+    from miya.services import extraction, planner
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "")
+    monkeypatch.setattr(extraction, "_client", None)
+
+    plan = await planner.plan_tomorrow(session)
+    assert plan.strip(), "the planner must fall back, not return nothing"

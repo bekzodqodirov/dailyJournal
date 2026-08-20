@@ -31,7 +31,7 @@ from miya.bot.formatting import clip
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
-from miya.db.models import ChatMonitor, Person
+from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
     audio,
@@ -160,6 +160,47 @@ async def cmd_review(message: Message) -> None:
         flagged, total = await queries.flagged_interactions(session)
         body = replies.review_report(flagged, total)
     await _safe_answer(message, body)
+
+
+@router.message(Command("qayta"))
+async def cmd_retry(message: Message) -> None:
+    """Re-extract everything `/tekshir` is holding (spec §14).
+
+    Extraction fails for reasons that later stop being true — an outage, a
+    rate limit, a bug in the pipeline. Without this the raw text is kept
+    faithfully and then never becomes a debt or a promise, which is only half
+    of not losing it.
+
+    Each interaction gets its own transaction: one that fails again must not
+    roll back the ones already rescued alongside it.
+    """
+    await _typing(message)
+    async with session_scope() as session:
+        pending = await queries.retryable_interactions(session)
+        ids = [row.id for row in pending]
+
+    if not ids:
+        await _safe_answer(message, replies.RETRY_NOTHING_TO_DO)
+        return
+
+    rescued = failed = 0
+    for interaction_id in ids:
+        try:
+            async with session_scope() as session:
+                interaction = await session.get(Interaction, interaction_id)
+                if interaction is None:
+                    continue
+                result = await process_interaction(session, interaction)
+                if result.ok:
+                    interaction.needs_review = False
+                    rescued += 1
+                else:
+                    failed += 1
+        except Exception:
+            log.exception("retrying interaction %s failed", interaction_id)
+            failed += 1
+
+    await _safe_answer(message, replies.retry_report(rescued, failed))
 
 
 @router.message(Command("qidir"))

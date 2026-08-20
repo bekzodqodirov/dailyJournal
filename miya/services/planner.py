@@ -11,13 +11,12 @@ import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-import anthropic
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.bot.formatting import escape
 from miya.config import settings
 from miya.services import queries
-from miya.services.extraction import get_client
+from miya.services.extraction import API_FAILURES, get_client
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -125,7 +124,7 @@ async def plan_for(session: AsyncSession, day: date) -> str:
             ],
             messages=[{"role": "user", "content": data_block}],
         )
-    except anthropic.APIError as exc:
+    except API_FAILURES as exc:
         log.warning("planner call failed, falling back to raw listing: %s", exc)
         return data_block
 

@@ -89,8 +89,17 @@ async def run() -> None:
     )
 
     try:
-        # Drop updates queued while the bot was down; MIYA logs the present.
-        await dp.start_polling(bot, drop_pending_updates=True)
+        # Deliberately NOT drop_pending_updates. Container restarts are routine
+        # here — a rebuild, a crash, a VPS reboot — and anything the owner sent
+        # during that window is a note, a debt or a promise that exists nowhere
+        # else. Dropping it would break the one guarantee the whole system
+        # rests on: nothing the owner said is ever silently lost.
+        #
+        # The backlog cannot run away: Telegram keeps undelivered updates for
+        # 24 hours, and this bot serves exactly one person, so the worst case
+        # is one day of the owner's own messages — which is precisely the data
+        # that must not be thrown away.
+        await dp.start_polling(bot, drop_pending_updates=False)
     finally:
         await bot.session.close()
         await engine.dispose()
