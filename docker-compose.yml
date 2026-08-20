@@ -20,8 +20,11 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
     # Localhost only — Postgres is never reachable from outside the VPS.
+    # The host port is configurable because a developer machine often already
+    # runs Postgres on 5432; the bind failing there took the whole stack down.
+    # Containers always reach the database as db:5432 regardless of this.
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-miya} -d ${POSTGRES_DB:-miya}"]
       interval: 5s
