@@ -120,6 +120,45 @@ def retry_report(rescued: int, still_failing: int) -> str:
     return "\n".join(lines)
 
 
+MEDIA_ASK_LABELS = {
+    "video": "video",
+    "too_large": "katta fayl",
+}
+
+MEDIA_APPROVED = "✅ Yuklab olaman — tayyor bo'lganda yozaman."
+MEDIA_DECLINED = "👌 Tegmadim."
+MEDIA_GONE = "⚠️ Bu so'rov eskirgan yoki yozuv o'chirilgan."
+
+
+def _size(nbytes: int | None) -> str:
+    if not nbytes:
+        return ""
+    mb = nbytes / (1024 * 1024)
+    return f"{mb:.0f} MB" if mb >= 1 else f"{nbytes / 1024:.0f} KB"
+
+
+def media_question(*, who: str | None, media: dict, reason: str) -> str:
+    """Ask the owner whether a large attachment is worth fetching.
+
+    Everything the answer depends on is in the question — who sent it, what it
+    is, how big, and its caption — because the file itself is what MIYA is
+    asking permission to look at. It cannot describe what it has not fetched.
+    """
+    kind = MEDIA_ASK_LABELS.get(reason, str(media.get("type") or "fayl"))
+    parts = [f"📎 <b>{escape(who or 'Nomaʼlum')}</b> {escape(kind)} yubordi"]
+
+    detail = " · ".join(
+        p for p in (escape(media.get("filename") or ""), _size(media.get("size"))) if p
+    )
+    if detail:
+        parts.append(detail)
+    caption = (media.get("caption") or "").strip()
+    if caption:
+        parts.append(f"<i>{escape(caption[:200])}</i>")
+    parts.append("O'qiyminmi?")
+    return "\n".join(parts)
+
+
 def person_not_found(name: str) -> str:
     return f"❓ <b>{escape(name)}</b> topilmadi."
 

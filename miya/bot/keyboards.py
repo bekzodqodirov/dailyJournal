@@ -80,3 +80,24 @@ def chats_keyboard(page: ChatsPage) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def media_approval(interaction_id: int) -> InlineKeyboardMarkup:
+    """Yes/no for one oversized attachment.
+
+    The interaction id is the whole payload: the answer has to survive the
+    worker restarting between question and tap, so nothing about it may live
+    in memory.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ O'qi", callback_data=f"md:y:{interaction_id}"
+                ),
+                InlineKeyboardButton(
+                    text="✖️ Kerak emas", callback_data=f"md:n:{interaction_id}"
+                ),
+            ]
+        ]
+    )

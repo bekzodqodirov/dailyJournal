@@ -30,12 +30,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from miya.bot import replies
+from miya.bot import keyboards, replies
 from miya.bot.formatting import clip, escape
 from miya.config import settings
-from miya.db.models import DailyReport
+from miya.db.models import DailyReport, Person
 from miya.db.session import engine, session_scope
 from miya.services import (
+    approvals,
     backup,
     batch,
     call_recordings,
@@ -177,6 +178,55 @@ async def window_job() -> None:
         flushed = await windows.flush_ready_windows(session)
     if flushed:
         log.info("window flush produced %d window(s)", len(flushed))
+
+
+async def media_ask_job(bot: Bot) -> None:
+    """Ask the owner about attachments too big to fetch on spec (spec §6).
+
+    Quiet-hours aware: a 300 MB video at 02:00 is not worth a notification,
+    and the question keeps until morning — the file is not going anywhere.
+    """
+    async with session_scope() as session:
+        expired = await approvals.expire_stale(session)
+    if expired:
+        log.info("expired %d unanswered media question(s)", expired)
+
+    if reminders.in_quiet_hours():
+        return
+
+    async with session_scope() as session:
+        pending = await approvals.awaiting_question(session)
+        questions = []
+        for interaction in pending:
+            person = (
+                await session.get(Person, interaction.person_id)
+                if interaction.person_id
+                else None
+            )
+            questions.append(
+                (
+                    interaction.id,
+                    replies.media_question(
+                        who=person.display_name if person else None,
+                        media=dict(interaction.media or {}),
+                        reason=approvals.reason_of(interaction),
+                    ),
+                )
+            )
+            # Marked before the send, not after: a question asked twice is
+            # worse than one lost to a failed send, which the owner can see
+            # is missing anyway.
+            approvals.set_state(interaction, approvals.ASKED)
+
+    for interaction_id, body in questions:
+        try:
+            await bot.send_message(
+                settings.owner_telegram_id,
+                clip(body),
+                reply_markup=keyboards.media_approval(interaction_id),
+            )
+        except Exception:
+            log.exception("could not ask about attachment %s", interaction_id)
 
 
 async def batch_submit_job() -> None:
@@ -378,6 +428,14 @@ async def run() -> None:
         window_job,
         IntervalTrigger(minutes=5),
         id="windows",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        media_ask_job,
+        IntervalTrigger(minutes=2),
+        id="media_ask",
+        args=[bot],
         max_instances=1,
         coalesce=True,
     )

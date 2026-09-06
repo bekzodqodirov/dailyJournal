@@ -73,11 +73,12 @@ class ChatMonitor(Base):
     chat_type: Mapped[e.ChatType] = mapped_column(CHAT_TYPE, nullable=False)
     title: Mapped[str | None] = mapped_column(sa.Text)
     # Default: private chats on, groups and channels off until whitelisted.
+    # Vision is on everywhere: receipts and invoices arrive as images.
     monitor_enabled: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
     vision_enabled: Mapped[bool] = mapped_column(
-        sa.Boolean, nullable=False, server_default=sa.false()
+        sa.Boolean, nullable=False, server_default=sa.true()
     )
     docs_enabled: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.true()

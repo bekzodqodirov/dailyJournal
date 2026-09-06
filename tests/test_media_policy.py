@@ -42,10 +42,13 @@ def test_photos_are_only_downloaded_where_vision_is_enabled():
     assert (on.download, on.vision) == (True, True)
 
 
-def test_video_is_never_processed_automatically():
+def test_video_is_never_downloaded_without_being_asked_about():
+    """Still never automatic — but the owner is now offered the choice rather
+    than the message being dropped where he would never learn of it."""
     result = plan(MediaKind.video)
     assert result.download is False
-    assert result.skip_reason == "video_on_demand"
+    assert result.ask is True
+    assert result.ask_reason == "video"
 
 
 def test_stickers_and_gifs_are_dropped_entirely():

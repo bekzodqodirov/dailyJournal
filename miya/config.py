@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     # bandwidth and Scribe minutes on content that is rarely business.
     audio_max_bytes: int = 30 * 1024 * 1024
 
+    # --- Oversized media: ask rather than skip ------------------------------
+    # Anything above audio_max_bytes / doc_max_bytes, and every video, used to
+    # be dropped silently. The owner would rather decide: MIYA asks in Telegram
+    # and downloads only on a yes. Above the hard ceiling it does not even ask —
+    # a multi-gigabyte file is not worth a round trip.
+    media_ask_max_bytes: int = 500 * 1024 * 1024
+    # How long an unanswered question stays actionable. After this the buttons
+    # are stale — the owner has moved on and the file is rarely still relevant.
+    media_ask_expiry_hours: int = 48
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

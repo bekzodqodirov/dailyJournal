@@ -34,6 +34,7 @@ from miya.db.enums import Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
+    approvals,
     audio,
     chats,
     documents,
@@ -391,6 +392,37 @@ async def _build_purge_plan(session, argument: str):
     if person is None or score < 70:
         return None, ""
     return await purge.plan_person(session, person), f"unut:p:{person.id}"
+
+
+@router.callback_query(F.data.startswith("md:"))
+async def on_media_button(callback: CallbackQuery) -> None:
+    """The owner's answer to "shall I read this?".
+
+    Only records the decision. The file lives in a private Telegram chat that
+    the assistant bot cannot see — the userbot fetches it on its next sweep.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    answer, raw_id = parts[1], parts[2]
+
+    async with session_scope() as session:
+        interaction = await session.get(Interaction, int(raw_id))
+        if interaction is None or approvals.state_of(interaction) in (
+            None,
+            approvals.EXPIRED,
+        ):
+            await _edit_callback(callback, replies.MEDIA_GONE)
+            return
+        approvals.set_state(
+            interaction,
+            approvals.APPROVED if answer == "y" else approvals.DECLINED,
+            answered_at=datetime.now(settings.tz).isoformat(),
+        )
+        body = replies.MEDIA_APPROVED if answer == "y" else replies.MEDIA_DECLINED
+
+    await _edit_callback(callback, body)
 
 
 @router.callback_query(F.data.startswith("unut:"))
