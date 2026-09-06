@@ -64,13 +64,42 @@ async def create_interaction(
     return interaction
 
 
+# No phone call is longer than this. The hint is client-supplied — Android's
+# CallLog.Calls.DURATION as the phone reports it — and it lands in UsageLog,
+# which is the only figure the owner has for what MIYA costs. A hint that could
+# not be true bills nothing rather than billing a fiction.
+MAX_BILLABLE_SECONDS = 6 * 3600
+
+
+def _billable_seconds(hint: float | None, measured: float) -> float:
+    if hint and 0 < hint <= MAX_BILLABLE_SECONDS:
+        return hint
+    if hint:
+        log.warning("ignoring implausible duration hint %s seconds", hint)
+    return measured
+
+
 async def transcribe_into(
-    session: AsyncSession, interaction: Interaction, audio_path: str | Path
+    session: AsyncSession,
+    interaction: Interaction,
+    audio_path: str | Path,
+    *,
+    language_hint: str | None = None,
+    duration_hint: float | None = None,
 ) -> str | None:
-    """Transcribe audio onto the interaction. Returns the text, or None on failure."""
+    """Transcribe audio onto the interaction. Returns the text, or None on failure.
+
+    `language_hint` reaches Scribe as `language_code` — a free accuracy win
+    whenever the caller knows the language (the phone reports its locale).
+    `duration_hint` is the true length of the audio when the source knows it
+    (Android's `CallLog.Calls.DURATION`): Scribe returns no duration field, so
+    `Transcript.duration` is reverse-engineered from the last word's end time
+    and collapses to 0.0 when word timings are missing — which is exactly the
+    unclear recording we would otherwise bill as free.
+    """
     transcriber = get_transcriber()
     try:
-        transcript = await transcriber.transcribe(audio_path)
+        transcript = await transcriber.transcribe(audio_path, language_hint=language_hint)
     except TranscriptionError as exc:
         log.error("transcription failed for interaction %s: %s", interaction.id, exc)
         interaction.needs_review = True
@@ -81,7 +110,7 @@ async def transcribe_into(
         session,
         provider=transcriber.name,
         model=transcriber.model,
-        seconds=transcript.duration,
+        seconds=_billable_seconds(duration_hint, transcript.duration),
         source_interaction_id=interaction.id,
     )
     if transcript.language:

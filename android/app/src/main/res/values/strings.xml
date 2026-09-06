@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MIYA Companion</string>
+    <string name="share_target_label">Send to MIYA</string>
+    <string name="channel_service_name">Sync activity</string>
+    <string name="channel_service_desc">Shown while MIYA is scanning for or uploading a recording.</string>
+    <string name="channel_alerts_name">Problems</string>
+    <string name="channel_alerts_desc">Shown when MIYA has stopped being able to upload recordings.</string>
+</resources>
