@@ -4,6 +4,13 @@ Syncthing drops the phone's call recordings into ``CALL_RECORDINGS_DIR``; a
 worker job scans that directory every minute and pushes each new file through
 the same pipeline as everything else: transcript → extraction → persisted rows.
 
+The Android companion app (POST /v1/recordings) drops files into the same
+directory, next to a ``<audio>.<ext>.json`` sidecar carrying what the phone
+knows and a filename cannot: the call's true start with its UTC offset, the
+direction, the contact's name, the number and the duration. When a sidecar is
+there it wins outright; the filename guesswork below is the fallback for files
+that arrive over Syncthing.
+
 Design points, all from the spec:
   * Samsung's filename format varies between firmware versions — parse
     defensively and fall back to the file's mtime.
@@ -18,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import time
@@ -37,7 +45,7 @@ from miya.services.ingest import (
     process_interaction,
     transcribe_into,
 )
-from miya.services.people import find_by_phone
+from miya.services.people import find_by_phone, resolve_person
 
 log = logging.getLogger(__name__)
 
@@ -49,14 +57,43 @@ _SYNC_TEMP_MARKERS = ("~syncthing~", ".syncthing.", ".tmp", ".part")
 # A file must be untouched this long before we trust that the sync finished.
 MIN_FILE_AGE_SECONDS = 30
 
+# The uploader stages bytes under this suffix and renames on completion; it is
+# one of _SYNC_TEMP_MARKERS above, so a half-written upload is already
+# invisible to the sweep without a second rule.
+UPLOAD_TEMP_SUFFIX = ".part"
+
+# Largest single recording POST /v1/recordings will spool to disk. An hour of
+# AMR is ~2 MB and an hour of Samsung's m4a ~30 MB, so 200 MB is generous for
+# a phone call and still small enough that a broken client cannot fill the
+# volume before the cap trips. Nothing else in the stack imposes a body limit:
+# uvicorn does not, there is no reverse proxy, and Content-Length is whatever
+# the client claims — so the handler counts the bytes itself.
+RECORDING_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
+
+# What Android's CallLog.Calls.TYPE means to us. Anything else (missed,
+# rejected, voicemail) is a call with no conversation in it, so `na` is honest.
+DIRECTION_BY_NAME = {
+    "incoming": Direction.in_,
+    "outgoing": Direction.out,
+}
+
 
 @dataclass(slots=True)
 class ParsedRecording:
-    """What the filename alone tells us — any field may be missing."""
+    """What is known about a recording before it is transcribed.
+
+    A filename fills in the first three fields at best; a sidecar from the
+    phone fills in all of them. Any field may be missing — the app must stay
+    useful on a handset where READ_CALL_LOG cannot be granted at all.
+    """
 
     counterparty: str | None = None  # contact name or phone number as recorded
     phone: str | None = None  # digits-only phone if the counterparty looks like one
     recorded_at: datetime | None = None
+    direction: Direction | None = None  # who called whom; a filename never says
+    duration_seconds: int | None = None  # true audio length, for usage accounting
+    language: str | None = None  # locale hint → Scribe language_code
+    call_id: str | None = None  # "<device_id>:<CallLog._ID>", survives re-encoding
 
 
 # Samsung stamps recordings with _YYMMDD_HHMMSS before the extension:
@@ -117,6 +154,64 @@ def file_sha256(path: Path, chunk_size: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+def sidecar_path(audio: Path) -> Path:
+    """``recording.m4a`` → ``recording.m4a.json``.
+
+    Appended, not substituted, so the sidecar cannot collide with a second
+    recording whose stem happens to match, and so the audio's own extension
+    stays readable in the sidecar's name.
+    """
+    return audio.with_suffix(audio.suffix + ".json")
+
+
+def staged_upload_paths(
+    directory: Path, *, started_at: datetime, sha256: str, suffix: str
+) -> tuple[Path, Path]:
+    """Where an uploaded recording and its sidecar belong.
+
+    Deterministic in the upload's own content, so a phone that retries after a
+    lost response writes the identical name instead of a second copy. The
+    client's filename never reaches the path — only its suffix does.
+    """
+    stem = f"{started_at.strftime('%Y%m%d-%H%M%S')}-{sha256[:12]}"
+    audio = directory / f"{stem}{suffix}"
+    return audio, sidecar_path(audio)
+
+
+def read_sidecar(audio: Path) -> ParsedRecording | None:
+    """The phone's own account of a call, or None when there is no sidecar.
+
+    Every field is optional and a malformed value is dropped rather than
+    raised: a recording that arrived is worth more than a metadata field, and
+    the fallbacks (filename, mtime) are all still there underneath.
+    """
+    path = sidecar_path(audio)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+
+    parsed = ParsedRecording(
+        counterparty=raw.get("counterparty_name") or raw.get("phone_e164"),
+        phone=re.sub(r"\D", "", raw.get("phone_e164") or "") or None,
+        language=raw.get("locale") or None,
+        call_id=raw.get("call_id") or None,
+        direction=DIRECTION_BY_NAME.get(raw.get("direction") or ""),
+    )
+    started_at = raw.get("started_at")
+    if isinstance(started_at, str):
+        try:
+            parsed.recorded_at = datetime.fromisoformat(started_at)
+        except ValueError:
+            parsed.recorded_at = None
+    duration = raw.get("duration_seconds")
+    if isinstance(duration, int | float) and duration > 0:
+        parsed.duration_seconds = int(duration)
+    return parsed
+
+
 def is_ready_recording(path: Path, *, now: float | None = None) -> bool:
     """True for a settled audio file; False for temp files and fresh syncs."""
     name = path.name.lower()
@@ -130,50 +225,115 @@ def is_ready_recording(path: Path, *, now: float | None = None) -> bool:
         return False
     if stat.st_size == 0:
         return False
+    if sidecar_path(path).exists():
+        # An upload becomes visible under this name by os.replace, and only
+        # after its sidecar is already on disk. The rename is atomic, so the
+        # file is whole the instant it is seen — waiting out the quiet period
+        # would only delay the owner's notification by half a minute.
+        return True
     now = now if now is not None else time.time()
     return (now - stat.st_mtime) >= MIN_FILE_AGE_SECONDS
 
 
-async def already_ingested(session: AsyncSession, sha256: str) -> bool:
+async def already_ingested(
+    session: AsyncSession, sha256: str, *, call_id: str | None = None
+) -> bool:
+    """Have we ingested this recording before, under any name?
+
+    Two independent keys, checked as two statements rather than one OR so the
+    sweep's hot path keeps using ix_interactions_media_sha256: the hash is
+    what the once-a-minute scan asks about, and it is index-backed. The
+    call_id is the stronger key — it survives a re-encode, which the hash does
+    not — but only an uploader knows one, so it costs a query only there.
+    """
     found = await session.scalar(
         sa.select(Interaction.id)
         .where(Interaction.source == InteractionSource.phone_call)
         .where(Interaction.media["sha256"].astext == sha256)
         .limit(1)
     )
+    if found is not None:
+        return True
+    if not call_id:
+        return False
+    found = await session.scalar(
+        sa.select(Interaction.id)
+        .where(Interaction.source == InteractionSource.phone_call)
+        .where(Interaction.media["call_id"].astext == call_id)
+        .limit(1)
+    )
     return found is not None
 
 
-async def ingest_recording(session: AsyncSession, path: Path) -> IngestResult | None:
-    """Push one audio file through the pipeline. None means already ingested."""
+def _context_line(parsed: ParsedRecording) -> str | None:
+    """The one line of context the extractor gets about who was on the call.
+
+    It matters more than it looks: `apply_extraction` resolves people from the
+    *model's output strings*, not from `interaction.person_id`, so a debt only
+    lands on the right Person when the name reached the prompt. This used to be
+    skipped whenever a phone number was parsed, which meant a call with a known
+    contact gave the model less to go on than a call with a stranger.
+    """
+    who = parsed.counterparty or parsed.phone
+    if not who:
+        return None
+    if parsed.direction is Direction.out:
+        return f"[qo'ng'iroq → {who}]"
+    if parsed.direction is Direction.in_:
+        return f"[qo'ng'iroq ← {who}]"
+    return f"[qo'ng'iroq: {who}]"
+
+
+async def ingest_recording(
+    session: AsyncSession, path: Path, *, meta: ParsedRecording | None = None
+) -> IngestResult | None:
+    """Push one audio file through the pipeline. None means already ingested.
+
+    `meta` is what a caller already knows about the recording — the sweep
+    passes the phone's sidecar. Supplied metadata is trusted outright: it comes
+    from Android's call log, so there is nothing left to guess and nothing to
+    second-guess it with.
+    """
     # Off the event loop: a long recording must not stall the whole worker.
     sha256 = await asyncio.to_thread(file_sha256, path)
-    if await already_ingested(session, sha256):
+
+    parsed = meta or read_sidecar(path)
+    trusted = parsed is not None
+    if parsed is None:
+        parsed = parse_filename(path)
+
+    if await already_ingested(session, sha256, call_id=parsed.call_id):
         log.debug("skipping already-ingested recording %s", path.name)
         return None
 
-    parsed = parse_filename(path)
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=settings.tz)
     occurred_at = parsed.recorded_at or mtime
     # Samsung stamps the filename in the *phone's* local time. On a China trip
     # that is UTC+8 while we pin it to Tashkent (UTC+5) — three hours off,
     # sometimes across a report-day boundary. The file's mtime is absolute
     # (Syncthing preserves it), so when the two disagree by more than a long
-    # call could explain, the mtime wins.
-    if parsed.recorded_at is not None:
+    # call could explain, the mtime wins. A phone-supplied start carries a real
+    # UTC offset, so there is nothing to drift and the guard is skipped.
+    if not trusted and parsed.recorded_at is not None:
         drift = abs((mtime - parsed.recorded_at).total_seconds())
         if drift > 90 * 60:
             occurred_at = mtime
 
     person = None
-    if parsed.phone:
+    if trusted and parsed.counterparty:
+        # A real contact name from the phone's address book: resolve_person
+        # strips honorifics, matches fuzzily, learns the spelling as an alias
+        # and backfills the number. A name guessed out of a filename gets none
+        # of that — "random-audio" must never become a Person.
+        person = await resolve_person(session, parsed.counterparty, phone=parsed.phone)
+    elif parsed.phone:
         person = await find_by_phone(session, parsed.phone)
 
     interaction = await create_interaction(
         session,
         source=InteractionSource.phone_call,
-        # Samsung filenames don't say who called whom.
-        direction=Direction.na,
+        # A filename never says who called whom; Android's call log does.
+        direction=parsed.direction or Direction.na,
         person_id=person.id if person else None,
         occurred_at=occurred_at,
         media={
@@ -183,20 +343,28 @@ async def ingest_recording(session: AsyncSession, path: Path) -> IngestResult | 
             "sha256": sha256,
             "counterparty": parsed.counterparty,
             "phone": parsed.phone,
+            "call_id": parsed.call_id,
+            "duration_seconds": parsed.duration_seconds,
             "processed": False,
         },
         meta={"filename": path.name},
     )
 
-    text = await transcribe_into(session, interaction, path)
+    text = await transcribe_into(
+        session,
+        interaction,
+        path,
+        language_hint=parsed.language,
+        duration_hint=parsed.duration_seconds,
+    )
     if text is None:
         # needs_review is already set; the hash row keeps the scan from
         # retrying a permanently broken file every minute. The owner reviews it.
         return IngestResult(interaction=interaction, applied=None, error="transcription")
 
-    # Give the extractor the little context the filename carries.
-    if parsed.counterparty and not parsed.phone:
-        interaction.raw_text = f"[qo'ng'iroq: {parsed.counterparty}]"
+    context = _context_line(parsed)
+    if context:
+        interaction.raw_text = context
 
     result = await process_interaction(session, interaction)
     if result.ok:
@@ -213,9 +381,18 @@ async def scan_directory(
         log.debug("call recordings directory %s does not exist yet", directory)
         return []
 
+    # One query, not one hash per file per sweep: the phone pushes recordings
+    # in continuously and hashing every settled file in a growing folder once a
+    # minute is unbounded disk I/O. A path already in the database is already
+    # ingested; the hash check below stays as the backstop for everything else
+    # (a renamed copy, a Syncthing conflict file).
+    known_paths = await _ingested_audio_paths(session)
+
     results: list[IngestResult] = []
     for path in sorted(directory.rglob("*")):
         if not path.is_file() or not is_ready_recording(path):
+            continue
+        if str(path) in known_paths:
             continue
         try:
             result = await ingest_recording(session, path)
