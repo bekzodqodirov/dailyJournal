@@ -1,0 +1,8 @@
+# Everything in this repo is consumed by Linux containers and shell. A CRLF
+# checkout on Windows would put a trailing \r inside .env values copied from
+# .env.example — a bot token with an invisible \r fails to authenticate with
+# no useful error.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.pdf binary

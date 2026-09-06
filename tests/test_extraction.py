@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 import pytest
 
+from miya.config import settings
 from miya.services import extraction as ex
 
 TZ = ZoneInfo("Asia/Tashkent")
@@ -106,21 +107,31 @@ def test_current_date_goes_in_the_user_turn_not_the_cached_system_prompt():
 
 
 class _StubMessages:
-    def __init__(self, responses):
+    def __init__(self, responses, created=()):
         self._responses = list(responses)
+        self._created = list(created)
         self.calls: list[dict] = []
+        self.create_calls: list[dict] = []
 
-    async def parse(self, **kwargs):
-        self.calls.append(kwargs)
-        item = self._responses.pop(0)
+    @staticmethod
+    def _next(queue):
+        item = queue.pop(0)
         if isinstance(item, Exception):
             raise item
         return item
 
+    async def parse(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._next(self._responses)
+
+    async def create(self, **kwargs):
+        self.create_calls.append(kwargs)
+        return self._next(self._created)
+
 
 class _StubClient:
-    def __init__(self, responses):
-        self.messages = _StubMessages(responses)
+    def __init__(self, responses, created=()):
+        self.messages = _StubMessages(responses, created)
 
 
 def _response(parsed, stop_reason="end_turn"):
@@ -138,12 +149,18 @@ def _response(parsed, stop_reason="end_turn"):
 
 @pytest.fixture
 def stub(monkeypatch):
-    def _install(responses):
-        client = _StubClient(responses)
+    def _install(responses, created=()):
+        client = _StubClient(responses, created)
         monkeypatch.setattr(ex, "get_client", lambda: client)
         return client
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def _structured_output_enabled(monkeypatch):
+    """The grammar flag is process-wide; keep it from leaking between tests."""
+    monkeypatch.setattr(ex, "_structured_output_unusable", False)
 
 
 async def test_blank_input_short_circuits_without_calling_the_api(stub):
@@ -220,3 +237,153 @@ async def test_truncated_output_is_retried(stub):
 
     assert outcome.ok
     assert len(client.messages.calls) == 2
+
+
+# --- when the API cannot compile the schema ---------------------------------
+#
+# "Grammar compilation timed out" is decided server-side, before the model is
+# sampled. Every real-time extraction hit it, so nothing was extracted at all
+# and the owner's messages produced no reply.
+
+
+def _grammar_timeout():
+    return anthropic.BadRequestError(
+        message=(
+            "Error code: 400 - {'type': 'error', 'error': {'type': "
+            "'invalid_request_error', 'message': 'Grammar compilation timed out.'}}"
+        ),
+        response=SimpleNamespace(status_code=400, headers={}, request=None),
+        body=None,
+    )
+
+
+def _text_response(payload, stop_reason="end_turn"):
+    return SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=payload)],
+        stop_reason=stop_reason,
+        usage=SimpleNamespace(
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+    )
+
+
+async def test_an_uncompilable_schema_falls_back_to_prompted_json(stub):
+    body = (
+        '{"summary":"Akmalga 5 mln berildi","debts":[{"direction":"they_owe_me",'
+        '"person":"Akmal","amount":5000000,"currency":"UZS"}]}'
+    )
+    stub([_grammar_timeout()], created=[_text_response(body)])
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert outcome.ok, outcome.error
+    assert outcome.result.debts[0].person == "Akmal"
+    assert outcome.result.debts[0].amount == 5_000_000
+
+
+async def test_the_fallback_carries_the_schema_the_grammar_would_have_enforced(stub):
+    """Without the grammar the model only knows the shape from the prompt."""
+    client = stub([_grammar_timeout()], created=[_text_response('{"summary":"x"}')])
+    await ex.extract("Akmalga 5 mln berdim")
+
+    system_text = client.messages.create_calls[0]["system"][0]["text"]
+    assert "debt_settlements" in system_text
+    assert "output_config" not in client.messages.create_calls[0]
+
+
+async def test_the_rejection_is_remembered_so_it_is_not_paid_for_twice(stub):
+    """One wasted call per process, not one per message."""
+    client = stub(
+        [_grammar_timeout()],
+        created=[_text_response('{"summary":"a"}'), _text_response('{"summary":"b"}')],
+    )
+
+    first = await ex.extract("birinchi xabar")
+    second = await ex.extract("ikkinchi xabar")
+
+    assert first.ok and second.ok
+    # The structured route was tried exactly once, by the first message.
+    assert len(client.messages.calls) == 1
+    assert len(client.messages.create_calls) == 2
+
+
+async def test_the_batch_path_stops_sending_a_schema_the_server_rejected(stub):
+    """A whole batch must not fail on a grammar already known to be uncompilable."""
+    before = ex.build_request_params("test", now=datetime(2026, 8, 20, tzinfo=TZ))
+    assert "output_config" in before
+
+    ex.note_grammar_failure(_grammar_timeout())
+    after = ex.build_request_params("test", now=datetime(2026, 8, 20, tzinfo=TZ))
+
+    assert "output_config" not in after
+    assert "debt_settlements" in after["system"][0]["text"]
+
+
+async def test_a_bad_request_that_is_not_about_the_grammar_still_fails(stub):
+    """The fallback is for one specific server-side refusal, not a blanket retry."""
+    other = anthropic.BadRequestError(
+        message="Error code: 400 - {'error': {'message': 'max_tokens too large'}}",
+        response=SimpleNamespace(status_code=400, headers={}, request=None),
+        body=None,
+    )
+    client = stub([other, other])
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert not outcome.ok
+    assert client.messages.create_calls == []
+    assert ex.structured_output_available()
+
+
+async def test_a_missing_api_key_comes_back_as_an_outcome_not_an_exception(monkeypatch):
+    """`extract` promises never to raise; callers rely on that to reach needs_review."""
+    monkeypatch.setattr(settings, "anthropic_api_key", "   ")
+    ex._client = None
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert not outcome.ok
+    assert "AnthropicUnavailable" in outcome.error
+
+
+# --- what the model actually returns without a grammar ----------------------
+
+
+@pytest.mark.parametrize(
+    "wrapping",
+    [
+        '```json\n{"summary":"Akmalga 5 mln"}\n```',
+        '```\n{"summary":"Akmalga 5 mln"}\n```',
+        '```JSON\n{"summary":"Akmalga 5 mln"}```',
+        'Mana natija:\n{"summary":"Akmalga 5 mln"}',
+        '{"summary":"Akmalga 5 mln"}',
+        '  {"summary":"Akmalga 5 mln"}  ',
+    ],
+)
+def test_json_survives_the_wrapping_models_add(wrapping):
+    """Without a grammar the model fences its JSON however plainly it is asked not to."""
+    result = ex.parse_extraction_json(wrapping)
+    assert result is not None
+    assert result.summary == "Akmalga 5 mln"
+
+
+@pytest.mark.parametrize("body", ["sorry, I cannot", "", "{not json at all}"])
+def test_unwrapping_never_rescues_a_genuinely_bad_object(body):
+    """Only presentation is forgiven; the object still has to validate."""
+    assert ex.parse_extraction_json(body) is None
+
+
+async def test_a_fenced_fallback_reply_still_produces_a_debt(stub):
+    fenced = (
+        '```json\n{"summary":"Akmalga 5 mln berildi","debts":'
+        '[{"direction":"they_owe_me","person":"Akmal","amount":5000000}]}\n```'
+    )
+    stub([_grammar_timeout()], created=[_text_response(fenced)])
+
+    outcome = await ex.extract("Akmalga 5 mln berdim")
+
+    assert outcome.ok, outcome.error
+    assert outcome.result.debts[0].person == "Akmal"

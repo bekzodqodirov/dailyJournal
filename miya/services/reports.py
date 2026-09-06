@@ -9,11 +9,10 @@ sent — a report day is never lost.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
-import anthropic
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +21,7 @@ from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
 from miya.services import planner, queries
-from miya.services.extraction import get_client
+from miya.services.extraction import API_FAILURES, get_client
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -43,6 +42,8 @@ Rules:
   🧾 Yangi qarz va va'dalar
   ⏰ Ochiq va muddati o'tganlar
   ✅ Bajarilganlar
+  💬 Chatlarda (qaysi chatda nima haqida gaplashildi)
+  📨 Sizga murojaatlar (guruhda to'g'ridan-to'g'ri yozilganlar)
   📅 Ertaga (given plan text — include as-is, lightly trimmed if long)
 - Keep the whole report short and scannable. Telegram formatting: plain text
   with <b>bold</b> section titles, no markdown, no # headers.
@@ -56,6 +57,8 @@ class ReportData:
     completed: queries.CompletedToday
     due: dict
     plan: str
+    chats: list = field(default_factory=list)
+    to_me: list = field(default_factory=list)
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -74,6 +77,11 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
         "new_debts": len(data.summary.new_debts),
         "new_promises": len(data.summary.new_promises),
         "interactions": data.summary.interactions,
+        "chats": [
+            {"title": d.title, "messages": d.messages, "to_me": len(d.to_me)}
+            for d in data.chats
+        ],
+        "to_me": len(data.to_me),
         "settled_debts": len(data.completed.settled_debts),
         "done_promises": len(data.completed.done_promises),
         "done_tasks": len(data.completed.done_tasks),
@@ -151,6 +159,27 @@ def render_data_block(data: ReportData) -> str:
     else:
         lines.append("- yo'q")
 
+    lines.append("\n💬 CHATLARDA:")
+    if data.chats:
+        for digest in data.chats[:8]:
+            head = f"- {escape(digest.title)} ({digest.messages} ta xabar)"
+            if digest.to_me:
+                head += f", {len(digest.to_me)} tasi sizga"
+            lines.append(head)
+            for summary in digest.summaries[:2]:
+                lines.append(f"  • {escape(summary)}")
+    else:
+        lines.append("- yo'q")
+
+    lines.append("\n📨 SIZGA MUROJAATLAR:")
+    if data.to_me:
+        for interaction in data.to_me[:10]:
+            body = (interaction.raw_text or interaction.transcript or "").strip()
+            when = interaction.occurred_at.astimezone(settings.tz).strftime("%H:%M")
+            lines.append(f"- {when}: {escape(body[:120] or '[media]')}")
+    else:
+        lines.append("- yo'q")
+
     lines.append("\n📅 ERTAGA:")
     lines.append(data.plan)
 
@@ -164,6 +193,8 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         completed=await queries.completed_on(session, day),
         due=await queries.due_items(session, horizon_days=1),
         plan=await planner.plan_for(session, day + timedelta(days=1)),
+        chats=await queries.chat_digests(session, day),
+        to_me=await queries.messages_to_me(session, day),
     )
 
 
@@ -194,7 +225,7 @@ async def generate_report(session: AsyncSession, day: date | None = None) -> str
             usage=response.usage,
         )
         content = "\n".join(b.text for b in response.content if b.type == "text").strip()
-    except anthropic.APIError as exc:
+    except API_FAILURES as exc:
         log.warning("report call failed, storing the raw data block: %s", exc)
 
     content = content or data_block

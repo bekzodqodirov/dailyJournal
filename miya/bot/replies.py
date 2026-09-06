@@ -16,6 +16,7 @@ from miya.bot.formatting import (
     short_date,
     usd,
 )
+from miya.config import settings
 from miya.db.enums import DebtDirection, PromiseMadeBy
 from miya.services.persistence import Applied
 from miya.services.queries import DaySummary, DebtBalance, PersonSummary
@@ -57,7 +58,10 @@ raqamlar bilan javob beraman.
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
 /unut — ma'lumotni butunlay o'chirish
+/menga — guruhlarda menga yozilganlar
+/guruhlar — guruhlarda nima gaplashildi
 /tekshir — qayta ishlanmagan yozuvlar
+/qayta — ularni qaytadan ajratishga urinish
 /yordam — shu ro'yxat
 """
 
@@ -102,6 +106,102 @@ DOCUMENT_FAILED_HINT = (
     "⚠️ Hujjatni o'qib bo'lmadi (formati qo'llab-quvvatlanmaydi yoki himoyalangan). "
     "Fayl saqlandi — /tekshir ro'yxatida turadi."
 )
+
+
+RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."
+
+
+def retry_report(rescued: int, still_failing: int) -> str:
+    """`/qayta`: what a second extraction pass managed to rescue."""
+    if not rescued and not still_failing:
+        return RETRY_NOTHING_TO_DO
+    lines = [f"🔁 <b>{rescued + still_failing} ta yozuv qayta ishlandi</b>"]
+    if rescued:
+        lines.append(f"✅ {rescued} tasi ajratildi")
+    if still_failing:
+        lines.append(f"⚠️ {still_failing} tasi yana bo'lmadi — /tekshir ro'yxatida qoladi")
+    return "\n".join(lines)
+
+
+MEDIA_ASK_LABELS = {
+    "video": "video",
+    "too_large": "katta fayl",
+}
+
+MEDIA_APPROVED = "✅ Yuklab olaman — tayyor bo'lganda yozaman."
+MEDIA_DECLINED = "👌 Tegmadim."
+MEDIA_GONE = "⚠️ Bu so'rov eskirgan yoki yozuv o'chirilgan."
+
+
+def _size(nbytes: int | None) -> str:
+    if not nbytes:
+        return ""
+    mb = nbytes / (1024 * 1024)
+    return f"{mb:.0f} MB" if mb >= 1 else f"{nbytes / 1024:.0f} KB"
+
+
+def media_question(*, who: str | None, media: dict, reason: str) -> str:
+    """Ask the owner whether a large attachment is worth fetching.
+
+    Everything the answer depends on is in the question — who sent it, what it
+    is, how big, and its caption — because the file itself is what MIYA is
+    asking permission to look at. It cannot describe what it has not fetched.
+    """
+    kind = MEDIA_ASK_LABELS.get(reason, str(media.get("type") or "fayl"))
+    parts = [f"📎 <b>{escape(who or 'Nomaʼlum')}</b> {escape(kind)} yubordi"]
+
+    detail = " · ".join(
+        p for p in (escape(media.get("filename") or ""), _size(media.get("size"))) if p
+    )
+    if detail:
+        parts.append(detail)
+    caption = (media.get("caption") or "").strip()
+    if caption:
+        parts.append(f"<i>{escape(caption[:200])}</i>")
+    parts.append("O'qiyminmi?")
+    return "\n".join(parts)
+
+
+TO_ME_EMPTY = "📭 Bugun guruhlarda sizga to'g'ridan-to'g'ri yozilmadi."
+CHATS_QUIET = "🤫 Bugun kuzatilayotgan chatlarda harakat bo'lmadi."
+
+
+def _line_of(interaction, limit: int = 160) -> str:
+    body = (interaction.raw_text or interaction.transcript or "").strip()
+    if not body:
+        body = f"[{(interaction.media or {}).get('type') or 'media'}]"
+    return escape(body[:limit])
+
+
+def to_me_report(interactions: list, titles: dict[int, str]) -> str:
+    """`/menga`: what was aimed at the owner in a group today."""
+    if not interactions:
+        return TO_ME_EMPTY
+    lines = [f"📨 <b>Sizga {len(interactions)} ta murojaat</b>"]
+    for interaction in interactions:
+        where = escape(titles.get(interaction.tg_chat_id or 0, "guruh"))
+        when = interaction.occurred_at.astimezone(settings.tz).strftime("%H:%M")
+        lines.append(f"• {when} · <b>{where}</b> — {_line_of(interaction)}")
+    return "\n".join(lines)
+
+
+def chat_digest_report(digests: list) -> str:
+    """`/guruhlar`: one line of subject matter per chat, busiest first."""
+    if not digests:
+        return CHATS_QUIET
+    lines = ["💬 <b>Bugun chatlarda</b>"]
+    for digest in digests:
+        head = f"\n<b>{escape(digest.title)}</b> · {digest.messages} ta xabar"
+        if digest.to_me:
+            head += f" · 📨 {len(digest.to_me)} ta sizga"
+        lines.append(head)
+        for summary in digest.summaries[:3]:
+            lines.append(f"• {escape(summary)}")
+        if not digest.summaries:
+            # A window only closes after the chat goes quiet, so an active
+            # conversation legitimately has nothing summarised yet.
+            lines.append("<i>• hali umumlashtirilmadi</i>")
+    return "\n".join(lines)
 
 
 def person_not_found(name: str) -> str:

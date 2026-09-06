@@ -31,9 +31,10 @@ from miya.bot.formatting import clip
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
-from miya.db.models import ChatMonitor, Person
+from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
+    approvals,
     audio,
     chats,
     documents,
@@ -154,12 +155,77 @@ async def cmd_today(message: Message) -> None:
     await _safe_answer(message, replies.day_report(summary))
 
 
+@router.message(Command("menga"))
+async def cmd_to_me(message: Message) -> None:
+    """Group traffic aimed at the owner, separated from the room's noise."""
+    async with session_scope() as session:
+        addressed = await queries.messages_to_me(session)
+        titles = dict(
+            (
+                await session.execute(
+                    sa.select(ChatMonitor.tg_chat_id, ChatMonitor.title)
+                )
+            ).all()
+        )
+        body = replies.to_me_report(addressed, titles)
+    await _safe_answer(message, body)
+
+
+@router.message(Command("guruhlar"))
+async def cmd_chat_digests(message: Message) -> None:
+    """What each monitored chat was actually about today."""
+    async with session_scope() as session:
+        body = replies.chat_digest_report(await queries.chat_digests(session))
+    await _safe_answer(message, body)
+
+
 @router.message(Command("tekshir"))
 async def cmd_review(message: Message) -> None:
     async with session_scope() as session:
         flagged, total = await queries.flagged_interactions(session)
         body = replies.review_report(flagged, total)
     await _safe_answer(message, body)
+
+
+@router.message(Command("qayta"))
+async def cmd_retry(message: Message) -> None:
+    """Re-extract everything `/tekshir` is holding (spec §14).
+
+    Extraction fails for reasons that later stop being true — an outage, a
+    rate limit, a bug in the pipeline. Without this the raw text is kept
+    faithfully and then never becomes a debt or a promise, which is only half
+    of not losing it.
+
+    Each interaction gets its own transaction: one that fails again must not
+    roll back the ones already rescued alongside it.
+    """
+    await _typing(message)
+    async with session_scope() as session:
+        pending = await queries.retryable_interactions(session)
+        ids = [row.id for row in pending]
+
+    if not ids:
+        await _safe_answer(message, replies.RETRY_NOTHING_TO_DO)
+        return
+
+    rescued = failed = 0
+    for interaction_id in ids:
+        try:
+            async with session_scope() as session:
+                interaction = await session.get(Interaction, interaction_id)
+                if interaction is None:
+                    continue
+                result = await process_interaction(session, interaction)
+                if result.ok:
+                    interaction.needs_review = False
+                    rescued += 1
+                else:
+                    failed += 1
+        except Exception:
+            log.exception("retrying interaction %s failed", interaction_id)
+            failed += 1
+
+    await _safe_answer(message, replies.retry_report(rescued, failed))
 
 
 @router.message(Command("qidir"))
@@ -350,6 +416,37 @@ async def _build_purge_plan(session, argument: str):
     if person is None or score < 70:
         return None, ""
     return await purge.plan_person(session, person), f"unut:p:{person.id}"
+
+
+@router.callback_query(F.data.startswith("md:"))
+async def on_media_button(callback: CallbackQuery) -> None:
+    """The owner's answer to "shall I read this?".
+
+    Only records the decision. The file lives in a private Telegram chat that
+    the assistant bot cannot see — the userbot fetches it on its next sweep.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    answer, raw_id = parts[1], parts[2]
+
+    async with session_scope() as session:
+        interaction = await session.get(Interaction, int(raw_id))
+        if interaction is None or approvals.state_of(interaction) in (
+            None,
+            approvals.EXPIRED,
+        ):
+            await _edit_callback(callback, replies.MEDIA_GONE)
+            return
+        approvals.set_state(
+            interaction,
+            approvals.APPROVED if answer == "y" else approvals.DECLINED,
+            answered_at=datetime.now(settings.tz).isoformat(),
+        )
+        body = replies.MEDIA_APPROVED if answer == "y" else replies.MEDIA_DECLINED
+
+    await _edit_callback(callback, body)
 
 
 @router.callback_query(F.data.startswith("unut:"))

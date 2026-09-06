@@ -789,3 +789,58 @@ async def test_an_unreadable_document_is_flagged_rather_than_lost(monkeypatch, t
 
     assert outcome.document is None
     assert outcome.failed is True  # shows up in /tekshir
+
+
+# --- /qayta rescues what /tekshir is only listing ----------------------------
+#
+# Extraction fails for reasons that later stop being true — an outage, a rate
+# limit, a bug in the pipeline. Keeping the raw text and never re-reading it is
+# only half of not losing it.
+
+
+async def test_only_rows_with_text_are_worth_another_extraction(session):
+    from miya.services.queries import retryable_interactions
+
+    with_text = await _interaction(session, text="Akmalga 5 mln berdim")
+    with_text.needs_review = True
+    # A voice note whose transcription failed has nothing to re-extract from;
+    # retrying it would spend money to fail again in exactly the same way.
+    no_text = await _interaction(session, text=None)
+    no_text.needs_review = True
+    healthy = await _interaction(session, text="allaqachon ishlangan")
+    await session.flush()
+
+    rows = await retryable_interactions(session)
+    ids = {row.id for row in rows}
+
+    assert with_text.id in ids
+    assert no_text.id not in ids
+    assert healthy.id not in ids
+
+
+async def test_a_rescued_row_leaves_the_review_list(session):
+    from miya.services.queries import flagged_interactions, retryable_interactions
+
+    interaction = await _interaction(session, text="Akmalga 5 mln berdim")
+    interaction.needs_review = True
+    await session.flush()
+
+    assert len(await retryable_interactions(session)) == 1
+
+    # What /qayta does on a successful re-extraction.
+    interaction.needs_review = False
+    await session.flush()
+
+    _, total = await flagged_interactions(session)
+    assert total == 0
+    assert await retryable_interactions(session) == []
+
+
+def test_the_retry_report_separates_rescued_from_still_failing():
+    body = replies.retry_report(rescued=3, still_failing=2)
+    assert "3" in body and "2" in body
+    assert "/tekshir" in body
+
+
+def test_the_retry_report_says_so_when_there_is_nothing_to_do():
+    assert "yo'q" in replies.retry_report(0, 0)

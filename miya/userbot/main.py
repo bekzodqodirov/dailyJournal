@@ -35,11 +35,16 @@ from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction
 from miya.db.session import engine, session_scope
-from miya.services import audio, documents
+from miya.services import approvals, audio, documents
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
-from miya.services.media_policy import MediaKind, MediaPlan, plan_for
+from miya.services.media_policy import (
+    MediaKind,
+    MediaPlan,
+    forced_plan,
+    plan_for,
+)
 from miya.services.people import resolve_person
 from miya.services.transcription import TranscriptionError, get_transcriber
 from miya.services.vision import describe_image
@@ -376,6 +381,13 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 "caption": text,
                 "processed": False,
             }
+            if plan.ask:
+                # Nothing is downloaded now. The worker turns this into a
+                # question in Telegram, and only a yes brings the file over.
+                media["approval"] = {
+                    "state": approvals.PENDING,
+                    "reason": plan.ask_reason,
+                }
 
         interaction = await create_interaction(
             session,
@@ -386,10 +398,10 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             text=text,
             occurred_at=message.date.astimezone(settings.tz),
             media=media,
-            meta={"tg_message_id": message.id},
+            meta=_message_meta(message, monitor),
         )
         interaction_id = interaction.id
-        if media is None:
+        if media is None or plan.ask:
             return True
 
     # The message is durable now. Everything slow happens with no database
@@ -403,6 +415,98 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             return True
         await persist_media(session, interaction, outcome)
     return True
+
+
+def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
+    """Was this message aimed at the owner rather than at the room?
+
+    Only meaningful in a group: in a private chat every message is addressed
+    to him, so the flag would mark everything and distinguish nothing.
+
+    Telethon sets `mentioned` for both an @-mention and a reply to one of the
+    owner's own messages, which is exactly the question being asked — the two
+    are the same act from where he is sitting.
+    """
+    if chat_type is ChatType.private:
+        return False
+    return bool(getattr(message, "mentioned", False))
+
+
+def _message_meta(message: object, monitor: ChatMonitor) -> dict:
+    meta = {"tg_message_id": message.id}
+    if addressed_to_owner(message, monitor.chat_type):
+        meta["to_me"] = True
+    return meta
+
+
+# --- approved media ----------------------------------------------------------
+#
+# The owner answers in the assistant bot, which has no Telegram *user* session
+# and so cannot fetch anything from a private group. Only this process can, so
+# it polls for the answers rather than being told about them.
+
+APPROVED_POLL_SECONDS = 60
+
+
+async def fetch_approved(client: TelegramClient) -> int:
+    """Download and process everything the owner has said yes to."""
+    async with session_scope() as session:
+        jobs = [
+            (
+                interaction.id,
+                interaction.tg_chat_id,
+                (interaction.meta or {}).get("tg_message_id"),
+                dict(interaction.media or {}),
+            )
+            for interaction in await approvals.approved_for_fetch(session)
+        ]
+
+    done = 0
+    for interaction_id, chat_id, message_id, media in jobs:
+        kind = MediaKind(media.get("type", MediaKind.other.value))
+        filename = media.get("filename")
+        try:
+            message = await client.get_messages(chat_id, ids=message_id)
+        except Exception:
+            log.exception("could not re-read approved message %s", message_id)
+            message = None
+
+        if message is None:
+            # Deleted, or the account lost access to the chat. Nothing will
+            # ever make this fetchable, so it must not stay in the queue.
+            async with session_scope() as session:
+                interaction = await session.get(Interaction, interaction_id)
+                if interaction is not None:
+                    approvals.set_state(interaction, approvals.DONE, error="gone")
+                    interaction.needs_review = True
+            continue
+
+        plan = forced_plan(kind, filename)
+        outcome = await fetch_media(client, message, plan, _suffix_for(kind, filename))
+
+        async with session_scope() as session:
+            interaction = await session.get(Interaction, interaction_id)
+            if interaction is None:  # purged while the download ran
+                continue
+            await persist_media(session, interaction, outcome)
+            # persist_media rewrites media wholesale, so the approval is
+            # stamped after it rather than before.
+            approvals.set_state(interaction, approvals.DONE)
+        done += 1
+
+    if done:
+        log.info("fetched %d approved attachment(s)", done)
+    return done
+
+
+async def approved_media_loop(client: TelegramClient) -> None:
+    while True:
+        try:
+            await fetch_approved(client)
+        except Exception:
+            # A failure here must never take the reader down with it.
+            log.exception("approved-media sweep failed")
+        await asyncio.sleep(APPROVED_POLL_SECONDS)
 
 
 # --- dialog sync -------------------------------------------------------------
@@ -458,8 +562,30 @@ async def run() -> None:
             "when USERBOT_ENABLED=true"
         )
 
+    # A session string is ~350 characters and starts with a version digit.
+    # Telethon rejects anything else with a bare `ValueError: Not a valid
+    # string` under twenty lines of traceback, which tells the owner nothing
+    # about the actual mistake — and the mistake is nearly always mechanical:
+    # the TELETHON_SESSION= prefix pasted twice, surviving quotes, or a line
+    # truncated by the terminal it was copied out of.
+    # Catching Exception, not ValueError: a string that starts with the right
+    # digit but was cut short gets far enough to fail unpacking instead, as
+    # `struct.error: unpack requires a buffer of 275 bytes` — and a truncated
+    # paste is the likeliest slip of all.
+    try:
+        session = StringSession(settings.telethon_session)
+    except Exception as exc:
+        raise SystemExit(
+            f"TELETHON_SESSION is not a valid session string ({exc}). "
+            f"It should be one unbroken line of about 350 characters starting "
+            f"with '1'; this one is {len(settings.telethon_session)} and starts "
+            f"with {settings.telethon_session[:6]!r}. Check .env for a repeated "
+            "TELETHON_SESSION= prefix, surrounding quotes, or a truncated "
+            "paste, then re-run miya.tools.userbot_login if it is lost."
+        ) from exc
+
     client = TelegramClient(
-        StringSession(settings.telethon_session),
+        session,
         settings.telethon_api_id,
         settings.telethon_api_hash,
     )
@@ -498,8 +624,12 @@ async def run() -> None:
 
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
+        sweeper = asyncio.create_task(approved_media_loop(client))
         log.info("listening for new messages in monitored chats")
-        await client.run_until_disconnected()
+        try:
+            await client.run_until_disconnected()
+        finally:
+            sweeper.cancel()
     finally:
         await client.disconnect()
         await engine.dispose()

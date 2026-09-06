@@ -29,6 +29,7 @@ from miya.db.enums import Direction, InteractionSource, WindowStatus
 from miya.db.models import ConversationWindow, Interaction
 from miya.services import usage as usage_service
 from miya.services.extraction import (
+    API_FAILURES,
     ExtractionResult,
     build_request_params,
     extract,
@@ -84,7 +85,7 @@ async def submit_pending(
 
     try:
         batch = await get_client().messages.batches.create(requests=requests)
-    except anthropic.APIError as exc:
+    except API_FAILURES as exc:
         # Windows stay pending; the next tick retries the whole set.
         log.warning(
             "batch submit failed (%d windows stay pending): %s", len(windows), exc

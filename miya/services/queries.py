@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.enums import Currency, DebtDirection, DebtStatus, PromiseStatus, TaskStatus
 from miya.db.models import (
+    ChatMonitor,
     Debt,
     DebtPayment,
     Event,
@@ -517,3 +518,130 @@ async def flagged_interactions(
         await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
     )
     return rows, total or 0
+
+
+async def retryable_interactions(
+    session: AsyncSession, *, limit: int = 50
+) -> list[Interaction]:
+    """Flagged interactions that another extraction attempt could still rescue.
+
+    Only rows that already hold text: a voice note whose transcription failed
+    has nothing to re-extract from, and re-running it would spend money to
+    fail again in exactly the same way.
+
+    Oldest first, so a backlog is rebuilt in the order the owner lived it.
+    """
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(
+            sa.or_(
+                sa.func.length(sa.func.coalesce(Interaction.raw_text, "")) > 0,
+                sa.func.length(sa.func.coalesce(Interaction.transcript, "")) > 0,
+            )
+        )
+        .order_by(Interaction.occurred_at)
+        .limit(limit)
+    )
+    return list(await session.scalars(stmt))
+
+
+# --- what happened in the groups (spec §7B) ----------------------------------
+
+
+@dataclass(slots=True)
+class ChatDigest:
+    """One chat's day: what it was about, and what was aimed at the owner."""
+
+    tg_chat_id: int
+    title: str
+    messages: int
+    summaries: list[str] = field(default_factory=list)
+    to_me: list[Interaction] = field(default_factory=list)
+
+
+def _addressed_to_owner():
+    """Rows the userbot marked as aimed at the owner.
+
+    `.astext` on the nested key: `metadata` holds JSON null for rows written
+    without one, and a missing key must simply not match.
+    """
+    return Interaction.meta["to_me"].astext == "true"
+
+
+async def messages_to_me(
+    session: AsyncSession, day: date | None = None, *, limit: int = 30
+) -> list[Interaction]:
+    """Group messages that mentioned the owner or replied to him, newest last."""
+    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    return list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(_addressed_to_owner())
+            .where(Interaction.occurred_at >= start)
+            .where(Interaction.occurred_at < end)
+            .order_by(Interaction.occurred_at)
+            .limit(limit)
+        )
+    )
+
+
+async def chat_digests(
+    session: AsyncSession, day: date | None = None
+) -> list[ChatDigest]:
+    """Per-chat digest of one day, busiest first.
+
+    Two different rows feed this. The window interactions carry the summaries
+    the extractor wrote — one per closed conversation — while the member
+    messages are what gets counted. Counting the windows instead would report
+    "3 messages" for a chat that saw ninety.
+    """
+    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    in_day = (Interaction.occurred_at >= start, Interaction.occurred_at < end)
+
+    titles = dict(
+        (
+            await session.execute(sa.select(ChatMonitor.tg_chat_id, ChatMonitor.title))
+        ).all()
+    )
+
+    counts = (
+        await session.execute(
+            sa.select(Interaction.tg_chat_id, sa.func.count(Interaction.id))
+            .where(Interaction.tg_chat_id.isnot(None))
+            .where(Interaction.window_id.is_(None))  # members, not the window row
+            .where(*in_day)
+            .group_by(Interaction.tg_chat_id)
+        )
+    ).all()
+
+    summaries: dict[int, list[str]] = {}
+    rows = await session.execute(
+        sa.select(Interaction.tg_chat_id, Interaction.summary)
+        .where(Interaction.window_id.isnot(None))
+        .where(Interaction.summary.isnot(None))
+        .where(*in_day)
+        .order_by(Interaction.occurred_at)
+    )
+    for chat_id, summary in rows:
+        if chat_id is not None and summary:
+            summaries.setdefault(chat_id, []).append(summary)
+
+    addressed: dict[int, list[Interaction]] = {}
+    for interaction in await session.scalars(
+        sa.select(Interaction).where(_addressed_to_owner()).where(*in_day)
+    ):
+        addressed.setdefault(interaction.tg_chat_id or 0, []).append(interaction)
+
+    digests = [
+        ChatDigest(
+            tg_chat_id=chat_id,
+            title=titles.get(chat_id) or str(chat_id),
+            messages=count,
+            summaries=summaries.get(chat_id, []),
+            to_me=addressed.get(chat_id, []),
+        )
+        for chat_id, count in counts
+    ]
+    digests.sort(key=lambda d: d.messages, reverse=True)
+    return digests

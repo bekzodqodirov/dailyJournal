@@ -12,10 +12,8 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
-
 from miya.config import settings
-from miya.services.extraction import get_client
+from miya.services.extraction import API_FAILURES, get_client
 from miya.services.prompts import VISION_TRIAGE_PROMPT
 
 log = logging.getLogger(__name__)
@@ -81,7 +79,7 @@ async def describe_image(path: str | Path) -> VisionResult:
                 }
             ],
         )
-    except anthropic.APIError as exc:
+    except API_FAILURES as exc:
         return VisionResult(text="", model=model, error=f"{type(exc).__name__}: {exc}")
 
     if response.stop_reason == "refusal":

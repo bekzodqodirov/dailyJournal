@@ -19,36 +19,66 @@ from miya.userbot import main as userbot
 
 USERBOT_PACKAGE = Path(userbot.__file__).parent
 
-# Anything that would write to Telegram, mark chats read, or bulk-download
-# history. The spec is explicit: the userbot reads, and does nothing else.
-FORBIDDEN_CALLS = {
+# Two different invariants, kept apart on purpose.
+#
+# Writing to Telegram is forbidden outright and everywhere: the counterparty
+# must never see a trace of MIYA in a conversation.
+WRITE_CALLS = {
     "send_message",
     "send_file",
     "send_read_acknowledge",
     "edit_message",
     "delete_messages",
     "forward_messages",
-    "get_messages",  # would pull history; only live events are allowed
-    "iter_messages",
 }
 
+# Reading history is a weaker rule — it is about *unsolicited* reading. The
+# userbot lives on live events and must not trawl backwards on its own, but
+# re-reading one message the owner explicitly approved is the opposite of
+# unsolicited. The allowlist is by function so the exception stays one
+# reviewable line rather than a whole-file exemption.
+HISTORY_CALLS = {"get_messages", "iter_messages"}
+HISTORY_ALLOWED_IN = {"fetch_approved"}
 
-def _called_attributes(source: str) -> set[str]:
+
+def _calls_by_function(source: str) -> dict[str | None, set[str]]:
+    """Attribute calls in each function; None is module level."""
     tree = ast.parse(source)
-    names: set[str] = set()
+    owner: dict[int, str | None] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for child in ast.walk(node):
+                owner.setdefault(id(child), node.name)
+
+    found: dict[str | None, set[str]] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            names.add(node.func.attr)
-    return names
+            found.setdefault(owner.get(id(node)), set()).add(node.func.attr)
+    return found
 
 
 @pytest.mark.parametrize("path", sorted(USERBOT_PACKAGE.glob("*.py")))
 def test_the_userbot_never_writes_to_telegram(path):
-    called = _called_attributes(path.read_text())
-    assert not (called & FORBIDDEN_CALLS), (
-        f"{path.name} calls {sorted(called & FORBIDDEN_CALLS)} — the userbot "
+    calls = _calls_by_function(path.read_text())
+    everything = set().union(*calls.values()) if calls else set()
+    assert not (everything & WRITE_CALLS), (
+        f"{path.name} calls {sorted(everything & WRITE_CALLS)} — the userbot "
         "must stay strictly read-only (spec §7B)"
     )
+
+
+@pytest.mark.parametrize("path", sorted(USERBOT_PACKAGE.glob("*.py")))
+def test_history_is_only_read_where_the_owner_asked_for_it(path):
+    for function, called in _calls_by_function(path.read_text()).items():
+        offending = called & HISTORY_CALLS
+        if not offending or function in HISTORY_ALLOWED_IN:
+            continue
+        pytest.fail(
+            f"{path.name}:{function or '<module>'} calls {sorted(offending)} — "
+            "the userbot follows live events and must not pull history on its "
+            f"own. Only {sorted(HISTORY_ALLOWED_IN)} may, to re-read a message "
+            "the owner approved."
+        )
 
 
 def test_the_kill_switch_stops_the_process_before_it_connects(monkeypatch):

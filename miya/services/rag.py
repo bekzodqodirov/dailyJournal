@@ -18,7 +18,6 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any
 
-import anthropic
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,7 +27,7 @@ from miya.db.models import Interaction, Memory, Person
 from miya.services import memories as memories_svc
 from miya.services import queries
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
-from miya.services.extraction import get_client
+from miya.services.extraction import API_FAILURES, get_client
 from miya.services.people import best_match
 from miya.services.usage import record_anthropic_usage
 
@@ -511,7 +510,7 @@ async def answer(
                 messages=messages,
                 tools=TOOLS,
             )
-        except anthropic.APIError as exc:
+        except API_FAILURES as exc:
             log.warning("rag call failed: %s", exc)
             return final_text or FALLBACK_ANSWER
 
