@@ -10,6 +10,8 @@ cosmetics after, and nothing cosmetic may be fatal.
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from miya.config import settings
@@ -99,3 +101,35 @@ def test_it_refuses_without_api_credentials(monkeypatch, capsys):
 
     assert userbot_login.main() == 1
     assert "my.telegram.org" in capsys.readouterr().err
+
+
+# --- a malformed session string is a mechanical mistake, not a crash ---------
+
+
+@pytest.mark.parametrize(
+    ("value", "mistake"),
+    [
+        ("TELETHON_SESSION=1BQANOtherStuff", "the prefix pasted twice"),
+        ('"1BQANOtherStuff"', "surviving quotes"),
+        ("1BQAN", "a truncated paste"),
+        ("   1BQANOtherStuff", "leading whitespace"),
+    ],
+)
+def test_a_bad_session_string_is_explained_not_tracebacked(monkeypatch, value, mistake):
+    """Telethon says only `ValueError: Not a valid string`, under twenty lines
+    of traceback. The owner needs to know which mechanical slip to look for."""
+    from miya.userbot import main as userbot_main
+
+    monkeypatch.setattr(settings, "userbot_enabled", True)
+    monkeypatch.setattr(settings, "telethon_api_id", 12345)
+    monkeypatch.setattr(settings, "telethon_api_hash", "hash")
+    monkeypatch.setattr(settings, "telethon_session", value)
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(userbot_main.run())
+
+    message = str(exc.value)
+    assert "TELETHON_SESSION" in message
+    # It must say what it actually got, or the owner cannot tell which slip.
+    assert str(len(value)) in message
+    assert repr(value[:6]) in message

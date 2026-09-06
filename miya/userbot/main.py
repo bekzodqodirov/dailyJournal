@@ -458,8 +458,30 @@ async def run() -> None:
             "when USERBOT_ENABLED=true"
         )
 
+    # A session string is ~350 characters and starts with a version digit.
+    # Telethon rejects anything else with a bare `ValueError: Not a valid
+    # string` under twenty lines of traceback, which tells the owner nothing
+    # about the actual mistake — and the mistake is nearly always mechanical:
+    # the TELETHON_SESSION= prefix pasted twice, surviving quotes, or a line
+    # truncated by the terminal it was copied out of.
+    # Catching Exception, not ValueError: a string that starts with the right
+    # digit but was cut short gets far enough to fail unpacking instead, as
+    # `struct.error: unpack requires a buffer of 275 bytes` — and a truncated
+    # paste is the likeliest slip of all.
+    try:
+        session = StringSession(settings.telethon_session)
+    except Exception as exc:
+        raise SystemExit(
+            f"TELETHON_SESSION is not a valid session string ({exc}). "
+            f"It should be one unbroken line of about 350 characters starting "
+            f"with '1'; this one is {len(settings.telethon_session)} and starts "
+            f"with {settings.telethon_session[:6]!r}. Check .env for a repeated "
+            "TELETHON_SESSION= prefix, surrounding quotes, or a truncated "
+            "paste, then re-run miya.tools.userbot_login if it is lost."
+        ) from exc
+
     client = TelegramClient(
-        StringSession(settings.telethon_session),
+        session,
         settings.telethon_api_id,
         settings.telethon_api_hash,
     )
