@@ -146,8 +146,11 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             StepCard(
                 number = 6,
                 title = "Server and token",
-                body = "The URL is your VPS on the private tunnel, e.g. http://100.x.y.z:8000. " +
-                    "The token is the one you put in UPLOAD_TOKENS on the server.",
+                body = "The URL is your VPS on the private tunnel. Use its Tailscale " +
+                    "MagicDNS name — http://vps.tailnet-name.ts.net:8000 — because a " +
+                    "plain-HTTP tailnet IP is blocked by Android unless you add that " +
+                    "exact address to res/xml/network_security_config.xml and rebuild. " +
+                    "The token is API_BEARER_TOKEN from the server's .env.",
             ) {
                 Column {
                     OutlinedTextField(

@@ -64,6 +64,21 @@ async def create_interaction(
     return interaction
 
 
+# No phone call is longer than this. The hint is client-supplied — Android's
+# CallLog.Calls.DURATION as the phone reports it — and it lands in UsageLog,
+# which is the only figure the owner has for what MIYA costs. A hint that could
+# not be true bills nothing rather than billing a fiction.
+MAX_BILLABLE_SECONDS = 6 * 3600
+
+
+def _billable_seconds(hint: float | None, measured: float) -> float:
+    if hint and 0 < hint <= MAX_BILLABLE_SECONDS:
+        return hint
+    if hint:
+        log.warning("ignoring implausible duration hint %s seconds", hint)
+    return measured
+
+
 async def transcribe_into(
     session: AsyncSession,
     interaction: Interaction,
@@ -95,7 +110,7 @@ async def transcribe_into(
         session,
         provider=transcriber.name,
         model=transcriber.model,
-        seconds=duration_hint if duration_hint else transcript.duration,
+        seconds=_billable_seconds(duration_hint, transcript.duration),
         source_interaction_id=interaction.id,
     )
     if transcript.language:

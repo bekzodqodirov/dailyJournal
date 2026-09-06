@@ -71,7 +71,7 @@ class ShareReceiverActivity : ComponentActivity() {
         contentResolver.openInputStream(uri)?.use { input ->
             target.outputStream().use { output -> input.copyTo(output, 1 shl 16) }
         } ?: throw IllegalStateException("openInputStream returned null")
-        Logx.i("Imported shared recording as ${target.name}")
+        Logx.i("Imported shared recording as ${Logx.redactName(target.name)}")
         true
     } catch (t: Throwable) {
         Logx.e("Share import failed", t)

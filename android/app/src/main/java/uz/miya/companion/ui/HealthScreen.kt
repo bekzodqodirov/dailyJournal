@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import uz.miya.companion.oem.OemHints
+import uz.miya.companion.util.StorageAccess
 import uz.miya.companion.util.TimeFmt
 
 /**
@@ -64,8 +65,18 @@ fun HealthScreen(
             )
             KeyValue(
                 "Watching",
-                if (state.watchedDirs.isEmpty()) "no readable folder yet"
-                else state.watchedDirs.joinToString("\n"),
+                when {
+                    state.watchedDirs.isNotEmpty() -> state.watchedDirs.joinToString("\n")
+                    // Not a fault, and not fixable by anything the owner can do
+                    // short of granting All files access: inotify needs real
+                    // read access to the path, which scoped storage does not
+                    // give. Saying "no readable folder yet" made a normal,
+                    // working install look broken.
+                    !StorageAccess.allFiles() ->
+                        "inotify unavailable without All files access — using call-end, " +
+                            "MediaStore and the 15-minute sweep"
+                    else -> "no readable folder yet"
+                },
             )
             if (!prefs?.lastError.isNullOrBlank()) {
                 Spacer(Modifier.height(8.dp))

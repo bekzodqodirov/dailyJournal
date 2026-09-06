@@ -50,7 +50,7 @@ fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
                 value = url,
                 onValueChange = { url = it },
                 label = { Text("Server URL") },
-                placeholder = { Text("http://100.x.y.z:8000") },
+                placeholder = { Text("http://vps.tailnet-name.ts.net:8000") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth(),
             )

@@ -22,13 +22,14 @@ import pytest
 import sqlalchemy as sa
 from fastapi.testclient import TestClient
 
+from miya.api import main
 from miya.api.main import app
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import Direction, InteractionSource
 from miya.services import call_recordings as cr
 from miya.services import extraction as ex
-from miya.services import ingest
+from miya.services import ingest, purge
 from miya.services.transcription import Transcript
 
 TZ = settings.tz
@@ -37,6 +38,9 @@ TOKEN = "test-token"
 AUDIO = b"RIFFfakeaudio-one-ten-second-test-call"
 SHA = hashlib.sha256(AUDIO).hexdigest()
 STARTED = "2026-09-06T14:30:25+05:00"
+DEVICE = "b7f1c2e0-0000-4000-8000-000000000001"
+# "<device_id>:<CallLog._ID>", exactly as RecordingScanner.kt mints it.
+CALL_ID = f"{DEVICE}:4711"
 
 
 @pytest.fixture
@@ -48,6 +52,33 @@ def recordings_dir(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def no_spooling(monkeypatch):
+    """Watches for the one thing the old stack did before checking the token.
+
+    `UploadFile` is a SpooledTemporaryFile: under a mebibyte it is memory, over
+    it `rollover()` writes the payload to a real file in the system temp dir —
+    not the ./data volume, so it fills the container's writable layer and takes
+    Postgres down with it. Recording every rollover is how a test can say
+    "nothing reached the disk" and mean it.
+    """
+    import tempfile
+
+    class _Watch:
+        def __init__(self) -> None:
+            self.rolled_over: list[int] = []
+
+    watch = _Watch()
+    real = tempfile.SpooledTemporaryFile.rollover
+
+    def spy(self):
+        watch.rolled_over.append(getattr(self, "_max_size", -1))
+        return real(self)
+
+    monkeypatch.setattr(tempfile.SpooledTemporaryFile, "rollover", spy)
+    return watch
+
+
+@pytest.fixture
 def client(monkeypatch):
     monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
     with TestClient(app) as c:
@@ -55,11 +86,24 @@ def client(monkeypatch):
         yield c
 
 
+class _FrozenDatetime:
+    """`datetime` with a scripted `now()`; everything else is the real thing."""
+
+    def __init__(self, clock) -> None:
+        self._clock = clock
+
+    def now(self, tz=None):
+        return next(self._clock)
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
+
+
 def _meta(**overrides) -> dict:
     meta = {
         "schema": 1,
-        "device_id": "b7f1c2e0-0000-4000-8000-000000000001",
-        "call_id": "b7f1c2e0:4711",
+        "device_id": DEVICE,
+        "call_id": CALL_ID,
         "sha256": SHA,
         "size_bytes": len(AUDIO),
         "started_at": STARTED,
@@ -88,7 +132,9 @@ def _post(client, *, audio=AUDIO, filename="Call recording Akmal.m4a", **overrid
 # --- auth --------------------------------------------------------------------
 
 
-def test_both_recording_routes_fail_closed_without_the_token(monkeypatch):
+def test_both_recording_routes_fail_closed_without_the_token(
+    monkeypatch, recordings_dir, no_spooling
+):
     monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
     with TestClient(app) as anonymous:
         upload = anonymous.post(
@@ -98,6 +144,65 @@ def test_both_recording_routes_fail_closed_without_the_token(monkeypatch):
         )
         assert upload.status_code == 401
         assert anonymous.post("/v1/recordings/probe", json={}).status_code == 401
+    # The status code is the cheap half of this guarantee. The other half is
+    # that the 401 was decided from the headers, so the payload never reached
+    # a temp file, a spool or the recordings directory.
+    assert list(recordings_dir.iterdir()) == []
+    assert no_spooling.rolled_over == []
+
+
+def test_an_unauthenticated_oversized_upload_never_reaches_the_disk(
+    monkeypatch, recordings_dir, no_spooling
+):
+    """The pre-auth hole, pinned.
+
+    FastAPI parses a multipart body before it solves router dependencies, and
+    Starlette streams a file part into a SpooledTemporaryFile that rolls over
+    to a real on-disk file at 1 MB — so an anonymous POST used to have its
+    whole payload written to /tmp before `require_token` ever ran, with no cap
+    at any layer. Both decisions now happen in the ASGI guard, above routing:
+    the body is refused before a byte of it is received.
+    """
+    monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
+    payload = b"x" * (4 * 1024 * 1024)
+
+    with TestClient(app) as anonymous:
+        response = anonymous.post(
+            "/v1/recordings",
+            data={"meta": json.dumps(_meta())},
+            files={"audio": ("big.m4a", payload, "audio/mp4")},
+        )
+
+    assert response.status_code == 401
+    assert no_spooling.rolled_over == []
+    assert list(recordings_dir.iterdir()) == []
+
+
+def test_a_declared_oversize_is_refused_from_the_headers_alone(
+    monkeypatch, recordings_dir, no_spooling
+):
+    """Content-Length over the cap: 413 before the receive channel is drained."""
+    monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
+    monkeypatch.setattr(cr, "RECORDING_UPLOAD_MAX_BYTES", 1024)
+    with TestClient(app) as c:
+        c.headers.update({"Authorization": f"Bearer {TOKEN}"})
+        response = _post(c, audio=b"y" * 8192, size_bytes=8192)
+
+    assert response.status_code == 413
+    assert "upload limit" in response.json()["detail"]
+    assert no_spooling.rolled_over == []
+    assert list(recordings_dir.iterdir()) == []
+
+
+def test_a_device_token_can_upload_and_nothing_else(monkeypatch, recordings_dir):
+    """An extracted APK must not be able to read the owner's debts back out."""
+    monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
+    monkeypatch.setattr(settings, "upload_tokens", "phone:device-secret")
+    with TestClient(app) as device:
+        device.headers.update({"Authorization": "Bearer device-secret"})
+        assert device.post("/v1/recordings/probe", json={}).status_code == 200
+        assert device.get("/v1/config").status_code == 401
+        assert device.post("/v1/ask", json={"question": "qarz?"}).status_code == 401
 
 
 def test_an_unconfigured_server_accepts_nothing(monkeypatch, recordings_dir):
@@ -121,7 +226,7 @@ async def test_an_upload_is_staged_with_its_sidecar_and_nothing_else(
     body = response.json()
     assert body["status"] == "accepted"
     assert body["sha256"] == SHA
-    assert body["call_id"] == "b7f1c2e0:4711"
+    assert body["call_id"] == CALL_ID
     assert body["staged_as"] == f"20260906-143025-{SHA[:12]}.m4a"
 
     audio = recordings_dir / body["staged_as"]
@@ -137,6 +242,42 @@ async def test_an_upload_is_staged_with_its_sidecar_and_nothing_else(
     ]
 
 
+async def test_a_multi_megabyte_recording_arrives_byte_for_byte(
+    session, client, recordings_dir, no_spooling
+):
+    """The realistic size, through the hand-rolled parser.
+
+    A real Samsung m4a is tens of megabytes and reaches the server as hundreds
+    of slices with boundaries falling anywhere; the sha256 check is what proves
+    they were reassembled in order and with nothing of the multipart framing
+    left in. Nothing spools on the way: the bytes go from the socket to the
+    staging file.
+    """
+    big = bytes(range(256)) * 12_000  # ~3 MB, and not compressible into a pattern
+    response = _post(
+        client,
+        audio=big,
+        sha256=hashlib.sha256(big).hexdigest(),
+        size_bytes=len(big),
+    )
+
+    assert response.status_code == 202
+    assert (recordings_dir / response.json()["staged_as"]).read_bytes() == big
+    assert no_spooling.rolled_over == []
+
+
+async def test_a_bloated_meta_part_is_refused(session, client, recordings_dir):
+    """`meta` is a small JSON object; it must not become a way to make us buffer."""
+    response = client.post(
+        "/v1/recordings",
+        data={"meta": json.dumps(_meta(recorded_by="x" * 200_000))},
+        files={"audio": ("a.m4a", AUDIO, "audio/mp4")},
+    )
+
+    assert response.status_code == 413
+    assert list(recordings_dir.iterdir()) == []
+
+
 async def test_the_client_filename_never_becomes_the_path(
     session, client, recordings_dir
 ):
@@ -150,14 +291,48 @@ async def test_the_client_filename_never_becomes_the_path(
     ]
 
 
-async def test_a_half_written_upload_is_invisible_to_the_sweep(recordings_dir):
-    """The bytes land under `.part`, which the scanner already refuses."""
-    partial = recordings_dir / f"20260906-143025-{SHA[:12]}.m4a.a1b2c3d4.part"
-    partial.write_bytes(AUDIO)
-    old = time.time() - 120
-    os.utime(partial, (old, old))
+async def test_a_half_written_upload_is_invisible_to_the_sweep(
+    session, client, recordings_dir, monkeypatch
+):
+    """Asked of the handler, not of a filename a test author typed.
 
-    assert cr.is_ready_recording(partial) is False
+    The staging name is the handler's own; if it ever stopped being one the
+    scanner refuses, this test sees it, which an assertion about a hand-written
+    `.part` name could not.
+    """
+    seen: dict = {}
+    real = main._write_chunk
+
+    def spy(fh, digest, chunk):
+        real(fh, digest, chunk)
+        fh.flush()
+        present = sorted(recordings_dir.iterdir())
+        seen["present"] = [p.name for p in present]
+        seen["ready"] = [p.name for p in present if cr.is_ready_recording(p)]
+
+    monkeypatch.setattr(main, "_write_chunk", spy)
+    assert _post(client).status_code == 202
+
+    # The bytes really were on disk mid-flight …
+    assert seen["present"], "the handler staged nothing"
+    assert all(name.endswith(".part") for name in seen["present"])
+    # … and the sweep would have ignored every one of them.
+    assert seen["ready"] == []
+
+
+async def test_an_abandoned_staging_file_is_reaped_by_the_sweep(session, recordings_dir):
+    """A killed process leaves up to 200 MB behind that nothing else removes."""
+    abandoned = recordings_dir / f"20260906-143025-{SHA[:12]}.m4a.a1b2c3d4.part"
+    abandoned.write_bytes(AUDIO)
+    stale = time.time() - 2 * cr.STALE_UPLOAD_SECONDS
+    os.utime(abandoned, (stale, stale))
+    fresh = recordings_dir / f"20260906-143026-{SHA[:12]}.m4a.b2c3d4e5.part"
+    fresh.write_bytes(AUDIO)
+
+    assert await cr.scan_directory(session) == []
+
+    assert not abandoned.exists()
+    assert fresh.exists(), "an upload still in flight must survive the sweep"
 
 
 # --- idempotency -------------------------------------------------------------
@@ -185,7 +360,7 @@ async def test_a_recording_already_ingested_is_not_uploaded_again(
         m.Interaction(
             source=InteractionSource.phone_call,
             occurred_at=datetime.now(TZ),
-            media={"type": "call_recording", "sha256": SHA, "call_id": "b7f1c2e0:4711"},
+            media={"type": "call_recording", "sha256": SHA, "call_id": CALL_ID},
         )
     )
     await session.commit()
@@ -204,8 +379,8 @@ async def test_a_re_encoded_copy_is_caught_by_the_call_id(
     session.add(
         m.Interaction(
             source=InteractionSource.phone_call,
-            occurred_at=datetime.now(TZ),
-            media={"type": "call_recording", "sha256": "0" * 64, "call_id": "dev7:4711"},
+            occurred_at=datetime.fromisoformat(STARTED),
+            media={"type": "call_recording", "sha256": "0" * 64, "call_id": CALL_ID},
         )
     )
     await session.commit()
@@ -216,12 +391,86 @@ async def test_a_re_encoded_copy_is_caught_by_the_call_id(
         audio=other,
         sha256=hashlib.sha256(other).hexdigest(),
         size_bytes=len(other),
-        call_id="dev7:4711",
     )
 
     assert response.status_code == 200
     assert response.json()["status"] == "duplicate"
     assert list(recordings_dir.iterdir()) == []
+
+
+async def test_a_reused_call_id_from_a_different_call_is_not_a_duplicate(
+    session, client, recordings_dir
+):
+    """The one case where "duplicate" destroys a recording.
+
+    `CallLog._ID` restarts at 1 when the call log's storage is cleared, while
+    the companion's device id survives — they are different apps — so a call
+    made afterwards can inherit a call_id that is already on file. The phone
+    treats a duplicate verdict as success: it marks the row done and may delete
+    the source. A call_id alone must therefore never be enough; the two have to
+    agree about when the call happened as well.
+    """
+    session.add(
+        m.Interaction(
+            source=InteractionSource.phone_call,
+            occurred_at=datetime.fromisoformat(STARTED) - timedelta(days=200),
+            media={"type": "call_recording", "sha256": "0" * 64, "call_id": CALL_ID},
+        )
+    )
+    await session.commit()
+
+    response = _post(client)
+
+    assert response.status_code == 202, "a new recording was thrown away"
+    assert (recordings_dir / response.json()["staged_as"]).read_bytes() == AUDIO
+
+
+async def test_a_call_id_from_another_device_is_refused(session, client, recordings_dir):
+    """call_id is "<device_id>:<_ID>" — one handset cannot veto another's."""
+    response = _post(client, call_id="some-other-device:4711")
+
+    assert response.status_code == 422
+    assert "device_id" in response.json()["detail"]
+    assert list(recordings_dir.iterdir()) == []
+
+
+async def test_a_broken_clock_does_not_break_idempotency(
+    session, client, recordings_dir, monkeypatch
+):
+    """The retry-stability of the staged name, in the branch that breaks it.
+
+    A clock-suspect upload gets a server-side `now()` for its occurred_at. If
+    that value also picked the filename, every retry from that handset would
+    land on a new name a second later, `audio_path.exists()` would never match,
+    and the volume would fill with copies — copies retention then refuses to
+    delete and the sweep re-hashes every minute forever.
+    """
+
+    def ticking(start: datetime):
+        """A clock that has moved on between every retry, as a real one would."""
+        while True:
+            yield start
+            start += timedelta(seconds=41)
+
+    monkeypatch.setattr(
+        main, "datetime", _FrozenDatetime(ticking(datetime(2026, 9, 6, 12, 0, tzinfo=TZ)))
+    )
+
+    statuses = [
+        _post(client, started_at="2031-01-01T09:00:00+05:00").status_code
+        for _ in range(3)
+    ]
+
+    assert statuses == [202, 200, 200]
+    assert [p.name for p in sorted(recordings_dir.glob("*.m4a"))] == [
+        f"20310101-090000-{SHA[:12]}.m4a"
+    ]
+    sidecar = json.loads(
+        (recordings_dir / f"20310101-090000-{SHA[:12]}.m4a.json").read_text()
+    )
+    # The correction still happens — it just lives where it belongs.
+    assert sidecar["clock_suspect"] is True
+    assert sidecar["started_at"] == "2026-09-06T12:00:00+05:00"
 
 
 # --- rejection ---------------------------------------------------------------
@@ -237,11 +486,17 @@ async def test_a_non_audio_upload_is_refused_with_a_usable_message(
     assert list(recordings_dir.iterdir()) == []
 
 
-async def test_an_oversized_recording_is_refused_before_it_reaches_the_disk(
-    session, client, recordings_dir, monkeypatch
+async def test_an_oversized_recording_is_cut_off_at_the_cap(
+    session, client, recordings_dir, monkeypatch, no_spooling
 ):
-    monkeypatch.setattr(cr, "RECORDING_UPLOAD_MAX_BYTES", 16)
-    big = b"x" * 4096
+    """Over a mebibyte, which is where the old stack silently spooled to disk.
+
+    The declared size is a lie here, so the only thing that can stop this is
+    counting the bytes as they arrive. Nothing is left behind, and nothing was
+    ever spooled: the audio part is streamed, never buffered into a temp file.
+    """
+    monkeypatch.setattr(cr, "RECORDING_UPLOAD_MAX_BYTES", 64 * 1024)
+    big = b"x" * (2 * 1024 * 1024)
 
     response = _post(
         client,
@@ -251,8 +506,48 @@ async def test_an_oversized_recording_is_refused_before_it_reaches_the_disk(
         size_bytes=8,
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 413
     assert "upload limit" in response.json()["detail"]
+    assert no_spooling.rolled_over == []
+    assert list(recordings_dir.iterdir()) == []
+
+
+async def test_a_probe_body_is_bounded_too(session, client):
+    """`await request.body()` is unbounded; the guard is what stops it."""
+    response = client.post(
+        "/v1/recordings/probe",
+        content=json.dumps({"sha256": ["a" * 64] * 40_000}),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+
+
+async def test_an_impossible_duration_is_refused_at_the_edge(
+    session, client, recordings_dir
+):
+    """This number bills the transcription; unbounded, it corrupts the ledger."""
+    response = _post(client, duration_seconds=999_999_999)
+
+    assert response.status_code == 422
+    assert "duration_seconds" in response.json()["detail"]
+    assert list(recordings_dir.iterdir()) == []
+
+
+async def test_a_sidecar_orphaned_by_a_failed_rename_is_cleaned_up(
+    session, client, recordings_dir, monkeypatch
+):
+    """The sidecar names the counterparty; it must not outlive its audio."""
+    real = os.replace
+
+    def fail_on_audio(src, dst):
+        if str(dst).endswith(".json"):
+            return real(src, dst)
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(main.os, "replace", fail_on_audio)
+    with pytest.raises(OSError):
+        _post(client)
+
     assert list(recordings_dir.iterdir()) == []
 
 
@@ -372,7 +667,7 @@ async def test_what_the_phone_knew_reaches_the_interaction(
     assert interaction.occurred_at.astimezone(TZ) == datetime.fromisoformat(STARTED)
     assert interaction.media["counterparty"] == "Akmal aka"
     assert interaction.media["phone"] == "998901234567"
-    assert interaction.media["call_id"] == "b7f1c2e0:4711"
+    assert interaction.media["call_id"] == CALL_ID
     assert interaction.media["duration_seconds"] == 412
 
     # The contact name resolved to a real Person and reached the extractor,
@@ -448,3 +743,46 @@ async def test_a_file_the_database_already_has_is_not_rehashed_every_minute(
 
     assert await cr.scan_directory(session) == []
     assert hashed == []
+
+
+# --- the sidecar is part of the recording, everywhere it is deleted ----------
+
+
+async def test_retention_deletes_the_sidecar_with_the_audio(
+    session, client, recordings_dir, stub_pipeline, monkeypatch
+):
+    """The audio says a name out loud; the sidecar writes it down."""
+    assert _post(client).status_code == 202
+    await cr.scan_directory(session)
+    await session.commit()
+    old = time.time() - 200 * 86400
+    for path in recordings_dir.iterdir():
+        os.utime(path, (old, old))
+
+    deleted = await cr.purge_old_audio(session)
+
+    assert deleted == 1
+    assert list(recordings_dir.iterdir()) == [], "the counterparty is still on disk"
+
+
+async def test_unut_leaves_no_trace_of_the_person_on_disk(
+    session, client, recordings_dir, stub_pipeline
+):
+    """/unut is the owner asking to forget someone, not to forget the audio."""
+    assert _post(client).status_code == 202
+    await cr.scan_directory(session)
+    await session.commit()
+    person = await session.scalar(sa.select(m.Person))
+    assert person is not None
+    # Everything the owner asked to forget is really in those files.
+    sidecars = list(recordings_dir.glob("*.json"))
+    assert len(sidecars) == 1
+    assert "Akmal aka" in sidecars[0].read_text()
+    assert "+998901234567" in sidecars[0].read_text()
+
+    plan = await purge.plan_person(session, person)
+    result = await purge.execute(session, plan)
+    await session.commit()
+
+    assert result.interactions == 1
+    assert list(recordings_dir.iterdir()) == []

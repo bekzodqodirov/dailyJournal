@@ -116,29 +116,54 @@ Behaviour that changes across the supported range is handled explicitly:
 ```
 OEM Dialer ──writes──▶ /Recordings/Call/*.m4a
                             │
-        FileObserver(CLOSE_WRITE|MOVED_TO) ─┐
+        FileObserver(CLOSE_WRITE|MOVED_TO) ─┐   (All files access only)
         MediaStore ContentObserver ─────────┤
         TelephonyCallback CALL_STATE_IDLE ──┤   (primary trigger)
         ScanWorker every 15 min ────────────┘   (reconciliation net)
                             ▼
-                     RecordingScanner
-                       · stability gate (size stable 2 s + container parses)
+                     RecordingScanner        ← confirmed folder only
+                       · stability gate (fresh files: size stable 2 s;
+                         all files: container parses)
                        · streaming SHA-256
                        · CallLog correlation, else filename, else mtime
                        · Room row (PK = sha256)   ← durable queue
+                       · at most 50 new files per sweep
                             ▼
                      UploadWorker (WorkManager)
                        · POST /v1/recordings/probe   (cheap "do you have it?")
                        · POST /v1/recordings         (meta part, then audio part)
-                       · exponential backoff, 30 s base, capped at 5 h
+                       · exponential backoff, 30 s base, capped at 5 h,
+                         and a ceiling of 10 attempts
 ```
+
+**Nothing is scanned until a folder is confirmed.** The OEM candidate list is
+for *probing* and contains very broad roots (`Recordings/`, `Sounds/`, `Call/`,
+`Truecaller/`) that MediaStore matches with every descendant. Scanning those
+speculatively would hash and upload voice memos, ringtones and every other
+indexed audio file under them — private non-call audio leaving the phone
+without the owner ever pointing at anything. Auto-detect and *Pick by hand*
+are what open the scanning path; until one of them has run, only recordings
+shared into MIYA by hand are ingested.
+
+**The `FileObserver` path needs All files access.** inotify requires real read
+access to the directory, and under scoped storage `File.isDirectory()` returns
+false for `/sdcard/Recordings/Call` even on a phone that records there
+perfectly well. Without `MANAGE_EXTERNAL_STORAGE` the observers are not
+registered at all, and the Health screen says so in those words rather than
+reporting an error. The call-end trigger, the MediaStore observer and the
+15-minute sweep carry the app on their own; the file observer is a latency
+optimisation, not a requirement.
 
 ### Four independent dedupe layers
 
 1. **Room primary key on `sha256`** — the same bytes can only occupy one queue
    row, no matter how many observers fire.
-2. **A `(sourceUri, size, mtime)` index** — a file already hashed is never
-   re-read on a later sweep.
+2. **A `(sourceUri, size, mtime)` index**, compared to the **second** — a file
+   already hashed is never re-read on a later sweep. Second precision, not
+   millisecond, because MediaStore reports `DATE_MODIFIED` in whole seconds
+   while `DocumentFile.lastModified()` reports true milliseconds: matching
+   exactly made the same physical file look like two different files, one per
+   access path, and every sweep re-hashed the lot.
 3. **The `probe` endpoint** — a lost `202` costs one small JSON round trip, not
    40 MB over a 3G link.
 4. **Server-side dedupe** on `sha256` *or* `call_id`, before a byte is spooled.
@@ -156,7 +181,10 @@ second time later *and* you pay to transcribe truncated audio. Four gates:
 - listen for `CLOSE_WRITE` / `MOVED_TO` only — never `CREATE` or `MODIFY`
   (Samsung writes a `.3ga` *during* the call and produces the `.m4a` at the end);
 - reject `.3ga`, `.tmp`, `.part`, dotfiles and unknown extensions by name;
-- require the file size to be unchanged across ~2 s of polling;
+- require the file size to be unchanged across ~2 s of polling — but only for
+  a file written in the last few minutes, since nothing is still writing a
+  recording from last March and 2 s per file across a year of history exceeds
+  WorkManager's 10-minute execution ceiling on its own;
 - require `MediaMetadataRetriever` to return a positive duration — a truncated
   MP4 has no readable `moov` atom and fails here.
 
@@ -222,8 +250,17 @@ Response handling (this is what the retry logic keys on):
 | `200` duplicate | mark `DONE`, drop from queue — **success, not an error** |
 | `401` | stop all uploads, red banner in Health, no retry |
 | `422` `sha256 mismatch` | re-hash locally, retry **once**, then park permanently |
-| `422` anything else | `FAILED_PERMANENT`, shown in the Queue screen, no retry |
-| `503` / `5xx` / timeout / reset | exponential backoff, 30 s base |
+| `422` anything else | `FAILED_PERMANENT`, shown in the Queue screen, no retry. Includes the server's 200 MB `RECORDING_UPLOAD_MAX_BYTES` cap |
+| `503` / `5xx` / timeout / reset | exponential backoff, 30 s base — **for at most 10 attempts**, then `FAILED_PERMANENT` with the last error kept verbatim |
+| cleartext refused by Android | `FAILED_PERMANENT`, with the host name and what to do about it. Never retried: no amount of network fixes a policy |
+| unparseable server URL | `FAILED_PERMANENT`, "Bad server URL …". Previously this escaped the worker entirely and left the row silently stuck in `UPLOADING` |
+| the file changed on disk mid-upload | `FAILED_PERMANENT`; the next scan sees the new size, re-hashes and queues it afresh |
+
+A ceiling exists because WorkManager's own retry count does not. Without one, a
+row failing for a durable reason that merely *looks* like a network error
+retries every five hours for ever, and the only thing that would ever say so is
+the 24-hour silence alert — which cancels itself the moment any other upload
+succeeds.
 
 ---
 
@@ -299,10 +336,50 @@ adb shell am compat enable FGS_INTRODUCE_TIME_LIMITS uz.miya.companion
 Ten to fifteen minutes, once. The app walks you through it and refuses to claim
 it is working until each step is verified.
 
-1. **On the VPS:** install Tailscale, note the tailnet IP, set
-   `API_BIND=<tailnet-ip>`, add `UPLOAD_TOKENS=phone:<generated-token>` to `.env`,
-   restart the API container.
-2. **On the phone:** install Tailscale, sign in to the same tailnet.
+1. **On the VPS:** install Tailscale and sign in, then make the API reachable
+   from the tailnet. **The server has no `API_BIND` setting** — `miya/config.py`
+   exposes `API_PORT`, `API_BEARER_TOKEN` and `UPLOAD_TOKENS`, none of which
+   move the listener — and `docker-compose.yml` hardcodes the bind address:
+
+   ```yaml
+   ports:
+     - "127.0.0.1:${API_PORT:-8000}:8000"     # as shipped: loopback only
+   ```
+
+   A phone cannot reach that. Edit the line to publish on the tailnet address
+   instead (`- "100.x.y.z:${API_PORT:-8000}:8000"`), or leave it alone and put
+   the tunnel in front of it with `tailscale serve`. Either way **do not
+   publish `0.0.0.0`** — that is the open internet, and a static bearer token
+   in front of every transcript, debt and contact you have is not an acceptable
+   posture there.
+
+   Then set `API_BEARER_TOKEN=<a long random string>` in `.env` and restart the
+   API container.
+
+   **Give the phone its own token, not yours.** Alongside `API_BEARER_TOKEN`
+   the server reads `UPLOAD_TOKENS`, a space- or comma-separated list of
+   `name:token` pairs:
+
+   ```
+   UPLOAD_TOKENS=phone:<a second long random string>
+   ```
+
+   A token from that list opens `/v1/recordings` and `/v1/recordings/probe`
+   and **nothing else** — present it to `/v1/ask`, `/v1/debts` or `/v1/config`
+   and the answer is 401. That is the whole point: a phone is lost, stolen and
+   unzipped far more easily than a server, and an APK's stored token is not a
+   secret in the way a server-side one is. With a device token, the worst a
+   thief can do is push audio at you. With the master token he can read every
+   transcript, debt and contact you have.
+
+   It also makes revocation cheap. Delete that one pair from `UPLOAD_TOKENS`,
+   restart the API, and the phone is cut off — nothing else needs rotating.
+   Put `API_BEARER_TOKEN` on the phone only if you have a reason to, and know
+   that losing the phone then means rotating it everywhere it is used.
+2. **On the phone:** install Tailscale, sign in to the same tailnet, and leave
+   **MagicDNS enabled** (it is on by default). The phone will address the
+   server by its MagicDNS name — see *Plaintext HTTP and the network security
+   config* below for why that matters.
 3. **Turn on call recording in the OEM dialer.** Phone → Settings → "Record
    calls" (Samsung) or "Call recording" (Xiaomi/MIUI).
    *If the setting is not there, stop — no app can change that.*
@@ -323,14 +400,75 @@ it is working until each step is verified.
 9. **Work the OEM checklist** the app shows — Autostart, Background autostart,
    "No restrictions", removal from "Sleeping apps". The app deep-links each
    screen. No manifest entry can do any of this.
-10. **Enter the server URL** (`http://<tailnet-ip>:8000`) and paste the bearer
-    token, then tap **Test connection**. It hits `/health` *and*
-    `/v1/recordings/probe` with an empty batch, so it proves reachability and
-    auth separately — a green tunnel with a bad token otherwise looks identical
-    to a working setup until the first real upload fails.
+10. **Enter the server URL** — `http://<machine>.<tailnet>.ts.net:8000`, the
+    MagicDNS name, **not** the raw `100.x.y.z` address unless you have edited
+    the network security config (next section) — and paste the phone's
+    `UPLOAD_TOKENS` token (see step 1),
+    then tap **Test connection**. It checks the cleartext policy first, then
+    hits `/health` *and* `/v1/recordings/probe` with an empty batch, so it
+    proves the three failure modes apart: blocked by Android, unreachable, or
+    reachable with a bad token. A green tunnel with a bad token otherwise looks
+    identical to a working setup until the first real upload fails.
+
+    Saving a URL or passing this test also **re-queues everything that was
+    blocked** while the server was unconfigured — which, on a first install, is
+    every recording already on the phone.
 11. **Make one more test call.** Within about two minutes it should appear in the
     Queue screen as `sent`. If it does not, the Health screen names the failing
     step.
+
+### Plaintext HTTP and the network security config
+
+Read this before you type a server URL. It decides whether the app works at all.
+
+Android blocks cleartext HTTP by default for every app targeting API 28 or
+newer, and this one targets 36. The whole design speaks `http://` to a server
+on a private tunnel, so without an explicit policy **every request dies inside
+OkHttp** with
+
+```
+java.net.UnknownServiceException:
+CLEARTEXT communication to 100.x.y.z not permitted by network security policy
+```
+
+and — because that is an `IOException` — it would be retried as a network
+error, forever, while the Health screen blamed the tunnel.
+
+`app/src/main/res/xml/network_security_config.xml` is the policy, and it is
+deliberately narrow. `android:usesCleartextTraffic="true"` is **not** used: it
+would permit plaintext to *any* host the owner ever types in, including one on
+the open internet. Instead:
+
+| Destination | Plaintext? |
+|---|---|
+| `*.ts.net` — every Tailscale MagicDNS name | **allowed** |
+| `localhost`, `127.0.0.1` — `adb reverse` while testing | allowed |
+| everything else | **refused** |
+
+**The trade-off, stated plainly:** Android's network security config matches
+*domain names*. It has no notion of an IP range, so Tailscale's `100.64.0.0/10`
+block **cannot be expressed** — `<domain>100.64.0.0</domain>` matches that one
+literal address and nothing else, and `includeSubdomains` extends a name
+leftwards (`x.example.com` under `example.com`), which is meaningless for an
+IP. So there are exactly two supported ways to address the server:
+
+1. **The MagicDNS name** — `http://vps.tailnet-name.ts.net:8000`. Nothing to
+   edit, nothing outside the tunnel reachable in plaintext. This is the
+   recommended path and the one the app's placeholder text suggests.
+2. **A raw tailnet IP** — uncomment the block at the bottom of
+   `network_security_config.xml`, put the exact address in it, and rebuild. One
+   `<domain>` line per address; there is no wildcard.
+
+If you get this wrong the app now tells you so instead of looking dead: the
+Settings screen refuses to pretend, the Health "Server and token" row goes red
+with the host name in it, and a blocked upload is parked as a permanent failure
+with the same message rather than retried for ever. That check asks
+`NetworkSecurityPolicy` — the platform's own answer, the same one OkHttp
+consults — so it cannot disagree with what actually happens on the wire.
+
+The honest alternative, if you would rather not think about any of this, is to
+put TLS in front of the API (Caddy, a `ts.net` certificate) and use `https://`,
+which this config permits everywhere with no edits.
 
 ### Recurring, and unavoidable
 
@@ -352,10 +490,24 @@ mistake.
 - **Queue** — every row with its state, correlation method, attempt count and
   **the exact `detail` string the server returned**. Paraphrasing a server error
   is how a fixable configuration problem becomes a mystery.
-- **Settings** — server URL, bearer token (masked; encrypted with an Android
-  KeyStore AES-GCM key, never in plain DataStore, never logged), folder
-  re-detect/re-pick, all-files opt-in, Wi-Fi-only, delete-local-after-upload
-  (default **off**), language hint, minimum call duration.
+- **Settings** — server URL (validated before it is stored, and checked against
+  the cleartext policy), bearer token (masked; encrypted with an Android
+  KeyStore AES-GCM key, never in plain DataStore, never logged — and if the
+  KeyStore refuses the key, Settings says so instead of reporting "Saved."),
+  folder re-detect/re-pick, all-files opt-in, Wi-Fi-only,
+  delete-local-after-upload (default **off**), language hint, minimum call
+  duration.
+
+### What reaches logcat
+
+Nothing that identifies a person. A call-recording filename is personal data,
+not a technical detail — on Samsung and Xiaomi it carries the counterparty's
+contact name and very often their number — and logcat is readable over adb and
+by crash tooling. Filenames and observer paths are logged through
+`Logx.redactName()`, which keeps the extension and a short hash of the stem;
+phone numbers go through `Logx.redactPhone()`. The bearer token is never
+logged at all: there is no OkHttp logging interceptor, and `TokenStore` logs
+exception text only.
 
 ---
 
@@ -372,7 +524,7 @@ mistake.
 | `RECEIVE_BOOT_COMPLETED` | Re-arm observers after a reboot. |
 | `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC` | `dataSync` is the honest type — its documented use cases are literally "local file processing" and "transfer data between a device and the cloud". `microphone` is deliberately **not** declared: we do not capture, and on Android 14+ it is a while-in-use type that cannot be started from the background at all. |
 | `REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` | Doze relief **and** background FGS start. |
-| `MANAGE_EXTERNAL_STORAGE` | Opt-in "advanced mode" only, never required to launch. It still cannot reach `/Android/data`, so it does not rescue Google Dialer recordings. |
+| `MANAGE_EXTERNAL_STORAGE` | Opt-in "advanced mode" only, never required to launch. It is also the only thing that makes the `FileObserver` (inotify) trigger possible at all — without it the app relies on call-end, MediaStore and the sweep. It still cannot reach `/Android/data`, so it does not rescue Google Dialer recordings. |
 | ~~`RECORD_AUDIO`~~ | **Never requested.** It would buy nothing and would make the app look exactly like the spyware it is not. |
 
 ---
@@ -479,4 +631,32 @@ Android SDK available to compile against:
   a fallback.
 - OEM settings deep links (`com.miui.securitycenter/...` and friends) are
   best-effort component names; each one falls back to the app's own settings page
-  when it does not resolve.
+  when it does not resolve. The `<queries>` block in the manifest makes those
+  packages visible under targetSdk 36 package filtering, which is what lets the
+  explicit-component intents resolve at all — but a component *renamed* by a
+  newer OEM build still falls back, and only a device can tell you which.
+- The `<service android:name="androidx.work.impl.foreground.SystemForegroundService"
+  tools:node="merge">` entry assumes that class name, which is WorkManager
+  internal API. It is stable across the 2.7–2.9 line, but if a future
+  WorkManager moves it, the merge silently stops applying and expedited work
+  fails again on Android 10/11. Pin the WorkManager version, or check this entry
+  when bumping it.
+- `NetworkSecurityPolicy.isCleartextTrafficPermitted(host)` is asked at save
+  time to decide whether the configured URL is usable. It is the same policy
+  OkHttp consults, but the two are checked at different moments, so a URL that
+  passes here can still be refused if the config changes between builds.
+- The cleartext policy in `res/xml/network_security_config.xml` permits
+  `*.ts.net` and loopback. **It has not been exercised against a real tailnet
+  from a real device.** If MagicDNS is disabled on the tailnet, or the server is
+  addressed by raw IP, uploads will be refused until the IP is added to that
+  file — by design, and reported in plain words, but it *is* a manual step.
+- The `mtimeMillis / 1000` comparison in `UploadDao.countBySource` is valid
+  SQLite integer division and Room compiles the query at build time; without an
+  SDK that compilation has not been run. Same for the new `nextRetryable` query.
+- The 50-new-files-per-sweep cap and the 5-minute freshness window on the
+  stability gate are judgement calls about I/O cost on a slow eMMC, not measured
+  numbers. They bound the work; they have not been timed on hardware.
+- Whether an OEM's `startForegroundService` → refused-start path really avoids
+  the `RemoteServiceException` window when the battery-optimisation exemption is
+  absent is behaviour, not contract. The app now skips the attempt entirely in
+  that case, which cannot be worse, but only a device confirms it.

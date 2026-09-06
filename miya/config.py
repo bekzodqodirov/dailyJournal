@@ -115,6 +115,12 @@ class Settings(BaseSettings):
     # --- Internal API -------------------------------------------------------
     api_bearer_token: str = ""
     api_port: int = 8000
+    # Optional per-device tokens for the Android companion, as space- or
+    # comma-separated `name:token` pairs (e.g. "phone:9f3c…"). A token listed
+    # here opens /v1/recordings and /v1/recordings/probe and nothing else, so
+    # an extracted APK cannot read /v1/ask, /v1/debts or /v1/config. Leave it
+    # empty and the phone uses API_BEARER_TOKEN, which authorises everything.
+    upload_tokens: str = ""
 
     # --- Scheduling ---------------------------------------------------------
     timezone: str = "Asia/Tashkent"
@@ -160,6 +166,16 @@ class Settings(BaseSettings):
     @property
     def backup_time_parsed(self) -> time:
         return _parse_hhmm(self.backup_time)
+
+    @property
+    def upload_tokens_parsed(self) -> dict[str, str]:
+        """`name:token` pairs → {name: token}. Malformed entries are ignored."""
+        pairs: dict[str, str] = {}
+        for entry in self.upload_tokens.replace(",", " ").split():
+            name, sep, token = entry.partition(":")
+            if sep and name.strip() and token.strip():
+                pairs[name.strip()] = token.strip()
+        return pairs
 
     @property
     def quiet_hours_parsed(self) -> tuple[time, time]:

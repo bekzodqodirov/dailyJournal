@@ -8,6 +8,7 @@ import androidx.work.WorkerParameters
 import uz.miya.companion.Graph
 import uz.miya.companion.data.UploadState
 import uz.miya.companion.ingest.Hasher
+import uz.miya.companion.ingest.StabilityGate
 import uz.miya.companion.net.UploadOutcome
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.Notifications
@@ -47,8 +48,17 @@ class UploadWorker(
 
         val snapshot = prefs.snapshot()
 
+        // Nearly every first install hits this: the app finds the test-call
+        // recording at onboarding step 4-5, long before the server URL and
+        // token are entered at step 10. The row is parked as a precondition
+        // failure rather than retried, and is released again by
+        // MainViewModel.saveServer()/testConnection() (which call
+        // retryAllFailed) and by DrainWorker, which now re-arms
+        // FAILED_PRECONDITION rows on every app start and boot. Without one of
+        // those, every pre-existing recording on the phone stayed blocked
+        // forever behind a manual "Retry all" tap.
         if (!snapshot.serverConfigured || !Graph.tokenStore.hasToken()) {
-            repo.markPrecondition(sha, "Server URL or token not configured")
+            repo.markPrecondition(sha, "Server URL or token not configured yet")
             return Result.failure()
         }
 
@@ -63,6 +73,25 @@ class UploadWorker(
         // generated on first use, and device_id is a REQUIRED contract field.
         val deviceId = prefs.deviceId()
         val ref = repo.refFor(row)
+
+        // The bytes must still be the bytes we hashed. One stat call, and it
+        // converts "the OEM rewrote the recording after we hashed it" from a
+        // Content-Length mismatch that looks like a network error (and retries
+        // for ever) into a precondition the next scan repairs by re-hashing.
+        val currentSize = StabilityGate.currentSize(applicationContext, ref.uri)
+        if (currentSize < 0L) {
+            repo.markPrecondition(sha, "Recording is no longer readable")
+            return Result.failure()
+        }
+        if (currentSize != row.sizeBytes) {
+            repo.markPrecondition(
+                sha,
+                "Recording changed on disk (${row.sizeBytes} -> $currentSize bytes); " +
+                    "the next scan will re-hash it",
+            )
+            return Result.failure()
+        }
+
         val attempt = runAttemptCount + 1
         repo.markUploading(sha, attempt)
 
@@ -135,13 +164,36 @@ class UploadWorker(
             }
 
             is UploadOutcome.Retry -> {
-                repo.markRetry(sha, attempt, outcome.detail)
-                Result.retry()
+                // A ceiling, because WorkManager's own retry count is
+                // effectively unbounded: a row failing for a durable reason
+                // that merely LOOKS like a network error would otherwise
+                // retry every five hours for ever, visible only through the
+                // 24-hour silence alert — which cancels itself as soon as any
+                // other upload succeeds.
+                if (attempt >= MAX_ATTEMPTS) {
+                    repo.markPermanent(
+                        sha,
+                        attempt,
+                        "Gave up after $attempt attempts: ${outcome.detail}",
+                    )
+                    Result.failure()
+                } else {
+                    repo.markRetry(sha, attempt, outcome.detail)
+                    Result.retry()
+                }
             }
         }
     }
 
     companion object {
         const val KEY_SHA = "sha256"
+
+        /**
+         * 30 s base, exponential, capped by WorkManager at 5 h: ten attempts
+         * span roughly a day and a half of real retrying. Past that the row is
+         * parked as permanent, stays visible in the Queue screen with the
+         * server's own words, and "Retry all" restarts it.
+         */
+        const val MAX_ATTEMPTS = 10
     }
 }

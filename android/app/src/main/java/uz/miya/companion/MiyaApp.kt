@@ -1,6 +1,7 @@
 package uz.miya.companion
 
 import android.app.Application
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.Notifications
@@ -23,6 +24,12 @@ class MiyaApp : Application() {
         // Materialise the device id once, at first launch: it is half of the
         // call_id the server de-duplicates on, and a REQUIRED contract field.
         Graph.appScope.launch { Graph.prefs.deviceId() }
+
+        // Pre-warm the token store OFF the main thread. The first touch loads a
+        // SharedPreferences file from disk and, if a token is present, runs an
+        // AndroidKeyStore lookup — work the Health screen would otherwise do on
+        // Dispatchers.Main during onboarding.
+        Graph.appScope.launch(Dispatchers.IO) { Graph.tokenStore.hasToken() }
 
         // Reconciliation sweep. KEEP, so an existing schedule is not reset on
         // every process start (which would mean it never actually runs).

@@ -14,12 +14,12 @@ import uz.miya.companion.data.RecordingRepository
 import uz.miya.companion.data.UploadEntity
 import uz.miya.companion.discover.FolderProbe
 import uz.miya.companion.discover.MediaStoreQuery
-import uz.miya.companion.discover.OemCandidates
 import uz.miya.companion.discover.SafScanner
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.Notifications
 import uz.miya.companion.util.StorageAccess
 import uz.miya.companion.util.TimeFmt
+import uz.miya.companion.work.Scheduling
 import java.io.File
 
 /**
@@ -87,13 +87,31 @@ class RecordingScanner(
         var unstable = 0
         var tooShort = 0
 
-        for (ref in candidates) {
+        // Oldest first, and a ceiling on how many NEW files one scan touches.
+        //
+        // Everything below the `alreadySeen` line costs real I/O: a stability
+        // check, MediaMetadataRetriever, and a full streaming SHA-256. A first
+        // run on a phone with a year of call recordings can see several hundred
+        // candidates, which is comfortably past WorkManager's hard 10-minute
+        // execution limit and eats into the Android 15 dataSync budget when the
+        // same walk runs inside IngestService. Capping means a large backlog
+        // drains over several sweeps instead of failing every sweep.
+        val ordered = candidates.sortedBy { it.lastModifiedMillis }
+        var processed = 0
+        var hitCap = false
+
+        for (ref in ordered) {
             if (repo.alreadySeen(ref)) continue
+            if (processed >= MAX_NEW_PER_SCAN) {
+                hitCap = true
+                break
+            }
+            processed++
 
             val verdict = StabilityGate.check(context, ref)
             if (!verdict.ready) {
                 unstable++
-                Logx.d("Not ready: ${ref.displayName} (${verdict.reason})")
+                Logx.d("Not ready: ${Logx.redactName(ref.displayName)} (${verdict.reason})")
                 continue
             }
 
@@ -102,7 +120,7 @@ class RecordingScanner(
             val hash = try {
                 Hasher.sha256(context, ref.uri)
             } catch (t: Throwable) {
-                Logx.w("Cannot hash ${ref.displayName}: ${t.message}")
+                Logx.w("Cannot hash ${Logx.redactName(ref.displayName)}: ${t.message}")
                 unstable++
                 continue
             }
@@ -112,8 +130,12 @@ class RecordingScanner(
             // the next sweep short-circuits instead of hashing it again.
             val existing = repo.byHash(hash.sha256)
             if (existing != null) {
+                // Second precision on the mtime comparison, for the same reason
+                // as in `alreadySeen`: MediaStore rounds to whole seconds and
+                // SAF does not, and a rebind triggered by precision alone made
+                // the two access paths fight over the row on every sweep.
                 if (existing.sourceUri != ref.key ||
-                    existing.mtimeMillis != ref.lastModifiedMillis
+                    existing.mtimeMillis / 1000L != ref.lastModifiedMillis / 1000L
                 ) {
                     repo.rebindSource(hash.sha256, ref)
                 }
@@ -135,7 +157,10 @@ class RecordingScanner(
             val effectiveSeconds = row.durationSeconds ?: containerSeconds
             if (effectiveSeconds in 0 until minDuration) {
                 tooShort++
-                Logx.d("Skipping ${ref.displayName}: ${effectiveSeconds}s < ${minDuration}s")
+                Logx.d(
+                    "Skipping ${Logx.redactName(ref.displayName)}: " +
+                        "${effectiveSeconds}s < ${minDuration}s"
+                )
                 repo.enqueueSkipped(row, "shorter than the ${minDuration}s floor")
                 continue
             }
@@ -145,6 +170,17 @@ class RecordingScanner(
 
         prefs.markScanned()
         runCatching { repo.purgeOldDone() }
+
+        // Best effort continuation for a backlog. It is deliberately only best
+        // effort: the burst work is unique-KEEP, so this is dropped when a scan
+        // is already queued, and the 15-minute reconciliation sweep is the
+        // guarantee. Only asked for when the scan actually made progress, so a
+        // folder full of files that can never pass the gates cannot become a
+        // rescan loop.
+        if (hitCap && enqueued + tooShort > 0) {
+            Logx.i("Scan cap reached ($MAX_NEW_PER_SCAN new files); continuing on the next sweep")
+            Scheduling.enqueueBurstScan(context)
+        }
 
         ScanResult(candidates.size, enqueued, unstable, tooShort, null)
     }
@@ -181,24 +217,48 @@ class RecordingScanner(
         treeUri: Uri?,
         hasAllFiles: Boolean,
     ): List<RecordingRef> {
+        // NOTHING is uploaded out of an unconfirmed folder.
+        //
+        // OemCandidates.ordered() exists to be PROBED, and it contains very
+        // broad roots — Recordings/, Sounds/, Call/, Calls/, Truecaller/ — that
+        // MediaStore matches with RELATIVE_PATH LIKE 'Recordings/%', i.e. every
+        // descendant. Scanning those before the owner has confirmed anything
+        // meant voice memos, ringtones and every other indexed audio file under
+        // those trees were hashed, queued and sent to the server as if they
+        // were call recordings: the owner's private non-call audio leaving the
+        // phone without their ever having pointed at it. FolderProbe still
+        // probes the whole candidate list (it samples five rows per folder and
+        // enqueues nothing), and confirming a folder — Auto-detect or Pick by
+        // hand — is what opens this path.
+        if (configuredFolder == null && treeUri == null) {
+            Logx.i("No confirmed recordings folder yet; scanning shared imports only")
+            return emptyList()
+        }
+
         val seen = LinkedHashMap<String, RecordingRef>()
 
         fun add(ref: RecordingRef) {
             if (!FolderProbe.isAudioName(ref.displayName)) return
-            val key = "${ref.displayName}|${ref.sizeBytes}|${ref.lastModifiedMillis}"
+            // Second precision on the mtime: MediaStore reports DATE_MODIFIED
+            // in whole seconds and DocumentFile.lastModified() in true millis,
+            // so a millisecond-exact key listed the same physical file twice —
+            // one entry matching the queue's source index and one not, which
+            // made every sweep re-hash and re-bind every file, for ever.
+            val key = "${ref.displayName}|${ref.sizeBytes}|${ref.lastModifiedMillis / 1000L}"
             seen.putIfAbsent(key, ref)
         }
 
-        // 1. The SAF tree the owner picked. Immune to .nomedia, so it goes first.
+        // 1. The SAF tree the owner picked. Immune to .nomedia, so it goes
+        //    first — and, because of putIfAbsent, it is the ref that wins when
+        //    a file is visible through both paths.
         if (treeUri != null) {
             SafScanner.list(context, treeUri).forEach(::add)
         }
 
-        // 2. MediaStore, restricted to the confirmed folder when we have one.
-        val folders = configuredFolder?.let { listOf(it) } ?: OemCandidates.ordered()
+        // 2. MediaStore, only under the confirmed folder.
+        val folders = listOfNotNull(configuredFolder)
         for (folder in folders) {
-            MediaStoreQuery.listUnder(context, folder, limit = if (folders.size == 1) 400 else 40)
-                .forEach(::add)
+            MediaStoreQuery.listUnder(context, folder, limit = 400).forEach(::add)
         }
 
         // 3. Direct filesystem, only in opt-in all-files mode.
@@ -323,5 +383,12 @@ class RecordingScanner(
     private companion object {
         const val SHARED_DIR = "shared"
         const val SHARED_SEPARATOR = "__"
+
+        /**
+         * New files hashed per scan. 50 x (stability check + container parse +
+         * streaming SHA-256) fits inside WorkManager's 10-minute ceiling with
+         * room to spare on a slow eMMC; a bigger backlog drains across sweeps.
+         */
+        const val MAX_NEW_PER_SCAN = 50
     }
 }

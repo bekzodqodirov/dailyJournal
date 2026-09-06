@@ -8,6 +8,8 @@ import android.os.Build
 import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -100,10 +102,25 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun refresh() {
         viewModelScope.launch {
             val snapshot = Graph.prefs.snapshot()
+            // viewModelScope dispatches on Dispatchers.Main.immediate, and all
+            // three of these block: the first tokenStore call loads a
+            // SharedPreferences file from disk, masked() does an AndroidKeyStore
+            // lookup plus an AES-GCM decrypt, and computeHealth() queries the
+            // package manager and PowerManager. refresh() runs in init, on
+            // every onResume and after every permission result, so on a cold
+            // start this was a StrictMode violation and a realistic ANR — on
+            // the onboarding screen, where the owner is already frustrated.
+            val computed = withContext(Dispatchers.IO) {
+                Triple(
+                    computeHealth(snapshot),
+                    Graph.tokenStore.hasToken(),
+                    Graph.tokenStore.masked(),
+                )
+            }
             local.value = local.value.copy(
-                health = computeHealth(snapshot),
-                tokenSet = Graph.tokenStore.hasToken(),
-                tokenMasked = Graph.tokenStore.masked(),
+                health = computed.first,
+                tokenSet = computed.second,
+                tokenMasked = computed.third,
                 watchedDirs = Graph.watchArmer.watchedDirs,
                 callTriggerActive = Graph.watchArmer.callTriggerActive,
             )
@@ -167,14 +184,21 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
         val tree = prefs.treeUri?.let(Uri::parse)
         val treeOk = tree != null && SafScanner.stillGranted(context, tree)
-        val folderOk = treeOk || (media && prefs.folderRelativePath != null) || StorageAccess.allFiles()
+        // A confirmed folder AND a way to read it. All-files access on its own
+        // is no longer enough, because an unconfirmed folder is never scanned:
+        // scanning every OEM candidate root uploaded the owner's voice memos
+        // and ringtones along with their calls.
+        val folderOk = treeOk ||
+            (prefs.folderRelativePath != null && (media || StorageAccess.allFiles()))
         items += HealthItem(
             title = "Recordings folder",
             ok = folderOk,
             detail = when {
                 treeOk -> "Folder grant held: ${tree?.lastPathSegment ?: prefs.treeUri}"
                 prefs.folderRelativePath != null -> "Watching /${prefs.folderRelativePath}"
-                StorageAccess.allFiles() -> "All-files access is on; every candidate folder is scanned."
+                StorageAccess.allFiles() ->
+                    "All-files access is on, but nothing is uploaded until a folder is " +
+                        "confirmed — tap Auto-detect or Pick by hand."
                 else -> "No folder confirmed yet. Record one test call, then run detection."
             },
             action = HealthAction.PICK_FOLDER,
@@ -194,7 +218,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             actionLabel = "Fix",
         )
 
-        val serverOk = prefs.serverConfigured && Graph.tokenStore.hasToken() && !prefs.authFailed
+        val cleartextHost = UploadApi.cleartextBlockedHost(prefs.serverUrl)
+        val serverOk = prefs.serverConfigured && Graph.tokenStore.hasToken() &&
+            !prefs.authFailed && cleartextHost == null
         items += HealthItem(
             title = "Server and token",
             ok = serverOk,
@@ -202,6 +228,11 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 !prefs.serverConfigured -> "No server URL set."
                 !Graph.tokenStore.hasToken() -> "No bearer token saved."
                 prefs.authFailed -> "The server rejected the token (401). Uploads are stopped."
+                // Asked of the platform, not guessed: this is the same policy
+                // OkHttp consults before it opens the socket, so it is the
+                // difference between "the tunnel is down" and "this build will
+                // never talk to that address in plaintext".
+                cleartextHost != null -> UploadApi.cleartextAdvice(cleartextHost)
                 else -> "Configured: ${prefs.serverUrl}"
             },
             action = HealthAction.SERVER_SETTINGS,
@@ -226,7 +257,12 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     fun runProbe() {
         viewModelScope.launch {
             local.value = local.value.copy(busy = true, message = null)
-            val verdict = FolderProbe.detect(context, StorageAccess.hasMediaAudio(context))
+            // Up to ~15 ContentResolver round trips into MediaProvider, plus
+            // File.listFiles() per candidate in all-files mode. Never on the
+            // main thread.
+            val verdict = withContext(Dispatchers.IO) {
+                FolderProbe.detect(context, StorageAccess.hasMediaAudio(context))
+            }
             when (verdict) {
                 is ProbeVerdict.Found -> {
                     Graph.prefs.setFolder(verdict.relativePath)
@@ -291,21 +327,59 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------------- server
 
+    /**
+     * Validates before it stores, and RELEASES the queue after it stores.
+     *
+     * Both halves were missing. An unparseable URL used to be saved happily and
+     * then blew up inside HttpUrl in a worker, where the failure was invisible.
+     * And nothing re-queued the rows that had already failed for want of a
+     * configuration: recordings found before this screen was ever reached sat
+     * in FAILED_PRECONDITION, and rows failed by the 401 latch sat in
+     * FAILED_PERMANENT, so the owner would paste a corrected token, see a green
+     * Health screen, and watch a queue that still never moved.
+     */
     fun saveServer(url: String, token: String?) {
         viewModelScope.launch {
-            Graph.prefs.setServerUrl(url)
-            if (!token.isNullOrBlank()) {
-                Graph.tokenStore.save(token.trim())
-                Graph.prefs.setAuthFailed(false)
+            val trimmed = url.trim().trimEnd('/')
+            if (trimmed.isNotBlank() && !UploadApi.looksLikeUrl(trimmed)) {
+                local.value = local.value.copy(
+                    message = "That is not a usable server URL. It must look like " +
+                        "http://vps.tailnet-name.ts.net:8000 — scheme included.",
+                )
+                return@launch
             }
-            local.value = local.value.copy(message = "Saved.")
+
+            Graph.prefs.setServerUrl(trimmed)
+
+            var message = "Saved."
+            if (!token.isNullOrBlank()) {
+                val stored = withContext(Dispatchers.IO) { Graph.tokenStore.save(token.trim()) }
+                if (stored) {
+                    Graph.prefs.setAuthFailed(false)
+                } else {
+                    message = "Could not store the token securely on this device. " +
+                        "The KeyStore refused the key; nothing was saved."
+                }
+            }
+
+            if (message == "Saved.") {
+                UploadApi.cleartextBlockedHost(trimmed)?.let { host ->
+                    message = "Saved, but uploads will fail. " + UploadApi.cleartextAdvice(host)
+                }
+            }
+
+            // The configuration just changed, so everything parked for want of
+            // one gets another chance — including the rows the 401 latch failed.
+            Graph.repository.retryAllFailed()
+
+            local.value = local.value.copy(message = message)
             refresh()
         }
     }
 
     fun clearToken() {
         viewModelScope.launch {
-            Graph.tokenStore.clear()
+            withContext(Dispatchers.IO) { Graph.tokenStore.clear() }
             refresh()
         }
     }
@@ -322,7 +396,18 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             if (!UploadApi.looksLikeUrl(snapshot.serverUrl)) {
                 local.value = local.value.copy(
                     busy = false,
-                    message = "Server URL must start with http:// or https://",
+                    message = "Server URL must be a full http:// or https:// address, " +
+                        "e.g. http://vps.tailnet-name.ts.net:8000",
+                )
+                return@launch
+            }
+            // Ask the platform first. Otherwise the cleartext refusal arrives
+            // as an IOException and gets reported as "is the tunnel up?", which
+            // sends the owner to debug a tunnel that is working fine.
+            UploadApi.cleartextBlockedHost(snapshot.serverUrl)?.let { host ->
+                local.value = local.value.copy(
+                    busy = false,
+                    message = UploadApi.cleartextAdvice(host),
                 )
                 return@launch
             }
@@ -347,9 +432,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 )
             } else {
                 Graph.prefs.setAuthFailed(false)
+                // Proven reachable and authorised: release everything that was
+                // parked while it was not.
+                Graph.repository.retryAllFailed()
                 local.value = local.value.copy(
                     busy = false,
-                    message = "Connection and token are good.",
+                    message = "Connection and token are good. Anything that was blocked " +
+                        "has been re-queued.",
                 )
             }
             refresh()

@@ -15,6 +15,7 @@ import uz.miya.companion.util.Logx
 import uz.miya.companion.util.Notifications
 import uz.miya.companion.work.Scheduling
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * A SHORT-LIVED dataSync foreground service, started on call end.
@@ -57,8 +58,15 @@ class IngestService : Service() {
         } catch (t: Throwable) {
             // On Android 12+ this can be refused outright if we were started
             // from the background without an exemption. Fall back to
-            // WorkManager rather than dying.
-            Logx.w("startForeground refused: ${t.javaClass.simpleName}")
+            // WorkManager rather than dying — but RECORD the reason, because
+            // this catch also swallows the foreground-service-type and
+            // permission errors that are otherwise undiagnosable, and because
+            // a burst that silently never happens looks exactly like an app
+            // that is working.
+            val reason = "Foreground burst refused: ${t.javaClass.simpleName}" +
+                (t.message?.let { ": $it" } ?: "")
+            Logx.w(reason)
+            Graph.appScope.launch { Graph.prefs.setLastError(reason) }
             Scheduling.enqueueBurstScan(this)
             stopSelf(startId)
             return START_NOT_STICKY
@@ -69,6 +77,11 @@ class IngestService : Service() {
             try {
                 val result = Graph.scanner.scan()
                 Logx.i("Burst scan enqueued ${result.enqueued} of ${result.inspected}")
+            } catch (c: CancellationException) {
+                // onTimeout()/onDestroy() cancelled us. Not an error, and the
+                // suspend setLastError below would throw again in an
+                // already-cancelled scope.
+                throw c
             } catch (t: Throwable) {
                 Logx.e("Burst scan failed", t)
                 Graph.prefs.setLastError("Burst scan failed: ${t.message}")

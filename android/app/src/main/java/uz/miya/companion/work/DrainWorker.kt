@@ -11,6 +11,11 @@ import uz.miya.companion.util.Logx
  * reboot or a force-stop, where WorkManager keeps its own database but the
  * cheapest way to be certain nothing was orphaned is to ask the queue.
  *
+ * It also re-arms FAILED_PRECONDITION rows, which is the second half of the
+ * first-install fix: recordings found before the server URL and token were
+ * entered are parked, and this is what unparks them on the next app start even
+ * if the owner never touches the Settings screen again.
+ *
  * Uploads oldest first, which is what the owner expects when a week offline
  * suddenly drains.
  */
@@ -22,9 +27,9 @@ class DrainWorker(
     override suspend fun doWork(): Result {
         Graph.init(applicationContext)
         return try {
-            val pending = Graph.repository.pendingRows(500)
-            for (row in pending) Graph.repository.scheduleUpload(row.sha256)
-            Logx.i("Drain re-armed ${pending.size} pending upload(s)")
+            val rows = Graph.repository.retryableRows(500)
+            for (row in rows) Graph.repository.scheduleUpload(row.sha256)
+            Logx.i("Drain re-armed ${rows.size} upload(s)")
             Result.success()
         } catch (t: Throwable) {
             Logx.e("Drain failed", t)

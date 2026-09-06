@@ -30,7 +30,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -69,6 +69,23 @@ UPLOAD_TEMP_SUFFIX = ".part"
 # uvicorn does not, there is no reverse proxy, and Content-Length is whatever
 # the client claims — so the handler counts the bytes itself.
 RECORDING_UPLOAD_MAX_BYTES = 200 * 1024 * 1024
+
+# The longest a phone call is allowed to claim to be. It bounds the duration
+# the phone reports, which is what transcription usage is billed against, so an
+# unbounded value would corrupt the owner's only view of what MIYA costs.
+MAX_CALL_SECONDS = 6 * 3600
+
+# How long a `.part` file may sit untouched before the sweep decides the
+# request that was writing it will never come back. A 200 MB upload over a bad
+# 3G link takes minutes, not an hour.
+STALE_UPLOAD_SECONDS = 3600
+
+# How far apart two recordings sharing a call_id may be before we stop
+# believing they are the same call. Android's CallLog._ID restarts from 1 when
+# the user clears the call log's storage, so a call_id can be reused by a
+# genuinely different call months later — and answering "duplicate" to that
+# makes the phone delete a recording the server never saw.
+CALL_ID_AGREEMENT_MINUTES = 10
 
 # What Android's CallLog.Calls.TYPE means to us. Anything else (missed,
 # rejected, voicemail) is a call with no conversation in it, so `na` is honest.
@@ -170,10 +187,20 @@ def staged_upload_paths(
     """Where an uploaded recording and its sidecar belong.
 
     Deterministic in the upload's own content, so a phone that retries after a
-    lost response writes the identical name instead of a second copy. The
-    client's filename never reaches the path — only its suffix does.
+    lost response writes the identical name instead of a second copy. That
+    makes `started_at` load-bearing: it must be the client's own value, never
+    a server-side `now()`, or a handset with a wrong clock — the one case the
+    correction exists for — would land on a new filename every single retry
+    and stage a fresh copy of the same call each time. The corrected start
+    belongs in the sidecar, which is what the sweep reads anyway.
+
+    The client's filename never reaches the path — only its suffix does.
     """
-    stem = f"{started_at.strftime('%Y%m%d-%H%M%S')}-{sha256[:12]}"
+    stem = (
+        f"{started_at.year:04d}{started_at.month:02d}{started_at.day:02d}"
+        f"-{started_at.hour:02d}{started_at.minute:02d}{started_at.second:02d}"
+        f"-{sha256[:12]}"
+    )
     audio = directory / f"{stem}{suffix}"
     return audio, sidecar_path(audio)
 
@@ -188,9 +215,17 @@ def read_sidecar(audio: Path) -> ParsedRecording | None:
     path = sidecar_path(audio)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError):
+        # Loud, because the fallback is bad: without the sidecar the direction,
+        # duration, locale and the person link are all lost, and a staged
+        # filename parses into a hash prefix that would reach the extractor as
+        # the counterparty's name.
+        log.warning("unreadable sidecar %s; falling back to the filename", path.name)
         return None
     if not isinstance(raw, dict):
+        log.warning("sidecar %s is not an object; falling back", path.name)
         return None
 
     parsed = ParsedRecording(
@@ -207,7 +242,10 @@ def read_sidecar(audio: Path) -> ParsedRecording | None:
         except ValueError:
             parsed.recorded_at = None
     duration = raw.get("duration_seconds")
-    if isinstance(duration, int | float) and duration > 0:
+    # Clamped again here, not only at the API edge: this value bills the
+    # transcription, and a sidecar written by an older server (or by hand)
+    # never went through the edge's validation.
+    if isinstance(duration, int | float) and 0 < duration <= MAX_CALL_SECONDS:
         parsed.duration_seconds = int(duration)
     return parsed
 
@@ -235,16 +273,30 @@ def is_ready_recording(path: Path, *, now: float | None = None) -> bool:
     return (now - stat.st_mtime) >= MIN_FILE_AGE_SECONDS
 
 
-async def already_ingested(
-    session: AsyncSession, sha256: str, *, call_id: str | None = None
-) -> bool:
-    """Have we ingested this recording before, under any name?
+async def find_ingested(
+    session: AsyncSession,
+    sha256: str,
+    *,
+    call_id: str | None = None,
+    occurred_at: datetime | None = None,
+) -> int | None:
+    """The interaction that already holds this recording, or None.
 
     Two independent keys, checked as two statements rather than one OR so the
     sweep's hot path keeps using ix_interactions_media_sha256: the hash is
     what the once-a-minute scan asks about, and it is index-backed. The
-    call_id is the stronger key — it survives a re-encode, which the hash does
-    not — but only an uploader knows one, so it costs a query only there.
+    call_id is the second key — it survives a re-encode, which the hash does
+    not — but it is a phone-local counter, not a fingerprint, so it is only
+    believed when the two recordings also agree about *when* the call was.
+
+    That agreement matters because of what a "duplicate" verdict costs: the
+    uploader answers 200 and the companion app then marks the row done and may
+    delete the source file from the phone. Android's `CallLog._ID` restarts at
+    1 when the call log's storage is cleared while the companion's device id
+    survives (they are different apps), so without the time check the first
+    call after a call-log wipe would be declared a duplicate of a months-old
+    one and destroyed. With no time to compare against, the caller is trading
+    nothing irreversible, and the bare call_id still applies.
     """
     found = await session.scalar(
         sa.select(Interaction.id)
@@ -253,16 +305,60 @@ async def already_ingested(
         .limit(1)
     )
     if found is not None:
-        return True
+        return found
     if not call_id:
-        return False
-    found = await session.scalar(
+        return None
+    stmt = (
         sa.select(Interaction.id)
         .where(Interaction.source == InteractionSource.phone_call)
         .where(Interaction.media["call_id"].astext == call_id)
-        .limit(1)
     )
-    return found is not None
+    if occurred_at is not None:
+        window = timedelta(minutes=CALL_ID_AGREEMENT_MINUTES)
+        stmt = stmt.where(
+            Interaction.occurred_at.between(occurred_at - window, occurred_at + window)
+        )
+    return await session.scalar(stmt.limit(1))
+
+
+async def already_ingested(
+    session: AsyncSession,
+    sha256: str,
+    *,
+    call_id: str | None = None,
+    occurred_at: datetime | None = None,
+) -> bool:
+    """Have we ingested this recording before, under any name?"""
+    return (
+        await find_ingested(session, sha256, call_id=call_id, occurred_at=occurred_at)
+        is not None
+    )
+
+
+async def remember_duplicate_path(
+    session: AsyncSession, interaction_id: int, path: Path
+) -> None:
+    """Note that `path` is another copy of a recording we already ingested.
+
+    A copy the database does not know about is a copy nothing can manage:
+    `scan_directory` re-hashes it on every sweep forever, `purge_old_audio`
+    refuses to delete a file no interaction claims, and an /unut of that person
+    would leave it behind. Recording it under the interaction that owns the
+    conversation puts it back under all three.
+    """
+    interaction = await session.get(Interaction, interaction_id)
+    if interaction is None:
+        return
+    media = dict(interaction.media or {})
+    known = list(media.get("duplicate_paths") or [])
+    target = str(path)
+    if target == media.get("path") or target == media.get("audio_path"):
+        return
+    if target in known:
+        return
+    known.append(target)
+    media["duplicate_paths"] = known
+    interaction.media = media
 
 
 def _context_line(parsed: ParsedRecording) -> str | None:
@@ -302,8 +398,12 @@ async def ingest_recording(
     if parsed is None:
         parsed = parse_filename(path)
 
-    if await already_ingested(session, sha256, call_id=parsed.call_id):
+    existing = await find_ingested(
+        session, sha256, call_id=parsed.call_id, occurred_at=parsed.recorded_at
+    )
+    if existing is not None:
         log.debug("skipping already-ingested recording %s", path.name)
+        await remember_duplicate_path(session, existing, path)
         return None
 
     mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=settings.tz)
@@ -381,6 +481,8 @@ async def scan_directory(
         log.debug("call recordings directory %s does not exist yet", directory)
         return []
 
+    await asyncio.to_thread(sweep_stale_uploads, directory)
+
     # One query, not one hash per file per sweep: the phone pushes recordings
     # in continuously and hashing every settled file in a growing folder once a
     # minute is unbounded disk I/O. A path already in the database is already
@@ -400,14 +502,44 @@ async def scan_directory(
             log.exception("failed to ingest recording %s", path)
             await session.rollback()
             continue
+        # Each recording is its own unit of work, and each Scribe call costs
+        # money: commit per file so a crash later in the sweep (or in the
+        # caller) can never roll back a transcription already paid for. Covers
+        # the needs_review row of a failed file, and the duplicate-path note
+        # that a None result may have left pending.
+        await session.commit()
         if result is not None:
-            # Each recording is its own unit of work, and each Scribe call
-            # costs money: commit per file so a crash later in the sweep (or
-            # in the caller) can never roll back a transcription already paid
-            # for. Covers the needs_review row of a failed file too.
-            await session.commit()
             results.append(result)
     return results
+
+
+def sweep_stale_uploads(
+    directory: Path, *, now: float | None = None, older_than: int = STALE_UPLOAD_SECONDS
+) -> int:
+    """Unlink `.part` files nobody is writing any more. Returns how many.
+
+    A process killed mid-upload leaves its staging file behind, up to
+    RECORDING_UPLOAD_MAX_BYTES of it. Nothing else would ever remove it: the
+    sweep skips `.part`, and so does retention, because it is not an audio
+    suffix. So the sweep that skips them is the right place to reap them.
+    """
+    now = now if now is not None else time.time()
+    removed = 0
+    for path in directory.rglob(f"*{UPLOAD_TEMP_SUFFIX}"):
+        if not path.is_file():
+            continue
+        try:
+            if now - path.stat().st_mtime < older_than:
+                continue
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            log.warning("could not remove abandoned upload %s", path)
+    if removed:
+        log.info("removed %d abandoned upload file(s)", removed)
+    return removed
 
 
 async def protected_audio_paths(session: AsyncSession) -> set[str]:
@@ -417,16 +549,25 @@ async def protected_audio_paths(session: AsyncSession) -> set[str]:
     never processed must survive retention — deleting it would destroy raw
     input the owner has not seen yet, which the spec forbids.
     """
+    unprocessed = sa.or_(
+        Interaction.needs_review.is_(True),
+        Interaction.processed.is_(False),
+    )
     rows = await session.scalars(
         sa.select(Interaction.media["path"].astext).where(
-            Interaction.media["path"].astext.isnot(None),
-            sa.or_(
-                Interaction.needs_review.is_(True),
-                Interaction.processed.is_(False),
-            ),
+            Interaction.media["path"].astext.isnot(None), unprocessed
         )
     )
-    return {p for p in rows if p}
+    paths = {p for p in rows if p}
+    extra = await session.scalars(_duplicate_paths_stmt().where(unprocessed))
+    return paths | {p for p in extra if p}
+
+
+def _duplicate_paths_stmt() -> sa.Select:
+    """Every path recorded as a second copy of an already-ingested recording."""
+    return sa.select(
+        sa.func.jsonb_array_elements_text(Interaction.media["duplicate_paths"])
+    ).where(Interaction.media["duplicate_paths"].isnot(None))
 
 
 async def _ingested_audio_paths(session: AsyncSession) -> set[str]:
@@ -437,7 +578,12 @@ async def _ingested_audio_paths(session: AsyncSession) -> set[str]:
             Interaction.media["audio_path"].astext,
         ).where(Interaction.media.isnot(None))
     )
-    return {p for row in rows for p in row if p}
+    paths = {p for row in rows for p in row if p}
+    # Second copies of a recording we already have. They belong here for both
+    # of this set's readers: the sweep must not re-hash them every minute, and
+    # retention must be allowed to delete them.
+    extra = await session.scalars(_duplicate_paths_stmt())
+    return paths | {p for p in extra if p}
 
 
 async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None) -> int:
@@ -466,6 +612,10 @@ async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None)
             try:
                 if path.stat().st_mtime < cutoff:
                     path.unlink()
+                    # The sidecar names the counterparty and holds their phone
+                    # number. Retaining it past the audio it describes would
+                    # keep exactly the part retention exists to drop.
+                    sidecar_path(path).unlink(missing_ok=True)
                     deleted += 1
             except OSError:
                 log.warning("could not delete expired audio %s", path)

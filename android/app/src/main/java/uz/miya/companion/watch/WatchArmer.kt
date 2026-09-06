@@ -2,7 +2,9 @@ package uz.miya.companion.watch
 
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -11,6 +13,7 @@ import uz.miya.companion.discover.MediaStoreQuery
 import uz.miya.companion.discover.OemCandidates
 import uz.miya.companion.service.IngestService
 import uz.miya.companion.util.Logx
+import uz.miya.companion.util.StorageAccess
 import uz.miya.companion.work.Scheduling
 import java.io.File
 
@@ -94,6 +97,16 @@ class WatchArmer(
         }
     }
 
+    /**
+     * @Synchronized because `rearm()` launches into a shared scope and is
+     * called concurrently from three different threads: the telephony
+     * executor (`onCallEnded`), the FileObserver thread (the ancestor
+     * callback), and the main thread (`runProbe` / `onFolderPicked`). Two
+     * overlapping runs could have one call `stopObservers()` on the instance
+     * the other had just registered, leaving `fileObserver` non-null but not
+     * watching — precisely the silent death this class exists to prevent.
+     */
+    @Synchronized
     private fun armFileObservers(relativePaths: List<String>) {
         val root = try {
             Environment.getExternalStorageDirectory()
@@ -102,19 +115,35 @@ class WatchArmer(
             return
         }
 
+        // inotify needs real read access to the path. Under scoped storage
+        // File.isDirectory() returns false for /sdcard/Recordings/Call even on
+        // a phone that records there perfectly well, and a watch on a path we
+        // cannot read delivers nothing — so on a normal install `targets` is
+        // empty and the ancestor branch is all that could run. Registering
+        // that branch anyway used to walk up to the first "existing"
+        // directory, which is the external storage ROOT, and then fired a
+        // burst scan plus a full re-arm for every screenshot and download.
+        val canWatch = StorageAccess.allFiles()
+
         val targets = LinkedHashSet<File>()
         val ancestors = LinkedHashSet<File>()
 
-        for (relative in relativePaths) {
-            val dir = File(root, relative.trim('/'))
-            if (dir.isDirectory) {
-                targets.add(dir)
-            } else {
-                // Watch the nearest EXISTING ancestor for the child appearing.
-                var parent: File? = dir.parentFile
-                while (parent != null && !parent.isDirectory) parent = parent.parentFile
-                if (parent != null && parent.absolutePath.startsWith(root.absolutePath)) {
-                    ancestors.add(parent)
+        if (canWatch) {
+            for (relative in relativePaths) {
+                val dir = File(root, relative.trim('/'))
+                if (dir.isDirectory) {
+                    targets.add(dir)
+                } else {
+                    // Watch the nearest EXISTING ancestor for the child
+                    // appearing — but never the storage root itself.
+                    var parent: File? = dir.parentFile
+                    while (parent != null && !parent.isDirectory) parent = parent.parentFile
+                    if (parent != null &&
+                        parent.absolutePath.startsWith(root.absolutePath) &&
+                        parent.absolutePath != root.absolutePath
+                    ) {
+                        ancestors.add(parent)
+                    }
                 }
             }
         }
@@ -126,7 +155,7 @@ class WatchArmer(
                 targets.toList(),
                 RecordingFileObserver.MASK_FILES,
             ) { _, path ->
-                Logx.d("FileObserver: finished write $path")
+                Logx.d("FileObserver: finished write ${Logx.redactName(path)}")
                 Scheduling.enqueueBurstScan(context)
             }.also { runCatching { it.startWatching() } }
         }
@@ -136,14 +165,21 @@ class WatchArmer(
                 ancestors.toList(),
                 RecordingFileObserver.MASK_DIRS,
             ) { _, path ->
-                Logx.d("FileObserver: new entry $path in ancestor; re-arming")
+                Logx.d("FileObserver: new entry ${Logx.redactName(path)} in ancestor; re-arming")
                 Scheduling.enqueueBurstScan(context)
                 rearm()
             }.also { runCatching { it.startWatching() } }
         }
 
         watchedDirs = targets.map { it.absolutePath }
-        Logx.i("Armed on ${targets.size} folder(s), ${ancestors.size} ancestor(s)")
+        if (!canWatch) {
+            Logx.i(
+                "inotify unavailable without All files access; relying on call-end, " +
+                    "MediaStore and the 15-minute sweep"
+            )
+        } else {
+            Logx.i("Armed on ${targets.size} folder(s), ${ancestors.size} ancestor(s)")
+        }
     }
 
     private fun stopObservers() {
@@ -163,6 +199,21 @@ class WatchArmer(
     fun onCallEnded() {
         // Re-arm first: the folder may have just been created by this very call.
         rearm()
+
+        // Do not even attempt the foreground start when the platform is known
+        // to refuse it. From Android 12 a background FGS start needs an
+        // enumerated exemption, and the battery-optimisation exemption is the
+        // one this app asks for; without it the start is refused — and because
+        // startForegroundService() was already called, several OEM builds
+        // still deliver the RemoteServiceException ("did not then call
+        // Service.startForeground()") for the five-second window even though
+        // the service stopped itself. WorkManager is the correct path there.
+        if (!canStartForegroundFromBackground()) {
+            Logx.d("Not exempt from battery optimisation; call-end burst goes to WorkManager")
+            Scheduling.enqueueBurstScan(context)
+            return
+        }
+
         try {
             ContextCompat.startForegroundService(
                 context,
@@ -174,6 +225,16 @@ class WatchArmer(
             // IllegalStateException; SecurityException is also possible.
             Logx.w("Foreground burst refused (${t.javaClass.simpleName}); using WorkManager")
             Scheduling.enqueueBurstScan(context)
+        }
+    }
+
+    private fun canStartForegroundFromBackground(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        val pm = context.getSystemService(PowerManager::class.java) ?: return false
+        return try {
+            pm.isIgnoringBatteryOptimizations(context.packageName)
+        } catch (t: Throwable) {
+            false
         }
     }
 

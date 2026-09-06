@@ -10,3 +10,14 @@ captures/
 *.apk
 *.keystore
 *.jks
+
+# The repository root .gitignore has a bare `data/` rule for the server's data
+# volume. A bare directory pattern matches at EVERY level, so it also swallowed
+# `app/src/main/java/uz/miya/companion/data/` — the whole Room/DataStore layer
+# (Prefs, TokenStore, UploadEntity, UploadDao, RecordingRepository,
+# RecordingRef). Those files were untracked, so a fresh clone did not contain
+# the app's queue at all and could not compile. Re-include the directory here:
+# a deeper .gitignore wins over a shallower one, and the directory has to be
+# re-included before anything inside it can be.
+!app/src/main/java/uz/miya/companion/data/
+!app/src/main/java/uz/miya/companion/data/**

@@ -9,6 +9,7 @@ import uz.miya.companion.Graph
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.Notifications
 import uz.miya.companion.util.TimeFmt
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * The reconciliation sweep. It catches whatever the observers missed — and on
@@ -37,6 +38,14 @@ class ScanWorker(
             )
             checkForSilence()
             Result.success()
+        } catch (c: CancellationException) {
+            // WorkManager stopping the worker (10-minute ceiling, constraint
+            // lost, cancelled by REPLACE) cancels this coroutine. Swallowing it
+            // and then calling a suspend Prefs setter in an already-cancelled
+            // scope throws a SECOND CancellationException that escapes as a
+            // hard failure. Cancellation is not an error: rethrow it and let
+            // WorkManager reschedule.
+            throw c
         } catch (t: Throwable) {
             Logx.e("Scan failed", t)
             Graph.prefs.setLastError("Scan failed: ${t.message}")
@@ -61,13 +70,28 @@ class ScanWorker(
         if (last > 0L && quietFor < DAY_MILLIS) return
         if (last == 0L && System.currentTimeMillis() - pending.first().createdAt < DAY_MILLIS) return
 
-        Notifications.alert(
-            applicationContext,
-            Notifications.ID_STALLED,
-            "MIYA has stopped uploading",
-            "Nothing has been accepted since ${TimeFmt.human(last)}. " +
-                "Open MIYA and check the Health screen.",
-        )
+        // "Nothing has been accepted since never" is what TimeFmt.human(0)
+        // produced, in the single most important failure case there is — the
+        // app has never worked at all — and it read as a bug in the alert
+        // rather than as a report about the queue.
+        val oldest = pending.first().createdAt
+        if (last == 0L) {
+            Notifications.alert(
+                applicationContext,
+                Notifications.ID_STALLED,
+                "MIYA has never uploaded anything",
+                "The oldest recording has been waiting since ${TimeFmt.human(oldest)}. " +
+                    "Open MIYA — the Health screen names the failing step.",
+            )
+        } else {
+            Notifications.alert(
+                applicationContext,
+                Notifications.ID_STALLED,
+                "MIYA has stopped uploading",
+                "Nothing has been accepted since ${TimeFmt.human(last)}. " +
+                    "Open MIYA and check the Health screen.",
+            )
+        }
     }
 
     private companion object {
