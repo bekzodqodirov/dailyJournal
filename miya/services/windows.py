@@ -65,7 +65,14 @@ def _speaker(interaction: Interaction, names: dict[int, str]) -> str:
     if interaction.direction is Direction.out:
         return "ME"
     name = names.get(interaction.person_id or -1)
-    return f"THEM ({name})" if name else "THEM"
+    speaker = f"THEM ({name})" if name else "THEM"
+    # In a busy group most messages are between other people. Marking the ones
+    # aimed at the owner lets the extractor tell "someone promised something"
+    # from "someone promised something to me", which is the whole difference
+    # between a fact about a stranger and a debt he is owed.
+    if (interaction.meta or {}).get("to_me"):
+        speaker += " → ME"
+    return speaker
 
 
 def render_window(interactions: list[Interaction], names: dict[int, str]) -> str:

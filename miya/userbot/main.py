@@ -398,7 +398,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             text=text,
             occurred_at=message.date.astimezone(settings.tz),
             media=media,
-            meta={"tg_message_id": message.id},
+            meta=_message_meta(message, monitor),
         )
         interaction_id = interaction.id
         if media is None or plan.ask:
@@ -415,6 +415,28 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             return True
         await persist_media(session, interaction, outcome)
     return True
+
+
+def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
+    """Was this message aimed at the owner rather than at the room?
+
+    Only meaningful in a group: in a private chat every message is addressed
+    to him, so the flag would mark everything and distinguish nothing.
+
+    Telethon sets `mentioned` for both an @-mention and a reply to one of the
+    owner's own messages, which is exactly the question being asked — the two
+    are the same act from where he is sitting.
+    """
+    if chat_type is ChatType.private:
+        return False
+    return bool(getattr(message, "mentioned", False))
+
+
+def _message_meta(message: object, monitor: ChatMonitor) -> dict:
+    meta = {"tg_message_id": message.id}
+    if addressed_to_owner(message, monitor.chat_type):
+        meta["to_me"] = True
+    return meta
 
 
 # --- approved media ----------------------------------------------------------

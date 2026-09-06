@@ -16,6 +16,7 @@ from miya.bot.formatting import (
     short_date,
     usd,
 )
+from miya.config import settings
 from miya.db.enums import DebtDirection, PromiseMadeBy
 from miya.services.persistence import Applied
 from miya.services.queries import DaySummary, DebtBalance, PersonSummary
@@ -57,6 +58,8 @@ raqamlar bilan javob beraman.
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
 /unut — ma'lumotni butunlay o'chirish
+/menga — guruhlarda menga yozilganlar
+/guruhlar — guruhlarda nima gaplashildi
 /tekshir — qayta ishlanmagan yozuvlar
 /qayta — ularni qaytadan ajratishga urinish
 /yordam — shu ro'yxat
@@ -157,6 +160,48 @@ def media_question(*, who: str | None, media: dict, reason: str) -> str:
         parts.append(f"<i>{escape(caption[:200])}</i>")
     parts.append("O'qiyminmi?")
     return "\n".join(parts)
+
+
+TO_ME_EMPTY = "📭 Bugun guruhlarda sizga to'g'ridan-to'g'ri yozilmadi."
+CHATS_QUIET = "🤫 Bugun kuzatilayotgan chatlarda harakat bo'lmadi."
+
+
+def _line_of(interaction, limit: int = 160) -> str:
+    body = (interaction.raw_text or interaction.transcript or "").strip()
+    if not body:
+        body = f"[{(interaction.media or {}).get('type') or 'media'}]"
+    return escape(body[:limit])
+
+
+def to_me_report(interactions: list, titles: dict[int, str]) -> str:
+    """`/menga`: what was aimed at the owner in a group today."""
+    if not interactions:
+        return TO_ME_EMPTY
+    lines = [f"📨 <b>Sizga {len(interactions)} ta murojaat</b>"]
+    for interaction in interactions:
+        where = escape(titles.get(interaction.tg_chat_id or 0, "guruh"))
+        when = interaction.occurred_at.astimezone(settings.tz).strftime("%H:%M")
+        lines.append(f"• {when} · <b>{where}</b> — {_line_of(interaction)}")
+    return "\n".join(lines)
+
+
+def chat_digest_report(digests: list) -> str:
+    """`/guruhlar`: one line of subject matter per chat, busiest first."""
+    if not digests:
+        return CHATS_QUIET
+    lines = ["💬 <b>Bugun chatlarda</b>"]
+    for digest in digests:
+        head = f"\n<b>{escape(digest.title)}</b> · {digest.messages} ta xabar"
+        if digest.to_me:
+            head += f" · 📨 {len(digest.to_me)} ta sizga"
+        lines.append(head)
+        for summary in digest.summaries[:3]:
+            lines.append(f"• {escape(summary)}")
+        if not digest.summaries:
+            # A window only closes after the chat goes quiet, so an active
+            # conversation legitimately has nothing summarised yet.
+            lines.append("<i>• hali umumlashtirilmadi</i>")
+    return "\n".join(lines)
 
 
 def person_not_found(name: str) -> str:

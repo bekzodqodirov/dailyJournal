@@ -155,6 +155,30 @@ async def cmd_today(message: Message) -> None:
     await _safe_answer(message, replies.day_report(summary))
 
 
+@router.message(Command("menga"))
+async def cmd_to_me(message: Message) -> None:
+    """Group traffic aimed at the owner, separated from the room's noise."""
+    async with session_scope() as session:
+        addressed = await queries.messages_to_me(session)
+        titles = dict(
+            (
+                await session.execute(
+                    sa.select(ChatMonitor.tg_chat_id, ChatMonitor.title)
+                )
+            ).all()
+        )
+        body = replies.to_me_report(addressed, titles)
+    await _safe_answer(message, body)
+
+
+@router.message(Command("guruhlar"))
+async def cmd_chat_digests(message: Message) -> None:
+    """What each monitored chat was actually about today."""
+    async with session_scope() as session:
+        body = replies.chat_digest_report(await queries.chat_digests(session))
+    await _safe_answer(message, body)
+
+
 @router.message(Command("tekshir"))
 async def cmd_review(message: Message) -> None:
     async with session_scope() as session:

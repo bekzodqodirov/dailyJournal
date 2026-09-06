@@ -30,7 +30,9 @@ Rules:
 - Dates: resolve relative dates ("ertaga", "завтра", "indinga", "next Monday")
   against CURRENT_DATE. Output ISO. Unknown → null.
 - In conversation windows, messages are labeled [ME] and [THEM (name)]. Attribute
-  statements to the correct party.
+  statements to the correct party. "[THEM (name) → ME]" means that message was
+  addressed to the owner directly (a mention or a reply to him) — in a group,
+  treat only those as commitments involving him; the rest is context.
 - Only extract what is present. Empty arrays are fine. Do NOT invent.
 - Keep person names as written; do not merge or guess IDs.
 - "facts" = durable info (preferences, relationships, recurring context), not trivia.
