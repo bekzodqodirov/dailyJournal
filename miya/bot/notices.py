@@ -38,6 +38,7 @@ COUNT_LABEL = {
     "transactions": "pul harakati",
     "events": "uchrashuv",
     "tasks": "vazifa",
+    "claims": "da'vo",
 }
 
 
@@ -49,7 +50,8 @@ def counts_of(applied: Applied) -> dict[str, int]:
     are counted apart so the summary says one is waiting. Every field that
     makes ``Applied.is_empty()`` false is counted here — a window that only
     closed a promise is a receipt, and must not be summarised as one with no
-    counts.
+    counts. A counterparty's claim is a question too, but its own kind: the
+    summary says how many are waiting for a word, not that money moved.
     """
     counts = {
         "debts": len(applied.debts),
@@ -61,6 +63,7 @@ def counts_of(applied: Applied) -> dict[str, int]:
         "transactions": len(applied.transactions),
         "events": len(applied.events),
         "tasks": len(applied.tasks),
+        "claims": len(applied.claims),
     }
     return {kind: n for kind, n in counts.items() if n}
 

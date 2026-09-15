@@ -27,7 +27,10 @@ Nothing is *written* silently either. Every applied window comes back as an
 about (a debt, a settlement, a promise, a transaction, an event, a task) is
 queued as a notice on the window's interaction until the worker has told him
 where it came from. The owner decided nothing lands from a chat without him
-being told; facts-only windows are not worth a ping.
+being told; facts-only windows are not worth a ping. And what a counterparty
+asserts — "you owe me", "I paid you back" — is not written at all until he
+says so (build step 3): it lands in ``Applied.claims`` as a question, the same
+receipt asks it, and the worker asks on its own when no receipt does.
 """
 
 from __future__ import annotations
@@ -235,7 +238,10 @@ async def _people_named(
     ids += [p.person_id for p in applied.promises]
     ids += [t.counterparty_person_id for t in applied.transactions]
     ids += [person.id for person, _ in applied.settlements]
-    if not any(ids) and window.person_id:
+    # A claim has no row yet, only the name as the counterparty gave it; the
+    # receipt still has to say whose word the question rests on.
+    claimed = [claim.person_name for claim in applied.claims if claim.person_name]
+    if not any(ids) and not claimed and window.person_id:
         ids.append(window.person_id)
     wanted = [i for i in dict.fromkeys(ids) if i]
     names: dict[int, str] = {}
@@ -248,6 +254,7 @@ async def _people_named(
     # Settlements that matched nothing carry the name, not the row.
     ordered += [name for name, _, _ in applied.unmatched_settlements]
     ordered += [name for name, _, _ in applied.ambiguous_settlements]
+    ordered += claimed
     return list(dict.fromkeys(ordered))
 
 

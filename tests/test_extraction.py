@@ -91,8 +91,8 @@ def test_defaults_match_the_spec_schema():
 # --- who asserted a money item ----------------------------------------------
 #
 # "You owe me 5 mln" typed by a supplier used to come back indistinguishable
-# from the owner typing it himself. The extractor now says who said it; the
-# persistence layer ignores the field until the ask-before-writing gate lands.
+# from the owner typing it himself. The extractor says who said it, and the
+# persistence layer parks a "them" as a claim to ask about (tests/test_claims.py).
 
 
 def test_counterparty_claims_come_back_marked_as_theirs():

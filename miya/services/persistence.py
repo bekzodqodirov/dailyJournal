@@ -23,6 +23,7 @@ from miya.db.enums import (
     TransactionType,
 )
 from miya.db.models import (
+    Claim,
     Debt,
     DebtPayment,
     Event,
@@ -33,9 +34,17 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import records
-from miya.services.extraction import ExtractionResult, to_money
-from miya.services.people import normalise, resolve_person
+from miya.services import claims, records
+from miya.services.extraction import (
+    ExtractedDebt,
+    ExtractedFulfilment,
+    ExtractedPromise,
+    ExtractedSettlement,
+    ExtractedTransaction,
+    ExtractionResult,
+    to_money,
+)
+from miya.services.people import MATCH_THRESHOLD, best_match, normalise, resolve_person
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +71,9 @@ class Applied:
     fulfilled: list[tuple[Promise, Person]] = field(default_factory=list)
     unmatched_fulfilments: list[tuple[str, str]] = field(default_factory=list)
     facts: int = 0
+    # What a counterparty asserted: parked as a question, not written (build
+    # step 3, docs/owner-decisions.md "Counterparty claims").
+    claims: list[Claim] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         return not any(
@@ -76,6 +88,7 @@ class Applied:
                 self.tasks,
                 self.fulfilled,
                 self.unmatched_fulfilments,
+                self.claims,
             )
         )
 
@@ -240,10 +253,258 @@ async def _apply_settlement(
         applied.unmatched_settlements.append((person.display_name, remaining, currency))
 
 
+# --- one writer per kind -----------------------------------------------------
+#
+# Each writer does for one item exactly what the extraction loop always did:
+# validates it, resolves the person, writes the row and reports it in
+# ``applied``. ``apply_extraction`` calls them for what the owner asserted;
+# ``claims.accept`` calls the same writer once the owner has said "Ha" to
+# what a counterparty asserted, so an accepted claim lands as the very row
+# the extraction would have written — plus one history entry naming the
+# claim, and the claim learns which row it became.
+
+
+def _claim_note(record: Debt | Promise, claim: Claim, now: datetime) -> None:
+    """The history entry an accepted claim leaves on the row it produced."""
+    # A fresh list, not .append(): the ORM only sees JSONB reassignment.
+    record.history = [
+        *(record.history or []),
+        {
+            "at": now.isoformat(),
+            "field": "claim",
+            "old": None,
+            "new": claims.ref(claim.id),
+            "by": claim.answered_by,
+            "asserted_by": "them",
+        },
+    ]
+
+
+def _claim_result(claim: Claim | None, kind: str, row_id: int | None) -> None:
+    if claim is not None:
+        claim.result_kind = kind
+        claim.result_id = row_id
+
+
+async def write_debt(
+    session: AsyncSession,
+    interaction: Interaction,
+    item: ExtractedDebt,
+    applied: Applied,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+) -> Debt | None:
+    amount = to_money(item.amount)
+    if amount is None:
+        log.warning("dropping debt with non-positive amount: %r", item.amount)
+        return None
+    person = await resolve_person(session, item.person)
+    if person is None:
+        return None
+    debt = Debt(
+        direction=DebtDirection(item.direction),
+        person_id=person.id,
+        amount=amount,
+        currency=Currency(item.currency),
+        reason=item.reason or None,
+        due_date=item.due,
+        source_interaction_id=interaction.id,
+    )
+    session.add(debt)
+    if claim is not None:
+        await session.flush()
+        _claim_note(debt, claim, now)
+        claim.person_id = person.id
+        _claim_result(claim, "debt", debt.id)
+    applied.debts.append(debt)
+    return debt
+
+
+async def write_settlement(
+    session: AsyncSession,
+    interaction: Interaction,
+    item: ExtractedSettlement,
+    applied: Applied,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+) -> None:
+    amount = to_money(item.amount)
+    if amount is None:
+        return
+    person = await resolve_person(session, item.person)
+    if person is None:
+        return
+    before = len(applied.settlements)
+    await _apply_settlement(
+        session,
+        person,
+        amount,
+        Currency(item.currency),
+        item.note,
+        applied,
+        DebtDirection(item.direction) if item.direction else None,
+    )
+    if claim is not None:
+        claim.person_id = person.id
+        # The first payment this settlement wrote; an unmatched or ambiguous
+        # repayment wrote none and stays a question in ``applied``.
+        if len(applied.settlements) > before:
+            await session.flush()
+            _claim_result(claim, "payment", applied.settlements[before][1].id)
+
+
+async def write_transaction(
+    session: AsyncSession,
+    interaction: Interaction,
+    item: ExtractedTransaction,
+    applied: Applied,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+) -> Transaction | None:
+    amount = to_money(item.amount)
+    if amount is None:
+        return None
+    counterparty = (
+        await resolve_person(session, item.counterparty) if item.counterparty else None
+    )
+    txn = Transaction(
+        type=TransactionType(item.type),
+        amount=amount,
+        currency=Currency(item.currency),
+        category=item.category or "other",
+        description=item.description or None,
+        counterparty_person_id=counterparty.id if counterparty else None,
+        occurred_at=interaction.occurred_at or now,
+        source_interaction_id=interaction.id,
+    )
+    session.add(txn)
+    if claim is not None:
+        await session.flush()
+        claim.person_id = counterparty.id if counterparty else None
+        _claim_result(claim, "transaction", txn.id)
+    applied.transactions.append(txn)
+    return txn
+
+
+async def write_promise(
+    session: AsyncSession,
+    interaction: Interaction,
+    item: ExtractedPromise,
+    applied: Applied,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+) -> Promise | None:
+    person = await resolve_person(session, item.person)
+    if person is None or not item.description.strip():
+        return None
+    promise = Promise(
+        made_by=PromiseMadeBy(item.made_by),
+        person_id=person.id,
+        description=item.description.strip(),
+        due_date=item.due,
+        source_interaction_id=interaction.id,
+    )
+    session.add(promise)
+    if claim is not None:
+        await session.flush()
+        _claim_note(promise, claim, now)
+        claim.person_id = person.id
+        _claim_result(claim, "promise", promise.id)
+    applied.promises.append(promise)
+    return promise
+
+
+async def write_fulfilment(
+    session: AsyncSession,
+    interaction: Interaction,
+    item: ExtractedFulfilment,
+    applied: Applied,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+) -> None:
+    if not item.description.strip():
+        return
+    # Never creates a person: a fulfilment names someone who already has
+    # a promise on the books, or it matches nothing either way.
+    person = await resolve_person(session, item.person, create=False)
+    if person is None:
+        applied.unmatched_fulfilments.append((item.person, item.description))
+        return
+    before = len(applied.fulfilled)
+    await _apply_fulfilment(
+        session,
+        person,
+        item.description.strip(),
+        PromiseMadeBy(item.made_by),
+        applied,
+        now=now,
+    )
+    if claim is not None:
+        claim.person_id = person.id
+        if len(applied.fulfilled) > before:
+            promise = applied.fulfilled[before][0]
+            _claim_note(promise, claim, now)
+            _claim_result(claim, "fulfilment", promise.id)
+
+
+# --- the gate ----------------------------------------------------------------
+
+
+async def _known_person_id(
+    session: AsyncSession, interaction: Interaction, name: str
+) -> int | None:
+    """The interaction's person, when the extractor's name is clearly them.
+
+    A window from a private chat already knows who the other side is; a
+    claim that names that same person can carry the id from the start, and
+    the surface can show it as such. Any other name waits for the accept.
+    """
+    if not interaction.person_id or not name.strip():
+        return None
+    person = await session.get(Person, interaction.person_id)
+    if person is None:
+        return None
+    _, score = best_match(name, [person])
+    return person.id if score >= MATCH_THRESHOLD else None
+
+
+async def _gate(
+    session: AsyncSession,
+    interaction: Interaction,
+    kind: str,
+    item,
+    applied: Applied,
+    *,
+    now: datetime,
+) -> bool:
+    """Park a counterparty's assertion as a claim. True when it was one."""
+    if not claims.is_claim(kind, item):
+        return False
+    name = getattr(item, "person", None) or getattr(item, "counterparty", None) or ""
+    person_id = await _known_person_id(session, interaction, name)
+    claim = await claims.create(
+        session, interaction, kind, item, person_id=person_id, now=now
+    )
+    applied.claims.append(claim)
+    return True
+
+
 async def apply_extraction(
     session: AsyncSession, interaction: Interaction, result: ExtractionResult
 ) -> Applied:
-    """Persist everything the extraction found, linked to `interaction`."""
+    """Persist everything the extraction found, linked to `interaction`.
+
+    What the owner asserted is written. What a counterparty asserted — a
+    debt, a repayment, money, a promise of the owner's, the counterparty's
+    own fulfilment — is parked as a claim and asked about (see
+    ``claims.is_claim``): opening a promise on their word is safe, closing
+    one or moving money is not.
+    """
     applied = Applied()
     tz = settings.tz
     occurred = interaction.occurred_at or datetime.now(tz)
@@ -252,99 +513,43 @@ async def apply_extraction(
         interaction.summary = result.summary
 
     for item in result.debts:
-        amount = to_money(item.amount)
-        if amount is None:
-            log.warning("dropping debt with non-positive amount: %r", item.amount)
-            continue
-        person = await resolve_person(session, item.person)
-        if person is None:
-            continue
-        debt = Debt(
-            direction=DebtDirection(item.direction),
-            person_id=person.id,
-            amount=amount,
-            currency=Currency(item.currency),
-            reason=item.reason or None,
-            due_date=item.due,
-            source_interaction_id=interaction.id,
-        )
-        session.add(debt)
-        applied.debts.append(debt)
+        now = datetime.now(tz)
+        if not await _gate(
+            session, interaction, claims.KIND_DEBT, item, applied, now=now
+        ):
+            await write_debt(session, interaction, item, applied, now=now)
 
     await session.flush()
 
     for item in result.debt_settlements:
-        amount = to_money(item.amount)
-        if amount is None:
-            continue
-        person = await resolve_person(session, item.person)
-        if person is None:
-            continue
-        await _apply_settlement(
-            session,
-            person,
-            amount,
-            Currency(item.currency),
-            item.note,
-            applied,
-            DebtDirection(item.direction) if item.direction else None,
-        )
+        now = datetime.now(tz)
+        if not await _gate(
+            session, interaction, claims.KIND_SETTLEMENT, item, applied, now=now
+        ):
+            await write_settlement(session, interaction, item, applied, now=now)
 
     # Before the new promises land, so a message that both closes one promise
     # and makes the next cannot close the one it just made.
     for item in result.fulfilments:
-        if not item.description.strip():
-            continue
-        # Never creates a person: a fulfilment names someone who already has
-        # a promise on the books, or it matches nothing either way.
-        person = await resolve_person(session, item.person, create=False)
-        if person is None:
-            applied.unmatched_fulfilments.append((item.person, item.description))
-            continue
-        await _apply_fulfilment(
-            session,
-            person,
-            item.description.strip(),
-            PromiseMadeBy(item.made_by),
-            applied,
-            now=datetime.now(tz),
-        )
+        now = datetime.now(tz)
+        if not await _gate(
+            session, interaction, claims.KIND_FULFILMENT, item, applied, now=now
+        ):
+            await write_fulfilment(session, interaction, item, applied, now=now)
 
     for item in result.promises:
-        person = await resolve_person(session, item.person)
-        if person is None or not item.description.strip():
-            continue
-        promise = Promise(
-            made_by=PromiseMadeBy(item.made_by),
-            person_id=person.id,
-            description=item.description.strip(),
-            due_date=item.due,
-            source_interaction_id=interaction.id,
-        )
-        session.add(promise)
-        applied.promises.append(promise)
+        now = datetime.now(tz)
+        if not await _gate(
+            session, interaction, claims.KIND_PROMISE, item, applied, now=now
+        ):
+            await write_promise(session, interaction, item, applied, now=now)
 
     for item in result.transactions:
-        amount = to_money(item.amount)
-        if amount is None:
-            continue
-        counterparty = (
-            await resolve_person(session, item.counterparty)
-            if item.counterparty
-            else None
-        )
-        txn = Transaction(
-            type=TransactionType(item.type),
-            amount=amount,
-            currency=Currency(item.currency),
-            category=item.category or "other",
-            description=item.description or None,
-            counterparty_person_id=counterparty.id if counterparty else None,
-            occurred_at=occurred,
-            source_interaction_id=interaction.id,
-        )
-        session.add(txn)
-        applied.transactions.append(txn)
+        now = datetime.now(tz)
+        if not await _gate(
+            session, interaction, claims.KIND_TRANSACTION, item, applied, now=now
+        ):
+            await write_transaction(session, interaction, item, applied, now=now)
 
     for item in result.events:
         start = item.start(tz)

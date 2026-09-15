@@ -13,6 +13,12 @@ product decisions, not defaults: code that contradicts them is wrong.
 - When someone *else* says "you owe me" or "I paid you back": **ask first**,
   never write silently.
 - He tolerates **20–30 confirmations a day**.
+- Implemented in step 3 as *claims*: money a counterparty asserts (a debt, a
+  repayment, a transaction), an obligation they say he took on, and their
+  own "I did my part" wait in `/davolar` with Ha / Yo'q / Tuzat. A
+  counterparty's own promise is written as before (opening one is safe;
+  closing one on their word is not). A repayment accepted before its debt
+  stays open until the debt is confirmed, so a Ha is never spent on nothing.
 
 ## Reminders and open loops
 - Undated promises and unanswered questions: **re-remind after one week**.
@@ -48,7 +54,7 @@ happened*, it answers."
 ## Agreed build order
 1. Close and correct (buttons, /bajarildi, /tuzat, /yop, fulfilment) — done
 2. Open loops and the morning brief — done (needs `OWNER_ALIASES` in `.env`)
-3. Ask-before-writing for counterparty claims
+3. Ask-before-writing for counterparty claims — done
 4. Per-person memory
 5. Self-monitoring (/holat, heartbeat, backups to Telegram)
 6. Phone app, missed calls, SMS — later

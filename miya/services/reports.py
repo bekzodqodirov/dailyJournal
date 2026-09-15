@@ -20,7 +20,7 @@ from miya.bot.formatting import escape, question_line, quiet_line, ref
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
-from miya.services import loops, nudges, planner, queries
+from miya.services import claims, loops, nudges, planner, queries
 from miya.services.extraction import API_FAILURES, get_client
 from miya.services.loops import QuietCounterparty, UnansweredQuestion
 from miya.services.usage import record_anthropic_usage
@@ -47,6 +47,7 @@ Rules:
   📨 Sizga murojaatlar (guruhda to'g'ridan-to'g'ri yozilganlar)
   ❓ Javobsiz qolganlar (kim nima so'radi, qancha vaqt javobsiz)
   🤫 Jim bo'lib qolganlar (kim necha kun jim, u bilan nima ochiq)
+  ❓ Tasdiqlanmagan da'volar (nechta javob kutmoqda — /davolar)
   📅 Ertaga (given plan text — include as-is, lightly trimmed if long)
 - Keep the whole report short and scannable. Telegram formatting: plain text
   with <b>bold</b> section titles, no markdown, no # headers.
@@ -66,6 +67,11 @@ class ReportData:
     # quiet with something open. Both from the loops engine — SQL, no model.
     questions: list[UnansweredQuestion] = field(default_factory=list)
     quiet: list[QuietCounterparty] = field(default_factory=list)
+    # What a counterparty asserted and the owner has not answered (build
+    # step 3). A count only: the questions themselves have their buttons on
+    # the receipt, the brief and /davolar, and the report is not a place to
+    # answer from.
+    claims_pending: int = 0
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -91,6 +97,7 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
         "to_me": len(data.to_me),
         "unanswered": len(data.questions),
         "quiet": len(data.quiet),
+        "claims_pending": data.claims_pending,
         "settled_debts": len(data.completed.settled_debts),
         "done_promises": len(data.completed.done_promises),
         "done_tasks": len(data.completed.done_tasks),
@@ -216,6 +223,9 @@ def render_data_block(data: ReportData) -> str:
     else:
         lines.append("- yo'q")
 
+    if data.claims_pending:
+        lines.append(f"\n❓ Tasdiqlanmagan da'volar: {data.claims_pending} (/davolar)")
+
     lines.append("\n📅 ERTAGA:")
     lines.append(data.plan)
 
@@ -233,6 +243,7 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         to_me=await queries.messages_to_me(session, day),
         questions=await nudges.unanswered_questions(session),
         quiet=await loops.quiet_counterparties(session),
+        claims_pending=await claims.pending_count(session),
     )
 
 

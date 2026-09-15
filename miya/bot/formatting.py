@@ -23,6 +23,7 @@ from miya.db.enums import (
 )
 
 if TYPE_CHECKING:  # annotations only: formatting never imports the services
+    from miya.services.claims import ClaimView
     from miya.services.loops import (
         QuietCounterparty,
         StaleCommitment,
@@ -367,3 +368,75 @@ def quiet_line(q: QuietCounterparty, *, markup: bool = True) -> str:
     if markup:
         return f"{_name(q.person_name, True)} · {q.days_quiet} kun jim: {items}"
     return f"{q.person_name}: {q.days_quiet} kun jim — {items}"
+
+
+# --- a counterparty's claim: one question line ---------------------------------
+#
+# What someone *else* asserted — "you owe me", "I paid you back", "you
+# promised" — is asked, never written silently (docs/owner-decisions.md,
+# "Counterparty claims"). The line names who said it, restates the item from
+# the owner's point of view, and ends in a question. Rendered with markup on
+# the receipt, the brief and the one-question message, and plain for the
+# report's data block, like the open-loop lines above.
+
+CLAIM_REF_PREFIX = "c"
+
+# The transaction's own type does not travel in the view yet; until it does
+# a counterparty's money is asked about as "pul harakati" (see the view).
+_TXN_LABEL = {"income": "kirim", "expense": "chiqim"}
+
+
+def claim_ref(claim_id: int) -> str:
+    """'c12' — the handle the question and `/tuzat c12` use."""
+    return f"{CLAIM_REF_PREFIX}{claim_id}"
+
+
+def _claim_money(view: ClaimView) -> str:
+    """The amount as said, or an honest gap when the payload lacks one."""
+    if view.amount is None or view.currency is None:
+        return "noma'lum summa"
+    return money(view.amount, view.currency)
+
+
+def _claim_body(view: ClaimView, markup: bool) -> str:
+    """What was claimed, from the owner's point of view, without the question."""
+    detail = f" ({quote(view.description, markup=markup)})" if view.description else ""
+    kind = view.kind
+    if kind == "debt":
+        amount = _claim_money(view)
+        if view.direction is DebtDirection.they_owe_me:
+            return f"u senga {amount} qarz{detail}"
+        if view.direction is DebtDirection.i_owe_them:
+            return f"sen unga {amount} qarzsan{detail}"
+        return f"orangizda {amount} qarz bor{detail}"
+    if kind == "settlement":
+        amount = _claim_money(view)
+        if view.direction is DebtDirection.i_owe_them:
+            # A settlement's direction names the debt it closes: the owner
+            # owed, so the counterparty says the owner paid him.
+            return f"sen unga {amount} to'lagansan{detail}"
+        return f"{amount} to'ladi{detail}"
+    if kind == "transaction":
+        label = _TXN_LABEL.get(getattr(view, "txn_type", None) or "", "pul harakati")
+        return f"{_claim_money(view)} {label}{detail}"
+    if kind == "promise":
+        due = f" ({short_date(view.due)})" if view.due else ""
+        return f"sen va'da bergansan — {quote(view.description, markup=markup)}{due}"
+    # fulfilment: the counterparty says he did what he had promised
+    return quote(view.description, markup=markup)
+
+
+def claim_line(view: ClaimView, *, markup: bool = True) -> str:
+    """One question per claim: who said it, what, and "to'g'rimi?".
+
+        ❓ c12 Akmal aytdi: u senga 5 mln so'm qarz («sabab») — to'g'rimi?
+
+    ``markup=False`` is the same line with no tags and no escaping, for the
+    report's data block. Never raises: the view is built to tolerate a
+    partial payload, and every gap reads as one here too.
+    """
+    handle = claim_ref(view.id)
+    handle = f"<code>{handle}</code>" if markup else handle
+    who = _name(view.person_name or "Kimdir", markup)
+    question = "va'dasi bajarilganmi?" if view.kind == "fulfilment" else "to'g'rimi?"
+    return f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}"

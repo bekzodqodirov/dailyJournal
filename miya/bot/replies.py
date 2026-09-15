@@ -9,6 +9,8 @@ from miya.bot.formatting import (
     TELEGRAM_LIMIT,
     age_label,
     bullet_list,
+    claim_line,
+    claim_ref,
     clip,
     clock,
     debt_line,
@@ -28,6 +30,7 @@ from miya.bot.formatting import (
 )
 from miya.config import settings
 from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
+from miya.services import claims
 from miya.services.brief import MorningBrief
 from miya.services.loops import UnansweredQuestion
 from miya.services.persistence import Applied
@@ -82,6 +85,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
 /tuzat &lt;id&gt; &lt;nima&gt; — yozuvni tuzatish (summa, valyuta, teskari, ism, muddat)
+/davolar — tasdiqlanmagan da'volar
 /unut — ma'lumotni butunlay o'chirish
 /menga — guruhlarda menga yozilganlar
 /guruhlar — guruhlarda nima gaplashildi
@@ -321,6 +325,10 @@ def confirmation(applied: Applied) -> str:
     if applied.facts:
         lines.append(f"🧠 {applied.facts} ta yangi ma'lumot eslab qolindi")
 
+    # What a counterparty asserted is not on the ledger yet: each line is a
+    # question, and the receipt's Ha / Yo'q / Tuzat rows answer it.
+    lines += [claim_line(claims.view(c)) for c in applied.claims]
+
     return clip("\n".join(lines))
 
 
@@ -331,6 +339,11 @@ def confirmation_refs(applied: Applied) -> list[tuple[str, int]]:
     refs += [("promise", p.id) for p in applied.promises if p.id is not None]
     refs += [("task", t.id) for t in applied.tasks if t.id is not None]
     return refs
+
+
+def confirmation_claim_ids(applied: Applied) -> list[int]:
+    """The claims a confirmation asks about, in the order the lines show."""
+    return [c.id for c in applied.claims if c.id is not None]
 
 
 def debts_report(balances: list[DebtBalance]) -> str:
@@ -648,7 +661,8 @@ TUZAT_USAGE = (
     "<code>/tuzat d12 300 $</code> — summa va valyuta\n"
     "<code>/tuzat d12 teskari</code> — kim kimga qarz (aksincha)\n"
     "<code>/tuzat d12 Sardor</code> — boshqa odam\n"
-    "<code>/tuzat p7 ertaga</code> — muddat (sana, ertaga, juma, 3 kun, muddatsiz)\n\n"
+    "<code>/tuzat p7 ertaga</code> — muddat (sana, ertaga, juma, 3 kun, muddatsiz)\n"
+    "<code>/tuzat c12 summa 4 mln</code> — tasdiqlanmagan da'voni, javobdan oldin\n\n"
     "<i>Aniq bo'lmasa: «kim Sardor», «summa 5 mln», «muddat juma».</i>"
 )
 
@@ -743,6 +757,115 @@ def record_still_open(kind: str, records, person) -> str:
     """ "Ha": the row — or every open row of the balance — stays open."""
     lines = "\n".join(record_line(kind, record, person) for record in records)
     return f"👌 Ochiq qoladi — bir haftadan keyin yana so'rayman.\n{lines}"
+
+
+# --- a counterparty's claim: ask first (build step 3) ---------------------------
+#
+# "You owe me", "I paid you back", "you promised" — said by the other side.
+# The owner decided such a thing is asked and never written silently
+# (docs/owner-decisions.md, "Counterparty claims"). The question line itself
+# is formatting.claim_line; here are the message around it, the list, and
+# what each answer says back.
+
+CLAIM_QUESTION_HEADER = "❓ <b>Tasdiqlash kerak</b>"
+CLAIMS_HEADER = "❓ <b>Tasdiqlanmagan da'volar</b>"
+CLAIMS_NONE = "✅ Tasdiqlanmagan da'vo yo'q."
+CLAIMS_HINT = "<i>✅ Ha — yozaman · ✖️ Yo'q — yozmayman · ✏️ Tuzat — avval tuzatasan</i>"
+
+CLAIM_ACCEPTED_PREFIX = "✅ <b>Yozib oldim:</b>"
+# "Ha" on a repayment or a hint that has nothing to land on: the claim stays
+# open, the owner confirms the debt or promise first and taps Ha again.
+CLAIM_ACCEPTED_UNMATCHED = (
+    "⚠️ <b>Hozircha yozilmadi</b> — avval tegishli qarz yoki va'dani tasdiqla, "
+    "keyin yana Ha bos:"
+)
+CLAIM_ACCEPTED_NOTHING = (
+    "⚠️ Tasdiqlading, lekin yozib bo'lmadi — da'voda ism yoki summa yetishmaydi. "
+    "Kerak bo'lsa o'zing yozib qo'y."
+)
+CLAIM_DECLINED = "✖️ Yozilmadi. Kerak bo'lsa o'zing yozib qo'y."
+CLAIM_GONE = "⚠️ Bu da'vo topilmadi — yozuvi o'chirilgan bo'lsa kerak."
+CLAIM_ALREADY = "Bu da'voga allaqachon javob berilgan."
+CLAIM_EDITED = "✏️ <b>Tuzatildi</b> — endi javob ber:"
+
+# How many claims the brief lists with buttons; the rest wait in /davolar.
+BRIEF_MAX_CLAIMS = 10
+
+
+def claim_question(view: claims.ClaimView) -> str:
+    """One message for one claim, when no receipt carried the question."""
+    return f"{CLAIM_QUESTION_HEADER}\n{claim_line(view)}"
+
+
+def claims_list(views: list[claims.ClaimView], *, hidden: int = 0) -> str:
+    """`/davolar`: every unanswered claim, oldest first, with the buttons' key.
+
+    ``hidden`` is how many more are waiting beyond the ones listed — the
+    keyboard has a ceiling, and a claim without its buttons is not asked.
+    """
+    if not views:
+        return CLAIMS_NONE
+    body = f"{CLAIMS_HEADER}\n" + "\n".join(claim_line(v) for v in views)
+    if hidden:
+        body += f"\n<i>… va yana {hidden} ta — javob bergach yana /davolar.</i>"
+    return clip(f"{body}\n{CLAIMS_HINT}")
+
+
+def claim_accepted(accepted: claims.Accepted) -> str:
+    """ "Ha": what accepting wrote, in the receipt's own words.
+
+    A settlement that matched no open debt, or a hint that closed no
+    promise, lands in the receipt as the same question it would have been
+    on the day. An item the writer refused outright says so, not "yozib
+    oldim" over nothing.
+    """
+    if accepted.applied.is_empty():
+        return CLAIM_ACCEPTED_NOTHING
+    if not accepted.written:
+        return f"{CLAIM_ACCEPTED_UNMATCHED}\n{confirmation(accepted.applied)}"
+    return f"{CLAIM_ACCEPTED_PREFIX}\n{confirmation(accepted.applied)}"
+
+
+def claim_edited(view: claims.ClaimView) -> str:
+    return f"{CLAIM_EDITED}\n{claim_line(view)}"
+
+
+# One example per field the kind can take (claims.EDITABLE), with the
+# prefix spelled out: a claim is corrected before it is a row, and the
+# owner should not have to guess whether "4 mln" is an amount or a name.
+_CLAIM_TUZAT_EXAMPLES = {
+    "amount": "summa 4 mln",
+    "person": "kim Akmal",
+    "currency": "valyuta $",
+    "due": "muddat 2026-10-01",
+    "direction": "teskari",
+}
+
+
+def claim_tuzat_hint(view: claims.ClaimView) -> str:
+    """What the ✏️ button says: the syntax, with this claim's ref filled in."""
+    handle = claim_ref(view.id)
+    examples = " · ".join(
+        f"<code>/tuzat {handle} {_CLAIM_TUZAT_EXAMPLES[field]}</code>"
+        for field in claims.EDITABLE.get(view.kind, ())
+        if field in _CLAIM_TUZAT_EXAMPLES
+    )
+    return (
+        f"✏️ <code>{handle}</code> ni tuzatish uchun yozing:\n{examples}\n"
+        f"<i>Keyin ✅ Ha yoki ✖️ Yo'q.</i>"
+    )
+
+
+def claim_field_refused(view: claims.ClaimView, field: str) -> str:
+    """`/tuzat c12 muddat …` on a claim that has no such field."""
+    label = _FIELD_LABEL.get(field, field)
+    return f"Bu da'voda {label}ni tuzatib bo'lmaydi.\n{claim_tuzat_hint(view)}"
+
+
+def claim_value_refused(view: claims.ClaimView) -> str:
+    """A field the claim has, but a value it cannot take (nothing to flip,
+    an empty name)."""
+    return f"Bu qiymat to'g'ri kelmadi.\n{claim_tuzat_hint(view)}"
 
 
 def search_results(hits, query: str) -> str:
@@ -904,6 +1027,7 @@ BRIEF_ALL_CLEAR = "✅ Hammasi joyida — bugun uchrashuv ham, ochiq qolgan nars
 BRIEF_EVENTS = "📅 <b>Bugungi uchrashuvlar</b>"
 BRIEF_DUE = "⏰ <b>Muddati bugun va kechikkanlar</b>"
 BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
+BRIEF_CLAIMS = "❓ Tasdiqlanmagan da'volar"
 BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
 BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
 
@@ -943,6 +1067,13 @@ def morning_brief(brief: MorningBrief) -> str:
     if loops is not None and loops.questions:
         lines = [question_line(q) for q in loops.questions]
         parts.append(f"{BRIEF_QUESTIONS}\n" + bullet_list(lines, empty="—"))
+    shown, hidden = _brief_claims(brief)
+    if shown:
+        lines = [claim_line(claims.view(c)) for c in shown]
+        block = f"<b>{BRIEF_CLAIMS}</b>\n" + bullet_list(lines, empty="—")
+        if hidden:
+            block += f"\n<i>… va yana {hidden} ta — /davolar.</i>"
+        parts.append(block)
     if loops is not None and loops.stale:
         lines = [stale_line(s) for s in loops.stale]
         parts.append(f"{BRIEF_STALE}\n" + bullet_list(lines, empty="—"))
@@ -968,6 +1099,23 @@ def morning_brief_refs(
         else []
     )
     return due, stale
+
+
+def _brief_claims(brief: MorningBrief) -> tuple[list, int]:
+    """The claims the brief shows, and how many more it only counts.
+
+    Only what is shown gets buttons and is marked as asked; the rest stay
+    pending for /davolar and the worker's one-question messages.
+    """
+    pending = [c for c in getattr(brief, "claims", []) or [] if c.id is not None]
+    shown = pending[:BRIEF_MAX_CLAIMS]
+    return shown, len(pending) - len(shown)
+
+
+def morning_brief_claim_ids(brief: MorningBrief) -> list[int]:
+    """The claims whose line the brief carries, in line order."""
+    shown, _ = _brief_claims(brief)
+    return [c.id for c in shown]
 
 
 NUDGE_HEADER = "❓ <b>Javobsiz savol</b>"

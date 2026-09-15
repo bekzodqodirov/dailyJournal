@@ -33,9 +33,9 @@ CurrencyCode = Literal["UZS", "USD", "CNY", "KRW", "RUB"]
 # Who stated a money or promise item. What another person says — "you owe me
 # 5 mln", "I paid you back" — is a claim, and the owner's decision is that a
 # claim is asked about, never written silently. This is where the extractor
-# records who said it; persistence does not act on it yet (the
-# ask-before-writing gate is a later build step), so it defaults to "me" and
-# every existing caller keeps its meaning.
+# records who said it; ``services.claims.is_claim`` is the gate that turns a
+# "them" into a question instead of a row. It defaults to "me" so every
+# caller that builds items by hand keeps its meaning.
 AssertedBy = Literal["me", "them"]
 
 _client: anthropic.AsyncAnthropic | None = None

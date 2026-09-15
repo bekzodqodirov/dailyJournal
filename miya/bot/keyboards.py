@@ -9,6 +9,7 @@ bytes, and a chat list page carries one payload per button.
     rec:<action>:<ref>          act on one record: d12 / p7 / t3 (see below)
     rec:qa|qs:q<interaction_id> a nudged question: answered / snooze till morning
     ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
+    cl:y|n|e:<claim_id>         a counterparty's claim: write it / drop it / correct it
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from miya.bot.formatting import ref
+from miya.bot.formatting import claim_ref, ref
 from miya.db.enums import ChatType
 from miya.db.models import ChatMonitor
 
@@ -344,17 +345,21 @@ def nudge_actions(interaction_id: int) -> InlineKeyboardMarkup:
 
 
 def brief_actions(
-    due: list[tuple[str, int]], stale: list[tuple[str, int]]
+    due: list[tuple[str, int]],
+    stale: list[tuple[str, int]],
+    claim_ids: list[int] | tuple[int, ...] = (),
 ) -> InlineKeyboardMarkup | None:
     """The morning brief's buttons: a ✅ / ✏️ row per due row, a Ha /
     Bajarildi / Yop row per undated one that has been sitting — the same rows
     the reminder and the "Hali ochiqmi?" question carry, so he acts from the
-    brief the way he acts from those. Always labelled: the brief carries many
+    brief the way he acts from those — and a Ha / Yo'q / Tuzat row per claim
+    still waiting for his word. Always labelled: the brief carries many
     rows, and a bare ✅ would not say which."""
     due = [(k, i) for k, i in due if i is not None]
     stale = [(k, i) for k, i in stale if i is not None and (k, i) not in due]
     rows = [record_row(k, i, labelled=True) for k, i in due]
     rows += [question_row(k, i, labelled=True) for k, i in stale]
+    rows += [claim_row(i) for i in claim_ids if i is not None]
     rows = rows[:MAX_ROWS]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
@@ -373,3 +378,106 @@ def new_group_question(monitor_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- a counterparty's claim: Ha / Yo'q / Tuzat ----------------------------------
+#
+# cl:y:<id>   ✅ Ha      — write it, exactly as the extraction would have
+# cl:n:<id>   ✖️ Yo'q    — drop it; nothing is written
+# cl:e:<id>   ✏️ Tuzat   — shows the /tuzat syntax with c<id> filled in
+#
+# The claim id is the whole payload, like every other button here: the tap
+# has to survive a restart between the question and the press. Always
+# labelled — a claim sits next to record rows on a receipt and next to other
+# claims on the brief, so a bare "Ha" would not say which.
+
+ACTION_CLAIM_YES = "y"
+ACTION_CLAIM_NO = "n"
+ACTION_CLAIM_EDIT = "e"
+CLAIM_PREFIX = "cl"
+
+
+def claim_row(claim_id: int) -> list[InlineKeyboardButton]:
+    handle = claim_ref(claim_id)
+    return [
+        InlineKeyboardButton(
+            text=f"✅ Ha {handle}",
+            callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_YES}:{claim_id}",
+        ),
+        InlineKeyboardButton(
+            text=f"✖️ Yo'q {handle}",
+            callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_NO}:{claim_id}",
+        ),
+        InlineKeyboardButton(
+            text=f"✏️ Tuzat {handle}",
+            callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_EDIT}:{claim_id}",
+        ),
+    ]
+
+
+def claim_actions(claim_ids: list[int]) -> InlineKeyboardMarkup | None:
+    """One Ha / Yo'q / Tuzat row per claim; None when there is none."""
+    ids = [i for i in claim_ids if i is not None][:MAX_ROWS]
+    if not ids:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[claim_row(i) for i in ids])
+
+
+def claim_ids_in(markup: InlineKeyboardMarkup | None) -> list[int]:
+    """The claims a keyboard carries a Ha / Yo'q / Tuzat row for, in row order.
+
+    Only what was actually shown may be marked as asked, and a keyboard has
+    a ceiling: the handler reads the built keyboard rather than re-deriving
+    which claims should have fitted.
+    """
+    head = f"{CLAIM_PREFIX}:{ACTION_CLAIM_YES}:"
+    ids: list[int] = []
+    for row in markup.inline_keyboard if markup else []:
+        for button in row:
+            data = button.callback_data or ""
+            if data.startswith(head) and data[len(head) :].isdigit():
+                ids.append(int(data[len(head) :]))
+    return ids
+
+
+def applied_actions(
+    record_refs: list[tuple[str, int]], claim_ids: list[int]
+) -> InlineKeyboardMarkup | None:
+    """A receipt's buttons: the record rows, then a row per claim it asks.
+
+    Record rows come first and are labelled as soon as the keyboard carries
+    more than one row of any kind — a claim row is always labelled, so a
+    lone ✅ Bajarildi next to "✅ Ha c12" would read wrong.
+    """
+    records = [(k, i) for k, i in record_refs if i is not None][:MAX_ROWS]
+    room = max(0, MAX_ROWS - len(records))
+    ids = [i for i in claim_ids if i is not None][:room]
+    if not records and not ids:
+        return None
+    labelled = len(records) + len(ids) > 1
+    rows = [record_row(k, i, labelled=labelled) for k, i in records]
+    rows += [claim_row(i) for i in ids]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def without_claim(
+    markup: InlineKeyboardMarkup | None, claim_id: int
+) -> InlineKeyboardMarkup | None:
+    """The same keyboard minus the row that asks about ``claim_id``.
+
+    An answered claim's buttons must go, but the record rows and the other
+    claims on the same receipt, brief or list still have work to do.
+    """
+    if markup is None:
+        return None
+    suffix = f":{claim_id}"
+    rows = [
+        row
+        for row in markup.inline_keyboard
+        if not any(
+            (b.callback_data or "").startswith(f"{CLAIM_PREFIX}:")
+            and (b.callback_data or "").endswith(suffix)
+            for b in row
+        )
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None

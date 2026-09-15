@@ -25,6 +25,8 @@ async def database_available() -> bool:
 async def _truncate(session) -> None:
     """Wipe owner data between tests. Order follows foreign keys."""
     for model in (
+        # Claims reference interactions and people, so they go before both.
+        m.Claim,
         m.ReminderLog,
         m.UsageLog,
         m.DailyReport,

@@ -39,6 +39,7 @@ from miya.services import (
     audio,
     brief,
     chats,
+    claims,
     documents,
     memories,
     nudges,
@@ -98,13 +99,34 @@ async def _safe_answer(message: Message, text: str | None, *, reply_markup=None)
 
 
 def _receipt(result) -> tuple[str, InlineKeyboardMarkup | None]:
-    """The confirmation text plus its ✅ / ✏️ / 🔄 rows, one per recorded row."""
+    """The confirmation text plus its ✅ / ✏️ / 🔄 rows, one per recorded row,
+    and a Ha / Yo'q / Tuzat row per claim a counterparty made in it.
+
+    The receipt is the ask: the claims it carries buttons for are marked as
+    asked here, inside the session scope that produced it, so the commit
+    that makes the rows durable records the question too. A send that then
+    fails leaves the claim pending in /davolar and the brief — never lost.
+    """
     if not result.ok:
         return replies.FAILED_EXTRACTION_HINT, None
-    return (
-        replies.confirmation(result.applied),
-        keyboards.record_actions(replies.confirmation_refs(result.applied)),
+    applied = result.applied
+    keyboard = keyboards.applied_actions(
+        replies.confirmation_refs(applied), replies.confirmation_claim_ids(applied)
     )
+    _ask(applied.claims, keyboard)
+    return replies.confirmation(applied), keyboard
+
+
+def _ask(pending, keyboard: InlineKeyboardMarkup | None) -> None:
+    """Mark as asked exactly the claims the keyboard carries a row for.
+
+    Read off the built keyboard, not re-derived: a keyboard has a ceiling,
+    and a claim whose row was capped away was not asked.
+    """
+    shown = set(keyboards.claim_ids_in(keyboard))
+    for claim in pending:
+        if claim.id in shown:
+            claims.mark_asked(claim)
 
 
 async def _typing(message: Message) -> None:
@@ -277,7 +299,11 @@ async def cmd_brief(message: Message) -> None:
         data = await brief.gather(session)
         body = replies.morning_brief(data)
         due, stale = replies.morning_brief_refs(data)
-    await _safe_answer(message, body, reply_markup=keyboards.brief_actions(due, stale))
+        keyboard = keyboards.brief_actions(
+            due, stale, claim_ids=replies.morning_brief_claim_ids(data)
+        )
+        _ask(data.claims, keyboard)
+    await _safe_answer(message, body, reply_markup=keyboard)
 
 
 @router.message(Command("reja"))
@@ -617,10 +643,16 @@ async def cmd_edit(message: Message, command: CommandObject) -> None:
         return
     keyboard = None
     async with session_scope() as session:
-        found = await records.find(session, handle)
-        if found is None:
-            body = replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+        claim_id = claims.parse_ref(handle)
+        if claim_id is not None:
+            # "c12": a counterparty's claim, corrected before it is answered.
+            body, keyboard = await _edit_claim(session, claim_id, edit)
+            found = None
         else:
+            found = await records.find(session, handle)
+            if found is None:
+                body = replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+        if found is not None:
             kind, record = found
             try:
                 change = await records.set_field(
@@ -638,6 +670,31 @@ async def cmd_edit(message: Message, command: CommandObject) -> None:
                 body = replies.new_person_question(exc.name)
                 keyboard = keyboards.new_person_question(ref_of(record), index)
     await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _edit_claim(
+    session, claim_id: int, edit: records.Edit
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """`/tuzat c12 summa 4 mln`: the claim's payload changes, the claim stays
+    pending, and the corrected question comes back with its buttons so the
+    owner answers it right there."""
+    try:
+        claim = await claims.edit(session, claim_id, edit, by=claims.BY_COMMAND)
+    except claims.AlreadyAnswered:
+        return replies.CLAIM_ALREADY, None
+    except ValueError:
+        claim = await claims.get(session, claim_id)
+        if claim is None:
+            return replies.CLAIM_GONE, None
+        view = claims.view(claim)
+        if edit.field not in claims.EDITABLE.get(claim.kind, ()):
+            body = replies.claim_field_refused(view, edit.field)
+        else:
+            body = replies.claim_value_refused(view)
+        return body, keyboards.claim_actions([claim_id])
+    if claim is None:
+        return replies.CLAIM_GONE, None
+    return replies.claim_edited(claims.view(claim)), keyboards.claim_actions([claim_id])
 
 
 async def _answer_new_person(session, action: str, handle: str, index: int) -> str:
@@ -830,6 +887,96 @@ async def on_record_button(callback: CallbackQuery) -> None:
             )
         except Exception:
             log.debug("could not trim the record keyboard", exc_info=True)
+    if callback.message is not None:
+        await _safe_answer(callback.message, outcome.text, reply_markup=outcome.keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
+# --- a counterparty's claim: ask first (build step 3) -------------------------
+
+
+@router.message(Command("davolar"))
+async def cmd_claims(message: Message) -> None:
+    """`/davolar` — every claim still waiting for the owner's word, oldest
+    first, each with its Ha / Yo'q / Tuzat row. Listing is asking: what is
+    shown with buttons is marked as asked."""
+    async with session_scope() as session:
+        pending = await claims.pending(session)
+        shown = pending[: keyboards.MAX_ROWS]
+        body = replies.claims_list(
+            [claims.view(c) for c in shown], hidden=len(pending) - len(shown)
+        )
+        keyboard = keyboards.claim_actions([c.id for c in shown])
+        _ask(shown, keyboard)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _answer_claim(session, action: str, claim_id: int) -> _Outcome | None:
+    """Ha / Yo'q / Tuzat on one claim. None for an action that is not one."""
+    try:
+        if action == keyboards.ACTION_CLAIM_YES:
+            accepted = await claims.accept(session, claim_id, by=claims.BY_BUTTON)
+            if accepted is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            # The row it became gets the receipt's own buttons — and nothing
+            # in it can be a claim again, so there is no second question.
+            keyboard = keyboards.applied_actions(
+                replies.confirmation_refs(accepted.applied), []
+            )
+            # Nothing written → the claim is still pending and its row stays.
+            return _Outcome(replies.claim_accepted(accepted), accepted.written, keyboard)
+        if action == keyboards.ACTION_CLAIM_NO:
+            claim = await claims.decline(session, claim_id, by=claims.BY_BUTTON)
+            if claim is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            return _Outcome(replies.CLAIM_DECLINED, True)
+        if action == keyboards.ACTION_CLAIM_EDIT:
+            claim = await claims.get(session, claim_id)
+            if claim is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            if claim.state != claims.PENDING:
+                return _Outcome(replies.CLAIM_ALREADY, True)
+            return _Outcome(replies.claim_tuzat_hint(claims.view(claim)), False)
+    except claims.AlreadyAnswered:
+        return _Outcome(replies.CLAIM_ALREADY, True)
+    return None
+
+
+@router.callback_query(F.data.startswith("cl:"))
+async def on_claim_button(callback: CallbackQuery) -> None:
+    """✅ Ha / ✖️ Yo'q / ✏️ Tuzat under a counterparty's claim.
+
+    "Ha" writes the item exactly as the extraction would have, had the owner
+    said it himself; "Yo'q" writes nothing. The outcome goes out as its own
+    message and the answered claim's row leaves the keyboard — the receipt,
+    brief or list it sat on stays readable, with its other rows intact. A
+    second tap finds the claim answered (the row lock in claims.accept) and
+    says so instead of writing twice.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    action, claim_id = parts[1], int(parts[2])
+
+    async with session_scope() as session:
+        outcome = await _answer_claim(session, action, claim_id)
+    if outcome is None:
+        await callback.answer()
+        return
+
+    if outcome.finished and callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.without_claim(
+                    callback.message.reply_markup, claim_id
+                )
+            )
+        except Exception:
+            log.debug("could not trim the claim keyboard", exc_info=True)
     if callback.message is not None:
         await _safe_answer(callback.message, outcome.text, reply_markup=outcome.keyboard)
     try:

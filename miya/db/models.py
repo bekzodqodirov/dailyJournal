@@ -391,6 +391,63 @@ class Task(Base):
     __table_args__ = (sa.Index("ix_tasks_status_due", "status", "due_date"),)
 
 
+class Claim(Base):
+    """Something a counterparty asserted, held until the owner answers (step 3).
+
+    "You owe me 5 mln", "I paid you back", "you promised to send the documents"
+    — said by the other side, not the owner. The owner's decision is that such
+    a claim is asked about and never written silently, so the extracted item
+    waits here as ``payload`` (the pydantic item, as JSON) until a button or a
+    command accepts it (the row is then written through the usual writer and
+    named by ``result_kind``/``result_id``) or declines it (nothing written).
+    Edits before the answer land in ``payload`` and are audited in ``history``.
+    """
+
+    __tablename__ = "claims"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # The interaction the words came from: the window's synthetic interaction
+    # on the userbot path, the bot or call interaction otherwise. A purge of
+    # that interaction takes the unanswered question with it.
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    # Resolved on accept, or earlier when the window already knows the person.
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    # The name as extracted; '' when the item named nobody.
+    person_name: Mapped[str] = mapped_column(
+        sa.Text, nullable=False, default="", server_default=""
+    )
+    # debt | settlement | transaction | promise | fulfilment
+    kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # pending | accepted | declined
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="pending"
+    )
+    asked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # button | command
+    answered_by: Mapped[str | None] = mapped_column(sa.String(16))
+    # What accepting wrote: debt | payment | transaction | promise | fulfilment
+    # (the promise a fulfilment closed). Null when accepting only produced a
+    # question, e.g. a settlement that matched no open debt.
+    result_kind: Mapped[str | None] = mapped_column(sa.String(16))
+    result_id: Mapped[int | None] = mapped_column(sa.Integer)
+    # Edits before the answer: [{at, field, old, new, by}, ...].
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.Index("ix_claims_interaction", "interaction_id"),
+        sa.Index("ix_claims_state_created", "state", "created_at"),
+    )
+
+
 class Memory(Base):
     """RAG store: durable facts + interaction summaries, embedded with bge-m3."""
 
@@ -478,6 +535,7 @@ class ReminderLog(Base):
 
 __all__ = [
     "ChatMonitor",
+    "Claim",
     "DailyReport",
     "Debt",
     "DebtPayment",

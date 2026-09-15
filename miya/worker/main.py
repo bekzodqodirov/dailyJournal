@@ -22,6 +22,9 @@ Jobs:
                    answered, with ✅ Javob berdim / ⏰ Ertaga (quiet-hours aware)
   * new_chat_ask — every 2 min; "Yangi guruh: … — o'qiymi?" once per new
                    group or channel (quiet-hours aware)
+  * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
+                   claim no receipt has shown after CLAIM_ASK_AFTER, a few
+                   per sweep (quiet-hours aware; build step 3)
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, escape
 from miya.config import settings
-from miya.db.models import DailyReport, Person, ReminderLog
+from miya.db.models import Claim, DailyReport, Person, ReminderLog
 from miya.db.session import engine, session_scope
 from miya.services import (
     approvals,
@@ -52,6 +55,7 @@ from miya.services import (
     brief,
     call_recordings,
     chats,
+    claims,
     gcal,
     memories,
     nudges,
@@ -258,10 +262,20 @@ async def brief_job(bot: Bot) -> bool:
         data = await brief.gather(session)
         body = replies.morning_brief(data)
         due, stale = replies.morning_brief_refs(data)
-    sent = await notify(bot, body, reply_markup=keyboards.brief_actions(due, stale))
+        claim_ids = replies.morning_brief_claim_ids(data)
+        keyboard = keyboards.brief_actions(due, stale, claim_ids=claim_ids)
+    sent = await notify(bot, body, reply_markup=keyboard)
     if sent:
         async with session_scope() as session:
             session.add(ReminderLog(kind=BRIEF_KIND, ref=data.day.isoformat()))
+            # A claim shown with its Ha / Yo'q row on the brief was asked;
+            # claim_ask_job must not repeat it as its own message.
+            if claim_ids:
+                now = datetime.now(settings.tz)
+                for claim in await session.scalars(
+                    sa.select(Claim).where(Claim.id.in_(claim_ids))
+                ):
+                    claims.mark_asked(claim, now=now)
     return sent
 
 
@@ -367,6 +381,50 @@ async def new_chat_ask_job(bot: Bot) -> None:
             log.exception("could not ask about chat monitor %s", monitor_id)
 
 
+# A claim rides on its window's receipt when there is one; these are for the
+# rest. Ten minutes leaves the receipt path time to run first (the window job
+# ticks every five), and five per sweep keeps a backlog from becoming a wall
+# of questions — the owner tolerates twenty-odd confirmations a day.
+CLAIM_ASK_AFTER = timedelta(minutes=10)
+CLAIM_MAX_PER_SWEEP = 5
+
+
+async def claim_ask_job(bot: Bot) -> None:
+    """Ask about counterparty claims no receipt has shown (build step 3).
+
+    The receipt normally carries the question; a claim from the batch path
+    with its receipt folded into the overflow summary, from a bot or a call
+    interaction, or one whose receipt keyboard was clipped, has nobody to
+    ask it. Once such a claim is CLAIM_ASK_AFTER old it is asked here, one
+    message each with its own ✅ / ✖️ / ✏️ row, at most CLAIM_MAX_PER_SWEEP
+    per sweep. Quiet-hours aware like every other ping: the claim keeps.
+
+    Marked asked and committed *before* the send, as the media question is:
+    a question asked twice is worse than one lost to a failed send, and a
+    claim is never lost — it stays pending, in /davolar and in the morning
+    brief, until he answers it. The sweep stops at the first undelivered
+    message; the rest wait for the next one.
+    """
+    if reminders.in_quiet_hours():
+        return
+
+    asked = 0
+    async with session_scope() as session:
+        waiting = await claims.unasked(
+            session, older_than=CLAIM_ASK_AFTER, limit=CLAIM_MAX_PER_SWEEP
+        )
+        for claim in waiting:
+            body = replies.claim_question(claims.view(claim))
+            keyboard = keyboards.claim_actions([claim.id])
+            claims.mark_asked(claim)
+            await session.commit()
+            if not await notify(bot, body, reply_markup=keyboard):
+                break
+            asked += 1
+    if asked:
+        log.info("asked about %d claim(s), %d more waiting", asked, len(waiting) - asked)
+
+
 async def media_ask_job(bot: Bot) -> None:
     """Ask the owner about attachments too big to fetch on spec (spec §6).
 
@@ -454,6 +512,14 @@ async def chat_notice_job(bot: Bot) -> None:
     go out one by one; anything beyond that — a day's backlog after an outage
     — is folded into one summary rather than a hundred messages. One delivery
     at a time, whichever job asked for it.
+
+    A detailed receipt also carries the questions its window raised: a ✅ /
+    ✖️ / ✏️ row per counterparty claim (build step 3), so "Akmal aytdi: sen
+    unga qarzsan — to'g'rimi?" is answered from the receipt itself. A claim
+    counts as asked only once the receipt really went out, and only if its
+    row fit under the message; the summary path asks nothing, and whatever
+    it (or a clipped keyboard) leaves unasked reaches him through
+    claim_ask_job.
     """
     async with _notice_lock:
         if reminders.in_quiet_hours():
@@ -468,12 +534,25 @@ async def chat_notice_job(bot: Bot) -> None:
             rest = queue[notices.MAX_DETAILED :]
 
             for item in detailed:
-                if not await notify(bot, item.text):
+                # Only claims nobody has asked yet ride on the receipt: one
+                # claim_ask_job may have beaten it after quiet hours, and the
+                # owner already holds that row.
+                waiting = [
+                    claim
+                    for claim in await claims.pending_for(session, item.interaction.id)
+                    if claim.asked_at is None
+                ]
+                shown = waiting[: keyboards.MAX_ROWS]
+                keyboard = keyboards.claim_actions([claim.id for claim in shown])
+                if not await notify(bot, item.text, reply_markup=keyboard):
                     # Unreachable: everything left stays queued for the next poll.
                     return
                 # Marked only after a successful send, and committed at once, so
                 # a crash mid-sweep repeats at most one receipt and loses none.
+                # The claims whose buttons he now sees are marked with it.
                 batch.mark_notified(item.interaction, now=now)
+                for claim in shown:
+                    claims.mark_asked(claim, now=now)
                 await session.commit()
 
             if rest:
@@ -735,6 +814,14 @@ async def run() -> None:
         IntervalTrigger(minutes=2),
         args=[bot],
         id="new_chat_ask",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        claim_ask_job,
+        IntervalTrigger(minutes=2),
+        args=[bot],
+        id="claim_ask",
         max_instances=1,
         coalesce=True,
     )
