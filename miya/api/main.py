@@ -33,8 +33,8 @@ from miya.db.enums import (
     PromiseStatus,
 )
 from miya.db.models import Debt, DebtPayment, Interaction, Person
-from miya.db.session import engine, get_session
-from miya.services import call_recordings, planner, queries, rag, reports
+from miya.db.session import SessionLocal, engine, get_session
+from miya.services import call_recordings, health, planner, queries, rag, reports
 from miya.services.embeddings import EmbeddingError, get_local_embedder
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -73,19 +73,59 @@ async def _db_ok() -> tuple[bool, str | None]:
         return False, f"{type(exc).__name__}: {exc}"
 
 
+# The api's own heartbeat is written from /health, which `make up` and a
+# monitor poll far more often than the liveness ledger needs: at most one
+# row write per minute, remembered in-process (build step 5).
+API_BEAT_EVERY = timedelta(seconds=60)
+_api_beat: dict[str, datetime] = {}
+
+
+async def _components(now: datetime) -> dict[str, dict[str, Any]]:
+    """Every process's heartbeat as the monitor sees it, after this one's own."""
+    async with SessionLocal() as session:
+        last = _api_beat.get("api")
+        if last is None or now - last >= API_BEAT_EVERY:
+            await health.beat(session, "api", detail={"version": __version__}, now=now)
+            await session.commit()
+            _api_beat["api"] = now
+        rows = await health.beats(session)
+    out: dict[str, dict[str, Any]] = {}
+    for name in health.COMPONENTS:
+        c = health.component_of(name, rows.get(name), now=now)
+        out[name] = {
+            "last_seen_at": c.last_seen_at.isoformat() if c.last_seen_at else None,
+            "age_seconds": c.age.total_seconds() if c.age is not None else None,
+            "stale": c.stale,
+        }
+    return out
+
+
 @app.get("/health", tags=["meta"])
-async def health() -> JSONResponse:
-    """Liveness + database reachability. Public (no token) so `make up` can poll it."""
+async def health_check() -> JSONResponse:
+    """Liveness + database reachability. Public (no token) so `make up` can poll it.
+
+    ``components`` is what the heartbeat ledger says about every process —
+    best effort, and informational: a stale bot or worker is reported, not
+    turned into a failing status, because this endpoint answers "is the api
+    up" and the owner's /holat answers the rest.
+    """
+    now = datetime.now(settings.tz)
     db_ok, db_error = await _db_ok()
     body: dict[str, Any] = {
         "status": "ok" if db_ok else "degraded",
         "version": __version__,
         "timezone": settings.timezone,
-        "now": datetime.now(settings.tz).isoformat(),
+        "now": now.isoformat(),
         "database": "ok" if db_ok else "unreachable",
     }
     if db_error:
         body["database_error"] = db_error
+    if db_ok:
+        try:
+            body["components"] = await _components(now)
+        except Exception:
+            log.warning("health: could not read the heartbeats", exc_info=True)
+            body["components"] = {}
     return JSONResponse(body, status_code=200 if db_ok else 503)
 
 

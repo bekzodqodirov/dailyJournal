@@ -37,7 +37,7 @@ from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction
 from miya.db.session import engine, session_scope
-from miya.services import approvals, audio, chats, documents
+from miya.services import approvals, audio, chats, documents, health
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
@@ -639,9 +639,38 @@ async def fetch_backfills(client: TelegramClient) -> int:
     return done
 
 
-async def approved_media_loop(client: TelegramClient) -> None:
-    """The owner's answers, polled: approved attachments and requested backfills."""
+async def beat_userbot(
+    *, enabled: bool, connected: bool | None = None, user_id: int | None = None
+) -> bool:
+    """The userbot's heartbeat (build step 5). Never raises.
+
+    ``{"enabled": false}`` is the switched-off process saying so once, which
+    /holat shows as ⏸ rather than ❌; a live one records whether Telethon is
+    still connected and as whom. A database hiccup is a log line: the reader
+    and its loop must not stop over a missed beat.
+    """
+    detail: dict = {"enabled": enabled}
+    if enabled:
+        detail.update({"connected": bool(connected), "user": user_id})
+    try:
+        async with session_scope() as session:
+            await health.beat(session, "userbot", detail=detail)
+        return True
+    except Exception:
+        log.warning("userbot heartbeat could not be written", exc_info=True)
+        return False
+
+
+async def approved_media_loop(
+    client: TelegramClient, *, user_id: int | None = None
+) -> None:
+    """The owner's answers, polled: approved attachments and requested backfills.
+
+    Every pass also beats the ``userbot`` heartbeat, so a reader whose
+    Telegram session died shows up as silent within USERBOT_STALE_MINUTES.
+    """
     while True:
+        await beat_userbot(enabled=True, connected=client.is_connected(), user_id=user_id)
         try:
             await fetch_approved(client)
         except Exception:
@@ -695,6 +724,11 @@ async def run() -> None:
         # unless-stopped` (so it survives a VPS reboot), and a clean exit here
         # would make Docker restart it in a tight loop forever.
         log.warning("USERBOT_ENABLED=false — the passive reader stays off")
+        # Said once, so /holat shows the reader as switched off, not silent.
+        # The pool is released afterwards: an idle process holds no
+        # connection for weeks.
+        await beat_userbot(enabled=False)
+        await engine.dispose()
         await _idle_forever()
         return
     if not (
@@ -757,6 +791,7 @@ async def run() -> None:
 
         me = await client.get_me()
         log.info("userbot connected as %s (read-only)", display_name_of(me))
+        await beat_userbot(enabled=True, connected=True, user_id=me.id)
         await sync_from_client(client)
 
         async def _on_message(event) -> None:
@@ -769,7 +804,7 @@ async def run() -> None:
 
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
-        sweeper = asyncio.create_task(approved_media_loop(client))
+        sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
         log.info("listening for new messages in monitored chats")
         try:
             await client.run_until_disconnected()

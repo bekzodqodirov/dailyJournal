@@ -555,6 +555,28 @@ class ReminderLog(Base):
     )
 
 
+class Heartbeat(Base):
+    """Liveness ledger (build step 5): one row per process or scheduler job.
+
+    ``component`` is "bot" / "worker" / "userbot" / "api" / "backup" or
+    "job:<scheduler job id>". Each writer upserts its own row through
+    ``services.health.beat``; ``detail`` is replaced whole on every beat
+    (``{"enabled": false}`` marks a userbot switched off on purpose, which
+    is not a fault). Nothing here is owner data — the table is wiped and
+    rebuilt by the processes themselves.
+    """
+
+    __tablename__ = "heartbeats"
+
+    component: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    last_seen_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    detail: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+
+
 __all__ = [
     "ChatMonitor",
     "Claim",
@@ -562,6 +584,7 @@ __all__ = [
     "Debt",
     "DebtPayment",
     "Event",
+    "Heartbeat",
     "Interaction",
     "Memory",
     "Person",

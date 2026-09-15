@@ -24,6 +24,10 @@ async def database_available() -> bool:
 
 async def _truncate(session) -> None:
     """Wipe owner data between tests. Order follows foreign keys."""
+    # Liveness rows are the processes' own, not owner data — but a heartbeat
+    # left behind by one test must not read as "alive" in the next. Nothing
+    # references the table, so it goes first, ahead of the ledger below.
+    await session.execute(sa.delete(m.Heartbeat))
     for model in (
         # Claims reference interactions and people, so they go before both.
         m.Claim,

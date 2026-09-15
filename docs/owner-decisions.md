@@ -40,6 +40,9 @@ product decisions, not defaults: code that contradicts them is wrong.
   He would prefer the system to learn what matters on its own.
 
 ## Backups
+- Implemented in step 5: `pg_dump -Fc | age` nightly, sent to the owner's
+  Telegram (split into 45 MB pieces when large), restored with
+  `make restore`. The key in `secrets/backup-key.txt` is the only way back.
 - **Yes**, send the encrypted backup to Telegram nightly.
 
 ## How people address him
@@ -56,5 +59,5 @@ happened*, it answers."
 2. Open loops and the morning brief — done (needs `OWNER_ALIASES` in `.env`)
 3. Ask-before-writing for counterparty claims — done
 4. Per-person memory — done (`/kim`, `/tarix`, `/eslab`; profiles refresh every 30 min)
-5. Self-monitoring (/holat, heartbeat, backups to Telegram)
+5. Self-monitoring (/holat, heartbeat, backups to Telegram) — done
 6. Phone app, missed calls, SMS — later

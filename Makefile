@@ -2,7 +2,7 @@
 COMPOSE := docker compose
 .PHONY: help env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill backup
+        backfill backup restore
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -70,6 +70,11 @@ backup: ## Run the encrypted database backup now
 	$(COMPOSE) run --rm worker python -c \
 		"import asyncio; from miya.services.backup import create_backup; \
 		 print(asyncio.run(create_backup()))"
+
+restore: ## Restore a backup: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]
+	@test -n "$(FILE)" || (echo "usage: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]" && exit 1)
+	$(COMPOSE) run --rm worker python -m miya.tools.restore "$(FILE)" \
+		--identity /app/secrets/backup-key.txt $(if $(DRY),--dry-run,) $(if $(FORCE),--force,)
 
 gcal-auth: ## One-time Google Calendar OAuth (use with: ssh -L 8765:127.0.0.1:8765)
 	$(COMPOSE) run --rm -p 127.0.0.1:8765:8765 -v ./secrets:/app/secrets worker \

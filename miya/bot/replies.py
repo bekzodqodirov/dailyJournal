@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from miya.bot.formatting import (
     PRIORITY_LABEL,
@@ -32,7 +32,7 @@ from miya.bot.formatting import (
 )
 from miya.config import settings
 from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
-from miya.services import claims
+from miya.services import claims, health
 from miya.services.brief import MorningBrief
 from miya.services.loops import UnansweredQuestion
 from miya.services.people import Match
@@ -91,6 +91,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /chats — qaysi Telegram chatlar o'qilishi
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
+/holat — MIYA'ning ahvoli
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -1320,3 +1321,174 @@ def new_group_accepted(title: str | None, tg_chat_id: int, days: int) -> str:
 def new_group_declined(title: str | None, tg_chat_id: int) -> str:
     name = escape(title or f"chat {tg_chat_id}")
     return f"👌 <b>{name}</b> — o'qimayman. Kerak bo'lsa /chats dan yoqasiz."
+
+
+# --- /holat: is MIYA alive, and what to type if not (build step 5) -----------
+#
+# One screen, one line per part, ✅ / ⚠️ / ❌ / ⏸ at the front so the owner
+# reads the colour before the words. The judgements come from
+# services/health.py; this only says them in Uzbek. Every dynamic string
+# (a job id, a bot username) is escaped, the whole thing is clipped.
+
+STATUS_HEADER = "🩺 <b>MIYA holati</b>"
+STATUS_NEVER = "hali yo'q"
+
+DB_DOWN_ALERT = (
+    "❌ Baza javob bermayapti — hech narsa yozilmayapti va o'qilmayapti. "
+    "Serverda: <code>docker compose ps</code>, <code>docker compose logs db</code>, "
+    "keyin <code>make up</code>."
+)
+
+
+def _ago(age: timedelta | None) -> str:
+    """'6 daqiqa oldin', or the honest gap when it never happened."""
+    if age is None:
+        return STATUS_NEVER
+    if age < timedelta(minutes=1):
+        return "hozirgina"
+    return f"{age_label(age)} oldin"
+
+
+def _since_when(when: datetime | None, now: datetime) -> str:
+    return _ago(now - when) if when is not None else STATUS_NEVER
+
+
+def _day_clock(when: datetime, now: datetime) -> str:
+    """'bugun 03:30' / 'kecha 03:30' / '12-sen 03:30'."""
+    local = when.astimezone(settings.tz)
+    days = (now.astimezone(settings.tz).date() - local.date()).days
+    if days == 0:
+        day = "bugun"
+    elif days == 1:
+        day = "kecha"
+    else:
+        day = short_date(local.date())
+    return f"{day} {clock(local)}"
+
+
+def worker_silent_alert(worker: health.Component) -> str:
+    """The bot's own alarm: the scheduler has stopped beating.
+
+    The same key as services/health.py's ``worker_silent`` and the same
+    remedy, so the shared ledger dedupes whichever process speaks first.
+    """
+    since = (
+        f"{age_label(worker.age)}dan beri jim"
+        if worker.age is not None
+        else "hali bir marta ham xabar bermagan"
+    )
+    return (
+        f"❌ Rejalashtiruvchi (worker) {since} — eslatmalar, hisobot va zaxira "
+        "nusxa to'xtab turibdi. Serverda: <code>docker compose restart worker</code>, "
+        "keyin <code>make worker</code> bilan logni ko'r."
+    )
+
+
+def _bot_line(status: health.Status) -> str:
+    # This very message is the proof: the bot rendering it is alive.
+    username = status.components["bot"].detail.get("username")
+    tail = f" · @{escape(str(username))}" if username else ""
+    return f"✅ Bot — ishlayapti{tail}"
+
+
+def _userbot_line(status: health.Status) -> str:
+    userbot = status.components["userbot"]
+    if userbot.disabled:
+        return "⏸ Telegram o'quvchi — o'chirilgan (USERBOT_ENABLED=false)"
+    last = f"oxirgi xabar: {_since_when(status.userbot_last_message_at, status.now)}"
+    if userbot.stale:
+        if userbot.age is None:
+            return f"❌ Telegram o'quvchi — hali ulanmagan · {last}"
+        return f"❌ Telegram o'quvchi — {age_label(userbot.age)}dan beri jim · {last}"
+    if userbot.detail.get("connected") is False:
+        return f"⚠️ Telegram o'quvchi — Telegramdan uzilgan · {last}"
+    return f"✅ Telegram o'quvchi — ulangan · {last}"
+
+
+def _worker_line(status: health.Status) -> str:
+    worker = status.components["worker"]
+    if not worker.stale:
+        return f"✅ Rejalashtiruvchi — oxirgi urish: {_ago(worker.age)}"
+    if worker.age is None:
+        return "❌ Rejalashtiruvchi — hali bir marta ham urmagan"
+    line = f"❌ Rejalashtiruvchi — {age_label(worker.age)}dan beri jim"
+    # The job that has waited longest says what the owner is missing.
+    known = [job for job in status.jobs.values() if job.age is not None]
+    if known:
+        oldest = max(known, key=lambda job: job.age)
+        line += f" · eng eski ish: {escape(oldest.name)} ({_ago(oldest.age)})"
+    return line
+
+
+def _db_line(status: health.Status) -> str:
+    if not status.db_ok:
+        return "❌ Baza — javob bermayapti"
+    return f"✅ Baza — javob beryapti · {health.size_label(status.db_size_bytes)}"
+
+
+def _disk_line(status: health.Status) -> str:
+    if status.disk_free_bytes is None:
+        return "⚠️ Disk — o'lchab bo'lmadi"
+    free = health.size_label(status.disk_free_bytes)
+    if status.disk_low:
+        return f"❌ Disk — {free} bo'sh (chegara {settings.disk_min_free_gb:g} GB)"
+    return f"✅ Disk — {free} bo'sh"
+
+
+def _backup_line(status: health.Status) -> str:
+    info = status.backup
+    if not info.configured:
+        return "⚠️ Zaxira nusxa — sozlanmagan (BACKUP_AGE_RECIPIENT bo'sh)"
+    if info.path is None or info.created_at is None:
+        return f"⚠️ Zaxira nusxa — {STATUS_NEVER}"
+    when = _day_clock(info.created_at, status.now)
+    size = health.size_label(info.size)
+    if info.stale:
+        return f"⚠️ Zaxira nusxa — {when} · {size} · eskirgan"
+    if info.sent_to_telegram:
+        return f"✅ Zaxira nusxa — {when} · {size} · Telegramga yuborildi"
+    if info.send_failed:
+        return f"⚠️ Zaxira nusxa — {when} · {size} · Telegramga yuborilmadi"
+    if not settings.backup_to_telegram:
+        return f"✅ Zaxira nusxa — {when} · {size} · faqat diskda"
+    return f"⚠️ Zaxira nusxa — {when} · {size} · Telegramga hali yuborilmagan"
+
+
+def _anthropic_line(status: health.Status) -> str:
+    if status.anthropic_failing:
+        return (
+            "⚠️ Anthropic — oxirgi muvaffaqiyat: "
+            f"{_since_when(status.anthropic_last_ok_at, status.now)} · "
+            f"{status.windows_pending} ta kutmoqda, {status.windows_failed} ta xato"
+        )
+    if status.anthropic_last_ok_at is None:
+        return "✅ Anthropic — hali ishlatilmagan"
+    last = _since_when(status.anthropic_last_ok_at, status.now)
+    return f"✅ Anthropic — oxirgi muvaffaqiyat: {last}"
+
+
+def status_report(status: health.Status, problems: list[health.Problem]) -> str:
+    """`/holat`: every part of MIYA on one line each, then what to do."""
+    now = status.now.astimezone(settings.tz)
+    lines = [
+        f"{STATUS_HEADER} · {short_date(now.date())} {clock(now)}",
+        _bot_line(status),
+        _userbot_line(status),
+        _worker_line(status),
+        _db_line(status),
+        _disk_line(status),
+        _backup_line(status),
+        _anthropic_line(status),
+        "<b>Navbatda</b>: "
+        f"kutayotgan suhbatlar {status.windows_pending} · "
+        f"batch'da {status.windows_submitted} · "
+        f"ishlanmagan {status.needs_review} (/tekshir) · "
+        f"da'volar {status.claims_pending} (/davolar)",
+        "<b>Xarajat</b>: "
+        f"bugun {usd(status.cost_today_usd)} · "
+        f"bu oy {usd(status.cost_month_usd)} (/xarajat)",
+    ]
+    if problems:
+        lines.append("")
+        lines += [problem.text for problem in problems]
+    return clip("\n".join(lines))

@@ -56,12 +56,18 @@ class _Bot:
 
     def __init__(self, *, reachable: bool = True) -> None:
         self.sent: list[str] = []
+        self.documents: list[tuple] = []
         self.reachable = reachable
 
     async def send_message(self, chat_id, text, **kwargs) -> None:
         if not self.reachable:
             raise RuntimeError("telegram is down")
         self.sent.append(text)
+
+    async def send_document(self, chat_id, document, **kwargs) -> None:
+        if not self.reachable:
+            raise RuntimeError("telegram is down")
+        self.documents.append((document, kwargs))
 
 
 # --- the receipt text --------------------------------------------------------

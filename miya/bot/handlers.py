@@ -42,6 +42,7 @@ from miya.services import (
     chats,
     claims,
     documents,
+    health,
     memories,
     nudges,
     planner,
@@ -399,6 +400,24 @@ async def cmd_usage(message: Message, command: CommandObject) -> None:
     async with session_scope() as session:
         summary = await queries.usage_summary(session, first, min(last, today))
     await _safe_answer(message, replies.usage_report(summary))
+
+
+@router.message(Command("holat"))
+async def cmd_status(message: Message) -> None:
+    """`/holat` — is every part of MIYA alive, and what to type if not.
+
+    The judgement (services/health.py) is the same one the worker's health
+    job alerts on; asking here is only ever a read.
+    """
+    try:
+        async with session_scope() as session:
+            status = await health.gather(session)
+    except Exception:
+        # The one report that must still come out when the database is
+        # down: the db_down line and its remedy, from what the bot can see.
+        log.exception("/holat: the database did not answer")
+        status = health.Status.unreachable(datetime.now(settings.tz))
+    await _safe_answer(message, replies.status_report(status, health.problems(status)))
 
 
 @router.message(Command("unut"))

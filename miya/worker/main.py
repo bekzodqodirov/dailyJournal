@@ -15,7 +15,9 @@ Jobs:
   * batch_submit — every BATCH_FLUSH_HOURS; pending windows → Batch API
   * batch_poll   — every 15 min; applies finished batches, then tells the
                    owner what his chats put on the ledger (quiet-hours aware)
-  * backup       — cron at BACKUP_TIME; encrypted pg_dump, 14-day retention
+  * backup       — cron at BACKUP_TIME; encrypted pg_dump -Fc, 14-day
+                   retention, and a copy to the owner's Telegram in ≤45 MB
+                   pieces (build step 5)
   * morning_brief — cron at MORNING_BRIEF_TIME; today's meetings, what is due,
                    and every open loop, deterministic, never skipped
   * nudges       — every 30 min; one short message per question nobody
@@ -28,26 +30,37 @@ Jobs:
   * profile_refresh — every 30 min; rewrites the written profile of up to
                    PROFILE_REFRESH_PER_RUN people whose activity is newer
                    than their profile (sends nothing; build step 4)
+  * heartbeat    — every minute; the worker's own liveness row (build step 5)
+  * health       — every 5 min; one status, the problems it shows, one alert
+                   per problem per ALERT_REPEAT_HOURS and one recovery notice
+                   when it clears; critical ones ignore quiet hours
+
+Every job's outcome is also recorded as a ``job:<id>`` heartbeat by an
+APScheduler listener, so /holat can name the job that last failed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import signal
 import sys
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
 
 import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.types import FSInputFile
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import keyboards, notices, replies
-from miya.bot.formatting import clip, escape
+from miya.bot.formatting import clip, clock, escape, short_date
 from miya.config import settings
 from miya.db.models import Claim, DailyReport, Person, ReminderLog
 from miya.db.session import engine, session_scope
@@ -60,6 +73,7 @@ from miya.services import (
     chats,
     claims,
     gcal,
+    health,
     memories,
     nudges,
     profiles,
@@ -592,17 +606,228 @@ async def chat_notice_job(bot: Bot) -> None:
 
 
 async def backup_job(bot: Bot) -> None:
-    """Nightly encrypted pg_dump (spec §10). Silence means it worked."""
+    """Nightly encrypted pg_dump (spec §10), then a copy to Telegram.
+
+    Silence means the dump worked. The file itself is the durable copy; the
+    Telegram copy (BACKUP_TO_TELEGRAM, the owner's decision in build step 5)
+    is what survives the VPS disk, and its outcome is recorded as the
+    ``backup`` heartbeat so /holat and the health job can say whether the
+    newest file ever left the server.
+    """
     result = await backup.create_backup()
-    if result.ok or result.error == "no_recipient":
+    if result.error == "no_recipient":
         return
-    # A backup that stopped working is worth waking the owner for — it is the
-    # only thing standing between a disk failure and losing everything.
-    await notify(
-        bot,
-        "⚠️ <b>Zaxira nusxa muvaffaqiyatsiz</b>\n\n"
-        f"<code>{escape(result.error or 'unknown')}</code>",
+    # Pieces left by an upload the container died in the middle of: nothing
+    # prunes them otherwise, and they are only ever a copy of the file.
+    stale_parts = sorted(backup.backup_dir().glob(f"*{backup.BACKUP_SUFFIX}.part[0-9]*"))
+    if stale_parts:
+        backup.remove_parts(stale_parts)
+    if not result.ok or result.path is None:
+        # A backup that stopped working is worth waking the owner for — it is
+        # the only thing standing between a disk failure and losing everything.
+        await notify(
+            bot,
+            "⚠️ <b>Zaxira nusxa muvaffaqiyatsiz</b>\n\n"
+            f"<code>{escape(result.error or 'unknown')}</code>",
+        )
+        return
+    if settings.backup_to_telegram:
+        await send_backup_to_telegram(bot, result.path, result.size)
+
+
+def _backup_caption(path: Path, size: int, index: int, total: int) -> str:
+    stamp = backup.backup_stamp(path) or datetime.now(settings.tz)
+    when = f"{short_date(stamp.date())} {clock(stamp)}"
+    return escape(f"🗄 Zaxira nusxa {when} · {health.size_label(size)} · {index}/{total}")
+
+
+async def _record_backup_delivery(
+    path: Path, size: int, *, sent: bool, now: datetime, error: str | None = None
+) -> None:
+    """The ``backup`` heartbeat: did *this* file reach Telegram. Never raises —
+    a database hiccup here must not turn a delivered backup into a warning."""
+    detail: dict = {"sent": sent, "path": str(path), "size": size}
+    if sent:
+        detail["sent_at"] = now.isoformat()
+    else:
+        detail["error"] = (error or "unknown")[:200]
+    try:
+        async with session_scope() as session:
+            await health.beat(session, health.BACKUP_COMPONENT, detail=detail, now=now)
+    except Exception:
+        log.exception("could not record the backup delivery heartbeat")
+
+
+async def send_backup_to_telegram(bot: Bot, path: Path, size: int) -> bool:
+    """Send one backup to the owner as documents, in pieces when it is big.
+
+    Telegram caps a bot document at 50 MB, so ``backup.split_for_telegram``
+    cuts anything larger into ``.partNN`` files next to the backup; every
+    piece goes out in order with its ``N/M`` caption and the pieces are
+    removed again whatever happens — the backup itself is never touched.
+    A failure (Telegram down, a file past ``backup.MAX_PARTS`` pieces) is
+    told to the owner as a warning that names the on-disk path: the backup is
+    fine, only the off-site copy is missing. The warning is logged under the
+    ``backup_failed`` alert key, so the health job does not repeat it at
+    once, and it waits for quiet hours to end like every other warning — the
+    ``backup`` heartbeat carries it to the health job in the morning.
+    Returns whether every piece was delivered.
+    """
+    now = datetime.now(settings.tz)
+    parts: list[Path] = []
+    try:
+        parts = await asyncio.to_thread(backup.split_for_telegram, path)
+        total = len(parts)
+        for index, part in enumerate(parts, 1):
+            await bot.send_document(
+                settings.owner_telegram_id,
+                FSInputFile(part),
+                caption=_backup_caption(path, size, index, total),
+                disable_notification=True,
+            )
+    except Exception as exc:
+        log.exception("backup %s could not be sent to Telegram", path.name)
+        await _record_backup_delivery(path, size, sent=False, now=now, error=str(exc))
+        if not reminders.in_quiet_hours():
+            told = await notify(
+                bot,
+                "⚠️ <b>Zaxira nusxa Telegramga yuborilmadi</b>\n\n"
+                f"Fayl diskda turibdi: <code>{escape(str(path))}</code>\n"
+                f"Sabab: <code>{escape(str(exc)[:200] or type(exc).__name__)}</code>\n"
+                "Keyingi kecha qayta uriniladi; hozir kerak bo'lsa "
+                "<code>make backup</code>.",
+            )
+            if told:
+                await _mark_alert_delivered("backup_failed", now=now)
+        return False
+    finally:
+        backup.remove_parts(parts)
+
+    await _record_backup_delivery(path, size, sent=True, now=now)
+    log.info("backup %s sent to Telegram in %d piece(s)", path.name, len(parts))
+    return True
+
+
+async def _mark_alert_delivered(key: str, *, now: datetime) -> None:
+    """Ledger entry for an alert this job sent itself, so the health job's
+    dedupe covers it. Best effort: the message already went out."""
+    try:
+        async with session_scope() as session:
+            health.mark_alerted(session, [key], now=now)
+    except Exception:
+        log.exception("could not record the %s alert", key)
+
+
+# --- self-monitoring (build step 5) -----------------------------------------
+
+
+async def record_job_event(job_id: str, *, ok: bool, error: str | None) -> None:
+    """Upsert the ``job:<id>`` heartbeat for one finished scheduler run.
+
+    Its own session, and it never raises: a heartbeat that cannot be written
+    is a log line, not a second failure on top of the job's own.
+    """
+    try:
+        async with session_scope() as session:
+            await health.beat(
+                session,
+                health.JOB_PREFIX + job_id,
+                detail={"ok": ok, "error": error[:200] if error else None},
+            )
+    except Exception:
+        log.exception("could not record the outcome of job %s", job_id)
+
+
+def _on_job_event(event, *, loop: asyncio.AbstractEventLoop):
+    """APScheduler listener (EVENT_JOB_EXECUTED | EVENT_JOB_ERROR).
+
+    Listeners are plain callbacks, so the upsert is handed to the loop as a
+    task; the returned future is for tests, APScheduler ignores it.
+    """
+    exc = getattr(event, "exception", None)
+    error = None if exc is None else f"{type(exc).__name__}: {exc}"
+    return asyncio.run_coroutine_threadsafe(
+        record_job_event(event.job_id, ok=exc is None, error=error), loop
     )
+
+
+async def heartbeat_job(scheduler: AsyncIOScheduler | None = None) -> None:
+    """The worker's own liveness row, once a minute."""
+    jobs = len(scheduler.get_jobs()) if scheduler is not None else 0
+    async with session_scope() as session:
+        await health.beat(session, "worker", detail={"jobs": jobs})
+
+
+# When the database is down the alert ledger is down with it; this memo is
+# what keeps the worker from repeating "Baza javob bermayapti" every five
+# minutes until it comes back. Per process, like the bot's.
+_offline_alerted_at: dict[str, datetime] = {}
+
+
+async def health_job(bot: Bot) -> None:
+    """Judge the system and tell the owner what needs a hand (every 5 min).
+
+    One status, the problems it shows, then the ledger decides: a problem is
+    said once per ALERT_REPEAT_HOURS while it lasts, and once more as
+    "tiklandi" when it clears. Critical problems (the database, the disk)
+    ignore quiet hours; warnings and recoveries wait for morning — the ledger
+    still shows them due then, nothing is lost. Only a delivered message is
+    recorded, so an unreachable Telegram means the alert is simply tried
+    again next tick.
+    """
+    now = datetime.now(settings.tz)
+    status: health.Status | None = None
+    try:
+        async with session_scope() as session:
+            status = await health.gather(session, now=now)
+            if status.db_ok:
+                await _alert_from_ledger(session, bot, health.problems(status), now=now)
+                return
+    except Exception:
+        # Leaving the scope commits; with the database gone that can fail
+        # too. A failure with the database *up* is a real one and stays loud.
+        if status is None or status.db_ok:
+            raise
+        log.warning("health sweep: the database is unreachable", exc_info=True)
+    await _alert_without_ledger(bot, health.problems(status), now=now)
+
+
+async def _alert_from_ledger(
+    session, bot: Bot, found: list[health.Problem], *, now: datetime
+) -> None:
+    quiet = reminders.in_quiet_hours(now)
+    due, recovered = await health.alerts_due(session, found, now=now)
+    for problem in due:
+        if problem.severity != "critical" and quiet:
+            continue
+        if await notify(bot, problem.text):
+            health.mark_alerted(session, [problem.key], now=now)
+            # Committed one by one: a crash mid-sweep repeats at most one.
+            await session.commit()
+    if quiet:
+        return
+    for key in recovered:
+        # Includes worker_silent, raised by the bot's watchdog: this job
+        # running again is the proof, so the worker alone announces it.
+        if await notify(bot, health.recovery_text(key)):
+            health.mark_recovered(session, [key], now=now)
+            await session.commit()
+
+
+async def _alert_without_ledger(
+    bot: Bot, found: list[health.Problem], *, now: datetime
+) -> None:
+    """The critical problems only, deduped in memory: with the database gone
+    there is nothing else to judge and nowhere to write."""
+    repeat = timedelta(hours=settings.alert_repeat_hours)
+    for problem in found:
+        if problem.severity != "critical":
+            continue
+        last = _offline_alerted_at.get(problem.key)
+        if last is not None and now - last <= repeat:
+            continue
+        if await notify(bot, problem.text):
+            _offline_alerted_at[problem.key] = now
 
 
 def _last_scheduled(at: time, now: datetime) -> datetime:
@@ -868,8 +1093,34 @@ async def run() -> None:
         coalesce=True,
         misfire_grace_time=3600,
     )
+    scheduler.add_job(
+        heartbeat_job,
+        IntervalTrigger(minutes=1),
+        args=[scheduler],
+        id="heartbeat",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        health_job,
+        IntervalTrigger(minutes=5),
+        args=[bot],
+        id="health",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_listener(
+        functools.partial(_on_job_event, loop=asyncio.get_running_loop()),
+        EVENT_JOB_EXECUTED | EVENT_JOB_ERROR,
+    )
     scheduler.start()
     log.info("worker started (tz=%s); jobs: %s", settings.timezone, scheduler.get_jobs())
+    # The first beat goes out before the catch-up, which can take minutes
+    # (a report, a backup): the bot's watchdog must not read that as silence.
+    try:
+        await heartbeat_job(scheduler)
+    except Exception:
+        log.exception("startup heartbeat failed; the scheduler carries on")
     # Never fatal: the worker's whole job is to keep running.
     try:
         await catch_up(bot)

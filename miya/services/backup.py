@@ -1,12 +1,24 @@
-"""Nightly encrypted database backup (spec §10).
+"""Nightly encrypted database backup (spec §10, build step 5).
 
-``pg_dump`` piped into `age`, kept for ``BACKUP_RETENTION_DAYS``. The dump
+``pg_dump -Fc`` piped into `age`, kept for ``BACKUP_RETENTION_DAYS``. The dump
 contains every debt, message and transcript in the system, so it is never
 written to disk in the clear: age encrypts it to the recipient public key in
 ``BACKUP_AGE_RECIPIENT`` before it lands.
 
 With no recipient configured the job logs once and does nothing — an
 unencrypted copy of this database is not an acceptable fallback.
+
+Format (build step 5): ``miya-<stamp>.dump.age`` is pg_dump's *custom*
+archive (compressed, restored with ``pg_restore`` — see
+``miya.tools.restore``) encrypted with age. Files from before this step are
+``miya-<stamp>.sql.age`` (plain SQL for ``psql``); they are left exactly as
+they are — never pruned, never counted as the current backup — until the
+owner deletes them by hand. Restore one with
+``age -d -i secrets/backup-key.txt miya-….sql.age | psql <DSN>``.
+
+The nightly file also goes to the owner's Telegram (his decision): a
+document is capped at 50 MB there, so ``split_for_telegram`` cuts a larger
+backup into ``.partNN`` pieces that ``miya.tools.restore`` joins back.
 """
 
 from __future__ import annotations
@@ -24,9 +36,24 @@ from miya.config import settings
 
 log = logging.getLogger(__name__)
 
-BACKUP_SUFFIX = ".sql.age"
+BACKUP_SUFFIX = ".dump.age"
+# The pre-step-5 format: plain SQL. Recognised so nothing touches those files.
+LEGACY_SUFFIX = ".sql.age"
 _STAMP_RE = re.compile(r"(\d{8}-\d{6})")
+_STAMP_FORMAT = "%Y%m%d-%H%M%S"
 PG_DUMP_TIMEOUT_SECONDS = 1800
+
+# Telegram accepts documents up to 50 MB from a bot; 45 MB leaves margin for
+# the multipart envelope. A backup larger than MAX_PARTS pieces is not sent
+# at all (the owner is told and the file stays on disk).
+TELEGRAM_PART_BYTES = 45 * 1024 * 1024
+MAX_PARTS = 10
+_PART_RE = re.compile(r"\.part(\d{2,})$")
+_CHUNK_BYTES = 1024 * 1024
+
+
+class BackupTooLarge(Exception):
+    """The backup would need more than MAX_PARTS Telegram documents."""
 
 
 @dataclass(slots=True)
@@ -41,14 +68,14 @@ class BackupResult:
         return self.error is None and self.path is not None
 
 
-def _dsn_and_env() -> tuple[str, dict[str, str]]:
-    """SQLAlchemy URL → libpq URL plus environment for pg_dump.
+def libpq_dsn_and_env(url: str) -> tuple[str, dict[str, str]]:
+    """SQLAlchemy URL → libpq URL plus environment for pg_dump / pg_restore.
 
     The password travels via PGPASSWORD, never argv: `/proc/*/cmdline` is
     world-readable, so a DSN with the password inline would show the database
     credentials to every process on the host for the duration of the dump.
     """
-    url = re.sub(r"^postgresql\+\w+://", "postgresql://", settings.database_url)
+    url = re.sub(r"^postgresql\+\w+://", "postgresql://", url)
     parsed = urlsplit(url)
     env = dict(os.environ)
     if parsed.password:
@@ -59,6 +86,11 @@ def _dsn_and_env() -> tuple[str, dict[str, str]]:
             netloc += f":{parsed.port}"
         url = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, ""))
     return url, env
+
+
+def _dsn_and_env() -> tuple[str, dict[str, str]]:
+    """The configured database, ready for pg_dump."""
+    return libpq_dsn_and_env(settings.database_url)
 
 
 def backup_dir() -> Path:
@@ -92,11 +124,14 @@ async def create_backup(*, now: datetime | None = None) -> BackupResult:
         log.exception("backup directory is not usable")
         return BackupResult(error=f"backup directory unusable: {exc}")
 
-    target = directory / f"miya-{now.strftime('%Y%m%d-%H%M%S')}{BACKUP_SUFFIX}"
+    target = directory / f"miya-{now.strftime(_STAMP_FORMAT)}{BACKUP_SUFFIX}"
     partial = target.with_suffix(target.suffix + ".partial")
 
-    # pg_dump | age -r <recipient> -o <file>. The plaintext only ever exists
-    # inside this pipe — it is never written to disk unencrypted.
+    # pg_dump -Fc | age -r <recipient> -o <file>. The plaintext only ever
+    # exists inside this pipe — it is never written to disk unencrypted.
+    # Custom format is compressed by pg_dump itself (a dump of transcripts
+    # shrinks several-fold), which is what keeps the Telegram copy under the
+    # document cap for a long time.
     #
     # A real OS pipe, not `dump.stdout`: asyncio hands back a StreamReader,
     # which has no file descriptor to give the second process.
@@ -105,6 +140,7 @@ async def create_backup(*, now: datetime | None = None) -> BackupResult:
     try:
         dump = await asyncio.create_subprocess_exec(
             "pg_dump",
+            "--format=custom",
             "--no-owner",
             "--no-privileges",
             dsn,
@@ -168,8 +204,47 @@ async def create_backup(*, now: datetime | None = None) -> BackupResult:
     return result
 
 
+def backup_stamp(path: Path) -> datetime | None:
+    """When a backup was taken, read from its name; None for a foreign file."""
+    match = _STAMP_RE.search(path.name)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group(1), _STAMP_FORMAT).replace(
+            tzinfo=settings.tz
+        )
+    except ValueError:
+        return None
+
+
+def _current_backups() -> list[Path]:
+    """Every backup in the current format, oldest first by stamp.
+
+    Only ``*.dump.age``: a legacy ``.sql.age``, a ``.partial`` still being
+    written and a ``.partNN`` waiting to go to Telegram all fall outside the
+    glob, so none of them is ever pruned or reported as "the newest backup".
+    A file without a stamp in its name is not one of ours.
+    """
+    try:
+        candidates = list(backup_dir().glob(f"*{BACKUP_SUFFIX}"))
+    except OSError:
+        log.warning("backup directory is not readable", exc_info=True)
+        return []
+    stamped = [(backup_stamp(p), p) for p in candidates]
+    return [p for _stamp, p in sorted(s for s in stamped if s[0] is not None)]
+
+
+async def newest_backup() -> Path | None:
+    """The most recent ``*.dump.age`` on disk, or None. Never raises."""
+    current = await asyncio.to_thread(_current_backups)
+    return current[-1] if current else None
+
+
 def prune_old(*, now: datetime | None = None) -> int:
-    """Delete backups older than the retention window. Returns how many."""
+    """Delete backups older than the retention window. Returns how many.
+
+    Legacy ``.sql.age`` files are outside the glob and are never touched.
+    """
     now = now or datetime.now(settings.tz)
     cutoff = now - timedelta(days=settings.backup_retention_days)
     pruned = 0
@@ -179,14 +254,8 @@ def prune_old(*, now: datetime | None = None) -> int:
         log.warning("backup directory is not readable; nothing pruned", exc_info=True)
         return 0
     for path in candidates:
-        match = _STAMP_RE.search(path.name)
-        if match is None:
-            continue
-        try:
-            stamp = datetime.strptime(match.group(1), "%Y%m%d-%H%M%S").replace(
-                tzinfo=settings.tz
-            )
-        except ValueError:
+        stamp = backup_stamp(path)
+        if stamp is None:
             continue
         if stamp < cutoff:
             try:
@@ -195,3 +264,64 @@ def prune_old(*, now: datetime | None = None) -> int:
             except OSError:
                 log.warning("could not prune old backup %s", path, exc_info=True)
     return pruned
+
+
+# --- Telegram copy ----------------------------------------------------------
+
+
+def split_for_telegram(path: Path) -> list[Path]:
+    """Cut one backup into pieces Telegram accepts; ``[path]`` when it fits.
+
+    Pieces are ``<name>.part01`` … ``<name>.partNN`` next to the file, each
+    TELEGRAM_PART_BYTES except the last, owner-only like the backup itself,
+    written with fixed-size reads so a multi-hundred-megabyte file never sits
+    in memory. Blocking I/O: the worker calls this through
+    ``asyncio.to_thread``. Raises BackupTooLarge (before writing anything)
+    past MAX_PARTS pieces. The caller removes the pieces with
+    ``remove_parts`` once they are sent — or failed to send.
+    """
+    size = path.stat().st_size
+    if size <= TELEGRAM_PART_BYTES:
+        return [path]
+    count = -(-size // TELEGRAM_PART_BYTES)
+    if count > MAX_PARTS:
+        raise BackupTooLarge(
+            f"{path.name} is {size} bytes, {count} pieces; the cap is {MAX_PARTS}"
+        )
+
+    parts: list[Path] = []
+    try:
+        with path.open("rb") as source:
+            for index in range(1, count + 1):
+                part = path.with_name(f"{path.name}.part{index:02d}")
+                fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                parts.append(part)
+                remaining = TELEGRAM_PART_BYTES
+                with os.fdopen(fd, "wb") as sink:
+                    while remaining > 0:
+                        chunk = source.read(min(_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            break
+                        sink.write(chunk)
+                        remaining -= len(chunk)
+    except OSError:
+        remove_parts(parts)
+        raise
+    return parts
+
+
+def remove_parts(parts: list[Path]) -> None:
+    """Delete the ``.partNN`` pieces; the backup itself is never touched."""
+    for part in parts:
+        if _PART_RE.search(part.name) is None:
+            continue
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not remove %s", part, exc_info=True)
+
+
+def part_number(path: Path) -> int | None:
+    """``…part03`` → 3; None for a whole backup."""
+    match = _PART_RE.search(path.name)
+    return int(match.group(1)) if match else None

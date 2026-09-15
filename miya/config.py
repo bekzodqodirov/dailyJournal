@@ -150,6 +150,27 @@ class Settings(BaseSettings):
     # than writing an unencrypted dump of every debt and transcript to disk.
     backup_age_recipient: str = ""
     backup_time: str = "03:30"
+    # The nightly file also goes to the owner's Telegram (his decision, build
+    # step 5) — the VPS disk is not the only copy. It is still age-encrypted;
+    # Telegram only ever sees ciphertext.
+    backup_to_telegram: bool = True
+
+    # --- Self-monitoring (build step 5) -------------------------------------
+    # A process whose heartbeat is older than this is "silent". The worker
+    # beats every minute, the bot every five, the api on each /health poll.
+    heartbeat_stale_minutes: int = Field(default=10, ge=1)
+    # The userbot beats once a minute from its media loop; a shorter fuse
+    # because a dropped Telegram session is the failure the owner cannot see.
+    userbot_stale_minutes: int = Field(default=5, ge=1)
+    # Below this much free space on the data volume /holat goes red and the
+    # owner is alerted even inside quiet hours: a full disk stops everything.
+    disk_min_free_gb: float = Field(default=2.0, ge=0)
+    # The newest backup may be this old before it counts as stale. Nightly
+    # plus a few hours of slack for a late run or a VPS reboot at 03:30.
+    backup_max_age_hours: int = Field(default=30, ge=1)
+    # The same problem is repeated no more often than this while it persists;
+    # a recovery notice goes out once when it clears.
+    alert_repeat_hours: int = Field(default=6, ge=1)
 
     # --- Internal API -------------------------------------------------------
     api_bearer_token: str = ""

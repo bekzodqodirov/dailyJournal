@@ -47,10 +47,15 @@ class _Bot:
 
     def __init__(self) -> None:
         self.sent: list[str] = []
+        self.documents: list[tuple] = []
 
     async def send_message(self, chat_id, text, **kwargs) -> None:
         await asyncio.sleep(0.01)
         self.sent.append(text)
+
+    async def send_document(self, chat_id, document, **kwargs) -> None:
+        await asyncio.sleep(0.01)
+        self.documents.append((document, kwargs))
 
 
 class _Editable(_Message):
