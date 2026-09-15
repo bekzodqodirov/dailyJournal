@@ -7,6 +7,8 @@ bytes, and a chat list page carries one payload per button.
     ch:p:<page>                 jump to a page of the chat list
     md:y|n:<interaction_id>     read / skip an oversized attachment
     rec:<action>:<ref>          act on one record: d12 / p7 / t3 (see below)
+    rec:qa|qs:q<interaction_id> a nudged question: answered / snooze till morning
+    ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
 """
 
 from __future__ import annotations
@@ -133,6 +135,13 @@ ACTION_REOPEN = "r"
 ACTION_PERSON_YES = "py"
 ACTION_PERSON_NO = "pn"
 PERSON_ANSWERS = (ACTION_PERSON_YES, ACTION_PERSON_NO)
+# rec:qa:q<id> ✅ Javob berdim — the nudged question is answered for good
+# rec:qs:q<id> ⏰ Ertalab eslat — snooze it until the next morning brief
+# The ref is "q" + the interaction id: not a record ref, and never parsed as
+# one — the handler routes these two actions before it looks for a d/p/t.
+ACTION_QUESTION_ANSWERED = "qa"
+ACTION_QUESTION_SNOOZE = "qs"
+QUESTION_ANSWERS = (ACTION_QUESTION_ANSWERED, ACTION_QUESTION_SNOOZE)
 
 # Telegram caps an inline keyboard well above this, but a reminder that
 # needs more rows than this is already unreadable; the tail comes back next
@@ -295,3 +304,72 @@ def without(
         if not any((b.callback_data or "").endswith(f":{handle}") for b in row)
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+# --- open loops: the nudge, the brief, a new group ----------------------------
+
+
+def question_ref(interaction_id: int) -> str:
+    return f"q{interaction_id}"
+
+
+def parse_question_ref(handle: str) -> int | None:
+    """'q12' → 12; anything else → None."""
+    if handle[:1] == "q" and handle[1:].isdigit():
+        return int(handle[1:])
+    return None
+
+
+def nudge_actions(interaction_id: int) -> InlineKeyboardMarkup:
+    """✅ Javob berdim / ⏰ Ertalab eslat under one nudged question.
+
+    "Ertalab", not "Ertaga": tapped at 08:00 the nudge comes back at today's
+    brief, so the label names the brief rather than a day.
+    """
+    handle = question_ref(interaction_id)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Javob berdim",
+                    callback_data=f"rec:{ACTION_QUESTION_ANSWERED}:{handle}",
+                ),
+                InlineKeyboardButton(
+                    text="⏰ Ertalab eslat",
+                    callback_data=f"rec:{ACTION_QUESTION_SNOOZE}:{handle}",
+                ),
+            ]
+        ]
+    )
+
+
+def brief_actions(
+    due: list[tuple[str, int]], stale: list[tuple[str, int]]
+) -> InlineKeyboardMarkup | None:
+    """The morning brief's buttons: a ✅ / ✏️ row per due row, a Ha /
+    Bajarildi / Yop row per undated one that has been sitting — the same rows
+    the reminder and the "Hali ochiqmi?" question carry, so he acts from the
+    brief the way he acts from those. Always labelled: the brief carries many
+    rows, and a bare ✅ would not say which."""
+    due = [(k, i) for k, i in due if i is not None]
+    stale = [(k, i) for k, i in stale if i is not None and (k, i) not in due]
+    rows = [record_row(k, i, labelled=True) for k, i in due]
+    rows += [question_row(k, i, labelled=True) for k, i in stale]
+    rows = rows[:MAX_ROWS]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def new_group_question(monitor_id: int) -> InlineKeyboardMarkup:
+    """Ha / Yo'q under "Yangi guruh: … — o'qiymi?" (or "Yangi kanal: …").
+
+    The monitor id is the whole payload — a channel and a group get the same
+    two buttons, and the handler answers with the row's own title.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Ha", callback_data=f"ng:y:{monitor_id}"),
+                InlineKeyboardButton(text="✖️ Yo'q", callback_data=f"ng:n:{monitor_id}"),
+            ]
+        ]
+    )

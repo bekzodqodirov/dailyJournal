@@ -8,13 +8,24 @@ from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
-from pydantic import BeforeValidator, Field, field_validator
+from pydantic import BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _parse_hhmm(value: str) -> time:
     hour, minute = value.strip().split(":")
     return time(hour=int(hour), minute=int(minute))
+
+
+def _within(current: time, start: time, end: time) -> bool:
+    """Is ``current`` inside [start, end), a range that may wrap midnight?
+
+    The same rule as reminders.in_quiet_hours, spelled here because that
+    module imports this one.
+    """
+    if start <= end:
+        return start <= current < end
+    return current >= start or current < end
 
 
 def _blank_to_none(v: object) -> object:
@@ -65,9 +76,37 @@ class Settings(BaseSettings):
     telethon_api_id: OptionalInt = None
     telethon_api_hash: str = ""
     telethon_session: str = ""
+    # How people address the owner in groups, comma-separated ("Bekzod,
+    # Begi, Bekzod aka"). A group message containing one of these as a whole
+    # word — Latin or Cyrillic, any case — counts as aimed at him, the same
+    # as an @-mention. Empty by default: the aliases are the owner's own and
+    # belong in .env, not in code.
+    owner_aliases: str = ""
+
+    # --- Open loops (docs/owner-decisions.md, build step 2) -----------------
+    # A question nobody answered is nudged after this many hours.
+    loop_question_hours: int = 4
+    # ... and is not a loop at all once older than this many days. The bound
+    # is also what keeps the half-hourly scan on the occurred_at indexes.
+    loop_question_max_days: int = Field(default=30, ge=1)
+    # An undated promise or debt untouched this long is "ageing" — and the
+    # weekly "Hali ochiqmi?" uses the same threshold, as does the re-ask
+    # cadence of a dated item the owner said is still open (the owner's
+    # decision: re-remind after one week). One knob, one week.
+    loop_undated_days: int = Field(default=7, ge=1)
+    # Someone with an open debt or promise not heard from for this long.
+    loop_quiet_days: int = 14
+    # When the morning brief goes out (owner's timezone). The owner's
+    # decision: 09:00 Asia/Tashkent — never skipped, so it must not fall
+    # inside QUIET_HOURS; a validator refuses that combination at start-up.
+    morning_brief_time: str = "09:00"
 
     # --- Userbot conversation windows (spec §7B) ----------------------------
     window_idle_minutes: int = 30
+    # A private chat, or a group backlog with a message aimed at the owner,
+    # closes its window after this much silence instead — and is extracted
+    # at once rather than on the next batch (build step 2: the instant path).
+    window_idle_minutes_addressed: int = 5
     window_max_messages: int = 25
     window_max_chars: int = 4000
     # A window whose batch keeps failing falls back to real-time extraction.
@@ -132,7 +171,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     debug: bool = Field(default=False)
 
-    @field_validator("report_time", "backup_time")
+    @field_validator("report_time", "backup_time", "morning_brief_time")
     @classmethod
     def _validate_report_time(cls, v: str) -> str:
         _parse_hhmm(v)
@@ -145,6 +184,19 @@ class Settings(BaseSettings):
         _parse_hhmm(start)
         _parse_hhmm(end)
         return v
+
+    @model_validator(mode="after")
+    def _brief_outside_quiet_hours(self) -> Settings:
+        """A brief inside quiet hours would either wake the owner or never
+        go out; neither is what "09:00, never skipped" means."""
+        start, end = self.quiet_hours_parsed
+        if _within(self.morning_brief_time_parsed, start, end):
+            raise ValueError(
+                f"MORNING_BRIEF_TIME={self.morning_brief_time} falls inside "
+                f"QUIET_HOURS={self.quiet_hours}; the brief is never skipped, "
+                "so pick a time outside the quiet range"
+            )
+        return self
 
     @property
     def tz(self) -> ZoneInfo:
@@ -166,6 +218,17 @@ class Settings(BaseSettings):
     @property
     def backup_time_parsed(self) -> time:
         return _parse_hhmm(self.backup_time)
+
+    @property
+    def morning_brief_time_parsed(self) -> time:
+        return _parse_hhmm(self.morning_brief_time)
+
+    @property
+    def owner_aliases_parsed(self) -> tuple[str, ...]:
+        """The comma-separated aliases, trimmed, blanks dropped, order kept."""
+        return tuple(
+            alias.strip() for alias in self.owner_aliases.split(",") if alias.strip()
+        )
 
     @property
     def upload_tokens_parsed(self) -> dict[str, str]:

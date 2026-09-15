@@ -83,6 +83,19 @@ class ChatMonitor(Base):
     docs_enabled: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.true()
     )
+    # New groups, one tap (build step 2): when the owner was asked "o'qiymi?"
+    # about a group or channel that started switched off — asked once, ever.
+    asked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # A "Ha" also requests a backfill of the last chats.BACKFILL_DAYS. The bot
+    # records the request; the userbot, the only process with a Telegram user
+    # session, performs it on its next sweep and stamps ``backfill_done_at``.
+    backfill_requested_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    backfill_done_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    backfill_attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0"
+    )
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
@@ -119,6 +132,13 @@ class ConversationWindow(Base):
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, server_default="0")
     submitted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     applied_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # The instant path (build step 2): a private chat, or a group window with
+    # a message aimed at the owner, is extracted in real time by the window
+    # job rather than waiting for the next batch. Cleared if that keeps
+    # failing, so the window falls back onto the batch ladder.
+    instant: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
     created_at: Mapped[datetime] = created_at_column()
 
     __table_args__ = (

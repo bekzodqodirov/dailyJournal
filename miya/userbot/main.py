@@ -19,7 +19,9 @@ Safety properties, all deliberate:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
+import re
 import sys
 import uuid
 from dataclasses import dataclass
@@ -35,7 +37,7 @@ from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction
 from miya.db.session import engine, session_scope
-from miya.services import approvals, audio, documents
+from miya.services import approvals, audio, chats, documents
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
@@ -46,6 +48,7 @@ from miya.services.media_policy import (
     plan_for,
 )
 from miya.services.people import resolve_person
+from miya.services.text import fold_apostrophes
 from miya.services.transcription import TranscriptionError, get_transcriber
 from miya.services.vision import describe_image
 
@@ -417,19 +420,115 @@ async def ingest_message(client: TelegramClient, message) -> bool:
     return True
 
 
+# --- who a message was aimed at ----------------------------------------------
+#
+# Uzbek Latin → Cyrillic, longest digraphs first. Enough to spell a name the
+# way the other script would: "Bekzod aka" → "бекзод ака", "G'ani" → "ғани".
+# Everything is lower-cased first; the match itself ignores case.
+_LATIN_TO_CYRILLIC = (
+    ("sh", "ш"),
+    ("ch", "ч"),
+    ("ng", "нг"),
+    ("yo", "ё"),
+    ("yu", "ю"),
+    ("ya", "я"),
+    ("ye", "е"),
+    ("ts", "ц"),
+    ("o'", "ў"),
+    ("g'", "ғ"),
+    ("a", "а"),
+    ("b", "б"),
+    ("c", "к"),
+    ("d", "д"),
+    ("e", "е"),
+    ("f", "ф"),
+    ("g", "г"),
+    ("h", "ҳ"),
+    ("i", "и"),
+    ("j", "ж"),
+    ("k", "к"),
+    ("l", "л"),
+    ("m", "м"),
+    ("n", "н"),
+    ("o", "о"),
+    ("p", "п"),
+    ("q", "қ"),
+    ("r", "р"),
+    ("s", "с"),
+    ("t", "т"),
+    ("u", "у"),
+    ("v", "в"),
+    ("w", "в"),
+    ("x", "х"),
+    ("y", "й"),
+    ("z", "з"),
+    ("'", "ъ"),
+)
+
+
+def transliterate(latin: str) -> str:
+    """A Latin-script Uzbek word in Cyrillic, lower-cased. Cyrillic input is
+    returned unchanged (nothing in the table matches it)."""
+    text = fold_apostrophes(latin.lower())
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        for src, dst in _LATIN_TO_CYRILLIC:
+            if text.startswith(src, i):
+                out.append(dst)
+                i += len(src)
+                break
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=8)
+def alias_pattern(aliases: tuple[str, ...]) -> re.Pattern[str] | None:
+    """One regex that matches any alias as a whole word, in either script.
+
+    Whole word means no letter or digit on either side — so "Bega" does not
+    fire on "Begalar" but does on "Bega," and "(Bega)". Inner whitespace in a
+    multi-word alias matches any run of whitespace. Cached per alias tuple,
+    so the userbot compiles it once and a test that changes the setting
+    gets a fresh one.
+    """
+    spellings: list[str] = []
+    for alias in aliases:
+        latin = fold_apostrophes(alias.strip())
+        for spelling in (latin, transliterate(latin)):
+            if spelling and spelling.lower() not in (s.lower() for s in spellings):
+                spellings.append(spelling)
+    if not spellings:
+        return None
+    words = (r"\s+".join(re.escape(part) for part in s.split()) for s in spellings)
+    return re.compile(r"(?<![\w'])(?:" + "|".join(words) + r")(?![\w'])", re.IGNORECASE)
+
+
 def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
     """Was this message aimed at the owner rather than at the room?
 
     Only meaningful in a group: in a private chat every message is addressed
-    to him, so the flag would mark everything and distinguish nothing.
+    to him, so the flag would mark everything and distinguish nothing. His
+    own outgoing messages are never addressed to him either — he writes his
+    company's name and signs with his own, and a flag there would list his
+    words under "Sizga murojaatlar" and put the group on the instant path.
 
     Telethon sets `mentioned` for both an @-mention and a reply to one of the
     owner's own messages, which is exactly the question being asked — the two
-    are the same act from where he is sitting.
+    are the same act from where he is sitting. People mostly do neither: they
+    type "Bekzod aka, konteyner qachon?" in plain text, so the message text is
+    also searched for the owner's aliases (OWNER_ALIASES), whole word, either
+    script, any case.
     """
-    if chat_type is ChatType.private:
+    if chat_type is ChatType.private or getattr(message, "out", False):
         return False
-    return bool(getattr(message, "mentioned", False))
+    if getattr(message, "mentioned", False):
+        return True
+    pattern = alias_pattern(settings.owner_aliases_parsed)
+    text = getattr(message, "message", None) or ""
+    return bool(pattern and pattern.search(fold_apostrophes(text)))
 
 
 def _message_meta(message: object, monitor: ChatMonitor) -> dict:
@@ -499,13 +598,59 @@ async def fetch_approved(client: TelegramClient) -> int:
     return done
 
 
+async def fetch_backfills(client: TelegramClient) -> int:
+    """Read the last week of every group the owner just said yes to.
+
+    The same shape as ``fetch_approved``: the bot recorded the request on the
+    monitor row (``chats.accept_join``), and this process — the only one with
+    a Telegram user session — performs it. The reading itself is delegated to
+    ``miya.tools.backfill``, so this package still contains no history call
+    of its own. A chat is stamped done after one successful pass; a failing
+    one is retried a bounded number of sweeps and then left alone, switched
+    on, with the failure in the log.
+    """
+    from miya.tools import backfill as backfill_tool
+
+    async with session_scope() as session:
+        jobs = [
+            (monitor.id, monitor.tg_chat_id, monitor.title)
+            for monitor in await chats.pending_backfills(session)
+        ]
+
+    done = 0
+    for monitor_id, chat_id, title in jobs:
+        try:
+            stored = await backfill_tool.backfill_chat(
+                client, chat_id, chats.BACKFILL_DAYS
+            )
+        except Exception:
+            log.exception("backfill of %s (%s) failed", title, chat_id)
+            stored = None
+        async with session_scope() as session:
+            monitor = await session.get(ChatMonitor, monitor_id)
+            if monitor is None:
+                continue
+            if stored is None:
+                chats.mark_backfill_failed(monitor)
+            else:
+                chats.mark_backfilled(monitor)
+                done += 1
+                log.info("backfilled %s (%s): %d message(s)", title, chat_id, stored)
+    return done
+
+
 async def approved_media_loop(client: TelegramClient) -> None:
+    """The owner's answers, polled: approved attachments and requested backfills."""
     while True:
         try:
             await fetch_approved(client)
         except Exception:
             # A failure here must never take the reader down with it.
             log.exception("approved-media sweep failed")
+        try:
+            await fetch_backfills(client)
+        except Exception:
+            log.exception("backfill sweep failed")
         await asyncio.sleep(APPROVED_POLL_SECONDS)
 
 

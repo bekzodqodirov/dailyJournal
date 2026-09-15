@@ -7,11 +7,28 @@ place that decides how money, dates and names are rendered.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from miya.config import settings
-from miya.db.enums import Currency, DebtDirection, TaskPriority
+from miya.db.enums import (
+    Currency,
+    DebtDirection,
+    DebtStatus,
+    PromiseMadeBy,
+    PromiseStatus,
+    TaskPriority,
+    TaskStatus,
+)
+
+if TYPE_CHECKING:  # annotations only: formatting never imports the services
+    from miya.services.loops import (
+        QuietCounterparty,
+        StaleCommitment,
+        UnansweredQuestion,
+    )
+    from miya.services.queries import DebtBalance
 
 MONTHS_SHORT = [
     "yan",
@@ -130,6 +147,21 @@ def relative_day(value: date, *, today: date | None = None) -> str:
     return short_date(value)
 
 
+def age_label(delta: timedelta) -> str:
+    """'25 daqiqa' / '3 soat' / '2 kun' — how long something has been waiting.
+
+    Lives here, not in replies.py, because the report's data block needs it
+    too and reports.py must not import the bot's reply module (that chain
+    pulls in the loops engine and the query layer).
+    """
+    seconds = max(int(delta.total_seconds()), 0)
+    if seconds < 3600:
+        return f"{seconds // 60} daqiqa"
+    if seconds < 86400:
+        return f"{seconds // 3600} soat"
+    return f"{seconds // 86400} kun"
+
+
 def debt_line(
     person_name: str,
     direction: DebtDirection,
@@ -219,3 +251,119 @@ def clip(text: str, *, limit: int = TELEGRAM_LIMIT) -> str:
     if cut < limit // 2:
         cut = limit
     return text[:cut] + "\n…<i>(qisqartirildi)</i>"
+
+
+# --- one record, one line ----------------------------------------------------
+
+_DEBT_STATUS = {
+    DebtStatus.settled: " · ✅ yopilgan",
+    DebtStatus.partially_paid: " · qisman to'langan",
+}
+_PROMISE_STATUS = {
+    PromiseStatus.done: " · ✅ bajarilgan",
+    PromiseStatus.cancelled: " · ✖️ yopilgan",
+    PromiseStatus.broken: " · ✖️ buzilgan",
+}
+_TASK_STATUS = {
+    TaskStatus.done: " · ✅ bajarilgan",
+    TaskStatus.dropped: " · ✖️ yopilgan",
+    TaskStatus.doing: " · jarayonda",
+}
+
+
+def _text(value: str, markup: bool) -> str:
+    """A contact's name or a message's words: escaped for Telegram HTML,
+    verbatim for a plain-text block (the report's data block escapes the
+    whole finished line itself)."""
+    return escape(value) if markup else value
+
+
+def _name(value: str, markup: bool) -> str:
+    return f"<b>{escape(value)}</b>" if markup else value
+
+
+def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
+    """How one debt / promise / task reads on its own, ref first.
+
+    Used for the corrected line after `/tuzat`, the button outcomes, and the
+    "Hali ochiqmi?" question — one shape, so the owner learns it once.
+    ``markup=False`` is the same line with no HTML tags and no escaping.
+    """
+    handle = ""
+    if record.id is not None:
+        handle = ref(kind, record.id)
+        handle = f"<code>{handle}</code> " if markup else f"{handle} "
+    name = _text(person.display_name, markup) if person is not None else "?"
+    if kind == "debt":
+        body = debt_line(
+            name, record.direction, record.amount, record.currency, record.due_date
+        )
+        return f"💰 {handle}{body}{_DEBT_STATUS.get(record.status, '')}"
+    if kind == "promise":
+        who = "Men" if record.made_by is PromiseMadeBy.me else "U"
+        due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+        return (
+            f"🤝 {handle}{who} — {name}: {_text(record.description, markup)}{due}"
+            f"{_PROMISE_STATUS.get(record.status, '')}"
+        )
+    due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+    status = _TASK_STATUS.get(record.status, "")
+    return f"✔️ {handle}{_text(record.description, markup)}{due}{status}"
+
+
+# --- open loops: one line each ----------------------------------------------
+#
+# The same three rows render twice: with markup for the owner (the morning
+# brief, the nudge) and plain for the report's data block, which the model
+# reads and which the fallback report sends as-is. ``markup=False`` means no
+# HTML tags and no escaping — the report escapes the finished line itself —
+# and the report's explicit words ("javobsiz", "qarzingiz") where the owner's
+# line relies on bold and arrows. They live here rather than in replies.py so
+# that reports.py can import them without pulling in the bot's reply module.
+
+
+def quote(text: str, limit: int = 120, *, markup: bool = True) -> str:
+    """Someone's words in «…», whitespace folded, cut with an ellipsis."""
+    body = " ".join((text or "").split())
+    if len(body) > limit:
+        body = body[: limit - 1] + "…"
+    return f"«{_text(body, markup)}»"
+
+
+def question_line(q: UnansweredQuestion, *, markup: bool = True) -> str:
+    """One unanswered question: who, where (a group), how long, the words."""
+    where = f" ({_text(q.chat_title, markup)})" if q.is_group and q.chat_title else ""
+    tail = f" (+{q.follow_ups} xabar)" if q.follow_ups else ""
+    age = f" · {age_label(q.age)}:" if markup else f", {age_label(q.age)} javobsiz:"
+    who = _name(q.person_name, markup)
+    return f"{who}{where}{age} {quote(q.text, markup=markup)}{tail}"
+
+
+def stale_line(s: StaleCommitment, *, markup: bool = True) -> str:
+    """An undated debt / promise / task and how long nobody moved it."""
+    line = record_line(s.record_kind, s.record, s.person, markup=markup)
+    if s.record_kind == "debt" and s.outstanding is not None and s.currency is not None:
+        # The row's own amount may be partly paid: say what is still owed.
+        line = line.replace(
+            money(s.record.amount, s.record.currency), money(s.outstanding, s.currency), 1
+        )
+    return f"{line} · {age_label(s.untouched_for)}dan beri harakat yo'q"
+
+
+def _quiet_balance(b: DebtBalance, markup: bool) -> str:
+    if markup:
+        side = "→ senga " if b.direction is DebtDirection.they_owe_me else "← sen "
+        return side + money(b.outstanding, b.currency) + tags("debt", b.ids)
+    side = "(sizdan qarzi)" if b.direction is DebtDirection.they_owe_me else "(qarzingiz)"
+    return f"{money(b.outstanding, b.currency)} {side}"
+
+
+def quiet_line(q: QuietCounterparty, *, markup: bool = True) -> str:
+    """Who went quiet, for how long, and what is open with them."""
+    open_items = [_quiet_balance(b, markup) for b in q.balances]
+    if q.promises:
+        open_items.append(f"{len(q.promises)} ta {'' if markup else 'ochiq '}va'da")
+    items = "; ".join(open_items) if open_items else "—"
+    if markup:
+        return f"{_name(q.person_name, True)} · {q.days_quiet} kun jim: {items}"
+    return f"{q.person_name}: {q.days_quiet} kun jim — {items}"

@@ -9,6 +9,14 @@ worker job flushes a window when **any** of the spec's three triggers fires:
   * ``WINDOW_MAX_MESSAGES`` messages buffered (default 25), or
   * ``WINDOW_MAX_CHARS`` characters buffered (default 4,000).
 
+What is addressed to the owner does not wait that long (build step 2). A
+private chat, or a group backlog holding a message flagged ``meta.to_me``,
+closes after ``WINDOW_IDLE_MINUTES_ADDRESSED`` (default 5). Of the windows
+sliced from it, a private chat's are all marked ``instant``, and a group's
+only where the window itself holds an addressed message: the worker extracts
+those in real time on the same tick instead of parking them for the next
+batch. Un-addressed group traffic keeps the half-price batch.
+
 Buffering lives in the database, not in process memory: a userbot restart or a
 worker crash can therefore never lose a message that was waiting for its
 window. A message is "claimed" the moment ``window_id`` is set, so no message
@@ -28,8 +36,8 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import Direction, InteractionSource, WindowStatus
-from miya.db.models import ConversationWindow, Interaction, Person
+from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
+from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
 from miya.services.ingest import text_for_extraction
 
 log = logging.getLogger(__name__)
@@ -119,12 +127,38 @@ def _content_length(interaction: Interaction) -> int:
     return len(text_for_extraction(interaction))
 
 
+def is_addressed(interaction: Interaction) -> bool:
+    """Did the userbot flag this message as aimed at the owner?"""
+    return bool((interaction.meta or {}).get("to_me"))
+
+
+def wants_instant(backlog: list[Interaction], chat_type: ChatType | None) -> bool:
+    """Does this backlog take the instant path?
+
+    A private chat as a whole — every message there is to him — or a group
+    backlog with at least one message aimed at him. A chat the userbot has
+    not registered yet (``chat_type`` None) is treated as a group: the
+    cheaper, slower path, never the other way round.
+    """
+    if chat_type is ChatType.private:
+        return True
+    return any(is_addressed(i) for i in backlog)
+
+
+def idle_minutes_for(instant: bool) -> int:
+    if instant:
+        return settings.window_idle_minutes_addressed
+    return settings.window_idle_minutes
+
+
 def _slice_to_flush(
-    interactions: list[Interaction], *, now: datetime
+    interactions: list[Interaction], *, now: datetime, idle_minutes: int | None = None
 ) -> list[Interaction] | None:
     """The messages that should become a window right now, or None to wait."""
     if not interactions:
         return None
+    if idle_minutes is None:
+        idle_minutes = settings.window_idle_minutes
 
     # Message-count trigger.
     if len(interactions) >= settings.window_max_messages:
@@ -139,7 +173,7 @@ def _slice_to_flush(
             return interactions[: index + 1]
 
     # Idle trigger.
-    idle_after = timedelta(minutes=settings.window_idle_minutes)
+    idle_after = timedelta(minutes=idle_minutes)
     if now - interactions[-1].occurred_at >= idle_after:
         return interactions
     return None
@@ -214,19 +248,43 @@ async def _person_names(
     return dict(rows.all())
 
 
+async def _chat_types(session: AsyncSession, chat_ids: list[int]) -> dict[int, ChatType]:
+    if not chat_ids:
+        return {}
+    rows = await session.execute(
+        sa.select(ChatMonitor.tg_chat_id, ChatMonitor.chat_type).where(
+            ChatMonitor.tg_chat_id.in_(chat_ids)
+        )
+    )
+    return dict(rows.all())
+
+
 async def flush_ready_windows(
     session: AsyncSession, *, now: datetime | None = None
 ) -> list[ConversationWindow]:
     """Turn every chat's ready backlog into windows. Returns what was created."""
     now = now or datetime.now(settings.tz)
     created: list[ConversationWindow] = []
+    backlogs = await _unclaimed_by_chat(session, now=now)
+    chat_types = await _chat_types(session, list(backlogs))
 
-    for tg_chat_id, backlog in (await _unclaimed_by_chat(session, now=now)).items():
+    for tg_chat_id, backlog in backlogs.items():
         names = await _person_names(session, backlog)
+        chat_type = chat_types.get(tg_chat_id)
+        # The idle rule is decided per backlog: one group message aimed at
+        # the owner closes that chat's whole backlog after five minutes,
+        # wherever it sits in it. The flag is decided per window, below: a
+        # week of backfill after "Ha", or a day of the userbot being down,
+        # slices into many windows, and only the one that actually holds the
+        # addressed line — or any window of a private chat — is worth a
+        # full-price real-time extraction. The rest keep the batch.
+        idle_minutes = idle_minutes_for(wants_instant(backlog, chat_type))
         remaining = backlog
         # A long backlog (userbot was down, or a busy group) yields several
         # windows in one pass rather than one oversized prompt.
-        while (batch := _slice_to_flush(remaining, now=now)) is not None:
+        while (
+            batch := _slice_to_flush(remaining, now=now, idle_minutes=idle_minutes)
+        ) is not None:
             window = ConversationWindow(
                 tg_chat_id=tg_chat_id,
                 person_id=next((i.person_id for i in batch if i.person_id), None),
@@ -237,6 +295,7 @@ async def flush_ready_windows(
                 text=render_window(batch, names),
                 status=WindowStatus.pending,
                 custom_id=f"w-{uuid.uuid4().hex}",
+                instant=wants_instant(batch, chat_type),
             )
             session.add(window)
             await session.flush()
@@ -252,12 +311,19 @@ async def flush_ready_windows(
 
 
 async def pending_windows(
-    session: AsyncSession, *, limit: int = 200
+    session: AsyncSession, *, limit: int = 200, instant: bool = False
 ) -> list[ConversationWindow]:
+    """Windows waiting for extraction, oldest first — one path at a time.
+
+    ``instant=False`` is the batch's queue; ``instant=True`` is what the
+    window job extracts in real time. The two never overlap, so a window is
+    paid for exactly once.
+    """
     return list(
         await session.scalars(
             sa.select(ConversationWindow)
             .where(ConversationWindow.status == WindowStatus.pending)
+            .where(ConversationWindow.instant.is_(instant))
             .order_by(ConversationWindow.created_at)
             .limit(limit)
         )

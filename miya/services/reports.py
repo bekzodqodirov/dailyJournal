@@ -1,7 +1,7 @@
 """Daily report (spec §8): cron at REPORT_TIME and the `/hisobot` command.
 
 The day's numbers are gathered by SQL (services/queries.py) and rendered into
-a deterministic data block; Sonnet only turns that block into a clean Uzbek
+a deterministic data block; the model only turns that block into a clean Uzbek
 report. If the API call fails the deterministic block itself is stored and
 sent — a report day is never lost.
 """
@@ -16,12 +16,13 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from miya.bot.formatting import escape, ref
+from miya.bot.formatting import escape, question_line, quiet_line, ref
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
-from miya.services import planner, queries
+from miya.services import loops, nudges, planner, queries
 from miya.services.extraction import API_FAILURES, get_client
+from miya.services.loops import QuietCounterparty, UnansweredQuestion
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,8 @@ Rules:
   ✅ Bajarilganlar
   💬 Chatlarda (qaysi chatda nima haqida gaplashildi)
   📨 Sizga murojaatlar (guruhda to'g'ridan-to'g'ri yozilganlar)
+  ❓ Javobsiz qolganlar (kim nima so'radi, qancha vaqt javobsiz)
+  🤫 Jim bo'lib qolganlar (kim necha kun jim, u bilan nima ochiq)
   📅 Ertaga (given plan text — include as-is, lightly trimmed if long)
 - Keep the whole report short and scannable. Telegram formatting: plain text
   with <b>bold</b> section titles, no markdown, no # headers.
@@ -59,6 +62,10 @@ class ReportData:
     plan: str
     chats: list = field(default_factory=list)
     to_me: list = field(default_factory=list)
+    # Open loops (build step 2): questions nobody answered, people who went
+    # quiet with something open. Both from the loops engine — SQL, no model.
+    questions: list[UnansweredQuestion] = field(default_factory=list)
+    quiet: list[QuietCounterparty] = field(default_factory=list)
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -82,6 +89,8 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
             for d in data.chats
         ],
         "to_me": len(data.to_me),
+        "unanswered": len(data.questions),
+        "quiet": len(data.quiet),
         "settled_debts": len(data.completed.settled_debts),
         "done_promises": len(data.completed.done_promises),
         "done_tasks": len(data.completed.done_tasks),
@@ -95,7 +104,7 @@ def render_data_block(data: ReportData) -> str:
     Telegram contacts and message text, which a counterparty controls: a
     supplier who sets his first name to "<b" would otherwise produce a report
     Telegram refuses to render, silently costing the owner his evening summary.
-    Escaping before Sonnet sees the text means the model copies the safe form.
+    Escaping before the model sees the text means the model copies the safe form.
     """
     s = data.summary
     lines: list[str] = [f"HISOBOT KUNI: {data.day.isoformat()}"]
@@ -190,6 +199,23 @@ def render_data_block(data: ReportData) -> str:
     else:
         lines.append("- yo'q")
 
+    # The two open-loop sections are the brief's own lines rendered plain
+    # (formatting.question_line / quiet_line with markup=False): no tags, so
+    # escaping the finished line is the same as escaping each name in it.
+    lines.append("\n❓ JAVOBSIZ QOLGANLAR:")
+    if data.questions:
+        for q in data.questions[:10]:
+            lines.append(f"- {escape(question_line(q, markup=False))}")
+    else:
+        lines.append("- yo'q")
+
+    lines.append("\n🤫 JIM BO'LIB QOLGANLAR:")
+    if data.quiet:
+        for q in data.quiet[:10]:
+            lines.append(f"- {escape(quiet_line(q, markup=False))}")
+    else:
+        lines.append("- yo'q")
+
     lines.append("\n📅 ERTAGA:")
     lines.append(data.plan)
 
@@ -205,6 +231,8 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         plan=await planner.plan_for(session, day + timedelta(days=1)),
         chats=await queries.chat_digests(session, day),
         to_me=await queries.messages_to_me(session, day),
+        questions=await nudges.unanswered_questions(session),
+        quiet=await loops.quiet_counterparties(session),
     )
 
 

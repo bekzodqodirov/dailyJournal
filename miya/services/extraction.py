@@ -1,4 +1,4 @@
-"""Claude Haiku extraction: raw text in, validated structured facts out (spec §5).
+"""Extraction: raw text in, validated structured facts out (spec §5).
 
 The response shape is normally enforced by the API through structured outputs.
 That can fail on the server before the model is ever sampled — a schema this
@@ -350,7 +350,7 @@ def extraction_system_block(*, with_schema: bool = False) -> list[dict]:
             "type": "text",
             "text": text,
             # Engages once the cached prefix clears the model's minimum (4096
-            # tokens on Haiku 4.5); harmless and forward-looking below that.
+            # tokens on the extraction model); harmless and forward-looking below that.
             "cache_control": {"type": "ephemeral"},
         }
     ]

@@ -10,10 +10,18 @@ Jobs:
   * gcal_pull    — every GCAL_PULL_MINUTES; Google → events (when authed)
   * gcal_push    — every 5 min; extracted events → Google (when authed)
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
+                   and extracts the ``instant`` ones (private chats, group
+                   messages aimed at the owner) on the spot, receipt included
   * batch_submit — every BATCH_FLUSH_HOURS; pending windows → Batch API
   * batch_poll   — every 15 min; applies finished batches, then tells the
                    owner what his chats put on the ledger (quiet-hours aware)
   * backup       — cron at BACKUP_TIME; encrypted pg_dump, 14-day retention
+  * morning_brief — cron at MORNING_BRIEF_TIME; today's meetings, what is due,
+                   and every open loop, deterministic, never skipped
+  * nudges       — every 30 min; one short message per question nobody
+                   answered, with ✅ Javob berdim / ⏰ Ertaga (quiet-hours aware)
+  * new_chat_ask — every 2 min; "Yangi guruh: … — o'qiymi?" once per new
+                   group or channel (quiet-hours aware)
 """
 
 from __future__ import annotations
@@ -35,15 +43,18 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, escape
 from miya.config import settings
-from miya.db.models import DailyReport, Person
+from miya.db.models import DailyReport, Person, ReminderLog
 from miya.db.session import engine, session_scope
 from miya.services import (
     approvals,
     backup,
     batch,
+    brief,
     call_recordings,
+    chats,
     gcal,
     memories,
+    nudges,
     reminders,
     reports,
     windows,
@@ -204,12 +215,156 @@ async def gcal_push_job() -> None:
         log.info("gcal push: %d events created in Google Calendar", pushed)
 
 
-async def window_job() -> None:
-    """Group the userbot's loose messages into extractable conversations."""
+async def window_job(bot: Bot) -> None:
+    """Group the userbot's loose messages into extractable conversations —
+    and extract the urgent ones now.
+
+    A window from a private chat, or a group window holding a message aimed
+    at the owner, is flagged ``instant`` by the flush and extracted on this
+    same tick at full price; the rest waits for the half-price batch. The
+    receipt for what landed goes out through the same queue the batch uses,
+    so quiet hours still hold it rather than drop it.
+    """
     async with session_scope() as session:
         flushed = await windows.flush_ready_windows(session)
     if flushed:
-        log.info("window flush produced %d window(s)", len(flushed))
+        log.info(
+            "window flush produced %d window(s), %d instant",
+            len(flushed),
+            sum(1 for w in flushed if w.instant),
+        )
+    async with session_scope() as session:
+        outcome = await batch.extract_instant(session)
+    if outcome.applied:
+        await chat_notice_job(bot)
+
+
+# reminder_log kind for one morning brief sent; the ref is the day. This is
+# what lets a restart spanning 09:00 know the brief never went out.
+BRIEF_KIND = "brief"
+
+
+async def brief_job(bot: Bot) -> bool:
+    """The morning brief (cron at MORNING_BRIEF_TIME). Never skipped.
+
+    Deterministic — SQL and the open-loops engine, no model call — so it
+    arrives even with Anthropic down. Quiet hours are not consulted: 09:00
+    is outside them by the owner's own choice, and a brief he asked for at a
+    time he chose is not a notification to be suppressed. Returns whether it
+    reached him; a sent brief is logged so the startup catch-up can tell a
+    missed one from a delivered one.
+    """
+    async with session_scope() as session:
+        data = await brief.gather(session)
+        body = replies.morning_brief(data)
+        due, stale = replies.morning_brief_refs(data)
+    sent = await notify(bot, body, reply_markup=keyboards.brief_actions(due, stale))
+    if sent:
+        async with session_scope() as session:
+            session.add(ReminderLog(kind=BRIEF_KIND, ref=data.day.isoformat()))
+    return sent
+
+
+async def _brief_is_missing(now: datetime) -> bool:
+    """True when today's brief is due, still worth sending, and never went out.
+
+    Due: MORNING_BRIEF_TIME has passed. Worth sending: outside quiet hours —
+    the first start after a deploy, or a reboot at 23:45, must not put
+    "Ertalabki xulosa" on his phone at night — and before REPORT_TIME, since
+    a morning brief after the evening report is stale. Never went out: no
+    brief logged for today, the case of a deploy or a reboot spanning 09:00.
+    """
+    due = datetime.combine(
+        now.date(), settings.morning_brief_time_parsed, tzinfo=settings.tz
+    )
+    if now < due:
+        return False
+    if reminders.in_quiet_hours(now):
+        return False
+    report_due = datetime.combine(
+        now.date(), settings.report_time_parsed, tzinfo=settings.tz
+    )
+    if now >= report_due:
+        return False
+    async with session_scope() as session:
+        found = await session.scalar(
+            sa.select(ReminderLog.id)
+            .where(
+                ReminderLog.kind == BRIEF_KIND, ReminderLog.ref == now.date().isoformat()
+            )
+            .limit(1)
+        )
+    return found is None
+
+
+async def nudge_job(bot: Bot) -> None:
+    """Nudge the owner about questions nobody answered (every 30 minutes).
+
+    One short message per question, ✅ Javob berdim / ⏰ Ertaga under each,
+    at most nudges.MAX_PER_SWEEP per sweep with one line for the rest —
+    those come next sweep, nothing is dropped. Quiet-hours aware the way
+    every other ping is: the sweep skips, the question keeps.
+    """
+    if reminders.in_quiet_hours():
+        return
+
+    async with session_scope() as session:
+        due = await nudges.collect(session)
+        if not due:
+            return
+        head, tail = due[: nudges.MAX_PER_SWEEP], due[nudges.MAX_PER_SWEEP :]
+        sent: list = []
+        for question in head:
+            if not await notify(
+                bot,
+                replies.nudge(question),
+                reply_markup=keyboards.nudge_actions(question.interaction_id),
+            ):
+                break
+            sent.append(question)
+        # Logged only for what went out, and committed at once: a crash
+        # mid-sweep repeats at most one nudge and loses none.
+        nudges.mark_nudged(session, sent)
+        await session.commit()
+        if tail and len(sent) == len(head):
+            await notify(bot, replies.nudge_overflow(len(tail)))
+
+    log.info("sent %d nudge(s), %d more waiting", len(sent), len(tail))
+
+
+async def new_chat_ask_job(bot: Bot) -> None:
+    """ "Yangi guruh: … — o'qiymi?" for every group or channel that started
+    switched off, once each (the owner's decision: new groups on with one
+    tap). Quiet-hours aware; a few per sweep so a first sync of fifty groups
+    is not fifty messages at once.
+    """
+    if reminders.in_quiet_hours():
+        return
+
+    async with session_scope() as session:
+        questions = []
+        for monitor in await chats.awaiting_join_question(session):
+            questions.append(
+                (
+                    monitor.id,
+                    replies.new_group_question(
+                        monitor.title, monitor.tg_chat_id, chat_type=monitor.chat_type
+                    ),
+                )
+            )
+            # Marked before the send, like the media question: asked twice
+            # is worse than once lost, and /chats still lists it.
+            chats.mark_asked(monitor)
+
+    for monitor_id, body in questions:
+        try:
+            await bot.send_message(
+                settings.owner_telegram_id,
+                clip(body),
+                reply_markup=keyboards.new_group_question(monitor_id),
+            )
+        except Exception:
+            log.exception("could not ask about chat monitor %s", monitor_id)
 
 
 async def media_ask_job(bot: Bot) -> None:
@@ -282,6 +437,14 @@ async def batch_poll_job(bot: Bot) -> None:
     await chat_notice_job(bot)
 
 
+# Two jobs deliver receipts — window_job on its own tick and batch_poll_job —
+# and their intervals are both anchored at scheduler start, so they coincide
+# every fifteen minutes. APScheduler's max_instances is per job id, so nothing
+# else stops the two from reading the queue together, before either has
+# marked a receipt sent, and telling the owner the same thing twice.
+_notice_lock = asyncio.Lock()
+
+
 async def chat_notice_job(bot: Bot) -> None:
     """Tell the owner what his chats put on the ledger, one receipt per window.
 
@@ -289,34 +452,36 @@ async def chat_notice_job(bot: Bot) -> None:
     receipts wait in the queue and go out on the first poll after quiet hours
     end. A worker restart in between changes nothing. The first MAX_DETAILED
     go out one by one; anything beyond that — a day's backlog after an outage
-    — is folded into one summary rather than a hundred messages.
+    — is folded into one summary rather than a hundred messages. One delivery
+    at a time, whichever job asked for it.
     """
-    if reminders.in_quiet_hours():
-        return
-
-    async with session_scope() as session:
-        queue = await batch.pending_notices(session)
-        if not queue:
+    async with _notice_lock:
+        if reminders.in_quiet_hours():
             return
-        now = datetime.now(settings.tz)
-        detailed = queue[: notices.MAX_DETAILED]
-        rest = queue[notices.MAX_DETAILED :]
 
-        for item in detailed:
-            if not await notify(bot, item.text):
-                # Unreachable: everything left stays queued for the next poll.
+        async with session_scope() as session:
+            queue = await batch.pending_notices(session)
+            if not queue:
                 return
-            # Marked only after a successful send, and committed at once, so a
-            # crash mid-sweep repeats at most one receipt and loses none.
-            batch.mark_notified(item.interaction, now=now)
-            await session.commit()
+            now = datetime.now(settings.tz)
+            detailed = queue[: notices.MAX_DETAILED]
+            rest = queue[notices.MAX_DETAILED :]
 
-        if rest:
-            summary = notices.overflow_summary([(q.chat, q.counts) for q in rest])
-            if not await notify(bot, summary):
-                return
-            for item in rest:
+            for item in detailed:
+                if not await notify(bot, item.text):
+                    # Unreachable: everything left stays queued for the next poll.
+                    return
+                # Marked only after a successful send, and committed at once, so
+                # a crash mid-sweep repeats at most one receipt and loses none.
                 batch.mark_notified(item.interaction, now=now)
+                await session.commit()
+
+            if rest:
+                summary = notices.overflow_summary([(q.chat, q.counts) for q in rest])
+                if not await notify(bot, summary):
+                    return
+                for item in rest:
+                    batch.mark_notified(item.interaction, now=now)
 
     log.info(
         "sent %d chat notice(s), %d more folded into a summary", len(detailed), len(rest)
@@ -381,9 +546,10 @@ async def catch_up(bot: Bot) -> None:
     """Run anything the scheduler missed while the worker was down.
 
     The jobstore is in memory, so a deploy or a VPS reboot spanning 19:00
-    silently loses that day's report, and one spanning BACKUP_TIME loses a
-    nightly backup. Both are cheap to detect on startup and worth recovering:
-    the report is the owner's evening ritual, and the backup is the only thing
+    silently loses that day's report, one spanning 09:00 loses the morning
+    brief, and one spanning BACKUP_TIME loses a nightly backup. All three
+    are cheap to detect on startup and worth recovering: the report and the
+    brief are the owner's two rituals, and the backup is the only thing
     between a disk failure and losing everything.
 
     Every branch is guarded. This runs before the worker settles into its
@@ -407,6 +573,18 @@ async def catch_up(bot: Bot) -> None:
             await notify(bot, f"📊 <b>Kunlik hisobot</b> ({day})\n\n{content}")
         except Exception:
             log.exception("catch-up report failed")
+
+    try:
+        brief_missing = await _brief_is_missing(now)
+    except Exception:
+        log.exception("catch-up could not check for a missed brief")
+        brief_missing = False
+    if brief_missing:
+        log.info("catch-up: today's morning brief was missed — sending now")
+        try:
+            await brief_job(bot)
+        except Exception:
+            log.exception("catch-up brief failed")
 
     if settings.backup_age_recipient:
         try:
@@ -504,6 +682,7 @@ async def run() -> None:
     scheduler.add_job(
         window_job,
         IntervalTrigger(minutes=5),
+        args=[bot],
         id="windows",
         max_instances=1,
         coalesce=True,
@@ -528,6 +707,34 @@ async def run() -> None:
         IntervalTrigger(minutes=15),
         args=[bot],
         id="batch_poll",
+        max_instances=1,
+        coalesce=True,
+    )
+    brief_at = settings.morning_brief_time_parsed
+    scheduler.add_job(
+        brief_job,
+        CronTrigger(
+            hour=brief_at.hour, minute=brief_at.minute, timezone=settings.timezone
+        ),
+        args=[bot],
+        id="morning_brief",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        nudge_job,
+        IntervalTrigger(minutes=30),
+        args=[bot],
+        id="nudges",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        new_chat_ask_job,
+        IntervalTrigger(minutes=2),
+        args=[bot],
+        id="new_chat_ask",
         max_instances=1,
         coalesce=True,
     )

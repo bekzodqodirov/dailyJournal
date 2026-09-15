@@ -13,6 +13,15 @@ Failure policy, in one place:
     and only if that also fails does it end up ``failed`` + ``needs_review``.
 Nothing is ever dropped silently.
 
+What is addressed to the owner does not go through the batch at all (build
+step 2). A window flagged ``instant`` — a private chat, or a group window with
+a message aimed at him — is extracted by ``extract_instant`` on the window
+job's own tick, at full price, and applied through the same ``_apply_result``
+so the receipt still fires. If that keeps failing the flag is cleared and the
+window joins the batch ladder; nothing is dropped on either path. Every usage
+row names its path: ``extract_window`` (batch), ``extract_window_instant``,
+``extract_window_fallback``.
+
 Nothing is *written* silently either. Every applied window comes back as an
 ``AppliedWindow`` carrying what actually landed, and anything the owner cares
 about (a debt, a settlement, a promise, a transaction, an event, a task) is
@@ -266,6 +275,97 @@ async def _fail_window(
         window.attempts,
         reason,
     )
+
+
+async def extract_instant(session: AsyncSession, *, limit: int = 50) -> BatchOutcome:
+    """Extract every ``instant`` window now, one commit per window.
+
+    Each window is its own unit of paid work, committed before the next one
+    is attempted, so a failure half way costs nothing already landed. A
+    window whose extraction fails — an API error, or anything raised while
+    applying it — stays pending for the next tick; at BATCH_MAX_ATTEMPTS it
+    loses the flag and takes the batch path instead, slower but never lost.
+    Windows are re-read by id after a rollback: the rollback expires every
+    object in the session, and a failing window must not wedge the queue.
+    """
+    outcome = BatchOutcome()
+    ids = [w.id for w in await pending_windows(session, limit=limit, instant=True)]
+    for window_id in ids:
+        window = await session.get(ConversationWindow, window_id)
+        if window is None:
+            continue
+        try:
+            partial = await _extract_one_instant(session, window)
+        except Exception:
+            log.exception("instant extraction of window %s raised", window_id)
+            await session.rollback()
+            window = await session.get(ConversationWindow, window_id)
+            partial = _instant_failed(window, "exception") if window else BatchOutcome()
+        await session.commit()
+        outcome.absorb(partial)
+    if outcome.applied or outcome.retried:
+        log.info(
+            "instant path: %d applied, %d deferred to the batch",
+            outcome.applied,
+            outcome.retried,
+        )
+    return outcome
+
+
+async def _extract_one_instant(
+    session: AsyncSession, window: ConversationWindow
+) -> BatchOutcome:
+    result = await extract(window.text, now=window.ended_at.astimezone(settings.tz))
+    if result.usage is not None:
+        await usage_service.record_anthropic_usage(
+            session,
+            model=result.model,
+            operation="extract_window_instant",
+            usage=result.usage,
+        )
+        # The call is paid for whether or not what follows works, so the
+        # usage row is committed on its own. Applying can raise, and the
+        # rollback in extract_instant would otherwise erase the row while
+        # the window is retried — and billed a second time as if this call
+        # had never happened.
+        await session.commit()
+        # Re-read by id after the commit, as extract_instant does after a
+        # rollback: what is applied below must be the session's current row.
+        window_id = window.id
+        window = await session.get(ConversationWindow, window_id)
+        if window is None:
+            log.warning("window %s vanished during instant extraction", window_id)
+            return BatchOutcome()
+    if result.ok:
+        applied = await _apply_result(session, window, result.result)
+        return BatchOutcome(windows=[applied])
+    return _instant_failed(window, result.error or "unknown")
+
+
+def _instant_failed(window: ConversationWindow, reason: str) -> BatchOutcome:
+    """One more failed real-time try; at the cap, hand the window to the batch.
+
+    The batch's own ladder ends in a real-time retry and, last, needs_review —
+    so a window that fails everywhere is still flagged, never dropped.
+    """
+    window.attempts += 1
+    if window.attempts >= settings.batch_max_attempts:
+        window.instant = False
+        window.attempts = 0
+        log.warning(
+            "window %s deferred to the batch after %d instant failure(s): %s",
+            window.id,
+            settings.batch_max_attempts,
+            reason,
+        )
+        return BatchOutcome(retried=1)
+    log.warning(
+        "window %s instant extraction failed (attempt %d): %s",
+        window.id,
+        window.attempts,
+        reason,
+    )
+    return BatchOutcome()
 
 
 async def _retry_or_fallback(

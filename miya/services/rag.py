@@ -1,6 +1,6 @@
 """RAG chat (spec §8): free-form owner questions, answered in Uzbek.
 
-The route is Sonnet with a fixed toolbox. Every financial figure comes from a
+The route is the reasoning model with a fixed toolbox. Every financial figure comes from a
 deterministic SQL tool (services/queries.py) — the model's system prompt and
 the tool design both enforce the spec's core rule: **the LLM never invents
 numbers, it only phrases SQL results**. Semantic questions go through the

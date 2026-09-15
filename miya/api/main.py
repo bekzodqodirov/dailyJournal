@@ -367,7 +367,7 @@ async def usage(session: SessionDep, date_from: date, date_to: date) -> dict[str
 # app only finds the file the dialer wrote and pushes it here. So this handler
 # does the least it possibly can: authenticate, stream the bytes to disk under
 # a byte cap, verify the hash, write the sidecar, rename atomically, answer.
-# Everything that costs money or takes minutes (Scribe, Haiku, the notify) is
+# Everything that costs money or takes minutes (Scribe, extraction, the notify) is
 # left to the worker's existing one-minute sweep, which is where `max_instances
 # =1`, per-file commit and the TranscriptionError semantics already live. A
 # 300-second Scribe call inside a request handler would hold a mobile

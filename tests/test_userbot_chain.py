@@ -3,6 +3,10 @@
 Telegram messages → conversation window → Batch API → debts in the database.
 Every unit is covered elsewhere; this test exists to prove they compose, since
 that is where the schema and the lifecycle actually meet.
+
+The chat is a group nobody addressed the owner in: that is the traffic that
+still takes the batch. A private chat, or a group message aimed at him, takes
+the instant path instead (test_open_loops_surface.py).
 """
 
 from __future__ import annotations
@@ -106,8 +110,10 @@ async def test_a_telegram_conversation_becomes_a_debt(session, monkeypatch):
     # 1. The chat is known and monitored, and the person is known.
     await chats.sync_dialogs(
         session,
-        [chats.DialogInfo(tg_chat_id=CHAT, chat_type=ChatType.private, title="Akmal")],
+        [chats.DialogInfo(tg_chat_id=CHAT, chat_type=ChatType.group, title="GZ yuk")],
     )
+    monitor = await chats.get_monitor(session, CHAT)
+    monitor.monitor_enabled = True  # the owner switched the group on
     person = await resolve_person(session, "Akmal", telegram_id=555)
 
     # 2. The userbot stored three messages an hour ago.
@@ -134,6 +140,7 @@ async def test_a_telegram_conversation_becomes_a_debt(session, monkeypatch):
     # 3. The chat has been quiet for an hour, so the window flushes.
     [window] = await windows.flush_ready_windows(session)
     assert window.message_count == 3
+    assert window.instant is False  # un-addressed group traffic: the batch
     assert '[THEM (Akmal)] "aka, 12 mln kerak edi"' in window.text
     assert '[ME] "mayli, bugun o\'tkazaman"' in window.text
 

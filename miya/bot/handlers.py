@@ -31,15 +31,17 @@ from miya.bot import keyboards, replies
 from miya.bot.formatting import clip, escape, ref_of
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
-from miya.db.enums import Direction, InteractionSource
+from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
     approvals,
     audio,
+    brief,
     chats,
     documents,
     memories,
+    nudges,
     planner,
     purge,
     queries,
@@ -267,6 +269,17 @@ async def cmd_report(message: Message) -> None:
     await _safe_answer(message, clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"))
 
 
+@router.message(Command("ertalab"))
+async def cmd_brief(message: Message) -> None:
+    """The morning brief on demand — the same message the worker sends at
+    MORNING_BRIEF_TIME, with the same buttons. No model call: it is SQL."""
+    async with session_scope() as session:
+        data = await brief.gather(session)
+        body = replies.morning_brief(data)
+        due, stale = replies.morning_brief_refs(data)
+    await _safe_answer(message, body, reply_markup=keyboards.brief_actions(due, stale))
+
+
 @router.message(Command("reja"))
 async def cmd_plan(message: Message) -> None:
     await _typing(message)
@@ -458,6 +471,41 @@ async def on_media_button(callback: CallbackQuery) -> None:
             answered_at=datetime.now(settings.tz).isoformat(),
         )
         body = replies.MEDIA_APPROVED if answer == "y" else replies.MEDIA_DECLINED
+
+    await _edit_callback(callback, body)
+
+
+@router.callback_query(F.data.startswith("ng:"))
+async def on_new_group_button(callback: CallbackQuery) -> None:
+    """Ha / Yo'q under "Yangi guruh: … — o'qiymi?".
+
+    Only records the decision. "Ha" switches the chat on and queues a
+    backfill of the last week; the userbot — the one process with a Telegram
+    user session — reads it on its next sweep, exactly as with approved media.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+        await callback.answer()
+        return
+    answer, monitor_id = parts[1], int(parts[2])
+
+    async with session_scope() as session:
+        if answer == "y":
+            monitor = await chats.accept_join(session, monitor_id)
+            body = (
+                replies.new_group_accepted(
+                    monitor.title, monitor.tg_chat_id, chats.BACKFILL_DAYS
+                )
+                if monitor is not None
+                else replies.NEW_GROUP_GONE
+            )
+        else:
+            monitor = await chats.decline_join(session, monitor_id)
+            body = (
+                replies.new_group_declined(monitor.title, monitor.tg_chat_id)
+                if monitor is not None
+                else replies.NEW_GROUP_GONE
+            )
 
     await _edit_callback(callback, body)
 
@@ -687,6 +735,66 @@ async def _act(session, action: str, handle: str, *, by: str) -> _Outcome:
         return _Outcome(replies.DEBT_NOT_CLOSABLE.format(ref=ref_of(record)), False)
 
 
+async def _answer_nudge(session, action: str, handle: str) -> str:
+    """✅ Javob berdim / ⏰ Ertaga on one nudged question.
+
+    "Answered" is written on the interaction's own metadata and is final: the
+    question leaves the brief, the report and the sweep at once. "Ertaga"
+    only snoozes the nudge until the next morning brief; the question itself
+    stays open and listed.
+    """
+    interaction_id = keyboards.parse_question_ref(handle)
+    interaction = (
+        await session.get(Interaction, interaction_id)
+        if interaction_id is not None
+        else None
+    )
+    if interaction is None:
+        return replies.NUDGE_GONE
+    if action == keyboards.ACTION_QUESTION_ANSWERED:
+        nudges.mark_answered(interaction, by=records.BY_BUTTON)
+        # And every follow-up, not only the newest: the open-loops engine
+        # walks only rows older than LOOP_QUESTION_HOURS, so a mark on a
+        # follow-up sent an hour ago is invisible to it for hours, and an
+        # older, unmarked "qachon?" would surface as a fresh nudge the moment
+        # this one was closed.
+        for row in await _follow_ups(session, interaction):
+            nudges.mark_answered(row, by=records.BY_BUTTON)
+        return replies.NUDGE_ANSWERED
+    until = nudges.next_morning()
+    nudges.snooze(interaction, until=until)
+    return replies.nudge_snoozed(until)
+
+
+async def _follow_ups(session, question: Interaction) -> list[Interaction]:
+    """Every incoming userbot message in the question's chat since it, oldest
+    first.
+
+    In a group only messages aimed at the owner count, the same rows the
+    open-loops engine reads there; other people talking afterwards is not
+    a follow-up. Empty when the question is the newest message itself.
+    """
+    if question.tg_chat_id is None:
+        return []
+    chat_type = await session.scalar(
+        sa.select(ChatMonitor.chat_type).where(
+            ChatMonitor.tg_chat_id == question.tg_chat_id
+        )
+    )
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.source == InteractionSource.telegram_userbot)
+        .where(Interaction.direction == Direction.in_)
+        .where(Interaction.tg_chat_id == question.tg_chat_id)
+        .where(Interaction.occurred_at >= question.occurred_at)
+        .where(Interaction.id != question.id)
+        .order_by(Interaction.occurred_at, Interaction.id)
+    )
+    if chat_type is not ChatType.private:
+        stmt = stmt.where(queries._addressed_to_owner())
+    return list(await session.scalars(stmt))
+
+
 @router.callback_query(F.data.startswith("rec:"))
 async def on_record_button(callback: CallbackQuery) -> None:
     """✅ / ✏️ / 🔄 / Ha / Yop / ↩️ Qaytar on a confirmation, reminder or outcome.
@@ -705,6 +813,12 @@ async def on_record_button(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     action, handle = parts[1], parts[2]
+    if action in keyboards.QUESTION_ANSWERS:
+        # A nudged question, not a record: "q<interaction id>".
+        async with session_scope() as session:
+            text = await _answer_nudge(session, action, handle)
+        await _edit_callback(callback, text)
+        return
 
     async with session_scope() as session:
         outcome = await _act(session, action, handle, by=records.BY_BUTTON)

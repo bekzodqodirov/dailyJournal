@@ -17,6 +17,12 @@ product decisions, not defaults: code that contradicts them is wrong.
 ## Reminders and open loops
 - Undated promises and unanswered questions: **re-remind after one week**.
 - Morning brief at **09:00 Asia/Tashkent**.
+- An unanswered question gets **one** nudge (after `LOOP_QUESTION_HOURS`),
+  then only the brief and the evening report carry it. "⏰ Ertalab eslat"
+  brings it back once more at the next brief. Chosen in step 2 so the same
+  question is not pinged three times a day.
+- Only groups discovered after step 2 is deployed are asked "o'qiymi?";
+  groups switched off earlier in /chats stay off without a question.
 
 ## Which chats
 - **Every private chat** is read (the current default stands).
@@ -40,8 +46,8 @@ with clients it is my assistant: when I ask *what was that thing that
 happened*, it answers."
 
 ## Agreed build order
-1. Close and correct (buttons, /bajarildi, /tuzat, /yop, fulfilment)
-2. Open loops and the morning brief
+1. Close and correct (buttons, /bajarildi, /tuzat, /yop, fulfilment) — done
+2. Open loops and the morning brief — done (needs `OWNER_ALIASES` in `.env`)
 3. Ask-before-writing for counterparty claims
 4. Per-person memory
 5. Self-monitoring (/holat, heartbeat, backups to Telegram)

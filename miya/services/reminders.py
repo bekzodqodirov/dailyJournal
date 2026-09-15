@@ -3,14 +3,15 @@
 Runs hourly, never during quiet hours. An item with a due date is pinged on
 the day it falls due, then at +1 day, then at +3 days; after that third ping
 it is asked — "Hali ochiqmi?" with Ha / Bajarildi / Yop buttons — a week
-after the due date, and the question repeats every week until it is
-answered. "Ha" keeps it open and re-asks a week later. A question the owner
-misses is therefore asked again, not dropped: the owner's decision is
-"re-remind after one week", and an unanswered question is the one case where
-silence would quietly bury the debt.
+after the due date, and the question repeats every LOOP_UNDATED_DAYS until
+it is answered. "Ha" keeps it open and re-asks after the same interval. A
+question the owner misses is therefore asked again, not dropped: the owner's
+decision is "re-remind after one week", and an unanswered question is the
+one case where silence would quietly bury the debt.
 
 Undated promises and tasks (the same decision) get the question a week after
-they were made, and every week after.
+they were made, and every week after — a week since whatever touched it last,
+which loops.stale_undated decides for the sweep and the morning brief alike.
 
 All of this state lives in ``reminder_log`` — one row per thing sent, keyed
 by kind and ref — so a worker restart changes nothing and the sweep can
@@ -35,7 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.models import Debt, ReminderLog
-from miya.services import queries
+from miya.services import loops, queries
 
 log = logging.getLogger(__name__)
 
@@ -43,15 +44,20 @@ log = logging.getLogger(__name__)
 ESCALATION_DAYS = (0, 1, 3)
 # Then the question, first on this day after the due date.
 ASK_AFTER_DAYS = 7
-# How often the question repeats: undated items, dated ones the owner said
-# are still open, and questions he never answered.
-NUDGE_EVERY = timedelta(days=7)
 # One "Hali ochiqmi?" message carries at most this many rows; the rest keep
 # qualifying and come next sweep.
 MAX_QUESTIONS = 20
 
 PING = "ping"
 ASK = "ask"
+
+
+def nudge_every() -> timedelta:
+    """How often the question repeats: dated items the owner said are still
+    open, and questions he never answered. The same LOOP_UNDATED_DAYS that
+    makes an undated item stale — one knob for "re-remind after one week".
+    Read on each call so a changed setting is seen without a restart."""
+    return timedelta(days=settings.loop_undated_days)
 
 
 def ask_kind(kind: str) -> str:
@@ -170,13 +176,15 @@ def decide(
     Pure, so the schedule is testable without a clock: the caller supplies
     ``now`` and the log rows.
     """
+    # Reached by direct callers and tests only: the sweep takes undated items
+    # from loops.stale_undated, one definition of "stale" for brief and ask.
     if due is None:
         # Weekly nudge: a week after it was made, then a week after whatever
         # was last sent or answered.
         last = history[-1][1] if history else created_at
         if last is None:
             return None
-        return ASK if now >= last + NUDGE_EVERY else None
+        return ASK if now >= last + nudge_every() else None
 
     since = datetime.combine(due, time.min, tzinfo=settings.tz)
     pings = [sent for k, sent in history if k == kind and sent >= since]
@@ -186,12 +194,12 @@ def decide(
     if acks and (not asks or acks[-1] >= asks[-1]):
         # "Ha, still open": the item is on a weekly question from that answer.
         last = max(sent for _, sent in history if sent >= acks[-1])
-        return ASK if now >= last + NUDGE_EVERY else None
+        return ASK if now >= last + nudge_every() else None
     if asks:
         # Asked and never answered: quiet for a week, then the same question
         # again. Returning None here for good is how a missed "Hali ochiqmi?"
         # used to turn into a debt the owner never heard of again.
-        return ASK if now >= asks[-1] + NUDGE_EVERY else None
+        return ASK if now >= asks[-1] + nudge_every() else None
 
     today = now.date()
     stage = len(pings)
@@ -267,31 +275,23 @@ async def collect_due(
         elif verdict == ASK:
             bundle.questions.append(Question("task", ref, [("task", task.id)], task))
 
-    undated = await queries.undated_open(session)
-    for promise, person in undated["promises"]:
-        ref = str(promise.id)
-        verdict = decide(
-            "promise",
-            await _history(session, "promise", ref),
-            due=None,
-            created_at=promise.created_at.astimezone(settings.tz),
-            now=now,
-        )
-        if verdict == ASK:
-            bundle.questions.append(
-                Question("promise", ref, [("promise", promise.id)], promise, person)
+    # Undated promises and tasks: the weekly question comes from the open-loops
+    # selection, so the sweep and the morning brief never disagree about what
+    # "undated and stale" means (loops.stale_undated: a week since it was made,
+    # last pinged, answered or corrected — whichever is latest). Undated debts
+    # are in that selection too; the brief shows them, the sweep does not ask.
+    for stale in await loops.stale_undated(session, now=now, kinds=("promise", "task")):
+        record = stale.record
+        ref = ref_for(stale.record_kind, record)
+        bundle.questions.append(
+            Question(
+                stale.record_kind,
+                ref,
+                [(stale.record_kind, record.id)],
+                record,
+                stale.person,
             )
-    for task in undated["tasks"]:
-        ref = str(task.id)
-        verdict = decide(
-            "task",
-            await _history(session, "task", ref),
-            due=None,
-            created_at=task.created_at.astimezone(settings.tz),
-            now=now,
         )
-        if verdict == ASK:
-            bundle.questions.append(Question("task", ref, [("task", task.id)], task))
 
     for event in await queries.upcoming_events(session, within_minutes=60):
         ref = str(event.id)

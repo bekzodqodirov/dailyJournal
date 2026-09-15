@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from miya.bot.formatting import (
     PRIORITY_LABEL,
     TELEGRAM_LIMIT,
+    age_label,
     bullet_list,
     clip,
     clock,
@@ -12,23 +15,28 @@ from miya.bot.formatting import (
     escape,
     full_date,
     money,
-    ref,
+    question_line,
+    quiet_line,
+    quote,
+    record_line,
     relative_day,
     short_date,
+    stale_line,
     tag,
     tags,
     usd,
 )
 from miya.config import settings
-from miya.db.enums import (
-    DebtDirection,
-    DebtStatus,
-    PromiseMadeBy,
-    PromiseStatus,
-    TaskStatus,
-)
+from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
+from miya.services.brief import MorningBrief
+from miya.services.loops import UnansweredQuestion
 from miya.services.persistence import Applied
 from miya.services.queries import DaySummary, DebtBalance, PersonSummary
+
+# age_label, record_line and the three open-loop lines (question_line,
+# stale_line, quiet_line) live in formatting.py: the report's data block
+# renders the same rows in plain text and reports.py must not import this
+# module. They stay importable from here for existing callers.
 
 FAILED_EXTRACTION_HINT = (
     "⚠️ Yozib oldim, lekin ma'lumot ajratib bo'lmadi — /tekshir ro'yxatida turadi."
@@ -65,6 +73,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /kim &lt;ism&gt; — odam bo'yicha xulosa
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — kunlik hisobot
+/ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
 /process — javob yozilgan media'ni qayta ishlash
@@ -612,49 +621,6 @@ def still_open_question_with_count(questions) -> tuple[str, int]:
     return body + f"\n{STILL_OPEN_HINT}", len(kept)
 
 
-# --- one record, one line ----------------------------------------------------
-
-_DEBT_STATUS = {
-    DebtStatus.settled: " · ✅ yopilgan",
-    DebtStatus.partially_paid: " · qisman to'langan",
-}
-_PROMISE_STATUS = {
-    PromiseStatus.done: " · ✅ bajarilgan",
-    PromiseStatus.cancelled: " · ✖️ yopilgan",
-    PromiseStatus.broken: " · ✖️ buzilgan",
-}
-_TASK_STATUS = {
-    TaskStatus.done: " · ✅ bajarilgan",
-    TaskStatus.dropped: " · ✖️ yopilgan",
-    TaskStatus.doing: " · jarayonda",
-}
-
-
-def record_line(kind: str, record, person=None) -> str:
-    """How one debt / promise / task reads on its own, ref first.
-
-    Used for the corrected line after `/tuzat`, the button outcomes, and the
-    "Hali ochiqmi?" question — one shape, so the owner learns it once.
-    """
-    handle = f"<code>{ref(kind, record.id)}</code> " if record.id is not None else ""
-    name = escape(person.display_name) if person is not None else "?"
-    if kind == "debt":
-        body = debt_line(
-            name, record.direction, record.amount, record.currency, record.due_date
-        )
-        return f"💰 {handle}{body}{_DEBT_STATUS.get(record.status, '')}"
-    if kind == "promise":
-        who = "Men" if record.made_by is PromiseMadeBy.me else "U"
-        due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
-        return (
-            f"🤝 {handle}{who} — {name}: {escape(record.description)}{due}"
-            f"{_PROMISE_STATUS.get(record.status, '')}"
-        )
-    due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
-    status = _TASK_STATUS.get(record.status, "")
-    return f"✔️ {handle}{escape(record.description)}{due}{status}"
-
-
 # --- /bajarildi, /yop, /tuzat ------------------------------------------------
 
 REF_USAGE = (
@@ -800,6 +766,7 @@ SEARCH_UNAVAILABLE = (
 OPERATION_LABEL = {
     "extract": "xabarlardan ajratish",
     "extract_window": "telegram suhbatlari (batch)",
+    "extract_window_instant": "telegram suhbatlari (tezkor)",
     "extract_window_fallback": "telegram suhbatlari (qayta)",
     "transcribe": "ovozni matnga o'girish",
     "vision": "rasmlarni o'qish",
@@ -922,3 +889,148 @@ def review_report(interactions, total: int) -> str:
     if total > len(interactions):
         header += f" (oxirgi {len(interactions)} tasi)"
     return clip(header + "\n" + bullet_list(lines, empty="—"))
+
+
+# --- open loops: the morning brief, the nudge, a new group -------------------
+#
+# question_line / stale_line / quiet_line live in formatting.py: the report's
+# data block renders the same rows in plain text (``markup=False``), and
+# reports.py must not import this module. They are re-exported above.
+
+
+BRIEF_HEADER = "🌅 <b>Ertalabki xulosa</b>"
+BRIEF_ALL_CLEAR = "✅ Hammasi joyida — bugun uchrashuv ham, ochiq qolgan narsa ham yo'q."
+
+BRIEF_EVENTS = "📅 <b>Bugungi uchrashuvlar</b>"
+BRIEF_DUE = "⏰ <b>Muddati bugun va kechikkanlar</b>"
+BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
+BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
+BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
+
+
+def morning_brief(brief: MorningBrief) -> str:
+    """The one morning message. Deterministic — SQL and the loops engine."""
+    parts = [f"{BRIEF_HEADER} · {full_date(brief.day)}"]
+    if brief.is_empty():
+        return "\n\n".join([*parts, BRIEF_ALL_CLEAR])
+
+    if brief.events:
+        lines = [
+            f"{clock(e.start_at)} — {escape(e.title)}"
+            + (f" ({escape(e.location)})" if e.location else "")
+            for e in brief.events
+        ]
+        parts.append(f"{BRIEF_EVENTS}\n" + bullet_list(lines, empty="—"))
+
+    due_lines = [
+        f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
+        f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
+        for b in brief.due.get("debts", [])
+    ]
+    due_lines += [
+        f"{escape(person.display_name)}: {escape(p.description)} · "
+        f"{relative_day(p.due_date)}" + tag("promise", p.id)
+        for p, person in brief.due.get("promises", [])
+    ]
+    due_lines += [
+        f"{escape(t.description)} · {relative_day(t.due_date)}" + tag("task", t.id)
+        for t in brief.due.get("tasks", [])
+    ]
+    if due_lines:
+        parts.append(f"{BRIEF_DUE}\n" + bullet_list(due_lines, empty="—"))
+
+    loops = brief.loops
+    if loops is not None and loops.questions:
+        lines = [question_line(q) for q in loops.questions]
+        parts.append(f"{BRIEF_QUESTIONS}\n" + bullet_list(lines, empty="—"))
+    if loops is not None and loops.stale:
+        lines = [stale_line(s) for s in loops.stale]
+        parts.append(f"{BRIEF_STALE}\n" + bullet_list(lines, empty="—"))
+    if loops is not None and loops.quiet:
+        lines = [quiet_line(q) for q in loops.quiet]
+        parts.append(f"{BRIEF_QUIET}\n" + bullet_list(lines, empty="—"))
+
+    return clip("\n\n".join(parts))
+
+
+def morning_brief_refs(
+    brief: MorningBrief,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """``(due, stale)`` — the rows the brief's buttons act on, in line order."""
+    due: list[tuple[str, int]] = []
+    for b in brief.due.get("debts", []):
+        due += [("debt", i) for i in b.ids]
+    due += [("promise", p.id) for p, _ in brief.due.get("promises", [])]
+    due += [("task", t.id) for t in brief.due.get("tasks", [])]
+    stale = (
+        [(s.record_kind, s.record.id) for s in brief.loops.stale]
+        if brief.loops is not None
+        else []
+    )
+    return due, stale
+
+
+NUDGE_HEADER = "❓ <b>Javobsiz savol</b>"
+NUDGE_ANSWERED = "✅ Javob berilgan deb yozib qo'ydim — boshqa eslatmayman."
+
+
+def nudge_snoozed(until: datetime) -> str:
+    """After ⏰ Ertalab eslat: name the moment, since "the next brief" is today's
+    09:00 for a tap before it (00:30 after an evening nudge, or 08:00) and
+    tomorrow's for a tap after it."""
+    local = until.astimezone(settings.tz)
+    day = "Bugun" if local.date() == datetime.now(settings.tz).date() else "Ertaga"
+    return f"⏰ {day} {local.strftime('%H:%M')} dagi ertalabki xulosada yana eslataman."
+
+
+NUDGE_GONE = "⚠️ Bu savol eskirgan yoki yozuv o'chirilgan."
+
+
+def nudge(q: UnansweredQuestion) -> str:
+    """One short message per unanswered question: who asked, what, how long."""
+    where = f" · {escape(q.chat_title)}" if q.is_group and q.chat_title else ""
+    lines = [
+        NUDGE_HEADER,
+        f"<b>{escape(q.person_name)}</b>{where} · {age_label(q.age)} oldin",
+        quote(q.text, limit=300),
+    ]
+    if q.follow_ups:
+        lines.append(
+            f"<i>Keyin yana {q.follow_ups} ta xabar keldi — hali javob yo'q.</i>"
+        )
+    return clip("\n".join(lines))
+
+
+def nudge_overflow(count: int) -> str:
+    return (
+        f"❓ <i>… va yana {count} ta javobsiz savol — keyingi safar eslataman "
+        f"(to'liq ro'yxat: /ertalab).</i>"
+    )
+
+
+NEW_GROUP_GONE = "⚠️ Bu chat endi ro'yxatda yo'q."
+
+# What a switched-off chat is called in the one-tap question. A channel is
+# not a group to the owner, and chats.awaiting_join_question asks about both.
+_NEW_CHAT_LABEL = {
+    ChatType.channel: "📢 <b>Yangi kanal:</b>",
+    ChatType.group: "👥 <b>Yangi guruh:</b>",
+}
+
+
+def new_group_question(
+    title: str | None, tg_chat_id: int, chat_type: ChatType | None = None
+) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    label = _NEW_CHAT_LABEL.get(chat_type, _NEW_CHAT_LABEL[ChatType.group])
+    return f"{label} {name} — o'qiymi?"
+
+
+def new_group_accepted(title: str | None, tg_chat_id: int, days: int) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    return f"✅ <b>{name}</b> — endi o'qiyman. Oxirgi {days} kunini ham o'qib chiqaman."
+
+
+def new_group_declined(title: str | None, tg_chat_id: int) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    return f"👌 <b>{name}</b> — o'qimayman. Kerak bo'lsa /chats dan yoqasiz."

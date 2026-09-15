@@ -73,7 +73,9 @@ def day_bounds(day: date) -> tuple[datetime, datetime]:
 
 
 # `debts.amount` minus everything paid against it — the outstanding balance.
-_OUTSTANDING = Debt.amount - sa.func.coalesce(
+# Public: loops.py ranks open loops by this same figure, so there is one
+# definition of "what is still owed" in the codebase.
+OUTSTANDING = Debt.amount - sa.func.coalesce(
     sa.select(sa.func.sum(DebtPayment.amount))
     .where(DebtPayment.debt_id == Debt.id)
     .correlate(Debt)
@@ -94,7 +96,7 @@ async def open_debts(
             Person,
             Debt.direction,
             Debt.currency,
-            sa.func.sum(_OUTSTANDING).label("outstanding"),
+            sa.func.sum(OUTSTANDING).label("outstanding"),
             sa.func.min(Debt.due_date).label("earliest_due"),
             sa.func.count(Debt.id).label("count"),
             sa.func.array_agg(sa.distinct(Debt.id)).label("ids"),
@@ -102,7 +104,7 @@ async def open_debts(
         .join(Person, Person.id == Debt.person_id)
         .where(Debt.status != DebtStatus.settled)
         .group_by(Person.id, Debt.direction, Debt.currency)
-        .having(sa.func.sum(_OUTSTANDING) > 0)
+        .having(sa.func.sum(OUTSTANDING) > 0)
         .order_by(Debt.direction, sa.desc("outstanding"))
     )
     if direction is not None:
@@ -300,28 +302,6 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
         )
     )
     return {"debts": debts, "promises": promises, "tasks": tasks}
-
-
-async def undated_open(session: AsyncSession) -> dict[str, list]:
-    """Open promises and tasks with no due date — the weekly-nudge source.
-
-    The owner's decision: an undated promise is re-reminded a week after it was
-    made and every week after, or it silently becomes a forgotten one.
-    """
-    promises = [
-        (p, person)
-        for p, person in await open_promises(session, limit=500)
-        if p.due_date is None
-    ]
-    tasks = list(
-        await session.scalars(
-            sa.select(Task)
-            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
-            .where(Task.due_date.is_(None))
-            .order_by(Task.created_at)
-        )
-    )
-    return {"promises": promises, "tasks": tasks}
 
 
 async def upcoming_events(
