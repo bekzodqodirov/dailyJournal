@@ -1,7 +1,8 @@
 """Scheduler process (APScheduler).
 
 Jobs:
-  * reminders    — hourly, on the hour; quiet-hours aware (Phase 1)
+  * reminders    — hourly, on the hour; quiet-hours aware; escalates and then
+                   asks "Hali ochiqmi?" (see services/reminders.py)
   * call_scan    — every minute; ingests new call recordings (Phase 2)
   * retention    — daily at 04:15; deletes audio past AUDIO_RETENTION_DAYS
   * embed        — every 2 min; backfills bge-m3 vectors for new memories
@@ -10,7 +11,8 @@ Jobs:
   * gcal_push    — every 5 min; extracted events → Google (when authed)
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
   * batch_submit — every BATCH_FLUSH_HOURS; pending windows → Batch API
-  * batch_poll   — every 15 min; applies finished batches
+  * batch_poll   — every 15 min; applies finished batches, then tells the
+                   owner what his chats put on the ledger (quiet-hours aware)
   * backup       — cron at BACKUP_TIME; encrypted pg_dump, 14-day retention
 """
 
@@ -30,7 +32,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from miya.bot import keyboards, replies
+from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, escape
 from miya.config import settings
 from miya.db.models import DailyReport, Person
@@ -51,20 +53,28 @@ from miya.services.embeddings import EmbeddingError, get_embedder
 log = logging.getLogger(__name__)
 
 
-async def notify(bot: Bot, text: str) -> bool:
+async def notify(bot: Bot, text: str, *, reply_markup=None) -> bool:
     """Send to the owner; retry as plain text if Telegram rejects the HTML.
 
     Report and reminder bodies carry names and descriptions that a
     counterparty controls, and the report itself is composed by a model. A
     single stray tag must not silently cost the owner his evening summary.
+    ``reply_markup`` (the reminder buttons) rides along on both attempts.
     """
     try:
-        await bot.send_message(settings.owner_telegram_id, clip(text))
+        await bot.send_message(
+            settings.owner_telegram_id, clip(text), reply_markup=reply_markup
+        )
         return True
     except Exception:
         log.warning("HTML send failed, retrying as plain text", exc_info=True)
     try:
-        await bot.send_message(settings.owner_telegram_id, clip(text), parse_mode=None)
+        await bot.send_message(
+            settings.owner_telegram_id,
+            clip(text),
+            parse_mode=None,
+            reply_markup=reply_markup,
+        )
         return True
     except Exception:
         log.exception("could not reach the owner at all")
@@ -72,7 +82,12 @@ async def notify(bot: Bot, text: str) -> bool:
 
 
 async def reminder_job(bot: Bot) -> None:
-    """Ping the owner about anything due. Silent during quiet hours."""
+    """Ping the owner about anything due. Silent during quiet hours.
+
+    Two messages at most: the pings, with a ✅ / ✏️ / 🔄 row per line so an
+    item can be closed or corrected from the reminder itself, and the
+    "Hali ochiqmi?" question for items the pings are done with.
+    """
     if reminders.in_quiet_hours():
         log.debug("inside quiet hours — skipping reminder sweep")
         return
@@ -85,21 +100,38 @@ async def reminder_job(bot: Bot) -> None:
         body, rendered = replies.reminder_with_counts(
             bundle.debts, bundle.promises, bundle.tasks, bundle.events
         )
-        if not body:
-            return
+        if body:
+            keyboard = keyboards.record_actions(
+                replies.reminder_refs(
+                    bundle.debts, bundle.promises, bundle.tasks, rendered
+                )
+            )
+            if not await notify(
+                bot, f"⏰ <b>Eslatma</b>\n\n{body}", reply_markup=keyboard
+            ):
+                return
+            # Recorded only after a successful send, and only for what fit: a
+            # clipped item must come back next hour, not be silently suppressed.
+            await reminders.mark_sent(session, bundle, rendered=rendered)
+            await session.commit()
 
-        if not await notify(bot, f"⏰ <b>Eslatma</b>\n\n{body}"):
-            return
-        # Recorded only after a successful send, and only for what fit: a
-        # clipped item must come back next hour, not be silently suppressed.
-        await reminders.mark_sent(session, bundle, rendered=rendered)
+        if bundle.questions:
+            # Same rule as the pings: only what fit in the message is logged
+            # as asked; the tail qualifies again next sweep.
+            body, shown = replies.still_open_question_with_count(bundle.questions)
+            shown = min(shown, keyboards.MAX_ROWS)
+            keyboard = keyboards.question_keyboard(bundle.questions[:shown])
+            if not await notify(bot, body, reply_markup=keyboard):
+                return
+            await reminders.mark_asked(session, bundle, rendered=shown)
 
     log.info(
-        "sent reminder: %d debts, %d promises, %d tasks, %d events",
+        "sent reminder: %d debts, %d promises, %d tasks, %d events, %d questions",
         len(bundle.debts),
         len(bundle.promises),
         len(bundle.tasks),
         len(bundle.events),
+        len(bundle.questions),
     )
 
 
@@ -234,16 +266,61 @@ async def batch_submit_job() -> None:
         await batch.submit_pending(session)
 
 
-async def batch_poll_job() -> None:
+async def batch_poll_job(bot: Bot) -> None:
     async with session_scope() as session:
         outcome = await batch.collect_submitted(session)
     if outcome.applied or outcome.failed:
         log.info(
-            "batch poll: %d applied, %d retried, %d failed",
+            "batch poll: %d applied (%d worth telling), %d retried, %d failed",
             outcome.applied,
+            sum(1 for landed in outcome.windows if landed.notice),
             outcome.retried,
             outcome.failed,
         )
+    # The receipts were parked with the rows; delivering them is a separate
+    # step so quiet hours delay them without touching the extraction.
+    await chat_notice_job(bot)
+
+
+async def chat_notice_job(bot: Bot) -> None:
+    """Tell the owner what his chats put on the ledger, one receipt per window.
+
+    Quiet-hours aware the way reminders are, but nothing is re-derived: the
+    receipts wait in the queue and go out on the first poll after quiet hours
+    end. A worker restart in between changes nothing. The first MAX_DETAILED
+    go out one by one; anything beyond that — a day's backlog after an outage
+    — is folded into one summary rather than a hundred messages.
+    """
+    if reminders.in_quiet_hours():
+        return
+
+    async with session_scope() as session:
+        queue = await batch.pending_notices(session)
+        if not queue:
+            return
+        now = datetime.now(settings.tz)
+        detailed = queue[: notices.MAX_DETAILED]
+        rest = queue[notices.MAX_DETAILED :]
+
+        for item in detailed:
+            if not await notify(bot, item.text):
+                # Unreachable: everything left stays queued for the next poll.
+                return
+            # Marked only after a successful send, and committed at once, so a
+            # crash mid-sweep repeats at most one receipt and loses none.
+            batch.mark_notified(item.interaction, now=now)
+            await session.commit()
+
+        if rest:
+            summary = notices.overflow_summary([(q.chat, q.counts) for q in rest])
+            if not await notify(bot, summary):
+                return
+            for item in rest:
+                batch.mark_notified(item.interaction, now=now)
+
+    log.info(
+        "sent %d chat notice(s), %d more folded into a summary", len(detailed), len(rest)
+    )
 
 
 async def backup_job(bot: Bot) -> None:
@@ -449,6 +526,7 @@ async def run() -> None:
     scheduler.add_job(
         batch_poll_job,
         IntervalTrigger(minutes=15),
+        args=[bot],
         id="batch_poll",
         max_instances=1,
         coalesce=True,

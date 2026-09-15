@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from miya.config import settings
 from miya.db.enums import Currency, DebtDirection, DebtStatus, PromiseStatus, TaskStatus
@@ -38,6 +39,8 @@ class DebtBalance:
     outstanding: Decimal
     earliest_due: date | None
     count: int
+    # The debt rows behind this balance, so a line can carry their d-refs.
+    ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -94,6 +97,7 @@ async def open_debts(
             sa.func.sum(_OUTSTANDING).label("outstanding"),
             sa.func.min(Debt.due_date).label("earliest_due"),
             sa.func.count(Debt.id).label("count"),
+            sa.func.array_agg(sa.distinct(Debt.id)).label("ids"),
         )
         .join(Person, Person.id == Debt.person_id)
         .where(Debt.status != DebtStatus.settled)
@@ -114,6 +118,7 @@ async def open_debts(
             outstanding=row[3],
             earliest_due=row[4],
             count=row[5],
+            ids=sorted(row[6] or []),
         )
         for row in (await session.execute(stmt)).all()
     ]
@@ -221,16 +226,22 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
     )
     summary.people_seen = [(row[0], row[1]) for row in people.all()]
 
+    # People are loaded eagerly: `/bugun` lists each new debt and promise by
+    # name and ref, and the relationships are lazy="raise".
     summary.new_debts = list(
         await session.scalars(
-            sa.select(Debt).where(Debt.created_at >= start, Debt.created_at < end)
+            sa.select(Debt)
+            .options(selectinload(Debt.person))
+            .where(Debt.created_at >= start, Debt.created_at < end)
+            .order_by(Debt.id)
         )
     )
     summary.new_promises = list(
         await session.scalars(
-            sa.select(Promise).where(
-                Promise.created_at >= start, Promise.created_at < end
-            )
+            sa.select(Promise)
+            .options(selectinload(Promise.person))
+            .where(Promise.created_at >= start, Promise.created_at < end)
+            .order_by(Promise.id)
         )
     )
     summary.interactions = await session.scalar(
@@ -289,6 +300,28 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
         )
     )
     return {"debts": debts, "promises": promises, "tasks": tasks}
+
+
+async def undated_open(session: AsyncSession) -> dict[str, list]:
+    """Open promises and tasks with no due date — the weekly-nudge source.
+
+    The owner's decision: an undated promise is re-reminded a week after it was
+    made and every week after, or it silently becomes a forgotten one.
+    """
+    promises = [
+        (p, person)
+        for p, person in await open_promises(session, limit=500)
+        if p.due_date is None
+    ]
+    tasks = list(
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
+            .where(Task.due_date.is_(None))
+            .order_by(Task.created_at)
+        )
+    )
+    return {"promises": promises, "tasks": tasks}
 
 
 async def upcoming_events(
@@ -387,11 +420,14 @@ async def completed_on(session: AsyncSession, day: date) -> CompletedToday:
         ),
         done_promises=list(
             await session.scalars(
-                sa.select(Promise).where(
+                sa.select(Promise)
+                .options(selectinload(Promise.person))
+                .where(
                     Promise.status == PromiseStatus.done,
                     Promise.completed_at >= start,
                     Promise.completed_at < end,
                 )
+                .order_by(Promise.completed_at)
             )
         ),
         done_tasks=list(

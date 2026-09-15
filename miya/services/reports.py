@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from miya.bot.formatting import escape
+from miya.bot.formatting import escape, ref
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
@@ -130,19 +130,28 @@ def render_data_block(data: ReportData) -> str:
 
     lines.append("\n⏰ OCHIQ VA MUDDATI O'TGANLAR:")
     due_lines = 0
+    # Every open line carries its ref (d12 / p7 / t3) — plain text, not
+    # markup, so the model copies it as-is and the owner can /bajarildi it.
     for b in data.due.get("debts", []):
         side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
+        handles = ", ".join(ref("debt", i) for i in b.ids)
         lines.append(
             f"- {escape(b.person.display_name)}: "
             f"{format_money(b.outstanding, b.currency)} ({side}, "
-            f"muddat: {b.earliest_due})"
+            f"muddat: {b.earliest_due}) [{handles}]"
         )
         due_lines += 1
     for p, person in data.due.get("promises", []):
-        lines.append(f"- va'da: {escape(person.display_name)} — {escape(p.description)}")
+        lines.append(
+            f"- va'da: {escape(person.display_name)} — {escape(p.description)} "
+            f"[{ref('promise', p.id)}]"
+        )
         due_lines += 1
     for t in data.due.get("tasks", []):
-        lines.append(f"- vazifa: {escape(t.description)} (muddat: {t.due_date})")
+        lines.append(
+            f"- vazifa: {escape(t.description)} (muddat: {t.due_date}) "
+            f"[{ref('task', t.id)}]"
+        )
         due_lines += 1
     if not due_lines:
         lines.append("- yo'q")
@@ -153,7 +162,8 @@ def render_data_block(data: ReportData) -> str:
         if c.settled_debts:
             lines.append(f"- yopilgan qarzlar: {len(c.settled_debts)} ta")
         for p in c.done_promises:
-            lines.append(f"- va'da bajarildi: {escape(p.description)}")
+            who = escape(p.person.display_name) if p.person is not None else "?"
+            lines.append(f"- va'da bajarildi: {who} — {escape(p.description)}")
         for t in c.done_tasks:
             lines.append(f"- vazifa bajarildi: {escape(t.description)}")
     else:

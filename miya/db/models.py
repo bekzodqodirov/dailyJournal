@@ -218,6 +218,11 @@ class Debt(Base):
     notes: Mapped[str | None] = mapped_column(sa.Text)
     created_at: Mapped[datetime] = created_at_column()
     settled_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # Every owner correction, oldest first: [{at, field, old, new, by}, ...].
+    # Lives on the row so a purge of the row takes its audit trail with it.
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
 
     person: Mapped[Person] = relationship(lazy="raise")
     payments: Mapped[list[DebtPayment]] = relationship(
@@ -271,6 +276,9 @@ class Promise(Base):
     )
     created_at: Mapped[datetime] = created_at_column()
     completed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
 
     person: Mapped[Person] = relationship(lazy="raise")
 
@@ -356,6 +364,9 @@ class Task(Base):
     )
     created_at: Mapped[datetime] = created_at_column()
     completed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
 
     __table_args__ = (sa.Index("ix_tasks_status_due", "status", "due_date"),)
 

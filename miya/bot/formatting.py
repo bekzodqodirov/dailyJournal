@@ -6,6 +6,7 @@ place that decides how money, dates and names are rendered.
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from decimal import Decimal
 
@@ -140,6 +141,55 @@ def debt_line(
     arrow = "→ senga" if direction is DebtDirection.they_owe_me else "← sen"
     tail = f" · {relative_day(due)}" if due else ""
     return f"{person_name} {arrow}: {money(amount, currency)}{tail}"
+
+
+# --- record references ------------------------------------------------------
+#
+# Every listed debt, promise and task carries a short handle — d12, p7, t3 —
+# so the owner can name one row in `/bajarildi d12` or `/tuzat p7 ertaga`.
+# The letter is the kind, the number is the row's primary key: stable across
+# restarts and never reused, unlike a position in a list.
+
+REF_PREFIX = {"debt": "d", "promise": "p", "task": "t"}
+KIND_OF_PREFIX = {prefix: kind for kind, prefix in REF_PREFIX.items()}
+
+_REF = re.compile(r"^\s*#?([dpt])(\d{1,9})\s*$", re.IGNORECASE)
+
+
+def ref(kind: str, record_id: int | None) -> str:
+    """'d12' for debt 12. Empty for an unsaved row, so a line never shows 'dNone'."""
+    if record_id is None:
+        return ""
+    return f"{REF_PREFIX[kind]}{record_id}"
+
+
+def ref_of(record) -> str:
+    """The reference of an ORM row, by its table."""
+    return ref(kind_of(record), record.id)
+
+
+def kind_of(record) -> str:
+    return {"debts": "debt", "promises": "promise", "tasks": "task"}[record.__tablename__]
+
+
+def parse_ref(text: str) -> tuple[str, int] | None:
+    """'d12' / 'D12' / '#d12' → ('debt', 12); anything else → None."""
+    match = _REF.match(text or "")
+    if match is None:
+        return None
+    return KIND_OF_PREFIX[match.group(1).lower()], int(match.group(2))
+
+
+def tag(kind: str, record_id: int | None) -> str:
+    """The reference as it appears at the end of a list line: ' [d12]'."""
+    handle = ref(kind, record_id)
+    return f" <code>{handle}</code>" if handle else ""
+
+
+def tags(kind: str, ids: list[int]) -> str:
+    """Several rows folded into one line (a debt balance): ' [d12, d15]'."""
+    handles = [ref(kind, i) for i in ids if i is not None]
+    return f" <code>{', '.join(handles)}</code>" if handles else ""
 
 
 def escape(text: str) -> str:

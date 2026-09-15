@@ -5,6 +5,14 @@ the spec: private chats on, groups and channels off until the owner whitelists
 them from `/chats`. A row is only ever created with those defaults — an
 existing row's toggles are the owner's decision and are never overwritten by a
 dialog re-sync.
+
+Only `monitor_enabled` is decided here, because it depends on the dialog. The
+fixed toggles (`vision_enabled`, `docs_enabled`) are deliberately *not* passed
+on insert: their defaults live in the schema (`server_default`, owned by the
+migrations — vision has been on since 0005, so receipts and payment screenshots
+are read). Keeping a second copy of a default in this module is how vision stayed
+off for every chat discovered after 0005: the migration flipped the column, and
+the stale constant here overrode it on every insert.
 """
 
 from __future__ import annotations
@@ -76,8 +84,7 @@ async def sync_dialogs(
                     chat_type=dialog.chat_type,
                     title=dialog.title,
                     monitor_enabled=default_monitor_enabled(dialog),
-                    vision_enabled=False,
-                    docs_enabled=True,
+                    # vision/docs: schema defaults, see the module docstring.
                 )
             )
             created += 1
@@ -118,8 +125,7 @@ async def ensure_monitor(session: AsyncSession, dialog: DialogInfo) -> ChatMonit
             chat_type=dialog.chat_type,
             title=dialog.title,
             monitor_enabled=default_monitor_enabled(dialog),
-            vision_enabled=False,
-            docs_enabled=True,
+            # vision/docs: schema defaults, see the module docstring.
         )
         .on_conflict_do_nothing(index_elements=[ChatMonitor.tg_chat_id])
     )

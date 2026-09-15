@@ -14,6 +14,7 @@ import logging
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import sqlalchemy as sa
 from aiogram import Bot, F, Router
@@ -26,8 +27,8 @@ from aiogram.types import (
     Message,
 )
 
-from miya.bot import replies
-from miya.bot.formatting import clip
+from miya.bot import keyboards, replies
+from miya.bot.formatting import clip, escape, ref_of
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
@@ -43,6 +44,8 @@ from miya.services import (
     purge,
     queries,
     rag,
+    records,
+    reminders,
     reports,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -75,21 +78,31 @@ def _media_path(suffix: str) -> Path:
     return settings.media_dir / f"{stamp}-{uuid.uuid4().hex[:8]}{suffix}"
 
 
-async def _safe_answer(message: Message, text: str | None) -> None:
+async def _safe_answer(message: Message, text: str | None, *, reply_markup=None) -> None:
     """Reply after the data is durable; a failed send only costs the receipt."""
     if not text:
         return
     try:
-        await message.answer(text)
+        await message.answer(text, reply_markup=reply_markup)
         return
     except Exception:
         log.exception("could not send reply to owner (data is committed)")
     # Model-composed replies can contain broken HTML; a plain-text retry beats
     # the owner never seeing the answer at all.
     try:
-        await message.answer(text, parse_mode=None)
+        await message.answer(text, parse_mode=None, reply_markup=reply_markup)
     except Exception:
         log.exception("plain-text retry failed too")
+
+
+def _receipt(result) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The confirmation text plus its ✅ / ✏️ / 🔄 rows, one per recorded row."""
+    if not result.ok:
+        return replies.FAILED_EXTRACTION_HINT, None
+    return (
+        replies.confirmation(result.applied),
+        keyboards.record_actions(replies.confirmation_refs(result.applied)),
+    )
 
 
 async def _typing(message: Message) -> None:
@@ -492,6 +505,225 @@ async def _edit_callback(callback: CallbackQuery, text: str) -> None:
         log.debug("could not acknowledge the callback", exc_info=True)
 
 
+# --- closing and correcting one record (build step 1) -----------------------
+
+
+@router.message(Command("bajarildi"))
+async def cmd_done(message: Message, command: CommandObject) -> None:
+    """`/bajarildi d12` — kept: promise/task done, debt settled in full."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_DONE, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text, reply_markup=outcome.keyboard)
+
+
+@router.message(Command("yop"))
+async def cmd_close(message: Message, command: CommandObject) -> None:
+    """`/yop p7` — closed without counting as kept."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_CLOSE, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text, reply_markup=outcome.keyboard)
+
+
+@router.message(Command("qaytar"))
+async def cmd_reopen(message: Message, command: CommandObject) -> None:
+    """`/qaytar p7` — undo a close; the same thing the ↩️ button does."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_REOPEN, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text)
+
+
+@router.message(Command("tuzat"))
+async def cmd_edit(message: Message, command: CommandObject) -> None:
+    """`/tuzat d12 6 mln` — one field of one row; the old value is kept.
+
+    A refusal explains itself: an amount below the recorded repayments, a
+    currency change with payments on the books, a field the kind does not
+    have. A name MIYA does not know is not created on the spot — the owner
+    decided anything uncertain is asked first — so it comes back as a
+    question with Ha / Yo'q.
+    """
+    # Any whitespace after the ref: a newline or a tab is as good as a space.
+    parts = (command.args or "").split(None, 1)
+    handle = parts[0] if parts else ""
+    edit = records.parse_edit(parts[1] if len(parts) > 1 else "")
+    if not handle or edit is None:
+        await _safe_answer(message, replies.TUZAT_USAGE)
+        return
+    keyboard = None
+    async with session_scope() as session:
+        found = await records.find(session, handle)
+        if found is None:
+            body = replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+        else:
+            kind, record = found
+            try:
+                change = await records.set_field(
+                    session, record, edit.field, edit.value, by=records.BY_COMMAND
+                )
+                body = replies.record_edited(change)
+            except records.NotEditable:
+                body = replies.FIELD_NOT_EDITABLE[kind]
+            except records.PaymentsExceed as exc:
+                body = replies.debt_payments_exceed(ref_of(record), exc)
+            except records.PaymentsExist:
+                body = replies.DEBT_CURRENCY_LOCKED.format(ref=ref_of(record))
+            except records.UnknownPerson as exc:
+                index = records.ask_new_person(record, exc.name, by=records.BY_COMMAND)
+                body = replies.new_person_question(exc.name)
+                keyboard = keyboards.new_person_question(ref_of(record), index)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _answer_new_person(session, action: str, handle: str, index: int) -> str:
+    """Ha / Yo'q on "Yangi odam 'Sardor' yaratilsinmi?".
+
+    Only "Ha" creates the person and attaches the row to it; "Yo'q" changes
+    nothing. The name comes from the row's history, where the question was
+    recorded, so a button pressed after a restart still knows it.
+    """
+    found = await records.find(session, handle)
+    if found is None:
+        return replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+    kind, record = found
+    name = records.pending_person(record, index)
+    if name is None:
+        return replies.NEW_PERSON_EXPIRED
+    if action == keyboards.ACTION_PERSON_NO:
+        return replies.NEW_PERSON_DECLINED.format(name=escape(name))
+    try:
+        change = await records.set_field(
+            session, record, "person", name, by=records.BY_BUTTON, create_person=True
+        )
+    except records.NotEditable:
+        return replies.FIELD_NOT_EDITABLE[kind]
+    return replies.record_edited(change)
+
+
+class _Outcome(NamedTuple):
+    """What one action produced: the reply, whether the row's buttons should
+    go, and the keyboard the reply carries (the ↩️ Qaytar after a close).
+
+    "Finished" means the row was closed or reopened, or the owner said it is
+    still open and will be asked again in a week.
+    """
+
+    text: str
+    finished: bool
+    keyboard: InlineKeyboardMarkup | None = None
+
+
+async def _act(session, action: str, handle: str, *, by: str) -> _Outcome:
+    """Run one button/command action on one ref."""
+    found = await records.find(session, handle)
+    if found is None:
+        return _Outcome(replies.RECORD_NOT_FOUND.format(ref=escape(handle)), True)
+    kind, record = found
+    person = records.person_of(record)
+    undo = keyboards.reopen_actions([(kind, record.id)])
+    try:
+        if action == keyboards.ACTION_DONE or (
+            action == keyboards.ACTION_SETTLE_BALANCE and kind != "debt"
+        ):
+            change = await records.mark_done(session, record, by=by)
+            return _Outcome(replies.record_done(change), True, undo)
+        if action == keyboards.ACTION_SETTLE_BALANCE:
+            # A "Hali ochiqmi?" line is a balance; its ✅ settles every row.
+            changes = await records.settle_balance(session, record, by=by)
+            return _Outcome(
+                replies.balance_settled(changes),
+                True,
+                keyboards.reopen_actions([(c.kind, c.record.id) for c in changes]),
+            )
+        if action == keyboards.ACTION_CLOSE:
+            change = await records.close(session, record, by=by)
+            return _Outcome(replies.record_closed(change), True, undo)
+        if action == keyboards.ACTION_REOPEN:
+            change = await records.reopen(session, record, by=by)
+            return _Outcome(replies.record_reopened(change), True)
+        if action == keyboards.ACTION_FLIP:
+            if kind != "debt":
+                return _Outcome(replies.FIELD_NOT_EDITABLE[kind], False)
+            change = await records.flip(session, record, by=by)
+            return _Outcome(replies.record_edited(change), False)
+        if action == keyboards.ACTION_OPEN:
+            # A debt question is about a balance and its button is keyed by
+            # the first row: "open" means any row of the balance is open.
+            if kind == "debt":
+                rows = await records.open_in_balance(session, record)
+            else:
+                rows = [record] if records.is_open(record) else []
+            if not rows:
+                # A stale "Ha" on a row closed since the question went out:
+                # nothing to keep open, and no ack to log.
+                return _Outcome(replies.RECORD_ALREADY_CLOSED, True)
+            await reminders.acknowledge(session, kind, record)
+            return _Outcome(replies.record_still_open(kind, rows, person), True)
+        return _Outcome(replies.tuzat_hint(kind, ref_of(record)), False)
+    except records.NotOpen:
+        return _Outcome(replies.RECORD_ALREADY_CLOSED, True)
+    except records.AlreadyOpen:
+        return _Outcome(replies.RECORD_ALREADY_OPEN, True)
+    except records.NotReopenable:
+        return _Outcome(replies.DEBT_NOT_REOPENABLE.format(ref=ref_of(record)), True)
+    except records.NotClosable:
+        return _Outcome(replies.DEBT_NOT_CLOSABLE.format(ref=ref_of(record)), False)
+
+
+@router.callback_query(F.data.startswith("rec:"))
+async def on_record_button(callback: CallbackQuery) -> None:
+    """✅ / ✏️ / 🔄 / Ha / Yop / ↩️ Qaytar on a confirmation, reminder or outcome.
+
+    The outcome goes out as its own message — the confirmation or reminder
+    stays readable — and the finished row's buttons are removed, leaving the
+    others in place.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) == 4 and parts[1] in keyboards.PERSON_ANSWERS and parts[3].isdigit():
+        async with session_scope() as session:
+            text = await _answer_new_person(session, parts[1], parts[2], int(parts[3]))
+        await _edit_callback(callback, text)
+        return
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    action, handle = parts[1], parts[2]
+
+    async with session_scope() as session:
+        outcome = await _act(session, action, handle, by=records.BY_BUTTON)
+
+    if outcome.finished and callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.without(callback.message.reply_markup, handle)
+            )
+        except Exception:
+            log.debug("could not trim the record keyboard", exc_info=True)
+    if callback.message is not None:
+        await _safe_answer(callback.message, outcome.text, reply_markup=outcome.keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
 @router.message(Command("kim"))
 async def cmd_person(message: Message, command: CommandObject) -> None:
     name = (command.args or "").strip()
@@ -570,7 +802,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             },
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
-        reply = await _process_on_demand(
+        reply, keyboard = await _process_on_demand(
             session,
             interaction,
             path,
@@ -578,43 +810,39 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             is_audio=is_audio,
             is_photo=is_photo,
         )
-    await _safe_answer(message, reply)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 async def _process_on_demand(
     session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
-) -> str:
+) -> tuple[str, InlineKeyboardMarkup | None]:
     """Run the right pipeline for one explicitly requested media file."""
     if is_video:
         audio_path = path.with_suffix(".mp3")
         if not await audio.extract_audio(path, audio_path):
             interaction.needs_review = True
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
         interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
         if await transcribe_into(session, interaction, audio_path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
     elif is_audio:
         if await transcribe_into(session, interaction, path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
     elif is_photo:
         described = await describe_into(session, interaction, path)
         if described is None and not interaction.raw_text:
-            return replies.PHOTO_FAILED_HINT
+            return replies.PHOTO_FAILED_HINT, None
     else:
         parsed = await documents.read_document_async(path)
         if parsed is None and not interaction.raw_text:
             interaction.needs_review = True
-            return replies.DOCUMENT_FAILED_HINT
+            return replies.DOCUMENT_FAILED_HINT, None
         if parsed is not None:
             interaction.transcript = parsed.text
 
     interaction.media = {**(interaction.media or {}), "processed": True}
     result = await process_interaction(session, interaction)
-    return (
-        replies.confirmation(result.applied)
-        if result.ok
-        else replies.FAILED_EXTRACTION_HINT
-    )
+    return _receipt(result)
 
 
 # --- content ----------------------------------------------------------------
@@ -650,12 +878,8 @@ async def on_text(message: Message) -> None:
             occurred_at=message.date.astimezone(settings.tz),
         )
         result = await process_interaction(session, interaction)
-        reply = (
-            replies.confirmation(result.applied)
-            if result.ok
-            else replies.FAILED_EXTRACTION_HINT
-        )
-    await _safe_answer(message, reply)
+        reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.voice | F.audio)
@@ -685,17 +909,14 @@ async def on_voice(message: Message, bot: Bot) -> None:
             },
         )
         text = await transcribe_into(session, interaction, path)
+        keyboard = None
         if text is None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            reply = (
-                replies.confirmation(result.applied)
-                if result.ok
-                else replies.FAILED_EXTRACTION_HINT
-            )
-    await _safe_answer(message, reply)
+            reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.photo)
@@ -723,24 +944,18 @@ async def on_photo(message: Message, bot: Bot) -> None:
         )
         # Photos sent straight to the bot are always vision-processed (spec §6).
         described = await describe_into(session, interaction, path)
+        keyboard = None
         if described is None and not message.caption:
             reply = replies.PHOTO_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            if not result.ok:
-                reply = replies.FAILED_EXTRACTION_HINT
-            elif described is None:
+            reply, keyboard = _receipt(result)
+            if result.ok and described is None:
                 # The caption was extracted, but the image itself was not read —
                 # the owner must not be told everything succeeded.
-                reply = (
-                    replies.confirmation(result.applied)
-                    + "\n"
-                    + replies.VISION_PARTIAL_HINT
-                )
-            else:
-                reply = replies.confirmation(result.applied)
-    await _safe_answer(message, reply)
+                reply = reply + "\n" + replies.VISION_PARTIAL_HINT
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.document)
@@ -770,6 +985,7 @@ async def on_document(message: Message, bot: Bot) -> None:
             },
         )
         parsed = await documents.read_document_async(path)
+        keyboard = None
         if parsed is None and not message.caption:
             interaction.needs_review = True
             reply = replies.DOCUMENT_FAILED_HINT
@@ -785,12 +1001,8 @@ async def on_document(message: Message, bot: Bot) -> None:
                 }
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            reply = (
-                replies.confirmation(result.applied)
-                if result.ok
-                else replies.FAILED_EXTRACTION_HINT
-            )
-    await _safe_answer(message, reply)
+            reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.video_note)
@@ -802,6 +1014,7 @@ async def on_video_note(message: Message, bot: Bot) -> None:
         return
 
     audio_path = path.with_suffix(".mp3")
+    keyboard = None
     async with session_scope() as session:
         # The row is created *before* ffmpeg runs. A failed audio extraction
         # must still leave a needs_review interaction the owner can find in
@@ -834,13 +1047,9 @@ async def on_video_note(message: Message, bot: Bot) -> None:
             else:
                 interaction.media = {**(interaction.media or {}), "processed": True}
                 result = await process_interaction(session, interaction)
-                reply = (
-                    replies.confirmation(result.applied)
-                    if result.ok
-                    else replies.FAILED_EXTRACTION_HINT
-                )
+                reply, keyboard = _receipt(result)
     # Replied only after the commit, like every other handler here.
-    await _safe_answer(message, reply)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.video)

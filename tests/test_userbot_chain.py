@@ -134,8 +134,8 @@ async def test_a_telegram_conversation_becomes_a_debt(session, monkeypatch):
     # 3. The chat has been quiet for an hour, so the window flushes.
     [window] = await windows.flush_ready_windows(session)
     assert window.message_count == 3
-    assert "[THEM (Akmal)] aka, 12 mln kerak edi" in window.text
-    assert "[ME] mayli, bugun o'tkazaman" in window.text
+    assert '[THEM (Akmal)] "aka, 12 mln kerak edi"' in window.text
+    assert '[ME] "mayli, bugun o\'tkazaman"' in window.text
 
     # 4. It goes out in a batch and comes back extracted.
     stub = _StubClient()

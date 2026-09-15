@@ -8,6 +8,7 @@ from datetime import datetime
 from decimal import Decimal
 
 import sqlalchemy as sa
+from rapidfuzz import fuzz
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
@@ -17,6 +18,7 @@ from miya.db.enums import (
     DebtStatus,
     EventSource,
     PromiseMadeBy,
+    PromiseStatus,
     TaskPriority,
     TransactionType,
 )
@@ -31,8 +33,9 @@ from miya.db.models import (
     Task,
     Transaction,
 )
+from miya.services import records
 from miya.services.extraction import ExtractionResult, to_money
-from miya.services.people import resolve_person
+from miya.services.people import normalise, resolve_person
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +57,10 @@ class Applied:
     transactions: list[Transaction] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     tasks: list[Task] = field(default_factory=list)
+    # Promises closed because the message said the thing happened, and the
+    # hints that matched nothing clearly enough to close on their own.
+    fulfilled: list[tuple[Promise, Person]] = field(default_factory=list)
+    unmatched_fulfilments: list[tuple[str, str]] = field(default_factory=list)
     facts: int = 0
 
     def is_empty(self) -> bool:
@@ -67,8 +74,85 @@ class Applied:
                 self.transactions,
                 self.events,
                 self.tasks,
+                self.fulfilled,
+                self.unmatched_fulfilments,
             )
         )
+
+
+# A fulfilment closes a promise only when one open promise of that person,
+# made by the same side, clearly reads like it. "Unambiguous" means all of:
+#
+#   * the hint has at least MIN_HINT_TOKENS distinct words — a one-word hint
+#     ("invoice", or "invoice invoice") is a topic, not a description, and
+#     would score 100 against any promise that mentions the word;
+#   * the best score is at least FULFIL_MATCH;
+#   * the runner-up is at least FULFIL_MARGIN below it.
+#
+# Anything less and the owner is shown the hint and closes the right one
+# himself — a wrongly closed promise is a silently broken one. The score is
+# token_set_ratio alone: partial_ratio let a short hint score 100 against
+# any longer promise containing it, which is exactly the over-match this
+# guards against.
+FULFIL_MATCH = 70
+FULFIL_MARGIN = 15
+MIN_HINT_TOKENS = 2
+
+
+def _fulfilment_score(description: str, promise_text: str) -> float:
+    a, b = normalise(description), normalise(promise_text)
+    if not a or not b:
+        return 0.0
+    return float(fuzz.token_set_ratio(a, b))
+
+
+async def _apply_fulfilment(
+    session: AsyncSession,
+    person: Person,
+    description: str,
+    made_by: PromiseMadeBy,
+    applied: Applied,
+    *,
+    now: datetime,
+) -> None:
+    # Distinct tokens: "invoice invoice" is still the one-word topic "invoice".
+    if len(set(normalise(description).split())) < MIN_HINT_TOKENS:
+        applied.unmatched_fulfilments.append((person.display_name, description))
+        return
+    # Only promises from the same side: "Akmal invoice yubordi" ends what
+    # Akmal promised, never what the owner promised Akmal.
+    open_promises = list(
+        await session.scalars(
+            sa.select(Promise)
+            .where(Promise.person_id == person.id)
+            .where(Promise.made_by == made_by)
+            .where(Promise.status == PromiseStatus.open)
+            .order_by(Promise.created_at)
+        )
+    )
+    scored = sorted(
+        ((_fulfilment_score(description, p.description), p) for p in open_promises),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if not scored or scored[0][0] < FULFIL_MATCH:
+        applied.unmatched_fulfilments.append((person.display_name, description))
+        return
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < FULFIL_MARGIN:
+        log.info(
+            "fulfilment %r for %s is ambiguous between promises %s and %s",
+            description,
+            person.display_name,
+            scored[0][1].id,
+            scored[1][1].id,
+        )
+        applied.unmatched_fulfilments.append((person.display_name, description))
+        return
+
+    promise = scored[0][1]
+    promise.person = person
+    await records.mark_done(session, promise, by=records.BY_EXTRACTION, now=now)
+    applied.fulfilled.append((promise, person))
 
 
 async def _apply_settlement(
@@ -131,7 +215,10 @@ async def _apply_settlement(
         )
         outstanding = debt.amount - Decimal(paid or 0)
         if outstanding <= 0:
+            # Already covered by earlier payments: settled, and dated — a
+            # settled row without settled_at never reaches "Bajarilganlar".
             debt.status = DebtStatus.settled
+            debt.settled_at = debt.settled_at or datetime.now(settings.tz)
             continue
 
         is_last = debt is debts[-1]
@@ -201,6 +288,26 @@ async def apply_extraction(
             item.note,
             applied,
             DebtDirection(item.direction) if item.direction else None,
+        )
+
+    # Before the new promises land, so a message that both closes one promise
+    # and makes the next cannot close the one it just made.
+    for item in result.fulfilments:
+        if not item.description.strip():
+            continue
+        # Never creates a person: a fulfilment names someone who already has
+        # a promise on the books, or it matches nothing either way.
+        person = await resolve_person(session, item.person, create=False)
+        if person is None:
+            applied.unmatched_fulfilments.append((item.person, item.description))
+            continue
+        await _apply_fulfilment(
+            session,
+            person,
+            item.description.strip(),
+            PromiseMadeBy(item.made_by),
+            applied,
+            now=datetime.now(tz),
         )
 
     for item in result.promises:

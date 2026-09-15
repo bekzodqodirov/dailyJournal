@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+
 import sqlalchemy as sa
 
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from miya.bot.keyboards import PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.db import models as m
 from miya.db.enums import ChatType
@@ -29,7 +34,8 @@ async def test_sync_applies_the_spec_defaults(session):
     assert rows[111].monitor_enabled is True  # private: on
     assert rows[-222].monitor_enabled is False  # group: whitelist only
     assert rows[-333].monitor_enabled is False  # channel: off
-    assert all(r.vision_enabled is False for r in rows.values())
+    # Vision is on everywhere (0005): receipts and payment screenshots are images.
+    assert all(r.vision_enabled is True for r in rows.values())
     assert all(r.docs_enabled is True for r in rows.values())
 
 
@@ -62,6 +68,92 @@ async def test_ensure_monitor_creates_a_chat_seen_for_the_first_time(session):
     assert again.id == monitor.id
 
 
+async def test_every_newly_discovered_chat_reads_images(session):
+    """Owner decision: receipts and payment screenshots arrive as photos, so a
+    chat must start with vision on — whichever path first registers it, and
+    whatever its type. Read back from the database, not from the instance."""
+    await chats.sync_dialogs(
+        session,
+        [
+            _dialog(777, ChatType.private, "Dilshod"),
+            _dialog(-778, ChatType.group, "Yuk guruhi"),
+            _dialog(-779, ChatType.channel, "Kanal"),
+        ],
+    )
+    await chats.ensure_monitor(session, _dialog(780, ChatType.private, "Sardor"))
+    await chats.ensure_monitor(session, _dialog(-781, ChatType.group, "Omborxona"))
+
+    rows = dict(
+        (
+            await session.execute(
+                sa.select(m.ChatMonitor.tg_chat_id, m.ChatMonitor.vision_enabled)
+            )
+        ).all()
+    )
+    assert rows == {777: True, -778: True, -779: True, 780: True, -781: True}
+
+
+async def test_the_schema_owns_the_fixed_toggle_defaults(session):
+    """The registry passes neither `vision_enabled` nor `docs_enabled` on insert,
+    relying on the column defaults the migrations set (0001, 0005). If someone
+    changes the model's `server_default` without a migration, or the other way
+    round, this is the test that notices."""
+    await session.execute(
+        sa.insert(m.ChatMonitor).values(tg_chat_id=888, chat_type=ChatType.private)
+    )
+    row = (
+        await session.execute(
+            sa.select(
+                m.ChatMonitor.monitor_enabled,
+                m.ChatMonitor.vision_enabled,
+                m.ChatMonitor.docs_enabled,
+            ).where(m.ChatMonitor.tg_chat_id == 888)
+        )
+    ).one()
+    assert tuple(row) == (False, True, True)
+
+
+def _load_revision(name: str):
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+async def test_0006_switches_vision_on_for_chats_made_while_the_service_forced_it_off(
+    session,
+):
+    """Chats registered between 0005 and the service fix were inserted with an
+    explicit false. The repair flips exactly those and leaves the rest alone."""
+    seeded = {901: False, 902: True, -903: False}
+    await session.execute(
+        sa.insert(m.ChatMonitor).values(
+            [
+                {"tg_chat_id": cid, "chat_type": ChatType.private, "vision_enabled": on}
+                for cid, on in seeded.items()
+            ]
+        )
+    )
+    revision = _load_revision("0006_vision_on_for_new_chats")
+
+    def run_upgrade(sync_session):
+        ctx = MigrationContext.configure(sync_session.connection())
+        with Operations.context(ctx):
+            revision.upgrade()
+
+    await session.run_sync(run_upgrade)
+
+    rows = dict(
+        (
+            await session.execute(
+                sa.select(m.ChatMonitor.tg_chat_id, m.ChatMonitor.vision_enabled)
+            )
+        ).all()
+    )
+    assert rows == {901: True, 902: True, -903: True}
+
+
 async def test_toggle_flips_exactly_one_flag(session):
     monitor = await chats.ensure_monitor(
         session, _dialog(555, ChatType.group, "Ish guruhi")
@@ -70,7 +162,7 @@ async def test_toggle_flips_exactly_one_flag(session):
 
     await chats.toggle(session, monitor.id, "monitor_enabled")
     assert monitor.monitor_enabled is True
-    assert monitor.vision_enabled is False
+    assert monitor.vision_enabled is True  # untouched: still the default
     assert monitor.docs_enabled is True
 
     await chats.toggle(session, monitor.id, "monitor_enabled")
