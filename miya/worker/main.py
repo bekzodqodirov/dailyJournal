@@ -25,6 +25,9 @@ Jobs:
   * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
                    claim no receipt has shown after CLAIM_ASK_AFTER, a few
                    per sweep (quiet-hours aware; build step 3)
+  * profile_refresh — every 30 min; rewrites the written profile of up to
+                   PROFILE_REFRESH_PER_RUN people whose activity is newer
+                   than their profile (sends nothing; build step 4)
 """
 
 from __future__ import annotations
@@ -59,6 +62,7 @@ from miya.services import (
     gcal,
     memories,
     nudges,
+    profiles,
     reminders,
     reports,
     windows,
@@ -423,6 +427,26 @@ async def claim_ask_job(bot: Bot) -> None:
             asked += 1
     if asked:
         log.info("asked about %d claim(s), %d more waiting", asked, len(waiting) - asked)
+
+
+# Profiles per sweep: one reasoning-model call each, so a first run over a
+# large contact list spreads across a few hours instead of one burst; a
+# person whose activity keeps changing is simply picked up again next sweep.
+PROFILE_REFRESH_PER_RUN = 10
+
+
+async def profile_refresh_job() -> None:
+    """Rewrite stale person profiles (build step 4), a few per sweep.
+
+    No quiet-hours guard: nothing is sent, the text only waits in
+    ``people.notes`` for the next /kim or "Akmal kim?". ``refresh_stale``
+    commits per person and never raises on a model failure, so a sweep
+    that loses the API keeps every profile it already wrote.
+    """
+    async with session_scope() as session:
+        written = await profiles.refresh_stale(session, limit=PROFILE_REFRESH_PER_RUN)
+    if written:
+        log.info("refreshed %d person profile(s)", written)
 
 
 async def media_ask_job(bot: Bot) -> None:
@@ -822,6 +846,13 @@ async def run() -> None:
         IntervalTrigger(minutes=2),
         args=[bot],
         id="claim_ask",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        profile_refresh_job,
+        IntervalTrigger(minutes=30),
+        id="profile_refresh",
         max_instances=1,
         coalesce=True,
     )

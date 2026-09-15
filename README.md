@@ -144,7 +144,9 @@ it recorded:
 | `/qarz` | Open balances, split into who owes you and who you owe |
 | `/vada` | Open promises, split into yours and theirs |
 | `/bugun` | Today: money in and out, people spoken to, new debts and promises |
-| `/kim <ism>` | One person: balances, promises, last contact |
+| `/kim <ism>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
+| `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
+| `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
 | `/hisobot` | Generate and send today's report right now |
 | `/reja` | Tomorrow's time-blocked plan |

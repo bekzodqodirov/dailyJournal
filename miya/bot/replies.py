@@ -13,6 +13,7 @@ from miya.bot.formatting import (
     claim_ref,
     clip,
     clock,
+    day_label,
     debt_line,
     escape,
     full_date,
@@ -26,6 +27,7 @@ from miya.bot.formatting import (
     stale_line,
     tag,
     tags,
+    timeline_line,
     usd,
 )
 from miya.config import settings
@@ -33,8 +35,14 @@ from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
 from miya.services import claims
 from miya.services.brief import MorningBrief
 from miya.services.loops import UnansweredQuestion
+from miya.services.people import Match
 from miya.services.persistence import Applied
-from miya.services.queries import DaySummary, DebtBalance, PersonSummary
+from miya.services.queries import (
+    DaySummary,
+    DebtBalance,
+    PersonSummary,
+    TimelineEntry,
+)
 
 # age_label, record_line and the three open-loop lines (question_line,
 # stale_line, quiet_line) live in formatting.py: the report's data block
@@ -73,7 +81,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /qarz — ochiq qarzlar
 /vada — ochiq va'dalar
 /bugun — bugungi holat
-/kim &lt;ism&gt; — odam bo'yicha xulosa
+/kim &lt;ism&gt; — odam haqida hamma narsa: profil, qarz, va'da, tarix
+/tarix &lt;ism&gt; [N] — odam bilan to'liq aloqa tarixi (oxirgi N ta)
+/eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — kunlik hisobot
 /ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
@@ -235,6 +245,34 @@ def chat_digest_report(digests: list) -> str:
 
 def person_not_found(name: str) -> str:
     return f"❓ <b>{escape(name)}</b> topilmadi."
+
+
+KIM_USAGE = "Ism yozing: <code>/kim Akmal</code>"
+TARIX_USAGE = "Ism yozing: <code>/tarix Akmal</code> yoki <code>/tarix Akmal 50</code>"
+ESLAB_USAGE = (
+    "Kim haqida nimani eslab qolay?\n" "<code>/eslab Akmal: mashinasi oq Malibu</code>"
+)
+
+# How each command's hint reads when the owner has to pick a candidate.
+_AMBIGUOUS_HINT = {
+    "kim": "/kim {name}",
+    "tarix": "/tarix {name}",
+    "eslab": "/eslab {name}: …",
+}
+
+
+def person_ambiguous(match: Match, *, command: str = "kim") -> str:
+    """Two people score alike — name both and ask, never guess.
+
+    Kimni nazarda tutding: Akmal GZ yoki Akmal Toshkent? (/kim Akmal GZ)
+    """
+    first = match.person.display_name if match.person else ""
+    second = match.runner_up.display_name if match.runner_up else ""
+    hint = _AMBIGUOUS_HINT.get(command, _AMBIGUOUS_HINT["kim"]).format(name=first)
+    return (
+        f"❓ Kimni nazarda tutding: <b>{escape(first)}</b> yoki "
+        f"<b>{escape(second)}</b>? (<code>{escape(hint)}</code>)"
+    )
 
 
 def confirmation(applied: Applied) -> str:
@@ -456,12 +494,50 @@ def day_report(summary: DaySummary) -> str:
     return clip("\n\n".join(parts))
 
 
-def person_report(summary: PersonSummary) -> str:
-    person = summary.person
-    parts = [f"<b>{escape(person.display_name)}</b>"]
+PROFILE_MISSING = "📝 Profil hali yozilmagan."
+KIM_FACTS = 5
+KIM_TIMELINE = 10
 
+
+def _identity_line(person) -> str:
+    """Name in bold, then everything that pins down who this is."""
+    bits = [f"<b>{escape(person.display_name)}</b>"]
     if person.aliases:
-        parts.append(f"<i>{escape(', '.join(person.aliases))}</i>")
+        bits.append(f"<i>{escape(', '.join(person.aliases))}</i>")
+    if person.telegram_username:
+        bits.append(f"@{escape(person.telegram_username)}")
+    if person.phone:
+        bits.append(escape(person.phone))
+    if person.relationship_:
+        bits.append(escape(person.relationship_))
+    return " · ".join(bits)
+
+
+def _profile_block(summary: PersonSummary) -> str:
+    """MIYA's own paragraph about the person, dated; never a source of figures."""
+    if not summary.profile:
+        return PROFILE_MISSING
+    stamp = ""
+    if summary.profile_updated_at is not None:
+        stamp = f" <i>({day_label(summary.profile_updated_at)})</i>"
+    return f"📝 <b>Profil</b>{stamp}\n{escape(summary.profile)}"
+
+
+def _fact_lines(facts, *, limit: int = KIM_FACTS) -> list[str]:
+    return [
+        f"{day_label(fact.occurred_at)} · {escape(fact.content)}"
+        for fact in facts[:limit]
+    ]
+
+
+def person_report(summary: PersonSummary) -> str:
+    """`/kim`: everything held about one person, on one screen.
+
+    Identity, the profile, the SQL figures (balances, promises), the facts
+    remembered, the last contacts, and where the full history lives.
+    """
+    person = summary.person
+    parts = [_identity_line(person), _profile_block(summary)]
 
     if summary.balances:
         lines = [
@@ -489,14 +565,75 @@ def person_report(summary: PersonSummary) -> str:
         ]
         parts.append("🤝 <b>Va'dalar</b>\n" + bullet_list(lines, empty="—"))
 
-    if summary.last_interactions:
-        last = summary.last_interactions[0]
+    if summary.facts:
         parts.append(
-            f"🕐 Oxirgi aloqa: {short_date(last.occurred_at.date())} "
-            f"{clock(last.occurred_at)} · jami {summary.total_interactions} ta"
+            "🧠 <b>Eslab qolganlarim</b>\n"
+            + bullet_list(_fact_lines(summary.facts), empty="—")
         )
 
+    if summary.timeline:
+        lines = [timeline_line(e) for e in summary.timeline[:KIM_TIMELINE]]
+        parts.append("🕐 <b>Oxirgi aloqalar</b>\n" + bullet_list(lines, empty="—"))
+
+    tail = []
+    last = summary.last_contact_at
+    if last is None and summary.last_interactions:
+        last = summary.last_interactions[0].occurred_at
+    if last is not None:
+        tail.append(f"Oxirgi aloqa: {day_label(last)} {clock(last)}")
+    tail.append(f"jami {summary.total_interactions} ta aloqa")
+    parts.append("🕐 " + " · ".join(tail))
+    parts.append(f"<i>/tarix {escape(person.display_name)} — to'liq tarix</i>")
+
     return clip("\n\n".join(parts))
+
+
+def _fit_oldest_first(lines_newest_first: list[str], *, budget: int) -> list[str]:
+    """Keep the newest lines that fit, returned oldest→newest.
+
+    ``clip`` cuts the tail of a message; a history reads oldest→newest, so
+    a tail cut would drop the most recent contact — the one the owner asked
+    for. Cut the old end instead.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in lines_newest_first:
+        used += len(line) + 3  # bullet and newline
+        if used > budget:
+            break
+        kept.append(line)
+    kept.reverse()
+    return kept
+
+
+def history_report(person, entries: list[TimelineEntry], *, requested: int) -> str:
+    """`/tarix`: a person's contacts, oldest at the top, newest at the bottom."""
+    name = escape(person.display_name)
+    if not entries:
+        return f"🕐 <b>{name}</b> bilan hali aloqa yozilmagan."
+    shown_count = min(requested, len(entries))
+    header = f"🕐 <b>{name}</b> — tarix (oxirgi {shown_count} ta)"
+    # Offer more only when there may be more: a short history is complete,
+    # and the cap is the cap.
+    hint = ""
+    if len(entries) >= requested and requested < TARIX_MAX:
+        hint = f"\n\n<i>Ko'proq: /tarix {name} {min(requested * 2, TARIX_MAX)}</i>"
+    lines = [timeline_line(e) for e in entries]  # newest first, as queried
+    budget = TELEGRAM_LIMIT - len(header) - len(hint) - 40
+    shown = _fit_oldest_first(lines, budget=budget)
+    body = bullet_list(shown, empty="—")
+    if len(shown) < len(lines):
+        body = f"<i>…(eskilari sig'madi)</i>\n{body}"
+    return clip(f"{header}\n\n{body}{hint}")
+
+
+TARIX_DEFAULT = 30
+TARIX_MAX = 100
+
+
+def remembered(person, text: str) -> str:
+    """`/eslab`: the owner's own words, stored against the person."""
+    return f"🧠 Eslab qoldim: <b>{escape(person.display_name)}</b> — {quote(text, 300)}"
 
 
 def reminder(debts, promises, tasks, events) -> str:
@@ -896,6 +1033,7 @@ OPERATION_LABEL = {
     "report": "kunlik hisobot",
     "planner": "reja tuzish",
     "rag": "savollarga javob",
+    "profile": "odam haqida profil",
 }
 
 

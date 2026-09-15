@@ -16,6 +16,8 @@ from miya.db.enums import (
     Currency,
     DebtDirection,
     DebtStatus,
+    Direction,
+    InteractionSource,
     PromiseMadeBy,
     PromiseStatus,
     TaskPriority,
@@ -29,7 +31,7 @@ if TYPE_CHECKING:  # annotations only: formatting never imports the services
         StaleCommitment,
         UnansweredQuestion,
     )
-    from miya.services.queries import DebtBalance
+    from miya.services.queries import DebtBalance, TimelineEntry
 
 MONTHS_SHORT = [
     "yan",
@@ -119,6 +121,18 @@ def short_date(value: date | None) -> str:
     if value is None:
         return "muddatsiz"
     return f"{value.day}-{MONTHS_SHORT[value.month - 1]}"
+
+
+def day_label(value: datetime, *, today: date | None = None) -> str:
+    """'12-sen' for this year, '12-sen 2025' for an older one.
+
+    A person's history spans years; a bare day-month would make last year's
+    call look like last week's.
+    """
+    local = value.astimezone(settings.tz).date()
+    today = today or datetime.now(settings.tz).date()
+    label = short_date(local)
+    return label if local.year == today.year else f"{label} {local.year}"
 
 
 def full_date(value: date) -> str:
@@ -440,3 +454,54 @@ def claim_line(view: ClaimView, *, markup: bool = True) -> str:
     who = _name(view.person_name or "Kimdir", markup)
     question = "va'dasi bajarilganmi?" if view.kind == "fulfilment" else "to'g'rimi?"
     return f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}"
+
+
+# --- one person's history: one line per contact ----------------------------
+#
+# The timeline (/kim, /tarix) shows where each contact came from with an
+# emoji and a word, so a call and a chat are told apart at a glance.
+
+SOURCE_EMOJI = {
+    InteractionSource.phone_call: "📞",
+    InteractionSource.telegram_userbot: "💬",
+    InteractionSource.assistant_bot: "✍️",
+    InteractionSource.manual: "✍️",
+    InteractionSource.receipt_photo: "🧾",
+    InteractionSource.calendar: "📅",
+}
+
+SOURCE_WORD = {
+    InteractionSource.phone_call: "qo'ng'iroq",
+    InteractionSource.telegram_userbot: "telegram",
+    InteractionSource.assistant_bot: "yozuv",
+    InteractionSource.manual: "yozuv",
+    InteractionSource.receipt_photo: "chek",
+    InteractionSource.calendar: "uchrashuv",
+}
+
+# A DM line shown on its own (``/tarix`` with a direction, the RAG tool)
+# needs to say who said it; a note the owner typed into the bot does not.
+_SPEAKER = {Direction.out: "sen", Direction.in_: "u"}
+
+TIMELINE_TEXT_LIMIT = 200
+TIMELINE_NO_TEXT = "[matn yo'q]"
+
+
+def timeline_line(entry: TimelineEntry, *, markup: bool = True) -> str:
+    """'12-sen · 📞 qo'ng'iroq · summary…' — one contact, one line.
+
+    ``markup=False`` is the same line with no escaping, for a plain-text
+    block. The text is someone's words or an extraction summary: folded to
+    one line, cut with an ellipsis, and escaped for Telegram HTML.
+    """
+    emoji = SOURCE_EMOJI.get(entry.source, "•")
+    word = SOURCE_WORD.get(entry.source, entry.source.value)
+    body = " ".join((entry.text or "").split())
+    if len(body) > TIMELINE_TEXT_LIMIT:
+        body = body[: TIMELINE_TEXT_LIMIT - 1] + "…"
+    if not body:
+        body = TIMELINE_NO_TEXT
+    speaker = ""
+    if entry.source is InteractionSource.telegram_userbot and entry.direction in _SPEAKER:
+        speaker = f"{_SPEAKER[entry.direction]}: "
+    return f"{day_label(entry.when)} · {emoji} {word} · {speaker}{_text(body, markup)}"

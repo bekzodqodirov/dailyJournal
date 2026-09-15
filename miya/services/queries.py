@@ -16,19 +16,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from miya.config import settings
-from miya.db.enums import Currency, DebtDirection, DebtStatus, PromiseStatus, TaskStatus
+from miya.db.enums import (
+    Currency,
+    DebtDirection,
+    DebtStatus,
+    Direction,
+    InteractionSource,
+    PromiseStatus,
+    TaskStatus,
+)
 from miya.db.models import (
     ChatMonitor,
     Debt,
     DebtPayment,
     Event,
     Interaction,
+    Memory,
     Person,
     Promise,
     Task,
     Transaction,
     UsageLog,
 )
+from miya.services import memories
 
 
 @dataclass(slots=True)
@@ -57,12 +67,31 @@ class DaySummary:
 
 
 @dataclass(slots=True)
+class TimelineEntry:
+    """One row of a person's history, as a surface shows it (build step 4)."""
+
+    interaction: Interaction
+    when: datetime
+    source: InteractionSource
+    direction: Direction
+    # The summary when extraction wrote one, else the words themselves.
+    text: str
+
+
+@dataclass(slots=True)
 class PersonSummary:
     person: Person
     balances: list[DebtBalance] = field(default_factory=list)
     open_promises: list[Promise] = field(default_factory=list)
     last_interactions: list[Interaction] = field(default_factory=list)
     total_interactions: int = 0
+    # Per-person memory (build step 4). ``profile`` is MIYA's own prose
+    # (people.notes) and never a source of figures; the figures are above.
+    last_contact_at: datetime | None = None
+    facts: list[Memory] = field(default_factory=list)
+    timeline: list[TimelineEntry] = field(default_factory=list)
+    profile: str | None = None
+    profile_updated_at: datetime | None = None
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -255,10 +284,149 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
     return summary
 
 
+# --- one person's history (build step 4) ------------------------------------
+
+# Sources whose every row is one contact worth a timeline line: a call, a
+# note the owner typed or spoke into the bot, a receipt. The userbot is
+# different — its member messages are one-liners, and the row worth showing
+# is the window's own synthetic interaction (meta.kind == "window"), which
+# carries the summary of the whole conversation.
+TIMELINE_SOURCES: tuple[InteractionSource, ...] = (
+    InteractionSource.phone_call,
+    InteractionSource.assistant_bot,
+    InteractionSource.manual,
+    InteractionSource.receipt_photo,
+)
+
+
+def _is_window_row():
+    # ``.astext`` on the nested key: ``metadata`` holds JSON null for rows
+    # written without one, and a missing key must simply not match.
+    return sa.and_(
+        Interaction.source == InteractionSource.telegram_userbot,
+        Interaction.meta["kind"].astext == "window",
+    )
+
+
+def timeline_filter(direction: Direction | None = None):
+    """Which interaction rows a timeline shows.
+
+    Without a direction: the window rows and every row of TIMELINE_SOURCES;
+    raw userbot member lines stay out. With one: the member lines *are* the
+    point — "what did I say to him" is the owner's own DM lines (direction
+    out), "what did he say" his — so only userbot rows with that direction
+    count. The owner's own notes to the bot are stored as direction ``in``
+    too, and a call transcript holds both voices; neither is "his lines".
+    The window row itself has direction ``na`` and drops out on its own.
+    """
+    if direction is not None:
+        return sa.and_(
+            Interaction.source == InteractionSource.telegram_userbot,
+            Interaction.direction == direction,
+        )
+    return sa.or_(_is_window_row(), Interaction.source.in_(TIMELINE_SOURCES))
+
+
+def timeline_text(interaction: Interaction, *, limit: int = 300) -> str:
+    if interaction.summary:
+        return interaction.summary.strip()
+    body = interaction.transcript or interaction.raw_text or ""
+    return body.strip()[:limit]
+
+
+def timeline_entry(interaction: Interaction) -> TimelineEntry:
+    return TimelineEntry(
+        interaction=interaction,
+        when=interaction.occurred_at,
+        source=interaction.source,
+        direction=interaction.direction,
+        text=timeline_text(interaction),
+    )
+
+
+async def timeline(
+    session: AsyncSession,
+    person_id: int,
+    *,
+    limit: int = 20,
+    before: datetime | None = None,
+    since: datetime | None = None,
+    direction: Direction | None = None,
+) -> list[TimelineEntry]:
+    """A person's contact history, newest first, in one query.
+
+    ``before`` pages backwards (strictly earlier rows), ``since`` bounds the
+    window (rows at or after it); the query walks
+    ``ix_interactions_person_occurred``.
+    """
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.person_id == person_id)
+        .where(timeline_filter(direction))
+        .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        stmt = stmt.where(Interaction.occurred_at < before)
+    if since is not None:
+        stmt = stmt.where(Interaction.occurred_at >= since)
+    return [timeline_entry(row) for row in await session.scalars(stmt)]
+
+
+def _last_of(column, *conditions) -> sa.ScalarSelect:
+    # Correlated on Person so the same expression serves a per-person scan
+    # (profiles.stale_people) and a single lookup by id.
+    return (
+        sa.select(sa.func.max(column))
+        .where(*conditions)
+        .correlate(Person)
+        .scalar_subquery()
+    )
+
+
+def last_contact_expr(person_id):
+    """GREATEST of every timestamp that proves contact with ``person_id``.
+
+    The same definition as loops.quiet_counterparties: an interaction either
+    way, a transaction with them, a debt or promise recorded about them, or a
+    payment on one of their debts — the owner types debts and repayments into
+    the bot with no interaction row of their own, and the row's timestamp is
+    still proof of contact. GREATEST skips NULLs in PostgreSQL and is NULL
+    only when nothing at all is recorded.
+    """
+    return sa.func.greatest(
+        _last_of(Interaction.occurred_at, Interaction.person_id == person_id),
+        _last_of(
+            Transaction.occurred_at, Transaction.counterparty_person_id == person_id
+        ),
+        _last_of(Debt.created_at, Debt.person_id == person_id),
+        _last_of(Promise.created_at, Promise.person_id == person_id),
+        _last_of(
+            DebtPayment.paid_at,
+            DebtPayment.debt_id == Debt.id,
+            Debt.person_id == person_id,
+        ),
+    )
+
+
+async def last_contact_at(session: AsyncSession, person_id: int) -> datetime | None:
+    """When the owner last had anything to do with this person, or None."""
+    return await session.scalar(sa.select(last_contact_expr(person_id)))
+
+
 async def person_summary(
-    session: AsyncSession, person: Person, *, recent: int = 5
+    session: AsyncSession,
+    person: Person,
+    *,
+    recent: int = 5,
+    timeline_limit: int = 10,
+    facts_limit: int = 8,
 ) -> PersonSummary:
-    """Debts, promises and recent contact for one person (`/kim`)."""
+    """Everything held about one person (`/kim`, the API, the RAG tool).
+
+    Seven queries, whatever the person's history: balances, open promises,
+    the last interactions and their count, last contact, facts, timeline.
+    """
     summary = PersonSummary(person=person)
     summary.balances = await open_debts(session, person_id=person.id)
     summary.open_promises = [
@@ -275,6 +443,11 @@ async def person_summary(
     summary.total_interactions = await session.scalar(
         sa.select(sa.func.count(Interaction.id)).where(Interaction.person_id == person.id)
     )
+    summary.last_contact_at = await last_contact_at(session, person.id)
+    summary.facts = await memories.facts_for(session, person.id, limit=facts_limit)
+    summary.timeline = await timeline(session, person.id, limit=timeline_limit)
+    summary.profile = person.notes
+    summary.profile_updated_at = person.profile_updated_at
     return summary
 
 

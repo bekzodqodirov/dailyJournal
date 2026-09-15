@@ -28,13 +28,12 @@ from miya.db.models import (
     DebtPayment,
     Event,
     Interaction,
-    Memory,
     Person,
     Promise,
     Task,
     Transaction,
 )
-from miya.services import claims, records
+from miya.services import claims, memories, records
 from miya.services.extraction import (
     ExtractedDebt,
     ExtractedFulfilment,
@@ -452,6 +451,60 @@ async def write_fulfilment(
             _claim_result(claim, "fulfilment", promise.id)
 
 
+# --- per-person memory (build step 4) ---------------------------------------
+
+
+async def _persist_people(
+    session: AsyncSession,
+    interaction: Interaction,
+    result: ExtractionResult,
+    applied: Applied,
+    *,
+    occurred: datetime,
+) -> set[int]:
+    """Keep what the extractor learned about each person named, as facts.
+
+    Only for people already on the books: a mention is not a contact, and
+    the owner decided a slip of the extractor must not create people. The
+    ids of the people written are returned for the fact scoping below.
+    """
+    written: set[int] = set()
+    for item in result.people:
+        context = (item.context or "").strip()
+        if not context:
+            continue
+        person = await resolve_person(session, item.name, create=False)
+        if person is None:
+            log.info("skipping context for unknown person %r", item.name)
+            continue
+        await memories.remember(
+            session,
+            context,
+            person_id=person.id,
+            occurred_at=occurred,
+            source_interaction_id=interaction.id,
+            tags=["person"],
+        )
+        applied.facts += 1
+        written.add(person.id)
+    return written
+
+
+def _single_person(applied: Applied, extra: set[int]) -> int | None:
+    """The one person this extraction wrote about, or None when it is unclear."""
+    ids: set[int] = set(extra)
+    ids.update(d.person_id for d in applied.debts)
+    ids.update(person.id for person, _ in applied.settlements)
+    ids.update(p.person_id for p in applied.promises)
+    ids.update(
+        t.counterparty_person_id
+        for t in applied.transactions
+        if t.counterparty_person_id is not None
+    )
+    ids.update(person.id for _, person in applied.fulfilled)
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
 # --- the gate ----------------------------------------------------------------
 
 
@@ -578,19 +631,28 @@ async def apply_extraction(
         session.add(task)
         applied.tasks.append(task)
 
+    # After the money and promise rows, so the people they name exist.
+    people_written = await _persist_people(
+        session, interaction, result, applied, occurred=occurred
+    )
+    # A fact belongs to the person on the interaction (a private chat, a
+    # call), else to the one person this extraction wrote about; a fact from
+    # a conversation involving two people is nobody's in particular and stays
+    # reachable by similarity alone.
+    fact_person_id = interaction.person_id or _single_person(applied, people_written)
+
     # Facts land without an embedding; Phase 3 backfills them with bge-m3.
     for fact in result.facts:
         text = fact.strip()
         if not text:
             continue
-        session.add(
-            Memory(
-                content=text,
-                embedding=None,
-                occurred_at=occurred,
-                tags=result.tags or [],
-                source_interaction_id=interaction.id,
-            )
+        await memories.remember(
+            session,
+            text,
+            person_id=fact_person_id,
+            occurred_at=occurred,
+            source_interaction_id=interaction.id,
+            tags=result.tags or [],
         )
         applied.facts += 1
 
@@ -599,14 +661,13 @@ async def apply_extraction(
     # once it ages out of the recent-interactions window.
     summary_text = (result.summary or "").strip()
     if summary_text and summary_text not in {f.strip() for f in result.facts}:
-        session.add(
-            Memory(
-                content=summary_text,
-                embedding=None,
-                occurred_at=occurred,
-                tags=result.tags or [],
-                source_interaction_id=interaction.id,
-            )
+        await memories.remember(
+            session,
+            summary_text,
+            person_id=fact_person_id,
+            occurred_at=occurred,
+            source_interaction_id=interaction.id,
+            tags=result.tags or [],
         )
 
     interaction.processed = True

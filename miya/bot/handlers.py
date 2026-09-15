@@ -11,6 +11,7 @@ hiccup cannot kill the handler before anything reached the database.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -58,7 +59,7 @@ from miya.services.ingest import (
     process_interaction,
     transcribe_into,
 )
-from miya.services.people import best_match
+from miya.services.people import best_match, find_person
 
 log = logging.getLogger(__name__)
 
@@ -985,20 +986,110 @@ async def on_claim_button(callback: CallbackQuery) -> None:
         log.debug("could not acknowledge the callback", exc_info=True)
 
 
+async def _lookup(
+    session, name: str, *, command: str
+) -> tuple[Person | None, str | None]:
+    """The person a question names, or the reply that says why there is none.
+
+    A question tolerates a looser match than a write (QUESTION_THRESHOLD),
+    but two people scoring alike are asked back, never guessed: a wrong
+    guess here answers about the wrong person.
+    """
+    match = await find_person(session, name)
+    if match.person is None:
+        return None, replies.person_not_found(name)
+    if match.ambiguous:
+        return None, replies.person_ambiguous(match, command=command)
+    return match.person, None
+
+
 @router.message(Command("kim"))
 async def cmd_person(message: Message, command: CommandObject) -> None:
+    """Everything held about one person: profile, figures, facts, history."""
     name = (command.args or "").strip()
     if not name:
-        await _safe_answer(message, "Ism yozing: <code>/kim Akmal</code>")
+        await _safe_answer(message, replies.KIM_USAGE)
         return
 
     async with session_scope() as session:
-        people = list(await session.scalars(sa.select(Person)))
-        person, score = best_match(name, people)
-        if person is None or score < 70:
-            body = replies.person_not_found(name)
-        else:
+        person, body = await _lookup(session, name, command="kim")
+        if person is not None:
             body = replies.person_report(await queries.person_summary(session, person))
+    await _safe_answer(message, body)
+
+
+_TARIX_COUNT = re.compile(r"^(?P<name>.+?)\s+(?P<count>\d{1,4})$")
+
+
+def _parse_history_args(args: str) -> tuple[str, int]:
+    """'Akmal 50' → ('Akmal', 50); 'Akmal' → ('Akmal', TARIX_DEFAULT).
+
+    The count is clamped to [1, TARIX_MAX]: a request for a thousand lines
+    is a request for as many as one message can carry.
+    """
+    args = args.strip()
+    found = _TARIX_COUNT.match(args)
+    if found is None:
+        return args, replies.TARIX_DEFAULT
+    count = min(max(int(found.group("count")), 1), replies.TARIX_MAX)
+    return found.group("name").strip(), count
+
+
+@router.message(Command("tarix"))
+async def cmd_history(message: Message, command: CommandObject) -> None:
+    """A person's contact history, oldest at the top, newest at the bottom."""
+    name, count = _parse_history_args(command.args or "")
+    if not name:
+        await _safe_answer(message, replies.TARIX_USAGE)
+        return
+
+    async with session_scope() as session:
+        person, body = await _lookup(session, name, command="tarix")
+        if person is not None:
+            entries = await queries.timeline(session, person.id, limit=count)
+            body = replies.history_report(person, entries, requested=count)
+    await _safe_answer(message, body)
+
+
+# "/eslab Akmal: matn" or "/eslab Akmal — matn": the first colon or dash
+# splits the name from the words.
+_ESLAB_SPLIT = re.compile(r"\s*(?::|—|–)\s*")
+
+
+def _parse_remember_args(args: str) -> tuple[str, str] | None:
+    parts = _ESLAB_SPLIT.split(args.strip(), maxsplit=1)
+    if len(parts) != 2:
+        return None
+    name, text = parts[0].strip(), parts[1].strip()
+    if not name or not text:
+        return None
+    return name, text
+
+
+@router.message(Command("eslab"))
+async def cmd_remember(message: Message, command: CommandObject) -> None:
+    """The owner tells MIYA something about a person, in his own words.
+
+    Stored as a memory against the person (tag ``manual``); the worker
+    embeds it on its next tick. No extraction: what he typed is the fact.
+    """
+    parsed = _parse_remember_args(command.args or "")
+    if parsed is None:
+        await _safe_answer(message, replies.ESLAB_USAGE)
+        return
+    name, text = parsed
+
+    async with session_scope() as session:
+        person, body = await _lookup(session, name, command="eslab")
+        if person is not None:
+            await memories.remember(
+                session,
+                text,
+                person_id=person.id,
+                occurred_at=datetime.now(settings.tz),
+                tags=["manual"],
+            )
+            body = replies.remembered(person, text)
     await _safe_answer(message, body)
 
 

@@ -10,16 +10,26 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
+from datetime import datetime
 
 import sqlalchemy as sa
 from rapidfuzz import fuzz, process
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.config import settings
 from miya.db.models import Person
 
 log = logging.getLogger(__name__)
 
+# Writing a row about someone must be sure of who; a lower bar would merge
+# "Akmal" and "Akmalov" into one ledger.
 MATCH_THRESHOLD = 85
+# Answering a question ("Akmal kim?", /kim, /tarix) may be more forgiving —
+# a wrong guess costs a wrong answer, not a wrong debt — and a close second
+# candidate is asked back instead of picked (see Match.ambiguous).
+QUESTION_THRESHOLD = 70
+AMBIGUITY_MARGIN = 10
 
 # Uzbek/Russian kinship and honorific suffixes carry no identity — "Akmal aka"
 # and "Akmal" are the same person, so they are stripped before comparing.
@@ -67,6 +77,11 @@ def best_match(name: str, people: list[Person]) -> tuple[Person | None, float]:
             index.setdefault(candidate, person)
     if not index:
         return None, 0.0
+    if target in index:
+        # An exact name wins before any fuzzy scoring: token_set_ratio gives
+        # "Akmal" a perfect score against "Akmal Toshkent" too, and the tie
+        # would send a fact about plain Akmal to whichever row is older.
+        return index[target], 100.0
 
     # token_set_ratio so word order and extra words ("Akmal GZ" vs "GZ Akmal")
     # do not sink an otherwise obvious match.
@@ -75,6 +90,104 @@ def best_match(name: str, people: list[Person]) -> tuple[Person | None, float]:
         return None, 0.0
     matched_name, score, _ = match
     return index[matched_name], float(score)
+
+
+@dataclass(slots=True)
+class Match:
+    """The outcome of looking a name up for a question (build step 4).
+
+    ``person`` is the best candidate at or above the threshold, or None.
+    ``runner_up`` is the best *other* person, whatever its score, so a
+    surface can name both when the two are too close to tell apart.
+    """
+
+    person: Person | None
+    score: float
+    runner_up: Person | None
+    runner_up_score: float
+    # The query equals one person's name or alias exactly. "Akmal" next to
+    # "Akmal Toshkent" scores 100 against both; the exact one is meant.
+    exact: bool = False
+
+    @property
+    def ambiguous(self) -> bool:
+        """A person was found, but another one scores within the margin."""
+        return (
+            not self.exact
+            and self.person is not None
+            and self.runner_up is not None
+            and self.score - self.runner_up_score <= AMBIGUITY_MARGIN
+        )
+
+
+def _person_score(target: str, person: Person) -> float:
+    """The same scorer as best_match, per person: its best candidate name."""
+    return max(
+        (float(fuzz.token_set_ratio(target, c)) for c in _candidates(person)),
+        default=0.0,
+    )
+
+
+async def find_person(
+    session: AsyncSession, name: str, *, threshold: float = QUESTION_THRESHOLD
+) -> Match:
+    """Best and second-best person for ``name`` — loads people once.
+
+    Never creates and never learns an alias: a question is not a contact.
+    """
+    target = normalise(name or "")
+    if not target:
+        return Match(person=None, score=0.0, runner_up=None, runner_up_score=0.0)
+    people = list(await session.scalars(sa.select(Person).order_by(Person.id)))
+    # Stable sort: on a tie the earlier row wins, as in best_match.
+    ranked = sorted(
+        ((_person_score(target, p), p) for p in people),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    exact = [p for p in people if target in set(_candidates(p))]
+    if len(exact) > 1:
+        # Two people literally sharing the name: ask back naming them both,
+        # not the longer name that merely contains it.
+        return Match(
+            person=exact[0], score=100.0, runner_up=exact[1], runner_up_score=100.0
+        )
+    if len(exact) == 1:
+        # Only two people literally sharing the name still ask back.
+        person = exact[0]
+        others = [(score, p) for score, p in ranked if p is not person]
+        runner_up_score, runner_up = others[0] if others else (0.0, None)
+        return Match(
+            person=person,
+            score=100.0,
+            runner_up=runner_up,
+            runner_up_score=runner_up_score,
+            exact=True,
+        )
+    if not ranked or ranked[0][0] < threshold:
+        best = ranked[0][0] if ranked else 0.0
+        return Match(person=None, score=best, runner_up=None, runner_up_score=0.0)
+    score, person = ranked[0]
+    runner_up, runner_up_score = None, 0.0
+    if len(ranked) > 1:
+        runner_up_score, runner_up = ranked[1]
+    return Match(
+        person=person,
+        score=score,
+        runner_up=runner_up,
+        runner_up_score=runner_up_score,
+    )
+
+
+def set_profile(person: Person, text: str, *, now: datetime | None = None) -> None:
+    """Store the written profile and stamp when it was generated."""
+    person.notes = (text or "").strip() or None
+    person.profile_updated_at = now or datetime.now(settings.tz)
+
+
+def set_relationship(person: Person, text: str | None) -> None:
+    """Who this person is to the owner, in the owner's own words."""
+    person.relationship_ = (text or "").strip() or None
 
 
 async def resolve_person(

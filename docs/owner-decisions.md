@@ -55,6 +55,6 @@ happened*, it answers."
 1. Close and correct (buttons, /bajarildi, /tuzat, /yop, fulfilment) — done
 2. Open loops and the morning brief — done (needs `OWNER_ALIASES` in `.env`)
 3. Ask-before-writing for counterparty claims — done
-4. Per-person memory
+4. Per-person memory — done (`/kim`, `/tarix`, `/eslab`; profiles refresh every 30 min)
 5. Self-monitoring (/holat, heartbeat, backups to Telegram)
 6. Phone app, missed calls, SMS — later
