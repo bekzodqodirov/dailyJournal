@@ -20,6 +20,20 @@ android {
         versionName = "1.0.0"
     }
 
+    signingConfigs {
+        // A committed DEBUG keystore (password "android", protecting nothing)
+        // so every CI build signs identically: without a stable signature an
+        // update from the rolling release would refuse to install over the
+        // previous one. It is not a secret; the server token never goes near
+        // it, and anyone able to abuse it already holds the unlocked phone.
+        getByName("debug") {
+            storeFile = rootProject.file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false

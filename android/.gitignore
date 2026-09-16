@@ -9,6 +9,8 @@ captures/
 .cxx/
 *.apk
 *.keystore
+# ...except the shared CI debug key (see app/build.gradle.kts signingConfigs).
+!debug.keystore
 *.jks
 
 # The repository root .gitignore has a bare `data/` rule for the server's data

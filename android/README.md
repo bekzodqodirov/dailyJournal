@@ -330,6 +330,21 @@ than breaks. SMS bodies are never logged, not even redacted
 
 ## Building it
 
+**Without Android Studio (recommended):** every push touching `android/`
+runs the GitHub Actions workflow `.github/workflows/android-apk.yml`,
+which builds the debug APK and publishes it on the rolling release
+`companion-apk` — the download link never changes:
+
+```
+https://github.com/<owner>/<repo>/releases/download/companion-apk/miya-companion.apk
+```
+
+Open it in the phone's browser, install, done. Every build signs with the
+committed `android/debug.keystore` (a debug key protecting nothing), so a
+new APK always installs over the old one.
+
+### Building it locally instead
+
 Requirements: **Android Studio Ladybug (2024.2) or newer, and JDK 17.**
 
 ```bash
