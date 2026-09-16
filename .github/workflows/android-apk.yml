@@ -1,0 +1,68 @@
+name: Android APK
+
+# Builds the companion app on GitHub's runners so the owner never needs
+# Android Studio: every push that touches android/ produces a signed debug
+# APK, uploaded both as a build artifact and onto a rolling release named
+# "companion-apk" for a one-tap download from a phone browser.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+    paths:
+      - "android/**"
+      - ".github/workflows/android-apk.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The wrapper JAR is deliberately not committed (binary blob), so CI
+      # installs the pinned Gradle itself instead of using ./gradlew.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Build debug APK
+        working-directory: android
+        run: gradle :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Stage the APK under a stable name
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk miya-companion.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: miya-companion-apk
+          path: miya-companion.apk
+
+      # A rolling release: the same tag is reused and the asset replaced, so
+      # the download link never changes:
+      #   https://github.com/<owner>/<repo>/releases/download/companion-apk/miya-companion.apk
+      - name: Publish to the rolling release
+        if: github.ref_name == 'master' || startsWith(github.ref_name, 'claude/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: companion-apk
+          name: MIYA Companion (oxirgi APK)
+          body: |
+            Telefonda shu faylni yuklab olib o'rnating: **miya-companion.apk**
+
+            O'rnatishdan keyin ilova o'zi sozlashni boshlab beradi
+            (server manzili, token, ruxsatlar). Yangi versiya chiqsa shu
+            sahifadagi fayl yangilanadi; ustidan o'rnatsa bo'ladi.
+          files: miya-companion.apk
+          prerelease: false

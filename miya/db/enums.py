@@ -24,6 +24,9 @@ class InteractionSource(str, enum.Enum):
     manual = "manual"
     receipt_photo = "receipt_photo"
     calendar = "calendar"
+    # Added by 0012 via ALTER TYPE ... ADD VALUE (build step 6): SMS the
+    # companion app uploads, mostly payment notifications from banks.
+    phone_sms = "phone_sms"
 
 
 class Direction(str, enum.Enum):

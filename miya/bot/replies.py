@@ -2,24 +2,53 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from miya.bot.formatting import (
     PRIORITY_LABEL,
     TELEGRAM_LIMIT,
+    age_label,
     bullet_list,
+    claim_line,
+    claim_ref,
     clip,
     clock,
+    day_label,
     debt_line,
     escape,
     full_date,
+    missed_line,
     money,
+    question_line,
+    quiet_line,
+    quote,
+    record_line,
     relative_day,
     short_date,
+    stale_line,
+    tag,
+    tags,
+    timeline_line,
     usd,
 )
 from miya.config import settings
-from miya.db.enums import DebtDirection, PromiseMadeBy
+from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
+from miya.services import claims, health
+from miya.services.brief import MorningBrief
+from miya.services.loops import MissedCall, UnansweredQuestion
+from miya.services.people import Match
 from miya.services.persistence import Applied
-from miya.services.queries import DaySummary, DebtBalance, PersonSummary
+from miya.services.queries import (
+    DaySummary,
+    DebtBalance,
+    PersonSummary,
+    TimelineEntry,
+)
+
+# age_label, record_line and the three open-loop lines (question_line,
+# stale_line, quiet_line) live in formatting.py: the report's data block
+# renders the same rows in plain text and reports.py must not import this
+# module. They stay importable from here for existing callers.
 
 FAILED_EXTRACTION_HINT = (
     "⚠️ Yozib oldim, lekin ma'lumot ajratib bo'lmadi — /tekshir ro'yxatida turadi."
@@ -46,17 +75,29 @@ qarz, va'da, xarajat va vazifalarni o'zim ajratib olib yozib qo'yaman.
 Savol bersangiz (masalan, «Akmal menga qancha qarz?») — bazadagi aniq
 raqamlar bilan javob beraman.
 
+Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</code>,
+<code>t3</code>. Shu raqam bilan yopasiz yoki tuzatasiz.
+
 <b>Buyruqlar</b>
 /qarz — ochiq qarzlar
 /vada — ochiq va'dalar
 /bugun — bugungi holat
-/kim &lt;ism&gt; — odam bo'yicha xulosa
+/kim &lt;ism&gt; — odam haqida hamma narsa: profil, qarz, va'da, tarix
+/tarix &lt;ism&gt; [N] — odam bilan to'liq aloqa tarixi (oxirgi N ta)
+/eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — kunlik hisobot
+/ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
+/holat — MIYA'ning ahvoli
+/bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
+/yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
+/qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
+/tuzat &lt;id&gt; &lt;nima&gt; — yozuvni tuzatish (summa, valyuta, teskari, ism, muddat)
+/davolar — tasdiqlanmagan da'volar
 /unut — ma'lumotni butunlay o'chirish
 /menga — guruhlarda menga yozilganlar
 /guruhlar — guruhlarda nima gaplashildi
@@ -208,6 +249,34 @@ def person_not_found(name: str) -> str:
     return f"❓ <b>{escape(name)}</b> topilmadi."
 
 
+KIM_USAGE = "Ism yozing: <code>/kim Akmal</code>"
+TARIX_USAGE = "Ism yozing: <code>/tarix Akmal</code> yoki <code>/tarix Akmal 50</code>"
+ESLAB_USAGE = (
+    "Kim haqida nimani eslab qolay?\n" "<code>/eslab Akmal: mashinasi oq Malibu</code>"
+)
+
+# How each command's hint reads when the owner has to pick a candidate.
+_AMBIGUOUS_HINT = {
+    "kim": "/kim {name}",
+    "tarix": "/tarix {name}",
+    "eslab": "/eslab {name}: …",
+}
+
+
+def person_ambiguous(match: Match, *, command: str = "kim") -> str:
+    """Two people score alike — name both and ask, never guess.
+
+    Kimni nazarda tutding: Akmal GZ yoki Akmal Toshkent? (/kim Akmal GZ)
+    """
+    first = match.person.display_name if match.person else ""
+    second = match.runner_up.display_name if match.runner_up else ""
+    hint = _AMBIGUOUS_HINT.get(command, _AMBIGUOUS_HINT["kim"]).format(name=first)
+    return (
+        f"❓ Kimni nazarda tutding: <b>{escape(first)}</b> yoki "
+        f"<b>{escape(second)}</b>? (<code>{escape(hint)}</code>)"
+    )
+
+
 def confirmation(applied: Applied) -> str:
     """Short receipt of what was recorded, so nothing lands silently."""
     if applied.is_empty():
@@ -221,7 +290,10 @@ def confirmation(applied: Applied) -> str:
         who = "senga" if debt.direction is DebtDirection.they_owe_me else "sen"
         arrow = "→" if debt.direction is DebtDirection.they_owe_me else "←"
         tail = f", muddat: {short_date(debt.due_date)}" if debt.due_date else ""
-        lines.append(f"💰 Qarz: {arrow} {who} {money(debt.amount, debt.currency)}{tail}")
+        lines.append(
+            f"💰 Qarz: {arrow} {who} {money(debt.amount, debt.currency)}{tail}"
+            + tag("debt", debt.id)
+        )
 
     for person, payment in applied.settlements:
         lines.append(
@@ -247,7 +319,24 @@ def confirmation(applied: Applied) -> str:
     for promise in applied.promises:
         who = "Men" if promise.made_by is PromiseMadeBy.me else "U"
         tail = f" ({short_date(promise.due_date)})" if promise.due_date else ""
-        lines.append(f"🤝 Va'da: {who} — {escape(promise.description)}{tail}")
+        lines.append(
+            f"🤝 Va'da: {who} — {escape(promise.description)}{tail}"
+            + tag("promise", promise.id)
+        )
+
+    for promise, person in applied.fulfilled:
+        lines.append(
+            f"✅ Va'da bajarildi: {escape(person.display_name)} — "
+            f"{escape(promise.description)}" + tag("promise", promise.id)
+        )
+
+    for name, description in applied.unmatched_fulfilments:
+        # Said to have happened, but no open promise matched clearly enough
+        # to close on its own — the owner closes the right one by its ref.
+        lines.append(
+            f"❓ {escape(name)}: «{escape(description)}» — bajarilgan ko'rinadi, "
+            f"lekin qaysi va'da ekani aniq emas (/vada, keyin /bajarildi p…)"
+        )
 
     for txn in applied.transactions:
         icon = "📈" if txn.type.value == "income" else "📉"
@@ -269,12 +358,32 @@ def confirmation(applied: Applied) -> str:
         priority = (
             f" [{PRIORITY_LABEL[task.priority]}]" if task.priority.value == "high" else ""
         )
-        lines.append(f"✔️ Vazifa: {escape(task.description)}{tail}{priority}")
+        lines.append(
+            f"✔️ Vazifa: {escape(task.description)}{tail}{priority}" + tag("task", task.id)
+        )
 
     if applied.facts:
         lines.append(f"🧠 {applied.facts} ta yangi ma'lumot eslab qolindi")
 
+    # What a counterparty asserted is not on the ledger yet: each line is a
+    # question, and the receipt's Ha / Yo'q / Tuzat rows answer it.
+    lines += [claim_line(claims.view(c)) for c in applied.claims]
+
     return clip("\n".join(lines))
+
+
+def confirmation_refs(applied: Applied) -> list[tuple[str, int]]:
+    """The rows a confirmation's buttons act on, in the order the lines show."""
+    refs: list[tuple[str, int]] = []
+    refs += [("debt", d.id) for d in applied.debts if d.id is not None]
+    refs += [("promise", p.id) for p in applied.promises if p.id is not None]
+    refs += [("task", t.id) for t in applied.tasks if t.id is not None]
+    return refs
+
+
+def confirmation_claim_ids(applied: Applied) -> list[int]:
+    """The claims a confirmation asks about, in the order the lines show."""
+    return [c.id for c in applied.claims if c.id is not None]
 
 
 def debts_report(balances: list[DebtBalance]) -> str:
@@ -286,22 +395,22 @@ def debts_report(balances: list[DebtBalance]) -> str:
     blocks: list[str] = []
 
     if they_owe:
-        lines = [
-            f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)}"
-            + (f" · {relative_day(b.earliest_due)}" if b.earliest_due else "")
-            for b in they_owe
-        ]
+        lines = [_balance_line(b) for b in they_owe]
         blocks.append("<b>Senga qarzdorlar</b>\n" + bullet_list(lines, empty="—"))
 
     if i_owe:
-        lines = [
-            f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)}"
-            + (f" · {relative_day(b.earliest_due)}" if b.earliest_due else "")
-            for b in i_owe
-        ]
+        lines = [_balance_line(b) for b in i_owe]
         blocks.append("<b>Sen qarzdorsan</b>\n" + bullet_list(lines, empty="—"))
 
     return clip("\n\n".join(blocks))
+
+
+def _balance_line(b: DebtBalance) -> str:
+    return (
+        f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)}"
+        + (f" · {relative_day(b.earliest_due)}" if b.earliest_due else "")
+        + tags("debt", b.ids)
+    )
 
 
 def promises_report(items) -> str:
@@ -311,12 +420,14 @@ def promises_report(items) -> str:
     mine = [
         f"{escape(p.description)} — {escape(person.display_name)}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+        + tag("promise", p.id)
         for p, person in items
         if p.made_by is PromiseMadeBy.me
     ]
     theirs = [
         f"{escape(person.display_name)}: {escape(p.description)}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+        + tag("promise", p.id)
         for p, person in items
         if p.made_by is PromiseMadeBy.them
     ]
@@ -357,23 +468,78 @@ def day_report(summary: DaySummary) -> str:
         parts.append("👥 <b>Muloqotlar</b>\n" + bullet_list(people, empty="—"))
 
     if summary.new_debts or summary.new_promises:
-        counts = []
-        if summary.new_debts:
-            counts.append(f"{len(summary.new_debts)} ta yangi qarz")
-        if summary.new_promises:
-            counts.append(f"{len(summary.new_promises)} ta yangi va'da")
-        parts.append("🧾 " + ", ".join(counts))
+        # Listed by ref, not counted: the day's fresh rows are the ones most
+        # likely to need /tuzat, and the owner needs a handle to name them.
+        new_lines = [
+            debt_line(
+                escape(debt.person.display_name),
+                debt.direction,
+                debt.amount,
+                debt.currency,
+                debt.due_date,
+            )
+            + tag("debt", debt.id)
+            for debt in summary.new_debts
+        ]
+        new_lines += [
+            ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
+            + f"{escape(p.person.display_name)} — {escape(p.description)}"
+            + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+            + tag("promise", p.id)
+            for p in summary.new_promises
+        ]
+        parts.append(
+            "🧾 <b>Yangi qarz va va'dalar</b>\n" + bullet_list(new_lines, empty="—")
+        )
 
     parts.append(f"\n<i>{summary.interactions} ta yozuv</i>")
     return clip("\n\n".join(parts))
 
 
-def person_report(summary: PersonSummary) -> str:
-    person = summary.person
-    parts = [f"<b>{escape(person.display_name)}</b>"]
+PROFILE_MISSING = "📝 Profil hali yozilmagan."
+KIM_FACTS = 5
+KIM_TIMELINE = 10
 
+
+def _identity_line(person) -> str:
+    """Name in bold, then everything that pins down who this is."""
+    bits = [f"<b>{escape(person.display_name)}</b>"]
     if person.aliases:
-        parts.append(f"<i>{escape(', '.join(person.aliases))}</i>")
+        bits.append(f"<i>{escape(', '.join(person.aliases))}</i>")
+    if person.telegram_username:
+        bits.append(f"@{escape(person.telegram_username)}")
+    if person.phone:
+        bits.append(escape(person.phone))
+    if person.relationship_:
+        bits.append(escape(person.relationship_))
+    return " · ".join(bits)
+
+
+def _profile_block(summary: PersonSummary) -> str:
+    """MIYA's own paragraph about the person, dated; never a source of figures."""
+    if not summary.profile:
+        return PROFILE_MISSING
+    stamp = ""
+    if summary.profile_updated_at is not None:
+        stamp = f" <i>({day_label(summary.profile_updated_at)})</i>"
+    return f"📝 <b>Profil</b>{stamp}\n{escape(summary.profile)}"
+
+
+def _fact_lines(facts, *, limit: int = KIM_FACTS) -> list[str]:
+    return [
+        f"{day_label(fact.occurred_at)} · {escape(fact.content)}"
+        for fact in facts[:limit]
+    ]
+
+
+def person_report(summary: PersonSummary) -> str:
+    """`/kim`: everything held about one person, on one screen.
+
+    Identity, the profile, the SQL figures (balances, promises), the facts
+    remembered, the last contacts, and where the full history lives.
+    """
+    person = summary.person
+    parts = [_identity_line(person), _profile_block(summary)]
 
     if summary.balances:
         lines = [
@@ -384,6 +550,7 @@ def person_report(summary: PersonSummary) -> str:
                 b.currency,
                 b.earliest_due,
             )
+            + tags("debt", b.ids)
             for b in summary.balances
         ]
         parts.append("💰 <b>Qarzlar</b>\n" + bullet_list(lines, empty="—"))
@@ -395,18 +562,80 @@ def person_report(summary: PersonSummary) -> str:
             ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
             + escape(p.description)
             + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+            + tag("promise", p.id)
             for p in summary.open_promises
         ]
         parts.append("🤝 <b>Va'dalar</b>\n" + bullet_list(lines, empty="—"))
 
-    if summary.last_interactions:
-        last = summary.last_interactions[0]
+    if summary.facts:
         parts.append(
-            f"🕐 Oxirgi aloqa: {short_date(last.occurred_at.date())} "
-            f"{clock(last.occurred_at)} · jami {summary.total_interactions} ta"
+            "🧠 <b>Eslab qolganlarim</b>\n"
+            + bullet_list(_fact_lines(summary.facts), empty="—")
         )
 
+    if summary.timeline:
+        lines = [timeline_line(e) for e in summary.timeline[:KIM_TIMELINE]]
+        parts.append("🕐 <b>Oxirgi aloqalar</b>\n" + bullet_list(lines, empty="—"))
+
+    tail = []
+    last = summary.last_contact_at
+    if last is None and summary.last_interactions:
+        last = summary.last_interactions[0].occurred_at
+    if last is not None:
+        tail.append(f"Oxirgi aloqa: {day_label(last)} {clock(last)}")
+    tail.append(f"jami {summary.total_interactions} ta aloqa")
+    parts.append("🕐 " + " · ".join(tail))
+    parts.append(f"<i>/tarix {escape(person.display_name)} — to'liq tarix</i>")
+
     return clip("\n\n".join(parts))
+
+
+def _fit_oldest_first(lines_newest_first: list[str], *, budget: int) -> list[str]:
+    """Keep the newest lines that fit, returned oldest→newest.
+
+    ``clip`` cuts the tail of a message; a history reads oldest→newest, so
+    a tail cut would drop the most recent contact — the one the owner asked
+    for. Cut the old end instead.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in lines_newest_first:
+        used += len(line) + 3  # bullet and newline
+        if used > budget:
+            break
+        kept.append(line)
+    kept.reverse()
+    return kept
+
+
+def history_report(person, entries: list[TimelineEntry], *, requested: int) -> str:
+    """`/tarix`: a person's contacts, oldest at the top, newest at the bottom."""
+    name = escape(person.display_name)
+    if not entries:
+        return f"🕐 <b>{name}</b> bilan hali aloqa yozilmagan."
+    shown_count = min(requested, len(entries))
+    header = f"🕐 <b>{name}</b> — tarix (oxirgi {shown_count} ta)"
+    # Offer more only when there may be more: a short history is complete,
+    # and the cap is the cap.
+    hint = ""
+    if len(entries) >= requested and requested < TARIX_MAX:
+        hint = f"\n\n<i>Ko'proq: /tarix {name} {min(requested * 2, TARIX_MAX)}</i>"
+    lines = [timeline_line(e) for e in entries]  # newest first, as queried
+    budget = TELEGRAM_LIMIT - len(header) - len(hint) - 40
+    shown = _fit_oldest_first(lines, budget=budget)
+    body = bullet_list(shown, empty="—")
+    if len(shown) < len(lines):
+        body = f"<i>…(eskilari sig'madi)</i>\n{body}"
+    return clip(f"{header}\n\n{body}{hint}")
+
+
+TARIX_DEFAULT = 30
+TARIX_MAX = 100
+
+
+def remembered(person, text: str) -> str:
+    """`/eslab`: the owner's own words, stored against the person."""
+    return f"🧠 Eslab qoldim: <b>{escape(person.display_name)}</b> — {quote(text, 300)}"
 
 
 def reminder(debts, promises, tasks, events) -> str:
@@ -438,7 +667,7 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
             "💰 <b>Qarz muddati</b>",
             [
                 f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
-                f"{relative_day(b.earliest_due)}"
+                f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
                 for b in debts
             ],
         ),
@@ -447,14 +676,18 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
             "🤝 <b>Va'da muddati</b>",
             [
                 f"{escape(person.display_name)}: {escape(p.description)} · "
-                f"{relative_day(p.due_date)}"
+                f"{relative_day(p.due_date)}" + tag("promise", p.id)
                 for p, person in promises
             ],
         ),
         (
             "task",
             "✔️ <b>Vazifalar</b>",
-            [f"{escape(t.description)} · {relative_day(t.due_date)}" for t in tasks],
+            [
+                f"{escape(t.description)} · {relative_day(t.due_date)}"
+                + tag("task", t.id)
+                for t in tasks
+            ],
         ),
     ]
 
@@ -482,6 +715,298 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
     return "\n\n".join(blocks), counts
 
 
+def reminder_refs(
+    debts, promises, tasks, rendered: dict[str, int]
+) -> list[tuple[str, int]]:
+    """The rows behind the lines that made it into the reminder body."""
+    refs: list[tuple[str, int]] = []
+    for b in debts[: rendered.get("debt", 0)]:
+        refs += [("debt", i) for i in b.ids]
+    refs += [("promise", p.id) for p, _ in promises[: rendered.get("promise", 0)]]
+    refs += [("task", t.id) for t in tasks[: rendered.get("task", 0)]]
+    return refs
+
+
+STILL_OPEN_HEADER = "📌 <b>Hali ochiqmi?</b>"
+STILL_OPEN_HINT = "<i>Ha — yana bir haftadan keyin so'rayman.</i>"
+
+
+def still_open_question(questions) -> str:
+    """The escalation's last word and the weekly nudge for undated items.
+
+    One message for all of them, a row of Ha / Bajarildi / Yop per line, so
+    ten forgotten tasks are one message, not ten. A debt question is about a
+    balance (several rows), the others about one row.
+    """
+    body, _ = still_open_question_with_count(questions)
+    return body
+
+
+def still_open_question_with_count(questions) -> tuple[str, int]:
+    """The question body, plus how many of its lines actually fit.
+
+    The same rule as `reminder_with_counts`: only what is shown may be
+    logged as asked. A question clipped off the end and still logged would
+    go quiet for a week without the owner ever having seen it; unlogged, it
+    simply qualifies again next sweep.
+    """
+    lines = [
+        _balance_line(q.balance)
+        if q.balance is not None
+        else record_line(q.kind, q.record, q.person)
+        for q in questions
+    ]
+    kept: list[str] = []
+    for line in lines:
+        trial = (
+            f"{STILL_OPEN_HEADER}\n"
+            + bullet_list([*kept, line], empty="—")
+            + f"\n{STILL_OPEN_HINT}"
+        )
+        if len(trial) > TELEGRAM_LIMIT - 60:
+            break
+        kept.append(line)
+    body = f"{STILL_OPEN_HEADER}\n" + bullet_list(kept, empty="—")
+    dropped = len(lines) - len(kept)
+    if dropped:
+        body += f"\n<i>… va yana {dropped} ta — keyingi eslatmada.</i>"
+    return body + f"\n{STILL_OPEN_HINT}", len(kept)
+
+
+# --- /bajarildi, /yop, /tuzat ------------------------------------------------
+
+REF_USAGE = (
+    "Yozuv raqamini yozing — ro'yxatlarda ko'rinadi: <code>d12</code> (qarz), "
+    "<code>p7</code> (va'da), <code>t3</code> (vazifa).\n"
+    "<code>/bajarildi p7</code> · <code>/yop t3</code> · <code>/tuzat d12 6 mln</code>"
+)
+
+RECORD_NOT_FOUND = "❓ Bunday yozuv topilmadi: <code>{ref}</code>"
+RECORD_ALREADY_CLOSED = "Bu yozuv allaqachon yopilgan."
+RECORD_ALREADY_OPEN = "Bu yozuv ochiq — qaytaradigan narsa yo'q."
+DEBT_NOT_REOPENABLE = (
+    "Bu qarz yozib olingan to'lovlar bilan yopilgan — ularni o'chirmayman. "
+    "Noto'g'ri bo'lsa: <code>/tuzat {ref} …</code>."
+)
+DEBT_NOT_CLOSABLE = (
+    "Qarzni /yop bilan yopib bo'lmaydi. To'liq to'langan bo'lsa — "
+    "<code>/bajarildi {ref}</code>; noto'g'ri yozilgan bo'lsa — "
+    "<code>/tuzat {ref} …</code>."
+)
+
+TUZAT_USAGE = (
+    "✏️ <b>/tuzat</b> — bitta yozuvni tuzatish.\n\n"
+    "<code>/tuzat d12 6 mln</code> — summa\n"
+    "<code>/tuzat d12 300 $</code> — summa va valyuta\n"
+    "<code>/tuzat d12 teskari</code> — kim kimga qarz (aksincha)\n"
+    "<code>/tuzat d12 Sardor</code> — boshqa odam\n"
+    "<code>/tuzat p7 ertaga</code> — muddat (sana, ertaga, juma, 3 kun, muddatsiz)\n"
+    "<code>/tuzat c12 summa 4 mln</code> — tasdiqlanmagan da'voni, javobdan oldin\n\n"
+    "<i>Aniq bo'lmasa: «kim Sardor», «summa 5 mln», «muddat juma».</i>"
+)
+
+
+# What the ✏️ button offers, per kind: only what `set_field` accepts for
+# that row (records.EDITABLE), so the hint never teaches a refused edit.
+_TUZAT_EXAMPLES = {
+    "debt": ("6 mln", "300 $", "teskari", "Sardor", "ertaga"),
+    "promise": ("Sardor", "ertaga"),
+    "task": ("ertaga",),
+}
+
+
+def tuzat_hint(kind: str, handle: str) -> str:
+    """What the ✏️ button says: the syntax, with this row's ref filled in."""
+    examples = " · ".join(
+        f"<code>/tuzat {handle} {example}</code>" for example in _TUZAT_EXAMPLES[kind]
+    )
+    return f"✏️ <code>{handle}</code> ni tuzatish uchun yozing:\n{examples}"
+
+
+_FIELD_LABEL = {
+    "amount": "summa",
+    "currency": "valyuta",
+    "direction": "yo'nalish",
+    "person": "odam",
+    "due": "muddat",
+}
+
+FIELD_NOT_EDITABLE = {
+    "debt": "Qarzda bunday maydon yo'q.",
+    "promise": "Va'dada faqat odam va muddatni tuzatish mumkin.",
+    "task": "Vazifada faqat muddatni tuzatish mumkin.",
+}
+
+DEBT_CURRENCY_LOCKED = (
+    "Bu qarzda to'lovlar yozilgan — valyutasini o'zgartirmayman, to'lovlar "
+    "eski valyutada qoladi. Avval <code>/qaytar {ref}</code> bilan qayta "
+    "oching yoki to'lovlarni tuzating, keyin valyutani."
+)
+
+NEW_PERSON_EXPIRED = "Bu savol eskirgan — <code>/tuzat</code> ni qaytadan yozing."
+NEW_PERSON_DECLINED = "Yaratilmadi: «{name}». Yozuv o'zgarmadi."
+
+
+def debt_payments_exceed(handle: str, exc) -> str:
+    """`/tuzat d12 3 mln` below what was really repaid."""
+    return (
+        f"Bu qarzga {money(exc.paid, exc.currency)} to'lov yozilgan — yangi summa "
+        f"{money(exc.amount, exc.currency)} undan kam, to'lovlarni kesmayman. "
+        f"Avval <code>/qaytar {handle}</code>, keyin to'lovlarni tuzating."
+    )
+
+
+def new_person_question(name: str) -> str:
+    return f"❓ Yangi odam «<b>{escape(name)}</b>» yaratilsinmi?"
+
+
+def record_done(change) -> str:
+    verb = "Yopildi" if change.kind == "debt" else "Bajarildi"
+    line = record_line(change.kind, change.record, change.person)
+    return f"✅ <b>{verb}</b>\n{line}"
+
+
+def record_closed(change) -> str:
+    return (
+        "✖️ <b>Yopildi</b> (bajarilgan hisoblanmaydi)\n"
+        f"{record_line(change.kind, change.record, change.person)}"
+    )
+
+
+def balance_settled(changes) -> str:
+    """Every row of a balance settled from one "Hali ochiqmi?" ✅."""
+    lines = [record_line(c.kind, c.record, c.person) for c in changes]
+    return "✅ <b>Yopildi</b>\n" + "\n".join(lines)
+
+
+def record_reopened(change) -> str:
+    return (
+        "↩️ <b>Qayta ochildi</b>\n"
+        f"{record_line(change.kind, change.record, change.person)}"
+    )
+
+
+def record_edited(change) -> str:
+    label = _FIELD_LABEL.get(change.field, change.field)
+    line = record_line(change.kind, change.record, change.person)
+    return f"✏️ <b>Tuzatildi</b> ({label})\n{line}"
+
+
+def record_still_open(kind: str, records, person) -> str:
+    """ "Ha": the row — or every open row of the balance — stays open."""
+    lines = "\n".join(record_line(kind, record, person) for record in records)
+    return f"👌 Ochiq qoladi — bir haftadan keyin yana so'rayman.\n{lines}"
+
+
+# --- a counterparty's claim: ask first (build step 3) ---------------------------
+#
+# "You owe me", "I paid you back", "you promised" — said by the other side.
+# The owner decided such a thing is asked and never written silently
+# (docs/owner-decisions.md, "Counterparty claims"). The question line itself
+# is formatting.claim_line; here are the message around it, the list, and
+# what each answer says back.
+
+CLAIM_QUESTION_HEADER = "❓ <b>Tasdiqlash kerak</b>"
+CLAIMS_HEADER = "❓ <b>Tasdiqlanmagan da'volar</b>"
+CLAIMS_NONE = "✅ Tasdiqlanmagan da'vo yo'q."
+CLAIMS_HINT = "<i>✅ Ha — yozaman · ✖️ Yo'q — yozmayman · ✏️ Tuzat — avval tuzatasan</i>"
+
+CLAIM_ACCEPTED_PREFIX = "✅ <b>Yozib oldim:</b>"
+# "Ha" on a repayment or a hint that has nothing to land on: the claim stays
+# open, the owner confirms the debt or promise first and taps Ha again.
+CLAIM_ACCEPTED_UNMATCHED = (
+    "⚠️ <b>Hozircha yozilmadi</b> — avval tegishli qarz yoki va'dani tasdiqla, "
+    "keyin yana Ha bos:"
+)
+CLAIM_ACCEPTED_NOTHING = (
+    "⚠️ Tasdiqlading, lekin yozib bo'lmadi — da'voda ism yoki summa yetishmaydi. "
+    "Kerak bo'lsa o'zing yozib qo'y."
+)
+CLAIM_DECLINED = "✖️ Yozilmadi. Kerak bo'lsa o'zing yozib qo'y."
+CLAIM_GONE = "⚠️ Bu da'vo topilmadi — yozuvi o'chirilgan bo'lsa kerak."
+CLAIM_ALREADY = "Bu da'voga allaqachon javob berilgan."
+CLAIM_EDITED = "✏️ <b>Tuzatildi</b> — endi javob ber:"
+
+# How many claims the brief lists with buttons; the rest wait in /davolar.
+BRIEF_MAX_CLAIMS = 10
+
+
+def claim_question(view: claims.ClaimView) -> str:
+    """One message for one claim, when no receipt carried the question."""
+    return f"{CLAIM_QUESTION_HEADER}\n{claim_line(view)}"
+
+
+def claims_list(views: list[claims.ClaimView], *, hidden: int = 0) -> str:
+    """`/davolar`: every unanswered claim, oldest first, with the buttons' key.
+
+    ``hidden`` is how many more are waiting beyond the ones listed — the
+    keyboard has a ceiling, and a claim without its buttons is not asked.
+    """
+    if not views:
+        return CLAIMS_NONE
+    body = f"{CLAIMS_HEADER}\n" + "\n".join(claim_line(v) for v in views)
+    if hidden:
+        body += f"\n<i>… va yana {hidden} ta — javob bergach yana /davolar.</i>"
+    return clip(f"{body}\n{CLAIMS_HINT}")
+
+
+def claim_accepted(accepted: claims.Accepted) -> str:
+    """ "Ha": what accepting wrote, in the receipt's own words.
+
+    A settlement that matched no open debt, or a hint that closed no
+    promise, lands in the receipt as the same question it would have been
+    on the day. An item the writer refused outright says so, not "yozib
+    oldim" over nothing.
+    """
+    if accepted.applied.is_empty():
+        return CLAIM_ACCEPTED_NOTHING
+    if not accepted.written:
+        return f"{CLAIM_ACCEPTED_UNMATCHED}\n{confirmation(accepted.applied)}"
+    return f"{CLAIM_ACCEPTED_PREFIX}\n{confirmation(accepted.applied)}"
+
+
+def claim_edited(view: claims.ClaimView) -> str:
+    return f"{CLAIM_EDITED}\n{claim_line(view)}"
+
+
+# One example per field the kind can take (claims.EDITABLE), with the
+# prefix spelled out: a claim is corrected before it is a row, and the
+# owner should not have to guess whether "4 mln" is an amount or a name.
+_CLAIM_TUZAT_EXAMPLES = {
+    "amount": "summa 4 mln",
+    "person": "kim Akmal",
+    "currency": "valyuta $",
+    "due": "muddat 2026-10-01",
+    "direction": "teskari",
+}
+
+
+def claim_tuzat_hint(view: claims.ClaimView) -> str:
+    """What the ✏️ button says: the syntax, with this claim's ref filled in."""
+    handle = claim_ref(view.id)
+    examples = " · ".join(
+        f"<code>/tuzat {handle} {_CLAIM_TUZAT_EXAMPLES[field]}</code>"
+        for field in claims.EDITABLE.get(view.kind, ())
+        if field in _CLAIM_TUZAT_EXAMPLES
+    )
+    return (
+        f"✏️ <code>{handle}</code> ni tuzatish uchun yozing:\n{examples}\n"
+        f"<i>Keyin ✅ Ha yoki ✖️ Yo'q.</i>"
+    )
+
+
+def claim_field_refused(view: claims.ClaimView, field: str) -> str:
+    """`/tuzat c12 muddat …` on a claim that has no such field."""
+    label = _FIELD_LABEL.get(field, field)
+    return f"Bu da'voda {label}ni tuzatib bo'lmaydi.\n{claim_tuzat_hint(view)}"
+
+
+def claim_value_refused(view: claims.ClaimView) -> str:
+    """A field the claim has, but a value it cannot take (nothing to flip,
+    an empty name)."""
+    return f"Bu qiymat to'g'ri kelmadi.\n{claim_tuzat_hint(view)}"
+
+
 def search_results(hits, query: str) -> str:
     """`/qidir`: raw semantic hits — no LLM, just what memory holds."""
     if not hits:
@@ -503,12 +1028,14 @@ SEARCH_UNAVAILABLE = (
 OPERATION_LABEL = {
     "extract": "xabarlardan ajratish",
     "extract_window": "telegram suhbatlari (batch)",
+    "extract_window_instant": "telegram suhbatlari (tezkor)",
     "extract_window_fallback": "telegram suhbatlari (qayta)",
     "transcribe": "ovozni matnga o'girish",
     "vision": "rasmlarni o'qish",
     "report": "kunlik hisobot",
     "planner": "reja tuzish",
     "rag": "savollarga javob",
+    "profile": "odam haqida profil",
 }
 
 
@@ -595,6 +1122,8 @@ SOURCE_LABEL = {
     "assistant_bot": "xabar",
     "telegram_userbot": "telegram",
     "phone_call": "qo'ng'iroq",
+    # A low-confidence money SMS waits in /tekshir; it must name itself.
+    "phone_sms": "sms",
     "manual": "qo'lda",
     "receipt_photo": "rasm",
     "calendar": "kalendar",
@@ -625,3 +1154,413 @@ def review_report(interactions, total: int) -> str:
     if total > len(interactions):
         header += f" (oxirgi {len(interactions)} tasi)"
     return clip(header + "\n" + bullet_list(lines, empty="—"))
+
+
+# --- open loops: the morning brief, the nudge, a new group -------------------
+#
+# question_line / stale_line / quiet_line live in formatting.py: the report's
+# data block renders the same rows in plain text (``markup=False``), and
+# reports.py must not import this module. They are re-exported above.
+
+
+BRIEF_HEADER = "🌅 <b>Ertalabki xulosa</b>"
+BRIEF_ALL_CLEAR = "✅ Hammasi joyida — bugun uchrashuv ham, ochiq qolgan narsa ham yo'q."
+
+BRIEF_EVENTS = "📅 <b>Bugungi uchrashuvlar</b>"
+BRIEF_DUE = "⏰ <b>Muddati bugun va kechikkanlar</b>"
+BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
+# After the questions and before the claims: an unanswered ring outranks a
+# decision the owner still has time to make.
+BRIEF_MISSED = "📵 <b>Javobsiz qo'ng'iroqlar</b>"
+BRIEF_CLAIMS = "❓ Tasdiqlanmagan da'volar"
+BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
+BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
+
+
+def morning_brief(brief: MorningBrief) -> str:
+    """The one morning message. Deterministic — SQL and the loops engine."""
+    parts = [f"{BRIEF_HEADER} · {full_date(brief.day)}"]
+    if brief.is_empty():
+        return "\n\n".join([*parts, BRIEF_ALL_CLEAR])
+
+    if brief.events:
+        lines = [
+            f"{clock(e.start_at)} — {escape(e.title)}"
+            + (f" ({escape(e.location)})" if e.location else "")
+            for e in brief.events
+        ]
+        parts.append(f"{BRIEF_EVENTS}\n" + bullet_list(lines, empty="—"))
+
+    due_lines = [
+        f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
+        f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
+        for b in brief.due.get("debts", [])
+    ]
+    due_lines += [
+        f"{escape(person.display_name)}: {escape(p.description)} · "
+        f"{relative_day(p.due_date)}" + tag("promise", p.id)
+        for p, person in brief.due.get("promises", [])
+    ]
+    due_lines += [
+        f"{escape(t.description)} · {relative_day(t.due_date)}" + tag("task", t.id)
+        for t in brief.due.get("tasks", [])
+    ]
+    if due_lines:
+        parts.append(f"{BRIEF_DUE}\n" + bullet_list(due_lines, empty="—"))
+
+    loops = brief.loops
+    if loops is not None and loops.questions:
+        lines = [question_line(q) for q in loops.questions]
+        parts.append(f"{BRIEF_QUESTIONS}\n" + bullet_list(lines, empty="—"))
+    missed = _brief_missed(brief)
+    if missed:
+        lines = [missed_line(m) for m in missed]
+        parts.append(f"{BRIEF_MISSED}\n" + bullet_list(lines, empty="—"))
+    shown, hidden = _brief_claims(brief)
+    if shown:
+        lines = [claim_line(claims.view(c)) for c in shown]
+        block = f"<b>{BRIEF_CLAIMS}</b>\n" + bullet_list(lines, empty="—")
+        if hidden:
+            block += f"\n<i>… va yana {hidden} ta — /davolar.</i>"
+        parts.append(block)
+    if loops is not None and loops.stale:
+        lines = [stale_line(s) for s in loops.stale]
+        parts.append(f"{BRIEF_STALE}\n" + bullet_list(lines, empty="—"))
+    if loops is not None and loops.quiet:
+        lines = [quiet_line(q) for q in loops.quiet]
+        parts.append(f"{BRIEF_QUIET}\n" + bullet_list(lines, empty="—"))
+
+    return clip("\n\n".join(parts))
+
+
+def morning_brief_refs(
+    brief: MorningBrief,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """``(due, stale)`` — the rows the brief's buttons act on, in line order."""
+    due: list[tuple[str, int]] = []
+    for b in brief.due.get("debts", []):
+        due += [("debt", i) for i in b.ids]
+    due += [("promise", p.id) for p, _ in brief.due.get("promises", [])]
+    due += [("task", t.id) for t in brief.due.get("tasks", [])]
+    stale = (
+        [(s.record_kind, s.record.id) for s in brief.loops.stale]
+        if brief.loops is not None
+        else []
+    )
+    return due, stale
+
+
+def _brief_claims(brief: MorningBrief) -> tuple[list, int]:
+    """The claims the brief shows, and how many more it only counts.
+
+    Only what is shown gets buttons and is marked as asked; the rest stay
+    pending for /davolar and the worker's one-question messages.
+    """
+    pending = [c for c in getattr(brief, "claims", []) or [] if c.id is not None]
+    shown = pending[:BRIEF_MAX_CLAIMS]
+    return shown, len(pending) - len(shown)
+
+
+def morning_brief_claim_ids(brief: MorningBrief) -> list[int]:
+    """The claims whose line the brief carries, in line order."""
+    shown, _ = _brief_claims(brief)
+    return [c.id for c in shown]
+
+
+def _brief_missed(brief: MorningBrief) -> list[MissedCall]:
+    """The missed-call loops the brief shows (build step 6).
+
+    Read defensively, like the claims above: a brief built before the loops
+    engine learned about missed calls simply has none.
+    """
+    loops = brief.loops
+    if loops is None:
+        return []
+    return list(getattr(loops, "missed", None) or [])
+
+
+def morning_brief_missed_ids(brief: MorningBrief) -> list[int]:
+    """The missed calls whose line the brief carries, in line order — the
+    interactions the ✅ Bog'landim / ⏰ rows act on."""
+    return [m.interaction_id for m in _brief_missed(brief)]
+
+
+NUDGE_HEADER = "❓ <b>Javobsiz savol</b>"
+NUDGE_ANSWERED = "✅ Javob berilgan deb yozib qo'ydim — boshqa eslatmayman."
+
+
+def nudge_snoozed(until: datetime) -> str:
+    """After ⏰ Ertalab eslat: name the moment, since "the next brief" is today's
+    09:00 for a tap before it (00:30 after an evening nudge, or 08:00) and
+    tomorrow's for a tap after it."""
+    local = until.astimezone(settings.tz)
+    day = "Bugun" if local.date() == datetime.now(settings.tz).date() else "Ertaga"
+    return f"⏰ {day} {local.strftime('%H:%M')} dagi ertalabki xulosada yana eslataman."
+
+
+NUDGE_GONE = "⚠️ Bu savol eskirgan yoki yozuv o'chirilgan."
+
+
+def nudge(q: UnansweredQuestion) -> str:
+    """One short message per unanswered question: who asked, what, how long."""
+    where = f" · {escape(q.chat_title)}" if q.is_group and q.chat_title else ""
+    lines = [
+        NUDGE_HEADER,
+        f"<b>{escape(q.person_name)}</b>{where} · {age_label(q.age)} oldin",
+        quote(q.text, limit=300),
+    ]
+    if q.follow_ups:
+        lines.append(
+            f"<i>Keyin yana {q.follow_ups} ta xabar keldi — hali javob yo'q.</i>"
+        )
+    return clip("\n".join(lines))
+
+
+def nudge_overflow(count: int) -> str:
+    return (
+        f"❓ <i>… va yana {count} ta javobsiz savol — keyingi safar eslataman "
+        f"(to'liq ro'yxat: /ertalab).</i>"
+    )
+
+
+# --- missed calls (build step 6) ---------------------------------------------
+#
+# The companion app uploads the call log; a missed or rejected ring nobody
+# dealt with is an open loop (loops.missed_calls). The nudge mirrors the
+# question nudge: once, plus once more after an "⏰ Ertalab eslat" snooze.
+
+MISSED_NUDGE_HEADER = "📵 <b>Javobsiz qo'ng'iroq</b>"
+MISSED_ANSWERED = "✅ Yozib qo'ydim — bog'landing."
+MISSED_GONE = "⚠️ Bu qo'ng'iroq eskirgan yoki yozuvi o'chirilgan."
+
+
+def missed_nudge(m: MissedCall) -> str:
+    """One short message per missed call: who rang, how long ago, how often."""
+    who = m.person_name if m.person is not None else (m.phone or "Noma'lum raqam")
+    lines = [
+        MISSED_NUDGE_HEADER,
+        f"<b>{escape(who)}</b> · {age_label(m.age)} oldin qo'ng'iroq qildi — "
+        "javob berilmadi.",
+    ]
+    if m.attempts > 1:
+        lines.append(f"<i>Jami {m.attempts} marta urindi.</i>")
+    return clip("\n".join(lines))
+
+
+NEW_GROUP_GONE = "⚠️ Bu chat endi ro'yxatda yo'q."
+
+# What a switched-off chat is called in the one-tap question. A channel is
+# not a group to the owner, and chats.awaiting_join_question asks about both.
+_NEW_CHAT_LABEL = {
+    ChatType.channel: "📢 <b>Yangi kanal:</b>",
+    ChatType.group: "👥 <b>Yangi guruh:</b>",
+}
+
+
+def new_group_question(
+    title: str | None, tg_chat_id: int, chat_type: ChatType | None = None
+) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    label = _NEW_CHAT_LABEL.get(chat_type, _NEW_CHAT_LABEL[ChatType.group])
+    return f"{label} {name} — o'qiymi?"
+
+
+def new_group_accepted(title: str | None, tg_chat_id: int, days: int) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    return f"✅ <b>{name}</b> — endi o'qiyman. Oxirgi {days} kunini ham o'qib chiqaman."
+
+
+def new_group_declined(title: str | None, tg_chat_id: int) -> str:
+    name = escape(title or f"chat {tg_chat_id}")
+    return f"👌 <b>{name}</b> — o'qimayman. Kerak bo'lsa /chats dan yoqasiz."
+
+
+# --- /holat: is MIYA alive, and what to type if not (build step 5) -----------
+#
+# One screen, one line per part, ✅ / ⚠️ / ❌ / ⏸ at the front so the owner
+# reads the colour before the words. The judgements come from
+# services/health.py; this only says them in Uzbek. Every dynamic string
+# (a job id, a bot username) is escaped, the whole thing is clipped.
+
+STATUS_HEADER = "🩺 <b>MIYA holati</b>"
+STATUS_NEVER = "hali yo'q"
+
+DB_DOWN_ALERT = (
+    "❌ Baza javob bermayapti — hech narsa yozilmayapti va o'qilmayapti. "
+    "Serverda: <code>docker compose ps</code>, <code>docker compose logs db</code>, "
+    "keyin <code>make up</code>."
+)
+
+
+def _ago(age: timedelta | None) -> str:
+    """'6 daqiqa oldin', or the honest gap when it never happened."""
+    if age is None:
+        return STATUS_NEVER
+    if age < timedelta(minutes=1):
+        return "hozirgina"
+    return f"{age_label(age)} oldin"
+
+
+def _since_when(when: datetime | None, now: datetime) -> str:
+    return _ago(now - when) if when is not None else STATUS_NEVER
+
+
+def _day_clock(when: datetime, now: datetime) -> str:
+    """'bugun 03:30' / 'kecha 03:30' / '12-sen 03:30'."""
+    local = when.astimezone(settings.tz)
+    days = (now.astimezone(settings.tz).date() - local.date()).days
+    if days == 0:
+        day = "bugun"
+    elif days == 1:
+        day = "kecha"
+    else:
+        day = short_date(local.date())
+    return f"{day} {clock(local)}"
+
+
+def worker_silent_alert(worker: health.Component) -> str:
+    """The bot's own alarm: the scheduler has stopped beating.
+
+    The same key as services/health.py's ``worker_silent`` and the same
+    remedy, so the shared ledger dedupes whichever process speaks first.
+    """
+    since = (
+        f"{age_label(worker.age)}dan beri jim"
+        if worker.age is not None
+        else "hali bir marta ham xabar bermagan"
+    )
+    return (
+        f"❌ Rejalashtiruvchi (worker) {since} — eslatmalar, hisobot va zaxira "
+        "nusxa to'xtab turibdi. Serverda: <code>docker compose restart worker</code>, "
+        "keyin <code>make worker</code> bilan logni ko'r."
+    )
+
+
+def _bot_line(status: health.Status) -> str:
+    # This very message is the proof: the bot rendering it is alive.
+    username = status.components["bot"].detail.get("username")
+    tail = f" · @{escape(str(username))}" if username else ""
+    return f"✅ Bot — ishlayapti{tail}"
+
+
+def _userbot_line(status: health.Status) -> str:
+    userbot = status.components["userbot"]
+    if userbot.disabled:
+        return "⏸ Telegram o'quvchi — o'chirilgan (USERBOT_ENABLED=false)"
+    last = f"oxirgi xabar: {_since_when(status.userbot_last_message_at, status.now)}"
+    if userbot.stale:
+        if userbot.age is None:
+            return f"❌ Telegram o'quvchi — hali ulanmagan · {last}"
+        return f"❌ Telegram o'quvchi — {age_label(userbot.age)}dan beri jim · {last}"
+    if userbot.detail.get("connected") is False:
+        return f"⚠️ Telegram o'quvchi — Telegramdan uzilgan · {last}"
+    return f"✅ Telegram o'quvchi — ulangan · {last}"
+
+
+def _worker_line(status: health.Status) -> str:
+    worker = status.components["worker"]
+    if not worker.stale:
+        return f"✅ Rejalashtiruvchi — oxirgi urish: {_ago(worker.age)}"
+    if worker.age is None:
+        return "❌ Rejalashtiruvchi — hali bir marta ham urmagan"
+    line = f"❌ Rejalashtiruvchi — {age_label(worker.age)}dan beri jim"
+    # The job that has waited longest says what the owner is missing.
+    known = [job for job in status.jobs.values() if job.age is not None]
+    if known:
+        oldest = max(known, key=lambda job: job.age)
+        line += f" · eng eski ish: {escape(oldest.name)} ({_ago(oldest.age)})"
+    return line
+
+
+def _db_line(status: health.Status) -> str:
+    if not status.db_ok:
+        return "❌ Baza — javob bermayapti"
+    return f"✅ Baza — javob beryapti · {health.size_label(status.db_size_bytes)}"
+
+
+def _disk_line(status: health.Status) -> str:
+    if status.disk_free_bytes is None:
+        return "⚠️ Disk — o'lchab bo'lmadi"
+    free = health.size_label(status.disk_free_bytes)
+    if status.disk_low:
+        return f"❌ Disk — {free} bo'sh (chegara {settings.disk_min_free_gb:g} GB)"
+    return f"✅ Disk — {free} bo'sh"
+
+
+def _backup_line(status: health.Status) -> str:
+    info = status.backup
+    if not info.configured:
+        return "⚠️ Zaxira nusxa — sozlanmagan (BACKUP_AGE_RECIPIENT bo'sh)"
+    if info.path is None or info.created_at is None:
+        return f"⚠️ Zaxira nusxa — {STATUS_NEVER}"
+    when = _day_clock(info.created_at, status.now)
+    size = health.size_label(info.size)
+    if info.stale:
+        return f"⚠️ Zaxira nusxa — {when} · {size} · eskirgan"
+    if info.sent_to_telegram:
+        return f"✅ Zaxira nusxa — {when} · {size} · Telegramga yuborildi"
+    if info.send_failed:
+        return f"⚠️ Zaxira nusxa — {when} · {size} · Telegramga yuborilmadi"
+    if not settings.backup_to_telegram:
+        return f"✅ Zaxira nusxa — {when} · {size} · faqat diskda"
+    return f"⚠️ Zaxira nusxa — {when} · {size} · Telegramga hali yuborilmagan"
+
+
+def _anthropic_line(status: health.Status) -> str:
+    if status.anthropic_failing:
+        return (
+            "⚠️ Anthropic — oxirgi muvaffaqiyat: "
+            f"{_since_when(status.anthropic_last_ok_at, status.now)} · "
+            f"{status.windows_pending} ta kutmoqda, {status.windows_failed} ta xato"
+        )
+    if status.anthropic_last_ok_at is None:
+        return "✅ Anthropic — hali ishlatilmagan"
+    last = _since_when(status.anthropic_last_ok_at, status.now)
+    return f"✅ Anthropic — oxirgi muvaffaqiyat: {last}"
+
+
+def _phone_line(status: health.Status) -> str | None:
+    """The companion app's last accepted batch — informational, never a fault.
+
+    None (no line at all) when no phone has ever uploaded: a phone-less
+    install is healthy and should not read as missing something.
+    """
+    phone = getattr(status, "phone", None)
+    if phone is None:
+        return None
+    detail = phone.detail or {}
+    parts = []
+    if detail.get("calls"):
+        parts.append(f"{detail['calls']} qo'ng'iroq")
+    if detail.get("sms"):
+        parts.append(f"{detail['sms']} sms")
+    tail = f" ({', '.join(parts)})" if parts else ""
+    return f"📱 Telefon — oxirgi yuklash: {_ago(phone.age)}{tail}"
+
+
+def status_report(status: health.Status, problems: list[health.Problem]) -> str:
+    """`/holat`: every part of MIYA on one line each, then what to do."""
+    now = status.now.astimezone(settings.tz)
+    lines = [
+        f"{STATUS_HEADER} · {short_date(now.date())} {clock(now)}",
+        _bot_line(status),
+        _userbot_line(status),
+        _worker_line(status),
+        _db_line(status),
+        _disk_line(status),
+        _backup_line(status),
+        _anthropic_line(status),
+        *([line] if (line := _phone_line(status)) else []),
+        "<b>Navbatda</b>: "
+        f"kutayotgan suhbatlar {status.windows_pending} · "
+        f"batch'da {status.windows_submitted} · "
+        f"ishlanmagan {status.needs_review} (/tekshir) · "
+        f"da'volar {status.claims_pending} (/davolar)",
+        "<b>Xarajat</b>: "
+        f"bugun {usd(status.cost_today_usd)} · "
+        f"bu oy {usd(status.cost_month_usd)} (/xarajat)",
+    ]
+    if problems:
+        lines.append("")
+        lines += [problem.text for problem in problems]
+    return clip("\n".join(lines))

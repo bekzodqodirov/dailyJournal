@@ -1,7 +1,7 @@
 """Daily report (spec §8): cron at REPORT_TIME and the `/hisobot` command.
 
 The day's numbers are gathered by SQL (services/queries.py) and rendered into
-a deterministic data block; Sonnet only turns that block into a clean Uzbek
+a deterministic data block; the model only turns that block into a clean Uzbek
 report. If the API call fails the deterministic block itself is stored and
 sent — a report day is never lost.
 """
@@ -16,12 +16,13 @@ from typing import Any
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from miya.bot.formatting import escape
+from miya.bot.formatting import escape, missed_line, question_line, quiet_line, ref
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
-from miya.services import planner, queries
+from miya.services import claims, loops, nudges, planner, queries
 from miya.services.extraction import API_FAILURES, get_client
+from miya.services.loops import MissedCall, QuietCounterparty, UnansweredQuestion
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -44,6 +45,10 @@ Rules:
   ✅ Bajarilganlar
   💬 Chatlarda (qaysi chatda nima haqida gaplashildi)
   📨 Sizga murojaatlar (guruhda to'g'ridan-to'g'ri yozilganlar)
+  ❓ Javobsiz qolganlar (kim nima so'radi, qancha vaqt javobsiz)
+  📵 Javobsiz qo'ng'iroqlar (kim qo'ng'iroq qildi, qachon, necha marta)
+  🤫 Jim bo'lib qolganlar (kim necha kun jim, u bilan nima ochiq)
+  ❓ Tasdiqlanmagan da'volar (nechta javob kutmoqda — /davolar)
   📅 Ertaga (given plan text — include as-is, lightly trimmed if long)
 - Keep the whole report short and scannable. Telegram formatting: plain text
   with <b>bold</b> section titles, no markdown, no # headers.
@@ -59,6 +64,17 @@ class ReportData:
     plan: str
     chats: list = field(default_factory=list)
     to_me: list = field(default_factory=list)
+    # Open loops (build step 2): questions nobody answered, people who went
+    # quiet with something open. Both from the loops engine — SQL, no model.
+    questions: list[UnansweredQuestion] = field(default_factory=list)
+    quiet: list[QuietCounterparty] = field(default_factory=list)
+    # Missed calls nobody returned (build step 6) — the same engine.
+    missed: list[MissedCall] = field(default_factory=list)
+    # What a counterparty asserted and the owner has not answered (build
+    # step 3). A count only: the questions themselves have their buttons on
+    # the receipt, the brief and /davolar, and the report is not a place to
+    # answer from.
+    claims_pending: int = 0
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -82,6 +98,10 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
             for d in data.chats
         ],
         "to_me": len(data.to_me),
+        "unanswered": len(data.questions),
+        "quiet": len(data.quiet),
+        "missed": len(data.missed),
+        "claims_pending": data.claims_pending,
         "settled_debts": len(data.completed.settled_debts),
         "done_promises": len(data.completed.done_promises),
         "done_tasks": len(data.completed.done_tasks),
@@ -95,7 +115,7 @@ def render_data_block(data: ReportData) -> str:
     Telegram contacts and message text, which a counterparty controls: a
     supplier who sets his first name to "<b" would otherwise produce a report
     Telegram refuses to render, silently costing the owner his evening summary.
-    Escaping before Sonnet sees the text means the model copies the safe form.
+    Escaping before the model sees the text means the model copies the safe form.
     """
     s = data.summary
     lines: list[str] = [f"HISOBOT KUNI: {data.day.isoformat()}"]
@@ -130,19 +150,28 @@ def render_data_block(data: ReportData) -> str:
 
     lines.append("\n⏰ OCHIQ VA MUDDATI O'TGANLAR:")
     due_lines = 0
+    # Every open line carries its ref (d12 / p7 / t3) — plain text, not
+    # markup, so the model copies it as-is and the owner can /bajarildi it.
     for b in data.due.get("debts", []):
         side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
+        handles = ", ".join(ref("debt", i) for i in b.ids)
         lines.append(
             f"- {escape(b.person.display_name)}: "
             f"{format_money(b.outstanding, b.currency)} ({side}, "
-            f"muddat: {b.earliest_due})"
+            f"muddat: {b.earliest_due}) [{handles}]"
         )
         due_lines += 1
     for p, person in data.due.get("promises", []):
-        lines.append(f"- va'da: {escape(person.display_name)} — {escape(p.description)}")
+        lines.append(
+            f"- va'da: {escape(person.display_name)} — {escape(p.description)} "
+            f"[{ref('promise', p.id)}]"
+        )
         due_lines += 1
     for t in data.due.get("tasks", []):
-        lines.append(f"- vazifa: {escape(t.description)} (muddat: {t.due_date})")
+        lines.append(
+            f"- vazifa: {escape(t.description)} (muddat: {t.due_date}) "
+            f"[{ref('task', t.id)}]"
+        )
         due_lines += 1
     if not due_lines:
         lines.append("- yo'q")
@@ -153,7 +182,8 @@ def render_data_block(data: ReportData) -> str:
         if c.settled_debts:
             lines.append(f"- yopilgan qarzlar: {len(c.settled_debts)} ta")
         for p in c.done_promises:
-            lines.append(f"- va'da bajarildi: {escape(p.description)}")
+            who = escape(p.person.display_name) if p.person is not None else "?"
+            lines.append(f"- va'da bajarildi: {who} — {escape(p.description)}")
         for t in c.done_tasks:
             lines.append(f"- vazifa bajarildi: {escape(t.description)}")
     else:
@@ -180,6 +210,34 @@ def render_data_block(data: ReportData) -> str:
     else:
         lines.append("- yo'q")
 
+    # The two open-loop sections are the brief's own lines rendered plain
+    # (formatting.question_line / quiet_line with markup=False): no tags, so
+    # escaping the finished line is the same as escaping each name in it.
+    lines.append("\n❓ JAVOBSIZ QOLGANLAR:")
+    if data.questions:
+        for q in data.questions[:10]:
+            lines.append(f"- {escape(question_line(q, markup=False))}")
+    else:
+        lines.append("- yo'q")
+
+    # Missed calls (build step 6): the brief's own lines rendered plain, the
+    # same way as the two sections around it. Shown only when there are any —
+    # a phone-less install should not read an empty section every evening.
+    if data.missed:
+        lines.append("\n📵 JAVOBSIZ QO'NG'IROQLAR:")
+        for miss in data.missed[:10]:
+            lines.append(f"- {escape(missed_line(miss, markup=False))}")
+
+    lines.append("\n🤫 JIM BO'LIB QOLGANLAR:")
+    if data.quiet:
+        for q in data.quiet[:10]:
+            lines.append(f"- {escape(quiet_line(q, markup=False))}")
+    else:
+        lines.append("- yo'q")
+
+    if data.claims_pending:
+        lines.append(f"\n❓ Tasdiqlanmagan da'volar: {data.claims_pending} (/davolar)")
+
     lines.append("\n📅 ERTAGA:")
     lines.append(data.plan)
 
@@ -195,6 +253,10 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         plan=await planner.plan_for(session, day + timedelta(days=1)),
         chats=await queries.chat_digests(session, day),
         to_me=await queries.messages_to_me(session, day),
+        questions=await nudges.unanswered_questions(session),
+        quiet=await loops.quiet_counterparties(session),
+        missed=await loops.missed_calls(session),
+        claims_pending=await claims.pending_count(session),
     )
 
 

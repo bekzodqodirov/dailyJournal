@@ -12,21 +12,42 @@ Failure policy, in one place:
   * after ``BATCH_MAX_ATTEMPTS`` the window is extracted in real time instead,
     and only if that also fails does it end up ``failed`` + ``needs_review``.
 Nothing is ever dropped silently.
+
+What is addressed to the owner does not go through the batch at all (build
+step 2). A window flagged ``instant`` — a private chat, or a group window with
+a message aimed at him — is extracted by ``extract_instant`` on the window
+job's own tick, at full price, and applied through the same ``_apply_result``
+so the receipt still fires. If that keeps failing the flag is cleared and the
+window joins the batch ladder; nothing is dropped on either path. Every usage
+row names its path: ``extract_window`` (batch), ``extract_window_instant``,
+``extract_window_fallback``.
+
+Nothing is *written* silently either. Every applied window comes back as an
+``AppliedWindow`` carrying what actually landed, and anything the owner cares
+about (a debt, a settlement, a promise, a transaction, an event, a task) is
+queued as a notice on the window's interaction until the worker has told him
+where it came from. The owner decided nothing lands from a chat without him
+being told; facts-only windows are not worth a ping. And what a counterparty
+asserts — "you owe me", "I paid you back" — is not written at all until he
+says so (build step 3): it lands in ``Applied.claims`` as a question, the same
+receipt asks it, and the worker asks on its own when no receipt does.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import anthropic
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.bot import notices
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource, WindowStatus
-from miya.db.models import ConversationWindow, Interaction
+from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
 from miya.services import usage as usage_service
 from miya.services.extraction import (
     API_FAILURES,
@@ -35,7 +56,7 @@ from miya.services.extraction import (
     extract,
     parse_extraction_json,
 )
-from miya.services.persistence import apply_extraction
+from miya.services.persistence import Applied, apply_extraction
 from miya.services.windows import pending_windows
 
 log = logging.getLogger(__name__)
@@ -46,12 +67,57 @@ MAX_REQUESTS_PER_BATCH = 500
 
 _TERMINAL_STATUS = "ended"
 
+# Keys on the window interaction's metadata that hold the owner notice: the
+# rendered receipt waiting to go out, and when it went. Metadata rather than a
+# column so that a worker restart, or eight hours of quiet hours, delays the
+# notice instead of losing it.
+NOTICE_KEY = "notice"
+NOTIFIED_KEY = "notified_at"
+
+
+@dataclass(slots=True)
+class AppliedWindow:
+    """One window's landed rows, plus where the conversation came from.
+
+    ``chat_title`` is the monitor's title (None for a chat the userbot has not
+    synced yet). ``people`` names everyone the landed rows point at — in a
+    group that is the person who actually owes, not whoever spoke first.
+    """
+
+    window: ConversationWindow
+    interaction: Interaction
+    applied: Applied
+    chat_title: str | None = None
+    people: list[str] = field(default_factory=list)
+    # The receipt parked for the owner; None when there was nothing worth
+    # telling (facts only, or nothing at all).
+    notice: str | None = None
+
 
 @dataclass(slots=True)
 class BatchOutcome:
-    applied: int = 0
     retried: int = 0
     failed: int = 0
+    windows: list[AppliedWindow] = field(default_factory=list)
+
+    @property
+    def applied(self) -> int:
+        return len(self.windows)
+
+    def absorb(self, other: BatchOutcome) -> None:
+        self.retried += other.retried
+        self.failed += other.failed
+        self.windows.extend(other.windows)
+
+
+@dataclass(slots=True)
+class QueuedNotice:
+    """A receipt waiting for the owner, read back from the interaction."""
+
+    interaction: Interaction
+    text: str
+    chat: str
+    counts: dict[str, int]
 
 
 def get_client() -> anthropic.AsyncAnthropic:
@@ -131,12 +197,65 @@ async def _window_interaction(
 
 async def _apply_result(
     session: AsyncSession, window: ConversationWindow, result: ExtractionResult
-) -> None:
+) -> AppliedWindow:
     interaction = await _window_interaction(session, window)
-    await apply_extraction(session, interaction, result)
+    applied = await apply_extraction(session, interaction, result)
     await _mark_members_processed(session, window)
     window.status = WindowStatus.applied
     window.applied_at = datetime.now(settings.tz)
+    landed = AppliedWindow(window=window, interaction=interaction, applied=applied)
+    # Parked here, in the same transaction as the rows, rather than by the
+    # worker afterwards: the per-batch commit in collect_submitted would
+    # otherwise leave a gap where the debt is durable and the receipt is not,
+    # and the rollback of a later broken batch expires every object in the
+    # session, so nothing rendered after it could be trusted.
+    #
+    # Everything the receipt needs — the chat title, the names — is looked
+    # up inside the guard: a receipt must never cost the ledger, and the
+    # rows are already in.
+    try:
+        landed.chat_title = await session.scalar(
+            sa.select(ChatMonitor.title).where(
+                ChatMonitor.tg_chat_id == window.tg_chat_id
+            )
+        )
+        landed.people = await _people_named(session, window, applied)
+        landed.notice = queue_notice(landed)
+    except Exception:
+        log.exception("could not park the owner notice for window %s", window.id)
+    return landed
+
+
+async def _people_named(
+    session: AsyncSession, window: ConversationWindow, applied: Applied
+) -> list[str]:
+    """Display names behind the landed rows, first mention first.
+
+    Falls back to the window's own person, so a private chat is still named
+    when the extraction only produced, say, an event with no counterparty.
+    """
+    ids: list[int] = [d.person_id for d in applied.debts]
+    ids += [p.person_id for p in applied.promises]
+    ids += [t.counterparty_person_id for t in applied.transactions]
+    ids += [person.id for person, _ in applied.settlements]
+    # A claim has no row yet, only the name as the counterparty gave it; the
+    # receipt still has to say whose word the question rests on.
+    claimed = [claim.person_name for claim in applied.claims if claim.person_name]
+    if not any(ids) and not claimed and window.person_id:
+        ids.append(window.person_id)
+    wanted = [i for i in dict.fromkeys(ids) if i]
+    names: dict[int, str] = {}
+    if wanted:
+        rows = await session.execute(
+            sa.select(Person.id, Person.display_name).where(Person.id.in_(wanted))
+        )
+        names = dict(rows.all())
+    ordered = [names[i] for i in wanted if i in names]
+    # Settlements that matched nothing carry the name, not the row.
+    ordered += [name for name, _, _ in applied.unmatched_settlements]
+    ordered += [name for name, _, _ in applied.ambiguous_settlements]
+    ordered += claimed
+    return list(dict.fromkeys(ordered))
 
 
 async def _mark_members_processed(
@@ -163,6 +282,97 @@ async def _fail_window(
         window.attempts,
         reason,
     )
+
+
+async def extract_instant(session: AsyncSession, *, limit: int = 50) -> BatchOutcome:
+    """Extract every ``instant`` window now, one commit per window.
+
+    Each window is its own unit of paid work, committed before the next one
+    is attempted, so a failure half way costs nothing already landed. A
+    window whose extraction fails — an API error, or anything raised while
+    applying it — stays pending for the next tick; at BATCH_MAX_ATTEMPTS it
+    loses the flag and takes the batch path instead, slower but never lost.
+    Windows are re-read by id after a rollback: the rollback expires every
+    object in the session, and a failing window must not wedge the queue.
+    """
+    outcome = BatchOutcome()
+    ids = [w.id for w in await pending_windows(session, limit=limit, instant=True)]
+    for window_id in ids:
+        window = await session.get(ConversationWindow, window_id)
+        if window is None:
+            continue
+        try:
+            partial = await _extract_one_instant(session, window)
+        except Exception:
+            log.exception("instant extraction of window %s raised", window_id)
+            await session.rollback()
+            window = await session.get(ConversationWindow, window_id)
+            partial = _instant_failed(window, "exception") if window else BatchOutcome()
+        await session.commit()
+        outcome.absorb(partial)
+    if outcome.applied or outcome.retried:
+        log.info(
+            "instant path: %d applied, %d deferred to the batch",
+            outcome.applied,
+            outcome.retried,
+        )
+    return outcome
+
+
+async def _extract_one_instant(
+    session: AsyncSession, window: ConversationWindow
+) -> BatchOutcome:
+    result = await extract(window.text, now=window.ended_at.astimezone(settings.tz))
+    if result.usage is not None:
+        await usage_service.record_anthropic_usage(
+            session,
+            model=result.model,
+            operation="extract_window_instant",
+            usage=result.usage,
+        )
+        # The call is paid for whether or not what follows works, so the
+        # usage row is committed on its own. Applying can raise, and the
+        # rollback in extract_instant would otherwise erase the row while
+        # the window is retried — and billed a second time as if this call
+        # had never happened.
+        await session.commit()
+        # Re-read by id after the commit, as extract_instant does after a
+        # rollback: what is applied below must be the session's current row.
+        window_id = window.id
+        window = await session.get(ConversationWindow, window_id)
+        if window is None:
+            log.warning("window %s vanished during instant extraction", window_id)
+            return BatchOutcome()
+    if result.ok:
+        applied = await _apply_result(session, window, result.result)
+        return BatchOutcome(windows=[applied])
+    return _instant_failed(window, result.error or "unknown")
+
+
+def _instant_failed(window: ConversationWindow, reason: str) -> BatchOutcome:
+    """One more failed real-time try; at the cap, hand the window to the batch.
+
+    The batch's own ladder ends in a real-time retry and, last, needs_review —
+    so a window that fails everywhere is still flagged, never dropped.
+    """
+    window.attempts += 1
+    if window.attempts >= settings.batch_max_attempts:
+        window.instant = False
+        window.attempts = 0
+        log.warning(
+            "window %s deferred to the batch after %d instant failure(s): %s",
+            window.id,
+            settings.batch_max_attempts,
+            reason,
+        )
+        return BatchOutcome(retried=1)
+    log.warning(
+        "window %s instant extraction failed (attempt %d): %s",
+        window.id,
+        window.attempts,
+        reason,
+    )
+    return BatchOutcome()
 
 
 async def _retry_or_fallback(
@@ -193,9 +403,9 @@ async def _retry_or_fallback(
             usage=outcome.usage,
         )
     if outcome.ok:
-        await _apply_result(session, window, outcome.result)
+        applied = await _apply_result(session, window, outcome.result)
         log.info("window %s extracted in real time after batch failures", window.id)
-        return BatchOutcome(applied=1)
+        return BatchOutcome(windows=[applied])
 
     await _fail_window(session, window, f"{reason}; fallback: {outcome.error}")
     return BatchOutcome(failed=1)
@@ -268,10 +478,9 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
                 # _retry_or_fallback bumps attempts itself; undo this one so
                 # the cap means the same number of tries here as everywhere.
                 window.attempts -= 1
-                partial = await _retry_or_fallback(session, window, "stream_unreadable")
-                outcome.applied += partial.applied
-                outcome.retried += partial.retried
-                outcome.failed += partial.failed
+                outcome.absorb(
+                    await _retry_or_fallback(session, window, "stream_unreadable")
+                )
         await session.flush()
         return outcome
     except anthropic.AnthropicError as exc:
@@ -285,10 +494,9 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
         # through the normal ladder and end up extracted in real time.
         log.warning("results of batch %s are unavailable: %s", batch_id, exc)
         for window in windows.values():
-            partial = await _retry_or_fallback(session, window, "results_unavailable")
-            outcome.applied += partial.applied
-            outcome.retried += partial.retried
-            outcome.failed += partial.failed
+            outcome.absorb(
+                await _retry_or_fallback(session, window, "results_unavailable")
+            )
         await session.flush()
         return outcome
 
@@ -312,19 +520,15 @@ async def collect_batch(session: AsyncSession, batch_id: str) -> BatchOutcome | 
             if parsed is None:
                 partial = await _retry_or_fallback(session, window, "invalid_json")
             else:
-                await _apply_result(session, window, parsed)
-                partial = BatchOutcome(applied=1)
-        outcome.applied += partial.applied
-        outcome.retried += partial.retried
-        outcome.failed += partial.failed
+                partial = BatchOutcome(
+                    windows=[await _apply_result(session, window, parsed)]
+                )
+        outcome.absorb(partial)
 
     # Results are only ever missing if the API omitted a request we sent —
     # treat that like any other failure rather than leaving the window stuck.
     for window in windows.values():
-        partial = await _retry_or_fallback(session, window, "missing_result")
-        outcome.retried += partial.retried
-        outcome.applied += partial.applied
-        outcome.failed += partial.failed
+        outcome.absorb(await _retry_or_fallback(session, window, "missing_result"))
 
     await session.flush()
     log.info(
@@ -363,7 +567,70 @@ async def collect_submitted(session: AsyncSession) -> BatchOutcome:
         await session.commit()
         if outcome is None:
             continue
-        total.applied += outcome.applied
-        total.retried += outcome.retried
-        total.failed += outcome.failed
+        total.absorb(outcome)
     return total
+
+
+# --- owner notices -----------------------------------------------------------
+
+
+def queue_notice(landed: AppliedWindow, *, now: datetime | None = None) -> str | None:
+    """Park the receipt for a window on its interaction until it is sent.
+
+    Returns the text, or None for a window with nothing worth telling — the
+    owner tolerates twenty-odd confirmations a day, not a ping for every
+    remembered detail, so facts-only windows stay quiet.
+
+    The text is stored ready to send rather than rebuilt later: a settlement
+    that matched no open debt, or one the owner has to disambiguate, exists
+    only in the ``Applied`` of the moment — there is no row to rebuild it from.
+    """
+    if landed.applied.is_empty():
+        return None
+    now = now or datetime.now(settings.tz)
+    chat, _ = notices.source_of(landed.chat_title, landed.people)
+    text = notices.window_notice(
+        chat_title=landed.chat_title,
+        people=landed.people,
+        ended_at=landed.window.ended_at,
+        applied=landed.applied,
+    )
+    interaction = landed.interaction
+    interaction.meta = {
+        **(interaction.meta or {}),
+        NOTICE_KEY: {
+            "text": text,
+            "chat": chat,
+            "counts": notices.counts_of(landed.applied),
+            "queued_at": now.isoformat(),
+        },
+    }
+    return text
+
+
+async def pending_notices(session: AsyncSession) -> list[QueuedNotice]:
+    """Receipts queued but not yet delivered, oldest conversation first."""
+    rows = await session.scalars(
+        sa.select(Interaction)
+        .where(Interaction.meta.has_key(NOTICE_KEY))
+        .where(sa.not_(Interaction.meta.has_key(NOTIFIED_KEY)))
+        .order_by(Interaction.occurred_at, Interaction.id)
+    )
+    queued: list[QueuedNotice] = []
+    for interaction in rows:
+        notice: dict[str, Any] = (interaction.meta or {}).get(NOTICE_KEY) or {}
+        queued.append(
+            QueuedNotice(
+                interaction=interaction,
+                text=str(notice.get("text") or ""),
+                chat=str(notice.get("chat") or ""),
+                counts={k: int(v) for k, v in (notice.get("counts") or {}).items()},
+            )
+        )
+    return queued
+
+
+def mark_notified(interaction: Interaction, *, now: datetime | None = None) -> None:
+    """Record delivery. The receipt stays on the row for the record."""
+    now = now or datetime.now(settings.tz)
+    interaction.meta = {**(interaction.meta or {}), NOTIFIED_KEY: now.isoformat()}

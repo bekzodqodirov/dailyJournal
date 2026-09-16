@@ -204,6 +204,17 @@ def test_every_v1_route_requires_the_token(monkeypatch):
         for path in ("/v1/debts", "/v1/promises", "/v1/config"):
             assert anonymous.get(path).status_code == 401, path
         assert anonymous.post("/v1/ask", json={"question": "x"}).status_code == 401
+        # The upload routes are the only ones a device off the tailnet can
+        # reach at all, so they are the ones that must fail closed loudest.
+        assert anonymous.post("/v1/recordings/probe", json={}).status_code == 401
+        assert (
+            anonymous.post(
+                "/v1/recordings",
+                data={"meta": "{}"},
+                files={"audio": ("a.m4a", b"x", "audio/mp4")},
+            ).status_code
+            == 401
+        )
 
 
 async def test_the_api_and_the_bot_never_disagree_about_a_balance(client, seeded):

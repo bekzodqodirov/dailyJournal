@@ -144,7 +144,9 @@ it recorded:
 | `/qarz` | Open balances, split into who owes you and who you owe |
 | `/vada` | Open promises, split into yours and theirs |
 | `/bugun` | Today: money in and out, people spoken to, new debts and promises |
-| `/kim <ism>` | One person: balances, promises, last contact |
+| `/kim <ism>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
+| `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
+| `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
 | `/hisobot` | Generate and send today's report right now |
 | `/reja` | Tomorrow's time-blocked plan |
@@ -153,6 +155,7 @@ it recorded:
 | `/xarajat` | What MIYA's own API calls cost this month |
 | `/unut` | Delete a person, a chat or a date range — asks first |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
+| `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
@@ -402,33 +405,76 @@ Telegram can never report different balances.
 * **The Telethon session string is a credential** — it grants full access to the
   owner's Telegram account. Keep it in `.env` or an encrypted file, never in the
   repository.
-* **Nightly backups are encrypted before they touch the disk.** `pg_dump` is
-  piped straight into `age`; the plaintext exists only inside that pipe. With
-  `BACKUP_AGE_RECIPIENT` unset the job writes nothing at all — an unencrypted
-  dump of every debt and transcript is not an acceptable fallback. Backups are
-  kept for `BACKUP_RETENTION_DAYS` (14) and a failing backup pings the owner.
-
-  ```bash
-  age-keygen -o secrets/backup-key.txt   # keep the private key OFF the VPS
-  # put the printed public key in BACKUP_AGE_RECIPIENT
-  make backup                            # run one now
-  age -d -i secrets/backup-key.txt data/backups/miya-….sql.age | psql …
-  ```
+* **Nightly backups are encrypted before they touch the disk.** `pg_dump -Fc`
+  (compressed custom format) is piped straight into `age`; the plaintext
+  exists only inside that pipe. With `BACKUP_AGE_RECIPIENT` unset the job
+  writes nothing at all — an unencrypted dump of every debt and transcript is
+  not an acceptable fallback. Backups are kept for `BACKUP_RETENTION_DAYS`
+  (14), the nightly file is also sent to the owner's Telegram as a document
+  (`BACKUP_TO_TELEGRAM`, in ≤ 45 MB pieces when large — still ciphertext),
+  and a failing or unsent backup pings the owner. See *Backups and restore*
+  below.
 
 * **`/unut` really deletes.** It shows exactly what would go — interactions,
   debts, promises, transactions, events, tasks, memories and media files — and
   only acts after the owner confirms. Cascades do the work, so nothing is left
   orphaned, and the audio and photos are unlinked from disk in the same pass.
 
+### Backups and restore
+
+**The key.** Backups are locked with an `age` key pair. The *public* key is
+`BACKUP_AGE_RECIPIENT` in `.env`; the *private* key is one line in
+`secrets/backup-key.txt`. Make it once and copy that file somewhere that is
+not this server — a password manager entry, a USB stick in a drawer, both:
+
+```bash
+age-keygen -o secrets/backup-key.txt   # prints the public key: put it in .env
+make backup                            # write one now, do not wait for 03:30
+```
+
+**Losing the key means losing every backup.** Nobody — not Telegram, not
+the person who wrote this — can open a `.dump.age` file without it. The
+files in Telegram and in `data/backups/` are only as safe as that one line.
+
+**What you have.** Every night at `BACKUP_TIME` the worker writes
+`data/backups/miya-<date>-<time>.dump.age` and sends the same file to your
+Telegram (as pieces `….dump.age.part01`, `.part02`, … when it is over 45 MB).
+`/holat` shows the newest one and whether it reached Telegram. Files from
+before this format, `….sql.age`, still open with
+`age -d -i secrets/backup-key.txt miya-….sql.age | psql "$DATABASE_URL"`.
+
+**Restoring, the three commands.** On a fresh server: clone the repo, copy
+`.env` and `secrets/backup-key.txt` back into place, put the backup file
+(or all of its pieces, from Telegram) into `data/backups/`, then:
+
+```bash
+docker compose up -d db                                               # 1. the database only
+make restore FILE=/data/backups/miya-20260915-033000.dump.age DRY=1   # 2. look inside first
+make restore FILE=/data/backups/miya-20260915-033000.dump.age         # 3. load it
+make up                                                               # 4. migrate forward, start everything
+```
+
+Only the database runs while the backup loads: the bot, worker and userbot
+would otherwise hold locks on the tables being replaced and write rows of
+their own. On a server that is already running, `docker compose stop bot
+worker userbot api` first and `make up` afterwards. For a split backup name
+any one piece, e.g. `….dump.age.part01`; the others are found next to it.
+The restore refuses a database that already holds people or debts; add
+`FORCE=1` to replace what is there. `make up` at the end brings an older
+backup up to the current schema.
+The decrypted dump exists only in a temporary file that is deleted when the
+command ends, success or not.
+
 ### Documented egress
 
-Three external services receive data. Nothing else leaves the VPS.
+Four external services receive data. Nothing else leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
 | **Anthropic API** | Message text, call transcripts, document text, receipt images | Extraction, daily report, planner, RAG answers |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
+| **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
 
 Embeddings run locally on the VPS CPU (`BAAI/bge-m3`) — no egress.
 

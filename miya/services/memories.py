@@ -8,12 +8,14 @@ extraction path must never wait on a 2 GB model). A worker job calls
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.config import settings
 from miya.db.models import Memory
 from miya.services.embeddings import Embedder
 
@@ -66,6 +68,49 @@ async def embed_pending(
     return len(rows)
 
 
+async def remember(
+    session: AsyncSession,
+    content: str,
+    *,
+    person_id: int | None = None,
+    occurred_at: datetime | None = None,
+    source_interaction_id: int | None = None,
+    tags: Iterable[str] = (),
+) -> Memory:
+    """The one place a memory row is built (extraction facts, summaries, /eslab).
+
+    The embedding is left NULL so ``embed_pending`` picks the row up on the
+    next worker tick; nothing here waits on the model.
+    """
+    text = (content or "").strip()
+    if not text:
+        raise ValueError("a memory needs some content")
+    memory = Memory(
+        content=text,
+        embedding=None,
+        person_id=person_id,
+        occurred_at=occurred_at or datetime.now(settings.tz),
+        tags=list(tags),
+        source_interaction_id=source_interaction_id,
+    )
+    session.add(memory)
+    return memory
+
+
+async def facts_for(
+    session: AsyncSession, person_id: int, *, limit: int = 20
+) -> list[Memory]:
+    """What is remembered about one person, newest first — no embedding needed."""
+    return list(
+        await session.scalars(
+            sa.select(Memory)
+            .where(Memory.person_id == person_id)
+            .order_by(Memory.occurred_at.desc(), Memory.id.desc())
+            .limit(limit)
+        )
+    )
+
+
 async def search(
     session: AsyncSession,
     embedder: Embedder,
@@ -73,8 +118,13 @@ async def search(
     *,
     k: int = 8,
     since: datetime | None = None,
+    person_id: int | None = None,
 ) -> list[MemoryHit]:
-    """Top-k memories by cosine similarity to the query."""
+    """Top-k memories by cosine similarity to the query.
+
+    ``person_id`` narrows the ranking to that person's facts — a fact about
+    Akmal is never an answer about Sardor, however similar the words.
+    """
     query = query.strip()
     if not query:
         return []
@@ -89,6 +139,8 @@ async def search(
     )
     if since is not None:
         stmt = stmt.where(Memory.occurred_at >= since)
+    if person_id is not None:
+        stmt = stmt.where(Memory.person_id == person_id)
 
     return [
         MemoryHit(memory=row[0], similarity=1.0 - float(row[1]))

@@ -11,9 +11,11 @@ hiccup cannot kill the handler before anything reached the database.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import sqlalchemy as sa
 from aiogram import Bot, F, Router
@@ -26,23 +28,29 @@ from aiogram.types import (
     Message,
 )
 
-from miya.bot import replies
-from miya.bot.formatting import clip
+from miya.bot import keyboards, replies
+from miya.bot.formatting import clip, escape, ref_of
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
-from miya.db.enums import Direction, InteractionSource
+from miya.db.enums import ChatType, Direction, InteractionSource
 from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
     approvals,
     audio,
+    brief,
     chats,
+    claims,
     documents,
+    health,
     memories,
+    nudges,
     planner,
     purge,
     queries,
     rag,
+    records,
+    reminders,
     reports,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -52,7 +60,7 @@ from miya.services.ingest import (
     process_interaction,
     transcribe_into,
 )
-from miya.services.people import best_match
+from miya.services.people import best_match, find_person
 
 log = logging.getLogger(__name__)
 
@@ -75,21 +83,52 @@ def _media_path(suffix: str) -> Path:
     return settings.media_dir / f"{stamp}-{uuid.uuid4().hex[:8]}{suffix}"
 
 
-async def _safe_answer(message: Message, text: str | None) -> None:
+async def _safe_answer(message: Message, text: str | None, *, reply_markup=None) -> None:
     """Reply after the data is durable; a failed send only costs the receipt."""
     if not text:
         return
     try:
-        await message.answer(text)
+        await message.answer(text, reply_markup=reply_markup)
         return
     except Exception:
         log.exception("could not send reply to owner (data is committed)")
     # Model-composed replies can contain broken HTML; a plain-text retry beats
     # the owner never seeing the answer at all.
     try:
-        await message.answer(text, parse_mode=None)
+        await message.answer(text, parse_mode=None, reply_markup=reply_markup)
     except Exception:
         log.exception("plain-text retry failed too")
+
+
+def _receipt(result) -> tuple[str, InlineKeyboardMarkup | None]:
+    """The confirmation text plus its ✅ / ✏️ / 🔄 rows, one per recorded row,
+    and a Ha / Yo'q / Tuzat row per claim a counterparty made in it.
+
+    The receipt is the ask: the claims it carries buttons for are marked as
+    asked here, inside the session scope that produced it, so the commit
+    that makes the rows durable records the question too. A send that then
+    fails leaves the claim pending in /davolar and the brief — never lost.
+    """
+    if not result.ok:
+        return replies.FAILED_EXTRACTION_HINT, None
+    applied = result.applied
+    keyboard = keyboards.applied_actions(
+        replies.confirmation_refs(applied), replies.confirmation_claim_ids(applied)
+    )
+    _ask(applied.claims, keyboard)
+    return replies.confirmation(applied), keyboard
+
+
+def _ask(pending, keyboard: InlineKeyboardMarkup | None) -> None:
+    """Mark as asked exactly the claims the keyboard carries a row for.
+
+    Read off the built keyboard, not re-derived: a keyboard has a ceiling,
+    and a claim whose row was capped away was not asked.
+    """
+    shown = set(keyboards.claim_ids_in(keyboard))
+    for claim in pending:
+        if claim.id in shown:
+            claims.mark_asked(claim)
 
 
 async def _typing(message: Message) -> None:
@@ -254,6 +293,24 @@ async def cmd_report(message: Message) -> None:
     await _safe_answer(message, clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"))
 
 
+@router.message(Command("ertalab"))
+async def cmd_brief(message: Message) -> None:
+    """The morning brief on demand — the same message the worker sends at
+    MORNING_BRIEF_TIME, with the same buttons. No model call: it is SQL."""
+    async with session_scope() as session:
+        data = await brief.gather(session)
+        body = replies.morning_brief(data)
+        due, stale = replies.morning_brief_refs(data)
+        keyboard = keyboards.brief_actions(
+            due,
+            stale,
+            claim_ids=replies.morning_brief_claim_ids(data),
+            missed_ids=replies.morning_brief_missed_ids(data),
+        )
+        _ask(data.claims, keyboard)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
 @router.message(Command("reja"))
 async def cmd_plan(message: Message) -> None:
     await _typing(message)
@@ -346,6 +403,24 @@ async def cmd_usage(message: Message, command: CommandObject) -> None:
     async with session_scope() as session:
         summary = await queries.usage_summary(session, first, min(last, today))
     await _safe_answer(message, replies.usage_report(summary))
+
+
+@router.message(Command("holat"))
+async def cmd_status(message: Message) -> None:
+    """`/holat` — is every part of MIYA alive, and what to type if not.
+
+    The judgement (services/health.py) is the same one the worker's health
+    job alerts on; asking here is only ever a read.
+    """
+    try:
+        async with session_scope() as session:
+            status = await health.gather(session)
+    except Exception:
+        # The one report that must still come out when the database is
+        # down: the db_down line and its remedy, from what the bot can see.
+        log.exception("/holat: the database did not answer")
+        status = health.Status.unreachable(datetime.now(settings.tz))
+    await _safe_answer(message, replies.status_report(status, health.problems(status)))
 
 
 @router.message(Command("unut"))
@@ -449,6 +524,41 @@ async def on_media_button(callback: CallbackQuery) -> None:
     await _edit_callback(callback, body)
 
 
+@router.callback_query(F.data.startswith("ng:"))
+async def on_new_group_button(callback: CallbackQuery) -> None:
+    """Ha / Yo'q under "Yangi guruh: … — o'qiymi?".
+
+    Only records the decision. "Ha" switches the chat on and queues a
+    backfill of the last week; the userbot — the one process with a Telegram
+    user session — reads it on its next sweep, exactly as with approved media.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
+        await callback.answer()
+        return
+    answer, monitor_id = parts[1], int(parts[2])
+
+    async with session_scope() as session:
+        if answer == "y":
+            monitor = await chats.accept_join(session, monitor_id)
+            body = (
+                replies.new_group_accepted(
+                    monitor.title, monitor.tg_chat_id, chats.BACKFILL_DAYS
+                )
+                if monitor is not None
+                else replies.NEW_GROUP_GONE
+            )
+        else:
+            monitor = await chats.decline_join(session, monitor_id)
+            body = (
+                replies.new_group_declined(monitor.title, monitor.tg_chat_id)
+                if monitor is not None
+                else replies.NEW_GROUP_GONE
+            )
+
+    await _edit_callback(callback, body)
+
+
 @router.callback_query(F.data.startswith("unut:"))
 async def on_purge_button(callback: CallbackQuery) -> None:
     parts = (callback.data or "").split(":")
@@ -492,20 +602,561 @@ async def _edit_callback(callback: CallbackQuery, text: str) -> None:
         log.debug("could not acknowledge the callback", exc_info=True)
 
 
-@router.message(Command("kim"))
-async def cmd_person(message: Message, command: CommandObject) -> None:
-    name = (command.args or "").strip()
-    if not name:
-        await _safe_answer(message, "Ism yozing: <code>/kim Akmal</code>")
+# --- closing and correcting one record (build step 1) -----------------------
+
+
+@router.message(Command("bajarildi"))
+async def cmd_done(message: Message, command: CommandObject) -> None:
+    """`/bajarildi d12` — kept: promise/task done, debt settled in full."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_DONE, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text, reply_markup=outcome.keyboard)
+
+
+@router.message(Command("yop"))
+async def cmd_close(message: Message, command: CommandObject) -> None:
+    """`/yop p7` — closed without counting as kept."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_CLOSE, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text, reply_markup=outcome.keyboard)
+
+
+@router.message(Command("qaytar"))
+async def cmd_reopen(message: Message, command: CommandObject) -> None:
+    """`/qaytar p7` — undo a close; the same thing the ↩️ button does."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.REF_USAGE)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_REOPEN, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text)
+
+
+@router.message(Command("tuzat"))
+async def cmd_edit(message: Message, command: CommandObject) -> None:
+    """`/tuzat d12 6 mln` — one field of one row; the old value is kept.
+
+    A refusal explains itself: an amount below the recorded repayments, a
+    currency change with payments on the books, a field the kind does not
+    have. A name MIYA does not know is not created on the spot — the owner
+    decided anything uncertain is asked first — so it comes back as a
+    question with Ha / Yo'q.
+    """
+    # Any whitespace after the ref: a newline or a tab is as good as a space.
+    parts = (command.args or "").split(None, 1)
+    handle = parts[0] if parts else ""
+    edit = records.parse_edit(parts[1] if len(parts) > 1 else "")
+    if not handle or edit is None:
+        await _safe_answer(message, replies.TUZAT_USAGE)
+        return
+    keyboard = None
+    async with session_scope() as session:
+        claim_id = claims.parse_ref(handle)
+        if claim_id is not None:
+            # "c12": a counterparty's claim, corrected before it is answered.
+            body, keyboard = await _edit_claim(session, claim_id, edit)
+            found = None
+        else:
+            found = await records.find(session, handle)
+            if found is None:
+                body = replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+        if found is not None:
+            kind, record = found
+            try:
+                change = await records.set_field(
+                    session, record, edit.field, edit.value, by=records.BY_COMMAND
+                )
+                body = replies.record_edited(change)
+            except records.NotEditable:
+                body = replies.FIELD_NOT_EDITABLE[kind]
+            except records.PaymentsExceed as exc:
+                body = replies.debt_payments_exceed(ref_of(record), exc)
+            except records.PaymentsExist:
+                body = replies.DEBT_CURRENCY_LOCKED.format(ref=ref_of(record))
+            except records.UnknownPerson as exc:
+                index = records.ask_new_person(record, exc.name, by=records.BY_COMMAND)
+                body = replies.new_person_question(exc.name)
+                keyboard = keyboards.new_person_question(ref_of(record), index)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _edit_claim(
+    session, claim_id: int, edit: records.Edit
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    """`/tuzat c12 summa 4 mln`: the claim's payload changes, the claim stays
+    pending, and the corrected question comes back with its buttons so the
+    owner answers it right there."""
+    try:
+        claim = await claims.edit(session, claim_id, edit, by=claims.BY_COMMAND)
+    except claims.AlreadyAnswered:
+        return replies.CLAIM_ALREADY, None
+    except ValueError:
+        claim = await claims.get(session, claim_id)
+        if claim is None:
+            return replies.CLAIM_GONE, None
+        view = claims.view(claim)
+        if edit.field not in claims.EDITABLE.get(claim.kind, ()):
+            body = replies.claim_field_refused(view, edit.field)
+        else:
+            body = replies.claim_value_refused(view)
+        return body, keyboards.claim_actions([claim_id])
+    if claim is None:
+        return replies.CLAIM_GONE, None
+    return replies.claim_edited(claims.view(claim)), keyboards.claim_actions([claim_id])
+
+
+async def _answer_new_person(session, action: str, handle: str, index: int) -> str:
+    """Ha / Yo'q on "Yangi odam 'Sardor' yaratilsinmi?".
+
+    Only "Ha" creates the person and attaches the row to it; "Yo'q" changes
+    nothing. The name comes from the row's history, where the question was
+    recorded, so a button pressed after a restart still knows it.
+    """
+    found = await records.find(session, handle)
+    if found is None:
+        return replies.RECORD_NOT_FOUND.format(ref=escape(handle))
+    kind, record = found
+    name = records.pending_person(record, index)
+    if name is None:
+        return replies.NEW_PERSON_EXPIRED
+    if action == keyboards.ACTION_PERSON_NO:
+        return replies.NEW_PERSON_DECLINED.format(name=escape(name))
+    try:
+        change = await records.set_field(
+            session, record, "person", name, by=records.BY_BUTTON, create_person=True
+        )
+    except records.NotEditable:
+        return replies.FIELD_NOT_EDITABLE[kind]
+    return replies.record_edited(change)
+
+
+class _Outcome(NamedTuple):
+    """What one action produced: the reply, whether the row's buttons should
+    go, and the keyboard the reply carries (the ↩️ Qaytar after a close).
+
+    "Finished" means the row was closed or reopened, or the owner said it is
+    still open and will be asked again in a week.
+    """
+
+    text: str
+    finished: bool
+    keyboard: InlineKeyboardMarkup | None = None
+
+
+async def _act(session, action: str, handle: str, *, by: str) -> _Outcome:
+    """Run one button/command action on one ref."""
+    found = await records.find(session, handle)
+    if found is None:
+        return _Outcome(replies.RECORD_NOT_FOUND.format(ref=escape(handle)), True)
+    kind, record = found
+    person = records.person_of(record)
+    undo = keyboards.reopen_actions([(kind, record.id)])
+    try:
+        if action == keyboards.ACTION_DONE or (
+            action == keyboards.ACTION_SETTLE_BALANCE and kind != "debt"
+        ):
+            change = await records.mark_done(session, record, by=by)
+            return _Outcome(replies.record_done(change), True, undo)
+        if action == keyboards.ACTION_SETTLE_BALANCE:
+            # A "Hali ochiqmi?" line is a balance; its ✅ settles every row.
+            changes = await records.settle_balance(session, record, by=by)
+            return _Outcome(
+                replies.balance_settled(changes),
+                True,
+                keyboards.reopen_actions([(c.kind, c.record.id) for c in changes]),
+            )
+        if action == keyboards.ACTION_CLOSE:
+            change = await records.close(session, record, by=by)
+            return _Outcome(replies.record_closed(change), True, undo)
+        if action == keyboards.ACTION_REOPEN:
+            change = await records.reopen(session, record, by=by)
+            return _Outcome(replies.record_reopened(change), True)
+        if action == keyboards.ACTION_FLIP:
+            if kind != "debt":
+                return _Outcome(replies.FIELD_NOT_EDITABLE[kind], False)
+            change = await records.flip(session, record, by=by)
+            return _Outcome(replies.record_edited(change), False)
+        if action == keyboards.ACTION_OPEN:
+            # A debt question is about a balance and its button is keyed by
+            # the first row: "open" means any row of the balance is open.
+            if kind == "debt":
+                rows = await records.open_in_balance(session, record)
+            else:
+                rows = [record] if records.is_open(record) else []
+            if not rows:
+                # A stale "Ha" on a row closed since the question went out:
+                # nothing to keep open, and no ack to log.
+                return _Outcome(replies.RECORD_ALREADY_CLOSED, True)
+            await reminders.acknowledge(session, kind, record)
+            return _Outcome(replies.record_still_open(kind, rows, person), True)
+        return _Outcome(replies.tuzat_hint(kind, ref_of(record)), False)
+    except records.NotOpen:
+        return _Outcome(replies.RECORD_ALREADY_CLOSED, True)
+    except records.AlreadyOpen:
+        return _Outcome(replies.RECORD_ALREADY_OPEN, True)
+    except records.NotReopenable:
+        return _Outcome(replies.DEBT_NOT_REOPENABLE.format(ref=ref_of(record)), True)
+    except records.NotClosable:
+        return _Outcome(replies.DEBT_NOT_CLOSABLE.format(ref=ref_of(record)), False)
+
+
+async def _answer_nudge(session, action: str, handle: str) -> str:
+    """✅ Javob berdim / ⏰ Ertaga on one nudged question.
+
+    "Answered" is written on the interaction's own metadata and is final: the
+    question leaves the brief, the report and the sweep at once. "Ertaga"
+    only snoozes the nudge until the next morning brief; the question itself
+    stays open and listed.
+    """
+    interaction_id = keyboards.parse_question_ref(handle)
+    interaction = (
+        await session.get(Interaction, interaction_id)
+        if interaction_id is not None
+        else None
+    )
+    if interaction is None:
+        return replies.NUDGE_GONE
+    if action == keyboards.ACTION_QUESTION_ANSWERED:
+        nudges.mark_answered(interaction, by=records.BY_BUTTON)
+        # And every follow-up, not only the newest: the open-loops engine
+        # walks only rows older than LOOP_QUESTION_HOURS, so a mark on a
+        # follow-up sent an hour ago is invisible to it for hours, and an
+        # older, unmarked "qachon?" would surface as a fresh nudge the moment
+        # this one was closed.
+        for row in await _follow_ups(session, interaction):
+            nudges.mark_answered(row, by=records.BY_BUTTON)
+        return replies.NUDGE_ANSWERED
+    until = nudges.next_morning()
+    nudges.snooze(interaction, until=until)
+    return replies.nudge_snoozed(until)
+
+
+async def _answer_missed(session, action: str, handle: str) -> str:
+    """✅ Bog'landim / ⏰ Ertalab eslat on one missed-call loop (build step 6).
+
+    The marks live on the loop's own interaction, exactly as they do for a
+    nudged question: "Bog'landim" is final for every ring at or before it
+    (loops.missed_calls reads the mark's timestamp as the floor for that
+    number), "Ertalab" only snoozes the nudge — the loop itself stays open
+    and listed until a real contact or the ✅ closes it.
+    """
+    interaction_id = keyboards.parse_missed_ref(handle)
+    interaction = (
+        await session.get(Interaction, interaction_id)
+        if interaction_id is not None
+        else None
+    )
+    if interaction is None:
+        return replies.MISSED_GONE
+    if action == keyboards.ACTION_MISSED_ANSWERED:
+        nudges.mark_answered(interaction, by=records.BY_BUTTON)
+        return replies.MISSED_ANSWERED
+    until = nudges.next_morning()
+    nudges.snooze(interaction, until=until)
+    return replies.nudge_snoozed(until)
+
+
+async def _follow_ups(session, question: Interaction) -> list[Interaction]:
+    """Every incoming userbot message in the question's chat since it, oldest
+    first.
+
+    In a group only messages aimed at the owner count, the same rows the
+    open-loops engine reads there; other people talking afterwards is not
+    a follow-up. Empty when the question is the newest message itself.
+    """
+    if question.tg_chat_id is None:
+        return []
+    chat_type = await session.scalar(
+        sa.select(ChatMonitor.chat_type).where(
+            ChatMonitor.tg_chat_id == question.tg_chat_id
+        )
+    )
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.source == InteractionSource.telegram_userbot)
+        .where(Interaction.direction == Direction.in_)
+        .where(Interaction.tg_chat_id == question.tg_chat_id)
+        .where(Interaction.occurred_at >= question.occurred_at)
+        .where(Interaction.id != question.id)
+        .order_by(Interaction.occurred_at, Interaction.id)
+    )
+    if chat_type is not ChatType.private:
+        stmt = stmt.where(queries._addressed_to_owner())
+    return list(await session.scalars(stmt))
+
+
+@router.callback_query(F.data.startswith("rec:"))
+async def on_record_button(callback: CallbackQuery) -> None:
+    """✅ / ✏️ / 🔄 / Ha / Yop / ↩️ Qaytar on a confirmation, reminder or outcome.
+
+    The outcome goes out as its own message — the confirmation or reminder
+    stays readable — and the finished row's buttons are removed, leaving the
+    others in place.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) == 4 and parts[1] in keyboards.PERSON_ANSWERS and parts[3].isdigit():
+        async with session_scope() as session:
+            text = await _answer_new_person(session, parts[1], parts[2], int(parts[3]))
+        await _edit_callback(callback, text)
+        return
+    if len(parts) != 3:
+        await callback.answer()
+        return
+    action, handle = parts[1], parts[2]
+    if action in keyboards.QUESTION_ANSWERS:
+        # A nudged question, not a record: "q<interaction id>".
+        async with session_scope() as session:
+            text = await _answer_nudge(session, action, handle)
+        await _edit_callback(callback, text)
+        return
+    if action in keyboards.MISSED_ANSWERS:
+        # A missed-call loop, not a record: "m<interaction id>". Unlike a
+        # question nudge, its row also rides the morning brief, so the
+        # outcome goes out as its own message and only the tapped row leaves
+        # the keyboard — the brief's other buttons still have work to do.
+        async with session_scope() as session:
+            text = await _answer_missed(session, action, handle)
+        if callback.message is not None:
+            try:
+                await callback.message.edit_reply_markup(
+                    reply_markup=keyboards.without(callback.message.reply_markup, handle)
+                )
+            except Exception:
+                log.debug("could not trim the missed-call keyboard", exc_info=True)
+            await _safe_answer(callback.message, text)
+        try:
+            await callback.answer()
+        except Exception:
+            log.debug("could not acknowledge the callback", exc_info=True)
         return
 
     async with session_scope() as session:
-        people = list(await session.scalars(sa.select(Person)))
-        person, score = best_match(name, people)
-        if person is None or score < 70:
-            body = replies.person_not_found(name)
-        else:
+        outcome = await _act(session, action, handle, by=records.BY_BUTTON)
+
+    if outcome.finished and callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.without(callback.message.reply_markup, handle)
+            )
+        except Exception:
+            log.debug("could not trim the record keyboard", exc_info=True)
+    if callback.message is not None:
+        await _safe_answer(callback.message, outcome.text, reply_markup=outcome.keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
+# --- a counterparty's claim: ask first (build step 3) -------------------------
+
+
+@router.message(Command("davolar"))
+async def cmd_claims(message: Message) -> None:
+    """`/davolar` — every claim still waiting for the owner's word, oldest
+    first, each with its Ha / Yo'q / Tuzat row. Listing is asking: what is
+    shown with buttons is marked as asked."""
+    async with session_scope() as session:
+        pending = await claims.pending(session)
+        shown = pending[: keyboards.MAX_ROWS]
+        body = replies.claims_list(
+            [claims.view(c) for c in shown], hidden=len(pending) - len(shown)
+        )
+        keyboard = keyboards.claim_actions([c.id for c in shown])
+        _ask(shown, keyboard)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _answer_claim(session, action: str, claim_id: int) -> _Outcome | None:
+    """Ha / Yo'q / Tuzat on one claim. None for an action that is not one."""
+    try:
+        if action == keyboards.ACTION_CLAIM_YES:
+            accepted = await claims.accept(session, claim_id, by=claims.BY_BUTTON)
+            if accepted is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            # The row it became gets the receipt's own buttons — and nothing
+            # in it can be a claim again, so there is no second question.
+            keyboard = keyboards.applied_actions(
+                replies.confirmation_refs(accepted.applied), []
+            )
+            # Nothing written → the claim is still pending and its row stays.
+            return _Outcome(replies.claim_accepted(accepted), accepted.written, keyboard)
+        if action == keyboards.ACTION_CLAIM_NO:
+            claim = await claims.decline(session, claim_id, by=claims.BY_BUTTON)
+            if claim is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            return _Outcome(replies.CLAIM_DECLINED, True)
+        if action == keyboards.ACTION_CLAIM_EDIT:
+            claim = await claims.get(session, claim_id)
+            if claim is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            if claim.state != claims.PENDING:
+                return _Outcome(replies.CLAIM_ALREADY, True)
+            return _Outcome(replies.claim_tuzat_hint(claims.view(claim)), False)
+    except claims.AlreadyAnswered:
+        return _Outcome(replies.CLAIM_ALREADY, True)
+    return None
+
+
+@router.callback_query(F.data.startswith("cl:"))
+async def on_claim_button(callback: CallbackQuery) -> None:
+    """✅ Ha / ✖️ Yo'q / ✏️ Tuzat under a counterparty's claim.
+
+    "Ha" writes the item exactly as the extraction would have, had the owner
+    said it himself; "Yo'q" writes nothing. The outcome goes out as its own
+    message and the answered claim's row leaves the keyboard — the receipt,
+    brief or list it sat on stays readable, with its other rows intact. A
+    second tap finds the claim answered (the row lock in claims.accept) and
+    says so instead of writing twice.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer()
+        return
+    action, claim_id = parts[1], int(parts[2])
+
+    async with session_scope() as session:
+        outcome = await _answer_claim(session, action, claim_id)
+    if outcome is None:
+        await callback.answer()
+        return
+
+    if outcome.finished and callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.without_claim(
+                    callback.message.reply_markup, claim_id
+                )
+            )
+        except Exception:
+            log.debug("could not trim the claim keyboard", exc_info=True)
+    if callback.message is not None:
+        await _safe_answer(callback.message, outcome.text, reply_markup=outcome.keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
+async def _lookup(
+    session, name: str, *, command: str
+) -> tuple[Person | None, str | None]:
+    """The person a question names, or the reply that says why there is none.
+
+    A question tolerates a looser match than a write (QUESTION_THRESHOLD),
+    but two people scoring alike are asked back, never guessed: a wrong
+    guess here answers about the wrong person.
+    """
+    match = await find_person(session, name)
+    if match.person is None:
+        return None, replies.person_not_found(name)
+    if match.ambiguous:
+        return None, replies.person_ambiguous(match, command=command)
+    return match.person, None
+
+
+@router.message(Command("kim"))
+async def cmd_person(message: Message, command: CommandObject) -> None:
+    """Everything held about one person: profile, figures, facts, history."""
+    name = (command.args or "").strip()
+    if not name:
+        await _safe_answer(message, replies.KIM_USAGE)
+        return
+
+    async with session_scope() as session:
+        person, body = await _lookup(session, name, command="kim")
+        if person is not None:
             body = replies.person_report(await queries.person_summary(session, person))
+    await _safe_answer(message, body)
+
+
+_TARIX_COUNT = re.compile(r"^(?P<name>.+?)\s+(?P<count>\d{1,4})$")
+
+
+def _parse_history_args(args: str) -> tuple[str, int]:
+    """'Akmal 50' → ('Akmal', 50); 'Akmal' → ('Akmal', TARIX_DEFAULT).
+
+    The count is clamped to [1, TARIX_MAX]: a request for a thousand lines
+    is a request for as many as one message can carry.
+    """
+    args = args.strip()
+    found = _TARIX_COUNT.match(args)
+    if found is None:
+        return args, replies.TARIX_DEFAULT
+    count = min(max(int(found.group("count")), 1), replies.TARIX_MAX)
+    return found.group("name").strip(), count
+
+
+@router.message(Command("tarix"))
+async def cmd_history(message: Message, command: CommandObject) -> None:
+    """A person's contact history, oldest at the top, newest at the bottom."""
+    name, count = _parse_history_args(command.args or "")
+    if not name:
+        await _safe_answer(message, replies.TARIX_USAGE)
+        return
+
+    async with session_scope() as session:
+        person, body = await _lookup(session, name, command="tarix")
+        if person is not None:
+            entries = await queries.timeline(session, person.id, limit=count)
+            body = replies.history_report(person, entries, requested=count)
+    await _safe_answer(message, body)
+
+
+# "/eslab Akmal: matn" or "/eslab Akmal — matn": the first colon or dash
+# splits the name from the words.
+_ESLAB_SPLIT = re.compile(r"\s*(?::|—|–)\s*")
+
+
+def _parse_remember_args(args: str) -> tuple[str, str] | None:
+    parts = _ESLAB_SPLIT.split(args.strip(), maxsplit=1)
+    if len(parts) != 2:
+        return None
+    name, text = parts[0].strip(), parts[1].strip()
+    if not name or not text:
+        return None
+    return name, text
+
+
+@router.message(Command("eslab"))
+async def cmd_remember(message: Message, command: CommandObject) -> None:
+    """The owner tells MIYA something about a person, in his own words.
+
+    Stored as a memory against the person (tag ``manual``); the worker
+    embeds it on its next tick. No extraction: what he typed is the fact.
+    """
+    parsed = _parse_remember_args(command.args or "")
+    if parsed is None:
+        await _safe_answer(message, replies.ESLAB_USAGE)
+        return
+    name, text = parsed
+
+    async with session_scope() as session:
+        person, body = await _lookup(session, name, command="eslab")
+        if person is not None:
+            await memories.remember(
+                session,
+                text,
+                person_id=person.id,
+                occurred_at=datetime.now(settings.tz),
+                tags=["manual"],
+            )
+            body = replies.remembered(person, text)
     await _safe_answer(message, body)
 
 
@@ -570,7 +1221,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             },
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
-        reply = await _process_on_demand(
+        reply, keyboard = await _process_on_demand(
             session,
             interaction,
             path,
@@ -578,43 +1229,39 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             is_audio=is_audio,
             is_photo=is_photo,
         )
-    await _safe_answer(message, reply)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 async def _process_on_demand(
     session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
-) -> str:
+) -> tuple[str, InlineKeyboardMarkup | None]:
     """Run the right pipeline for one explicitly requested media file."""
     if is_video:
         audio_path = path.with_suffix(".mp3")
         if not await audio.extract_audio(path, audio_path):
             interaction.needs_review = True
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
         interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
         if await transcribe_into(session, interaction, audio_path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
     elif is_audio:
         if await transcribe_into(session, interaction, path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT
+            return replies.TRANSCRIPTION_FAILED_HINT, None
     elif is_photo:
         described = await describe_into(session, interaction, path)
         if described is None and not interaction.raw_text:
-            return replies.PHOTO_FAILED_HINT
+            return replies.PHOTO_FAILED_HINT, None
     else:
         parsed = await documents.read_document_async(path)
         if parsed is None and not interaction.raw_text:
             interaction.needs_review = True
-            return replies.DOCUMENT_FAILED_HINT
+            return replies.DOCUMENT_FAILED_HINT, None
         if parsed is not None:
             interaction.transcript = parsed.text
 
     interaction.media = {**(interaction.media or {}), "processed": True}
     result = await process_interaction(session, interaction)
-    return (
-        replies.confirmation(result.applied)
-        if result.ok
-        else replies.FAILED_EXTRACTION_HINT
-    )
+    return _receipt(result)
 
 
 # --- content ----------------------------------------------------------------
@@ -650,12 +1297,8 @@ async def on_text(message: Message) -> None:
             occurred_at=message.date.astimezone(settings.tz),
         )
         result = await process_interaction(session, interaction)
-        reply = (
-            replies.confirmation(result.applied)
-            if result.ok
-            else replies.FAILED_EXTRACTION_HINT
-        )
-    await _safe_answer(message, reply)
+        reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.voice | F.audio)
@@ -685,17 +1328,14 @@ async def on_voice(message: Message, bot: Bot) -> None:
             },
         )
         text = await transcribe_into(session, interaction, path)
+        keyboard = None
         if text is None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            reply = (
-                replies.confirmation(result.applied)
-                if result.ok
-                else replies.FAILED_EXTRACTION_HINT
-            )
-    await _safe_answer(message, reply)
+            reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.photo)
@@ -723,24 +1363,18 @@ async def on_photo(message: Message, bot: Bot) -> None:
         )
         # Photos sent straight to the bot are always vision-processed (spec §6).
         described = await describe_into(session, interaction, path)
+        keyboard = None
         if described is None and not message.caption:
             reply = replies.PHOTO_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            if not result.ok:
-                reply = replies.FAILED_EXTRACTION_HINT
-            elif described is None:
+            reply, keyboard = _receipt(result)
+            if result.ok and described is None:
                 # The caption was extracted, but the image itself was not read —
                 # the owner must not be told everything succeeded.
-                reply = (
-                    replies.confirmation(result.applied)
-                    + "\n"
-                    + replies.VISION_PARTIAL_HINT
-                )
-            else:
-                reply = replies.confirmation(result.applied)
-    await _safe_answer(message, reply)
+                reply = reply + "\n" + replies.VISION_PARTIAL_HINT
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.document)
@@ -770,6 +1404,7 @@ async def on_document(message: Message, bot: Bot) -> None:
             },
         )
         parsed = await documents.read_document_async(path)
+        keyboard = None
         if parsed is None and not message.caption:
             interaction.needs_review = True
             reply = replies.DOCUMENT_FAILED_HINT
@@ -785,12 +1420,8 @@ async def on_document(message: Message, bot: Bot) -> None:
                 }
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
-            reply = (
-                replies.confirmation(result.applied)
-                if result.ok
-                else replies.FAILED_EXTRACTION_HINT
-            )
-    await _safe_answer(message, reply)
+            reply, keyboard = _receipt(result)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.video_note)
@@ -802,6 +1433,7 @@ async def on_video_note(message: Message, bot: Bot) -> None:
         return
 
     audio_path = path.with_suffix(".mp3")
+    keyboard = None
     async with session_scope() as session:
         # The row is created *before* ffmpeg runs. A failed audio extraction
         # must still leave a needs_review interaction the owner can find in
@@ -834,13 +1466,9 @@ async def on_video_note(message: Message, bot: Bot) -> None:
             else:
                 interaction.media = {**(interaction.media or {}), "processed": True}
                 result = await process_interaction(session, interaction)
-                reply = (
-                    replies.confirmation(result.applied)
-                    if result.ok
-                    else replies.FAILED_EXTRACTION_HINT
-                )
+                reply, keyboard = _receipt(result)
     # Replied only after the commit, like every other handler here.
-    await _safe_answer(message, reply)
+    await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 @router.message(F.video)

@@ -1,6 +1,6 @@
 """Tomorrow planner (spec §8): `/reja` and the daily report's last section.
 
-All inputs are SQL; Sonnet only arranges them into a realistic time-blocked
+All inputs are SQL; the reasoning model only arranges them into a realistic time-blocked
 Uzbek schedule around the fixed event times. If the API call fails, the owner
 still gets the deterministic listing — a plan must never silently vanish.
 """
@@ -107,7 +107,7 @@ def render_inputs(inputs: PlanInputs) -> str:
 
 
 async def plan_for(session: AsyncSession, day: date) -> str:
-    """A plan for one day. Falls back to the raw listing when Sonnet fails."""
+    """A plan for one day. Falls back to the raw listing when the model fails."""
     inputs = await plan_inputs(session, day)
     data_block = render_inputs(inputs)
 

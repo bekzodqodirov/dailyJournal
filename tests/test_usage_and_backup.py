@@ -205,14 +205,23 @@ async def test_a_real_backup_round_trips_through_age(session, monkeypatch, tmp_p
     result = await backup.create_backup()
 
     assert result.ok, result.error
+    assert result.path.name.endswith(".dump.age")
     assert result.path.stat().st_mode & 0o777 == 0o600  # owner-only
     plaintext = subprocess.run(
         ["age", "-d", "-i", str(key), str(result.path)],
         check=True,
         capture_output=True,
-    ).stdout.decode()
-    assert "PostgreSQL database dump" in plaintext
-    assert "CREATE TABLE public.debts" in plaintext
+    ).stdout
+    # pg_dump's custom archive, not SQL: pg_restore's input.
+    assert plaintext.startswith(b"PGDMP")
+    if shutil.which("pg_restore"):
+        archive = tmp_path / "plain.dump"
+        archive.write_bytes(plaintext)
+        toc = subprocess.run(
+            ["pg_restore", "--list", str(archive)], check=True, capture_output=True
+        ).stdout.decode()
+        assert "debts" in toc
+    assert await backup.newest_backup() == result.path
 
 
 def test_a_file_without_a_timestamp_is_never_deleted(monkeypatch, tmp_path):
@@ -222,3 +231,136 @@ def test_a_file_without_a_timestamp_is_never_deleted(monkeypatch, tmp_path):
 
     assert backup.prune_old(now=datetime(2030, 1, 1, tzinfo=TZ)) == 0
     assert odd.exists()
+
+
+# --- the step-5 format: .dump.age, old .sql.age left alone ------------------
+
+
+def test_the_current_format_is_pg_restore_custom():
+    assert backup.BACKUP_SUFFIX == ".dump.age"
+    assert backup.LEGACY_SUFFIX == ".sql.age"
+
+
+def test_old_sql_backups_are_neither_pruned_nor_current(monkeypatch, tmp_path):
+    """A pre-step-5 ``.sql.age`` is the owner's to delete: prune skips it and
+    it is never reported as the newest backup, however recent."""
+    monkeypatch.setattr(settings, "backup_dir", str(tmp_path))
+    monkeypatch.setattr(settings, "backup_retention_days", 14)
+    now = datetime(2026, 9, 15, 3, 30, tzinfo=TZ)
+
+    legacy_old = tmp_path / f"miya-20260101-033000{backup.LEGACY_SUFFIX}"
+    legacy_new = tmp_path / f"miya-20260915-020000{backup.LEGACY_SUFFIX}"
+    current = tmp_path / f"miya-20260914-033000{backup.BACKUP_SUFFIX}"
+    stale = tmp_path / f"miya-20260801-033000{backup.BACKUP_SUFFIX}"
+    for path in (legacy_old, legacy_new, current, stale):
+        path.write_bytes(b"x")
+
+    assert backup.prune_old(now=now) == 1
+    assert legacy_old.exists()
+    assert legacy_new.exists()
+    assert current.exists()
+    assert not stale.exists()
+
+
+async def test_newest_backup_ignores_pieces_partials_and_legacy_files(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(settings, "backup_dir", str(tmp_path))
+    older = tmp_path / f"miya-20260913-033000{backup.BACKUP_SUFFIX}"
+    newest = tmp_path / f"miya-20260914-033000{backup.BACKUP_SUFFIX}"
+    for path in (
+        older,
+        newest,
+        tmp_path / f"miya-20260915-033000{backup.LEGACY_SUFFIX}",
+        tmp_path / f"miya-20260916-033000{backup.BACKUP_SUFFIX}.partial",
+        tmp_path / f"miya-20260916-033000{backup.BACKUP_SUFFIX}.part01",
+        tmp_path / f"notes{backup.BACKUP_SUFFIX}",
+    ):
+        path.write_bytes(b"x")
+
+    assert await backup.newest_backup() == newest
+
+
+async def test_newest_backup_survives_a_missing_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "backup_dir", str(tmp_path / "nowhere" / "yet"))
+    assert await backup.newest_backup() is None
+
+
+def test_backup_stamp_reads_the_name():
+    from pathlib import Path
+
+    stamp = backup.backup_stamp(Path("miya-20260915-033000.dump.age"))
+    assert stamp == datetime(2026, 9, 15, 3, 30, tzinfo=TZ)
+    assert backup.backup_stamp(Path("manual.dump.age")) is None
+    assert backup.backup_stamp(Path("miya-20261399-033000.dump.age")) is None
+
+
+# --- the Telegram copy: pieces under the 50 MB document cap -----------------
+
+
+def _sparse_file(path, size: int) -> None:
+    with path.open("wb") as handle:
+        handle.seek(size - 1)
+        handle.write(b"\0")
+
+
+def test_a_small_backup_goes_as_one_document(tmp_path):
+    path = tmp_path / f"miya-20260915-033000{backup.BACKUP_SUFFIX}"
+    path.write_bytes(b"small")
+    assert backup.split_for_telegram(path) == [path]
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_a_100mb_backup_becomes_three_pieces_and_is_cleaned_up(tmp_path):
+    import hashlib
+
+    path = tmp_path / f"miya-20260915-033000{backup.BACKUP_SUFFIX}"
+    size = 100 * 1024 * 1024
+    _sparse_file(path, size)
+    # Make the content non-trivial so the join really is checked.
+    with path.open("r+b") as handle:
+        handle.seek(46 * 1024 * 1024)
+        handle.write(b"MIYA")
+
+    parts = backup.split_for_telegram(path)
+
+    assert [p.name for p in parts] == [f"{path.name}.part0{n}" for n in (1, 2, 3)]
+    assert [p.stat().st_size for p in parts] == [
+        backup.TELEGRAM_PART_BYTES,
+        backup.TELEGRAM_PART_BYTES,
+        size - 2 * backup.TELEGRAM_PART_BYTES,
+    ]
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in parts)
+    joined = hashlib.sha256()
+    for part in parts:
+        joined.update(part.read_bytes())
+    assert joined.hexdigest() == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert [backup.part_number(p) for p in parts] == [1, 2, 3]
+
+    backup.remove_parts(parts)
+
+    assert not any(p.exists() for p in parts)
+    assert path.exists()  # the backup itself is never touched
+    backup.remove_parts([path])
+    assert path.exists()
+
+
+def test_a_backup_past_the_piece_cap_is_refused_before_writing(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setattr(backup, "TELEGRAM_PART_BYTES", 1024)
+    monkeypatch.setattr(backup, "MAX_PARTS", 2)
+    path = tmp_path / f"miya-20260915-033000{backup.BACKUP_SUFFIX}"
+    _sparse_file(path, 5 * 1024)
+
+    with pytest.raises(backup.BackupTooLarge):
+        backup.split_for_telegram(path)
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_part_number_only_reads_pieces():
+    from pathlib import Path
+
+    assert backup.part_number(Path("miya-x.dump.age.part07")) == 7
+    assert backup.part_number(Path("miya-x.dump.age")) is None
+    assert backup.part_number(Path("miya-x.dump.age.partial")) is None

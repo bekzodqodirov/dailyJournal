@@ -1,0 +1,449 @@
+"""Phone events (build step 6): call-log entries and SMS from the companion.
+
+The Android app uploads two metadata streams next to the recordings it
+already sends: call-log events (incoming/outgoing/missed/rejected — number,
+timestamp, duration, nothing else) and SMS, mostly payment notifications.
+This module is the whole server side of that ingest:
+
+* every event becomes exactly one interaction, idempotently — the key is
+  minted on the phone (``call_event_key`` / ``sms_event_key``) and the
+  partial unique index ``ux_interactions_event_key`` is the guarantee; the
+  pre-select here only makes retried batches cheap;
+* a money SMS is parsed DETERMINISTICALLY (services/sms_money.py) into one
+  transaction. A bank SMS is the bank's record, not a counterparty claim:
+  nothing here calls ``ingest.process_interaction`` or the claim gate, and
+  no model token is ever spent on it;
+* a call-log row must NEVER carry ``media["call_id"]``. The recording
+  uploader dedupes on that key (call_recordings.find_ingested), the phone
+  deletes the audio when told "duplicate" — a call-log row wearing the
+  recording's key would destroy the recording of that same call. Event rows
+  use ``media["event_key"]`` and nothing else.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime
+
+import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from miya.db.enums import Direction, InteractionSource
+from miya.db.models import Interaction, Transaction
+from miya.services import sms_money
+from miya.services.people import find_by_phone, resolve_person
+
+log = logging.getLogger(__name__)
+
+CALL_TYPES = ("incoming", "outgoing", "missed", "rejected", "unknown")
+MEDIA_CALL_LOG = "call_log"
+MEDIA_SMS = "sms"
+# One upload may carry at most this many events; the API caps the request
+# body to the same figure, so a bigger batch is a caller bug, not data.
+MAX_BATCH = 200
+# The API refuses longer bodies too; this is the service's own line.
+SMS_BODY_MAX_CHARS = 4096
+
+# Only a conversation has a direction; a missed or rejected ring does not.
+_DIRECTION_OF_CALL = {"incoming": Direction.in_, "outgoing": Direction.out}
+
+_MISSED_LABEL = {"missed": "javobsiz", "rejected": "rad etilgan"}
+
+
+def call_event_key(device_id: str, call_log_id: int) -> str:
+    """The dedupe key of one call-log row: stable across retries."""
+    return f"{device_id}:call:{call_log_id}"
+
+
+def sms_event_key(
+    device_id: str,
+    sms_id: int,
+    sender: str,
+    received_at: datetime | str,
+    body: str,
+) -> str:
+    """The dedupe key of one SMS.
+
+    The content hash is load-bearing: Android's ``Sms._ID`` restarts after a
+    wipe, so the provider id alone could make a genuinely new message look
+    like an old one. Hashing sender, timestamp and body ties the key to the
+    message itself.
+    """
+    if isinstance(received_at, str):
+        received_at = datetime.fromisoformat(received_at)
+    digest = hashlib.sha256(
+        f"{sender}|{received_at.isoformat()}|{body}".encode()
+    ).hexdigest()[:16]
+    return f"{device_id}:sms:{sms_id}:{digest}"
+
+
+@dataclass(slots=True)
+class EventOutcome:
+    """What one batch became: nothing in it is ever silently dropped —
+    every event is accepted, a duplicate, or rejected with its reason."""
+
+    accepted: int = 0
+    duplicates: int = 0
+    rejected: list[tuple[int, str]] = field(default_factory=list)  # (index, reason)
+
+
+# --- validation ---------------------------------------------------------------
+
+
+def _parse_ts(value: object) -> datetime | None:
+    """A client timestamp: ISO-8601 WITH an offset (or an aware datetime).
+
+    Used verbatim as ``occurred_at`` so retries stay stable; a naive value
+    would be ambiguous the moment the phone travels, so it is refused.
+    """
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value
+    return None
+
+
+def _int(value: object, *, minimum: int | None = None) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if minimum is not None and value < minimum:
+        return None
+    return value
+
+
+def _optional_str(value: object) -> tuple[str | None, bool]:
+    """(cleaned value, ok): None and '' collapse to None, non-strings fail."""
+    if value is None:
+        return None, True
+    if isinstance(value, str):
+        return value.strip() or None, True
+    return None, False
+
+
+def _validate_call(event: dict) -> tuple[dict | None, str | None]:
+    call_log_id = _int(event.get("call_log_id"), minimum=0)
+    if call_log_id is None:
+        return None, "bad call_log_id"
+    started_at = _parse_ts(event.get("started_at"))
+    if started_at is None:
+        return None, "bad started_at (ISO-8601 with offset required)"
+    duration = _int(event.get("duration_seconds"), minimum=0)
+    if duration is None:
+        return None, "bad duration_seconds"
+    call_type = event.get("type")
+    if call_type not in CALL_TYPES:
+        return None, "bad type"
+    number, ok = _optional_str(event.get("number"))
+    if not ok:
+        return None, "bad number"
+    contact_name, ok = _optional_str(event.get("contact_name"))
+    if not ok:
+        return None, "bad contact_name"
+    sim_slot = event.get("sim_slot")
+    if sim_slot is not None and _int(sim_slot) is None:
+        return None, "bad sim_slot"
+    return {
+        "call_log_id": call_log_id,
+        "started_at": started_at,
+        "duration_seconds": duration,
+        "type": call_type,
+        "number": number,
+        "contact_name": contact_name,
+    }, None
+
+
+def _validate_sms(message: dict) -> tuple[dict | None, str | None]:
+    sms_id = _int(message.get("sms_id"), minimum=0)
+    if sms_id is None:
+        return None, "bad sms_id"
+    sender = message.get("sender")
+    if not isinstance(sender, str) or not sender.strip():
+        return None, "bad sender"
+    received_at = _parse_ts(message.get("received_at"))
+    if received_at is None:
+        return None, "bad received_at (ISO-8601 with offset required)"
+    body = message.get("body")
+    if not isinstance(body, str):
+        return None, "bad body"
+    if len(body) > SMS_BODY_MAX_CHARS:
+        return None, f"body over {SMS_BODY_MAX_CHARS} chars"
+    sim_slot = message.get("sim_slot")
+    if sim_slot is not None and _int(sim_slot) is None:
+        return None, "bad sim_slot"
+    return {
+        "sms_id": sms_id,
+        "sender": sender.strip(),
+        "received_at": received_at,
+        "body": body,
+        "sim_slot": sim_slot,
+    }, None
+
+
+# --- shared mechanics ---------------------------------------------------------
+
+
+async def _existing_event_keys(session: AsyncSession, keys: list[str]) -> set[str]:
+    """Which of these keys are already interactions — one IN query, so a
+    fully-duplicate retry batch costs a single index scan."""
+    if not keys:
+        return set()
+    rows = await session.scalars(
+        sa.select(Interaction.media["event_key"].astext).where(
+            Interaction.media["event_key"].astext.in_(keys)
+        )
+    )
+    return set(rows)
+
+
+async def _ingest_batch(
+    session: AsyncSession, device_id: str, events: list[dict], validate, key_of, insert
+) -> EventOutcome:
+    """Validate, pre-select, then insert each event under its own SAVEPOINT.
+
+    The savepoint (session.begin_nested) catching IntegrityError is the real
+    race guard: two workers posting the same event both pass the pre-select,
+    and the second one's insert lands on ux_interactions_event_key and is
+    counted a duplicate instead of failing the batch. The caller commits.
+    """
+    if len(events) > MAX_BATCH:
+        raise ValueError(f"batch of {len(events)} exceeds MAX_BATCH={MAX_BATCH}")
+    outcome = EventOutcome()
+    prepared: list[tuple[int, dict | None, str | None, str | None]] = []
+    keys: list[str] = []
+    for index, event in enumerate(events):
+        fields, error = validate(event)
+        if error is not None or fields is None:
+            prepared.append((index, None, None, error or "invalid"))
+            continue
+        key = key_of(device_id, fields)
+        prepared.append((index, fields, key, None))
+        keys.append(key)
+
+    existing = await _existing_event_keys(session, keys)
+    for index, fields, key, error in prepared:
+        if error is not None:
+            outcome.rejected.append((index, error))
+            continue
+        if key in existing:
+            outcome.duplicates += 1
+            continue
+        try:
+            async with session.begin_nested():
+                await insert(session, device_id, key, fields)
+        except IntegrityError as exc:
+            # Only the event-key collision is a duplicate; any other
+            # constraint would be a programming error hiding as one.
+            constraint = getattr(
+                getattr(getattr(exc, "orig", None), "diag", None),
+                "constraint_name",
+                None,
+            )
+            if constraint is not None and constraint != "ux_interactions_event_key":
+                raise
+            if constraint is None:
+                log.debug("integrity error taken as a duplicate for %s", key)
+            outcome.duplicates += 1
+            continue
+        existing.add(key)  # the same batch may carry the same event twice
+        outcome.accepted += 1
+    return outcome
+
+
+# --- call-log events ----------------------------------------------------------
+
+
+def _call_line(call_type: str, who: str) -> str:
+    """The one Uzbek line /tarix shows for a call-log row (raw; the renderer
+    escapes). Mirrors call_recordings._context_line's arrows."""
+    if call_type == "incoming":
+        return f"[qo'ng'iroq ← {who}]"
+    if call_type == "outgoing":
+        return f"[qo'ng'iroq → {who}]"
+    label = _MISSED_LABEL.get(call_type)
+    if label:
+        return f"[qo'ng'iroq ✖ {who} — {label}]"
+    return f"[qo'ng'iroq: {who}]"
+
+
+async def _insert_call_event(
+    session: AsyncSession, device_id: str, key: str, fields: dict
+) -> Interaction:
+    number: str | None = fields["number"]
+    contact_name: str | None = fields["contact_name"]
+    digits = re.sub(r"\D", "", number or "") or None
+    person = None
+    if contact_name:
+        # The phone's address book is trusted, exactly as the recording
+        # sidecar's counterparty_name is: resolve fuzzily, learn the
+        # spelling, backfill the number.
+        person = await resolve_person(session, contact_name, phone=digits)
+    elif number:
+        # A bare number never creates a Person; it may match one.
+        person = await find_by_phone(session, number)
+
+    interaction = Interaction(
+        source=InteractionSource.phone_call,
+        direction=_DIRECTION_OF_CALL.get(fields["type"], Direction.na),
+        person_id=person.id if person else None,
+        occurred_at=fields["started_at"],  # the client's own moment, verbatim
+        raw_text=_call_line(fields["type"], contact_name or number or "noma'lum raqam"),
+        processed=True,  # metadata only: there is nothing to extract
+        needs_review=False,
+        media={
+            "type": MEDIA_CALL_LOG,
+            "event_key": key,
+            "call_type": fields["type"],
+            "phone": number,
+            "contact_name": contact_name,
+            "duration_seconds": fields["duration_seconds"],
+            "device_id": device_id,
+            # NEVER "call_id" here: the recording uploader dedupes on it and
+            # the phone deletes audio it is told is a duplicate. A test pins
+            # that the recording of this same call still uploads.
+        },
+    )
+    session.add(interaction)
+    await session.flush()
+    return interaction
+
+
+async def ingest_call_events(
+    session: AsyncSession, device_id: str, events: list[dict]
+) -> EventOutcome:
+    """One batch of call-log events → interactions, idempotently.
+
+    Fields per event: ``call_log_id`` (int), ``started_at`` (ISO with
+    offset, becomes occurred_at verbatim), ``duration_seconds`` (int >= 0),
+    ``type`` (one of CALL_TYPES), ``number``, ``contact_name``, ``sim_slot``.
+    The caller commits.
+    """
+    return await _ingest_batch(
+        session,
+        device_id,
+        events,
+        _validate_call,
+        lambda device, fields: call_event_key(device, fields["call_log_id"]),
+        _insert_call_event,
+    )
+
+
+# --- SMS ----------------------------------------------------------------------
+
+
+def _sender_phone(sender: str) -> str | None:
+    """The sender as a phone number, or None for an alphanumeric sender.
+
+    Only a numeric sender with at least 7 digits may reach find_by_phone —
+    "PAYME" must never be looked up, let alone become a Person.
+    """
+    cleaned = re.sub(r"[\s\-().+]", "", sender)
+    if cleaned.isdigit() and len(cleaned) >= 7:
+        return sender
+    return None
+
+
+async def _insert_sms(
+    session: AsyncSession, device_id: str, key: str, fields: dict
+) -> Interaction:
+    sender: str = fields["sender"]
+    body: str = fields["body"]
+
+    person = None
+    phone = _sender_phone(sender)
+    if phone is not None:
+        person = await find_by_phone(session, phone)
+
+    # Deterministic, token-free: a bank SMS is the bank's record, so it goes
+    # through sms_money.parse and never through extraction or the claim gate.
+    parsed = sms_money.parse(sender, body)
+    media: dict = {
+        "type": MEDIA_SMS,
+        "event_key": key,
+        "sender": sender,
+        "sim_slot": fields["sim_slot"],
+        "device_id": device_id,
+    }
+    needs_review = False
+    if parsed is not None and parsed.confidence == sms_money.HIGH:
+        media["payment"] = {
+            "amount": str(parsed.amount),
+            "currency": parsed.currency.value,
+            "card_last4": parsed.card_last4,
+            "merchant": parsed.merchant,
+            "balance_after": (
+                str(parsed.balance_after) if parsed.balance_after is not None else None
+            ),
+        }
+    elif parsed is not None:
+        # The sender is a bank but the figures could not be read with
+        # certainty: the owner's /tekshir eye, nothing invented.
+        needs_review = True
+
+    interaction = Interaction(
+        source=InteractionSource.phone_sms,
+        direction=Direction.in_,
+        person_id=person.id if person else None,
+        occurred_at=fields["received_at"],  # the client's own moment, verbatim
+        raw_text=body,
+        processed=True,
+        needs_review=needs_review,
+        media=media,
+    )
+    session.add(interaction)
+    await session.flush()
+
+    if parsed is not None and parsed.confidence == sms_money.HIGH:
+        # Belt over the event-key index (transactions has no unique
+        # constraint): one transaction per SMS interaction, ever.
+        already = await session.scalar(
+            sa.select(Transaction.id)
+            .where(Transaction.source_interaction_id == interaction.id)
+            .limit(1)
+        )
+        if already is None:
+            session.add(
+                Transaction(
+                    type=parsed.type,
+                    amount=parsed.amount,
+                    currency=parsed.currency,
+                    category=sms_money.category_of(parsed.merchant, body),
+                    description=f"{sender}: {parsed.merchant or body[:80]}",
+                    counterparty_person_id=None,  # a bank is not a counterparty
+                    occurred_at=fields["received_at"],
+                    source_interaction_id=interaction.id,
+                )
+            )
+            await session.flush()
+    return interaction
+
+
+async def ingest_sms(
+    session: AsyncSession, device_id: str, messages: list[dict]
+) -> EventOutcome:
+    """One batch of SMS → interactions (plus a transaction per money SMS).
+
+    Fields per message: ``sms_id`` (int), ``sender`` (str, may be
+    alphanumeric), ``received_at`` (ISO with offset), ``body`` (str, at most
+    SMS_BODY_MAX_CHARS), ``sim_slot``. The caller commits.
+    """
+    return await _ingest_batch(
+        session,
+        device_id,
+        messages,
+        _validate_sms,
+        lambda device, fields: sms_event_key(
+            device,
+            fields["sms_id"],
+            fields["sender"],
+            fields["received_at"],
+            fields["body"],
+        ),
+        _insert_sms,
+    )

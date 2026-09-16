@@ -7,8 +7,10 @@ disappear, show it, and only then execute.
 Everything derived from an interaction hangs off ``source_interaction_id`` with
 ``ON DELETE CASCADE``, so removing the interactions removes the debts,
 promises, transactions, events, tasks and memories that came out of them. Media
-files on disk are unlinked in the same pass — a purge that left the audio
-behind would not be a purge.
+files on disk are unlinked in the same pass, each with the JSON sidecar that
+sits beside it — a purge that left the audio behind would not be a purge, and
+one that left the sidecar behind would leave the purged person's name and phone
+number on disk, which is worse.
 """
 
 from __future__ import annotations
@@ -34,12 +36,16 @@ from miya.db.models import (
     Task,
     Transaction,
 )
+from miya.services import call_recordings
 from miya.services.queries import day_bounds
 
 log = logging.getLogger(__name__)
 
 # Media keys that hold a filesystem path.
 _PATH_KEYS = ("path", "audio_path")
+# …and the key that holds a list of them: second copies of a recording we
+# already had, noted by the sweep so they stay purgeable.
+_PATH_LIST_KEYS = ("duplicate_paths",)
 
 
 @dataclass(slots=True)
@@ -109,6 +115,10 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
                 value = (media or {}).get(key)
                 if value:
                     files.append(value)
+            for key in _PATH_LIST_KEYS:
+                values = (media or {}).get(key) or []
+                if isinstance(values, list):
+                    files.extend(str(v) for v in values if v)
         plan.files = files
 
         window_ids = await session.scalars(
@@ -199,7 +209,14 @@ async def plan_range(session: AsyncSession, date_from: date, date_to: date) -> P
 
 
 def _unlink(paths: list[str]) -> int:
-    """Remove media files. A missing file is already in the desired state."""
+    """Remove media files and their sidecars.
+
+    A missing file is already in the desired state. The sidecar an upload
+    writes next to a call recording holds the counterparty's name, their phone
+    number, the device id and the call id — everything the audio does not say
+    out loud — so a purge that took only the audio would leave the person the
+    owner asked to forget named on disk forever.
+    """
     deleted = 0
     for raw in paths:
         path = Path(raw)
@@ -207,9 +224,13 @@ def _unlink(paths: list[str]) -> int:
             path.unlink()
             deleted += 1
         except FileNotFoundError:
-            continue
+            pass
         except OSError:
             log.warning("could not delete media file %s", path, exc_info=True)
+        try:
+            call_recordings.sidecar_path(path).unlink(missing_ok=True)
+        except OSError:
+            log.warning("could not delete sidecar for %s", path, exc_info=True)
     return deleted
 
 

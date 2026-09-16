@@ -1,4 +1,4 @@
-"""Claude Haiku extraction: raw text in, validated structured facts out (spec §5).
+"""Extraction: raw text in, validated structured facts out (spec §5).
 
 The response shape is normally enforced by the API through structured outputs.
 That can fail on the server before the model is ever sampled — a schema this
@@ -29,6 +29,14 @@ from miya.services.prompts import EXTRACTION_SYSTEM_PROMPT
 log = logging.getLogger(__name__)
 
 CurrencyCode = Literal["UZS", "USD", "CNY", "KRW", "RUB"]
+
+# Who stated a money or promise item. What another person says — "you owe me
+# 5 mln", "I paid you back" — is a claim, and the owner's decision is that a
+# claim is asked about, never written silently. This is where the extractor
+# records who said it; ``services.claims.is_claim`` is the gate that turns a
+# "them" into a question instead of a row. It defaults to "me" so every
+# caller that builds items by hand keeps its meaning.
+AssertedBy = Literal["me", "them"]
 
 _client: anthropic.AsyncAnthropic | None = None
 
@@ -102,6 +110,7 @@ class ExtractedDebt(BaseModel):
     currency: CurrencyCode = "UZS"
     reason: str = ""
     due_date: str | None = None
+    asserted_by: AssertedBy = "me"
 
     @property
     def due(self) -> date | None:
@@ -118,6 +127,7 @@ class ExtractedSettlement(BaseModel):
     # books — so this is asked for explicitly, and left null when the text
     # genuinely does not say (the persistence layer then refuses to guess).
     direction: Literal["they_owe_me", "i_owe_them"] | None = None
+    asserted_by: AssertedBy = "me"
 
 
 class ExtractedPromise(BaseModel):
@@ -125,6 +135,10 @@ class ExtractedPromise(BaseModel):
     person: str
     description: str
     due_date: str | None = None
+    # Distinct from made_by: "Akmal promised to pay Friday" typed by the owner
+    # is made_by=them, asserted_by=me; the same words in Akmal's own message
+    # are made_by=them, asserted_by=them.
+    asserted_by: AssertedBy = "me"
 
     @property
     def due(self) -> date | None:
@@ -138,6 +152,7 @@ class ExtractedTransaction(BaseModel):
     category: str = "other"
     description: str = ""
     counterparty: str | None = None
+    asserted_by: AssertedBy = "me"
 
 
 class ExtractedEvent(BaseModel):
@@ -172,6 +187,27 @@ class ExtractedTask(BaseModel):
         return _parse_iso_date(self.due_date)
 
 
+class ExtractedFulfilment(BaseModel):
+    """A hint that something promised earlier has now happened.
+
+    "Akmal invoice yubordi" is not a new promise — it is the end of one.
+    Persistence closes the best-matching open promise of that person only
+    when the match is unambiguous; otherwise the hint is shown and the
+    reminder buttons finish the job. Repayments are settlements, not this.
+
+    ``made_by`` says whose promise ended, with the same meaning as on a
+    promise: "them" when the other person did the thing they had promised,
+    "me" when the owner did what he had promised them. Without it a hint
+    could close the owner's own promise to Akmal because Akmal did
+    something similar.
+    """
+
+    made_by: Literal["me", "them"]
+    person: str
+    description: str
+    asserted_by: AssertedBy = "me"
+
+
 class ExtractionResult(BaseModel):
     """The exact schema of spec §5."""
 
@@ -184,6 +220,7 @@ class ExtractionResult(BaseModel):
     transactions: list[ExtractedTransaction] = Field(default_factory=list)
     events: list[ExtractedEvent] = Field(default_factory=list)
     tasks: list[ExtractedTask] = Field(default_factory=list)
+    fulfilments: list[ExtractedFulfilment] = Field(default_factory=list)
     facts: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
 
@@ -202,6 +239,7 @@ class ExtractionResult(BaseModel):
                 self.transactions,
                 self.events,
                 self.tasks,
+                self.fulfilments,
                 self.facts,
             )
         )
@@ -264,6 +302,25 @@ def is_grammar_failure(exc: Exception) -> bool:
     return isinstance(exc, anthropic.BadRequestError) and "grammar" in str(exc).lower()
 
 
+def extraction_schema() -> dict:
+    """The JSON Schema both request paths are built from.
+
+    ``asserted_by`` keeps its Python default so old rows and existing callers
+    parse unchanged, but the *model* must always say who made a claim: the
+    prompt demands it, and a field with a default is optional in the schema
+    pydantic emits — the grammar path then strips the default too, leaving
+    the model free to omit it. So it is marked required here, on every
+    definition that carries it.
+    """
+    schema = TypeAdapter(ExtractionResult).json_schema()
+    for definition in schema.get("$defs", {}).values():
+        if "asserted_by" in definition.get("properties", {}):
+            required = definition.setdefault("required", [])
+            if "asserted_by" not in required:
+                required.append("asserted_by")
+    return schema
+
+
 @lru_cache(maxsize=1)
 def _schema_instructions() -> str:
     """The schema as prompt text, for when the grammar path is unavailable.
@@ -271,7 +328,7 @@ def _schema_instructions() -> str:
     Generated from the same model the structured path uses, so the two can
     never drift apart.
     """
-    schema = TypeAdapter(ExtractionResult).json_schema()
+    schema = extraction_schema()
     return (
         "\n\nReturn a JSON object valid against this JSON Schema. "
         "Emit the object only — no prose, no markdown fences.\n"
@@ -293,7 +350,7 @@ def extraction_system_block(*, with_schema: bool = False) -> list[dict]:
             "type": "text",
             "text": text,
             # Engages once the cached prefix clears the model's minimum (4096
-            # tokens on Haiku 4.5); harmless and forward-looking below that.
+            # tokens on the extraction model); harmless and forward-looking below that.
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -307,7 +364,7 @@ def extraction_output_config() -> dict:
     API takes raw params, so the batch path builds the identical object here
     rather than hand-writing a second copy of the schema.
     """
-    schema = TypeAdapter(ExtractionResult).json_schema()
+    schema = extraction_schema()
     return {"format": {"type": "json_schema", "schema": transform_schema(schema)}}
 
 
