@@ -17,6 +17,7 @@ object Scheduling {
     const val UNIQUE_PERIODIC_SCAN = "miya-periodic-scan"
     const val UNIQUE_BURST_SCAN = "miya-burst-scan"
     const val UNIQUE_DRAIN = "miya-drain-queue"
+    const val UNIQUE_EVENT_SYNC = "miya-event-sync"
 
     /**
      * RECONCILIATION, not detection. 15 minutes is MIN_PERIODIC_INTERVAL_MILLIS;
@@ -66,6 +67,34 @@ object Scheduling {
         WorkManager.getInstance(context).enqueueUniqueWork(
             UNIQUE_BURST_SCAN,
             ExistingWorkPolicy.REPLACE,
+            request,
+        )
+    }
+
+    /**
+     * Phone events (build step 6): harvest new call-log rows and SMS, then
+     * POST them. Enqueued from every call end and every SMS receipt, and it
+     * also rides the 15-minute ScanWorker as a safety sweep.
+     *
+     * KEEP with a 10 s delay is the same debounce as [enqueueBurstScan] — a
+     * burst of SMS collapses into one run — and the delay gives the dialer
+     * time to commit the call-log row the trigger fired for. CONNECTED
+     * always, never UNMETERED: these are a few KB of JSON, and a missed call
+     * should reach the server within a minute of the ring even on mobile
+     * data with Wi-Fi-only uploads configured.
+     */
+    fun enqueueEventSync(context: Context) {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+        val request = OneTimeWorkRequestBuilder<EventSyncWorker>()
+            .setInitialDelay(10, TimeUnit.SECONDS)
+            .setConstraints(constraints)
+            .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+            .build()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            UNIQUE_EVENT_SYNC,
+            ExistingWorkPolicy.KEEP,
             request,
         )
     }

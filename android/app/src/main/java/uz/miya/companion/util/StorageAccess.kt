@@ -27,6 +27,20 @@ object StorageAccess {
 
     fun hasMediaAudio(context: Context): Boolean = granted(context, mediaAudioPermission())
 
+    /** Call-log events (build step 6) and recording correlation both hang on it. */
+    fun hasCallLog(context: Context): Boolean =
+        granted(context, Manifest.permission.READ_CALL_LOG)
+
+    /**
+     * SMS upload needs both halves: RECEIVE_SMS for the wake-up broadcast and
+     * READ_SMS for the provider the worker actually reads. Both live in the
+     * same hard-restricted permission group as READ_CALL_LOG, so a sideloaded
+     * APK may never be able to hold them — the app degrades, never breaks.
+     */
+    fun hasSms(context: Context): Boolean =
+        granted(context, Manifest.permission.READ_SMS) &&
+            granted(context, Manifest.permission.RECEIVE_SMS)
+
     fun granted(context: Context, permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 }

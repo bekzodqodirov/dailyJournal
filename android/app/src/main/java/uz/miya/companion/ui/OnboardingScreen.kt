@@ -102,6 +102,23 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
 
             StepCard(
                 number = 3,
+                title = "Missed calls and payment SMS (optional)",
+                body = "MIYA can also send your call log — so a missed call becomes a " +
+                    "reminder to call back — and your payment SMS, so a Payme or bank " +
+                    "message becomes a transaction in your journal automatically.\n\n" +
+                    "Honest terms: SMS goes to YOUR server and nowhere else, and by " +
+                    "default only messages from banks and payment services are sent at " +
+                    "all — you can switch that to all SMS, or off, in Settings. Like the " +
+                    "call log, these permissions are hard-restricted on a sideloaded " +
+                    "app and may be refused; everything else keeps working.",
+            ) {
+                Button(onClick = { actions.requestPermissions(phoneEventPermissionSet()) }) {
+                    Text("Grant")
+                }
+            }
+
+            StepCard(
+                number = 4,
                 title = "Find the recordings folder",
                 body = state.prefs?.probeVerdict?.let { "Detection result: $it" }
                     ?: "Auto-detect looks for real audio files in the folders your brand of " +
@@ -116,7 +133,7 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             }
 
             StepCard(
-                number = 4,
+                number = 5,
                 title = "Disable battery optimisation",
                 body = "This does double duty: it stops Doze deferring uploads, and it is one " +
                     "of the few exemptions that let MIYA start its short background burst when " +
@@ -128,7 +145,7 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             }
 
             StepCard(
-                number = 5,
+                number = 6,
                 title = "Work the ${android.os.Build.MANUFACTURER} checklist",
                 body = "Autostart, background autostart, \"no restrictions\", removal from " +
                     "sleeping apps — whichever your phone has. No app can set these for you, " +
@@ -144,7 +161,7 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             }
 
             StepCard(
-                number = 6,
+                number = 7,
                 title = "Server and token",
                 body = "The URL is your VPS on the private tunnel. Use its Tailscale " +
                     "MagicDNS name — http://vps.tailnet-name.ts.net:8000 — because a " +
@@ -185,7 +202,7 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             }
 
             StepCard(
-                number = 7,
+                number = 8,
                 title = "Make one more test call",
                 body = "Record it, then watch the Queue screen. If it does not turn up, the " +
                     "Health screen names the step that is failing.",

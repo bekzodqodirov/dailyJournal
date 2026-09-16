@@ -143,6 +143,18 @@ class Settings(BaseSettings):
     call_recordings_dir: str = "/data/call_recordings"
     audio_retention_days: int = 90
 
+    # --- Phone events (call log, SMS) ---------------------------------------
+    # A missed call becomes an open loop only after this many minutes — a
+    # fresher one may just mean the owner is on another call.
+    loop_missed_call_minutes: int = Field(default=45, ge=1)
+    # ... and stops being one past this many days: nobody calls back a
+    # three-day-old ring, and the bound keeps the scan on the indexes.
+    loop_missed_call_max_days: int = Field(default=3, ge=1)
+    # Extra payment/bank SMS senders, comma- or space-separated, on top of
+    # the built-in list in services/sms_money.py. Matching ignores case,
+    # spaces and punctuation.
+    payment_sms_senders: str = ""
+
     # --- Backups (spec §10) -------------------------------------------------
     backup_dir: str = "/data/backups"
     backup_retention_days: int = 14

@@ -8,6 +8,7 @@ bytes, and a chat list page carries one payload per button.
     md:y|n:<interaction_id>     read / skip an oversized attachment
     rec:<action>:<ref>          act on one record: d12 / p7 / t3 (see below)
     rec:qa|qs:q<interaction_id> a nudged question: answered / snooze till morning
+    rec:ma|ms:m<interaction_id> a missed call: got in touch / snooze till morning
     ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
     cl:y|n|e:<claim_id>         a counterparty's claim: write it / drop it / correct it
 """
@@ -143,6 +144,13 @@ PERSON_ANSWERS = (ACTION_PERSON_YES, ACTION_PERSON_NO)
 ACTION_QUESTION_ANSWERED = "qa"
 ACTION_QUESTION_SNOOZE = "qs"
 QUESTION_ANSWERS = (ACTION_QUESTION_ANSWERED, ACTION_QUESTION_SNOOZE)
+# rec:ma:m<id> ✅ Bog'landim — the missed call was returned; the loop closes
+# rec:ms:m<id> ⏰ Ertalab eslat — snooze it until the next morning brief
+# The ref is "m" + the interaction id of the loop's oldest open ring
+# (build step 6), routed like the question pair above.
+ACTION_MISSED_ANSWERED = "ma"
+ACTION_MISSED_SNOOZE = "ms"
+MISSED_ANSWERS = (ACTION_MISSED_ANSWERED, ACTION_MISSED_SNOOZE)
 
 # Telegram caps an inline keyboard well above this, but a reminder that
 # needs more rows than this is already unreadable; the tail comes back next
@@ -344,22 +352,66 @@ def nudge_actions(interaction_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def missed_ref(interaction_id: int) -> str:
+    """'m12' — the loop's oldest open ring, by its interaction id."""
+    return f"m{interaction_id}"
+
+
+def parse_missed_ref(handle: str) -> int | None:
+    """'m12' → 12; anything else → None."""
+    if handle[:1] == "m" and handle[1:].isdigit():
+        return int(handle[1:])
+    return None
+
+
+def missed_row(
+    interaction_id: int, *, labelled: bool = True
+) -> list[InlineKeyboardButton]:
+    """✅ Bog'landim / ⏰ Ertalab eslat for one missed-call loop."""
+    handle = missed_ref(interaction_id)
+    suffix = f" {handle}" if labelled else ""
+    return [
+        InlineKeyboardButton(
+            text=f"✅ Bog'landim{suffix}",
+            callback_data=f"rec:{ACTION_MISSED_ANSWERED}:{handle}",
+        ),
+        InlineKeyboardButton(
+            text=f"⏰ Ertalab eslat{suffix}",
+            callback_data=f"rec:{ACTION_MISSED_SNOOZE}:{handle}",
+        ),
+    ]
+
+
+def missed_actions(interaction_id: int) -> InlineKeyboardMarkup:
+    """The two buttons under one missed-call nudge (build step 6).
+
+    Unlabelled: the nudge is one message about one caller, so a bare
+    ✅ Bog'landim cannot be misread. The brief's rows are labelled instead.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[missed_row(interaction_id, labelled=False)]
+    )
+
+
 def brief_actions(
     due: list[tuple[str, int]],
     stale: list[tuple[str, int]],
     claim_ids: list[int] | tuple[int, ...] = (),
+    missed_ids: list[int] | tuple[int, ...] = (),
 ) -> InlineKeyboardMarkup | None:
     """The morning brief's buttons: a ✅ / ✏️ row per due row, a Ha /
     Bajarildi / Yop row per undated one that has been sitting — the same rows
     the reminder and the "Hali ochiqmi?" question carry, so he acts from the
-    brief the way he acts from those — and a Ha / Yo'q / Tuzat row per claim
-    still waiting for his word. Always labelled: the brief carries many
-    rows, and a bare ✅ would not say which."""
+    brief the way he acts from those — a Ha / Yo'q / Tuzat row per claim
+    still waiting for his word, and a ✅ Bog'landim / ⏰ row per missed call.
+    Always labelled: the brief carries many rows, and a bare ✅ would not
+    say which."""
     due = [(k, i) for k, i in due if i is not None]
     stale = [(k, i) for k, i in stale if i is not None and (k, i) not in due]
     rows = [record_row(k, i, labelled=True) for k, i in due]
     rows += [question_row(k, i, labelled=True) for k, i in stale]
     rows += [claim_row(i) for i in claim_ids if i is not None]
+    rows += [missed_row(i) for i in missed_ids if i is not None]
     rows = rows[:MAX_ROWS]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 

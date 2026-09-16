@@ -18,9 +18,17 @@ from miya.config import settings
 _UNAUTHORIZED = {"WWW-Authenticate": "Bearer"}
 
 
+# The metadata streams the companion uploads next to its recordings (build
+# step 6): call-log events and SMS. Exact paths, no prefix — a device token
+# must not grow into new routes by accident.
+PHONE_EVENT_PATHS = ("/v1/phone/calls", "/v1/phone/sms")
+
+
 def is_upload_path(path: str) -> bool:
-    """True for the two routes the Android companion is allowed to reach."""
-    return path == "/v1/recordings" or path.startswith("/v1/recordings/")
+    """True for the routes the Android companion is allowed to reach."""
+    if path == "/v1/recordings" or path.startswith("/v1/recordings/"):
+        return True
+    return path in PHONE_EVENT_PATHS
 
 
 def bearer_credentials(authorization: str | None) -> str | None:
@@ -38,8 +46,9 @@ def check_authorization(authorization: str | None, *, path: str) -> None:
 
     Two token families. `API_BEARER_TOKEN` is the owner's, and opens
     everything. An `UPLOAD_TOKENS` entry is a device's, and opens only the
-    recording routes — so a stolen phone (or an APK someone unzipped) can push
-    audio but cannot read a single debt, transcript or contact back out.
+    upload routes (recordings, call-log events, SMS) — so a stolen phone (or
+    an APK someone unzipped) can push data but cannot read a single debt,
+    transcript or contact back out.
     """
     upload_tokens = settings.upload_tokens_parsed
     if not settings.api_bearer_token and not upload_tokens:

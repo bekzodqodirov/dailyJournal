@@ -217,6 +217,10 @@ class Status:
     cost_month_usd: Decimal
     anthropic_last_ok_at: datetime | None
     anthropic_failing: bool
+    # The companion app's last accepted batch, when a phone ever uploaded.
+    # Informational only: a phone-less install is healthy, so no Problem
+    # and no staleness alert ever comes from this row.
+    phone: Component | None = None
 
     @classmethod
     def unreachable(cls, now: datetime) -> Status:
@@ -402,6 +406,9 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         components={
             name: component_of(name, rows.get(name), now=now) for name in COMPONENTS
         },
+        phone=(
+            component_of("phone", rows["phone"], now=now) if "phone" in rows else None
+        ),
         jobs={
             key[len(JOB_PREFIX) :]: component_of(key[len(JOB_PREFIX) :], row, now=now)
             for key, row in rows.items()

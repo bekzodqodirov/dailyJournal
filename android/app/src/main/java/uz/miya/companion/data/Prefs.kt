@@ -16,6 +16,18 @@ import java.util.UUID
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "miya_prefs")
 
 /**
+ * The three SMS upload modes (build step 6). "payments" is the default: only
+ * messages whose sender is on the payment allow-list leave the phone. The
+ * server re-checks the sender either way — the client filter only limits what
+ * leaves the phone, it is not the security boundary.
+ */
+object SmsMode {
+    const val OFF = "off"
+    const val PAYMENTS = "payments"
+    const val ALL = "all"
+}
+
+/**
  * Everything except the bearer token. The token lives in [TokenStore], encrypted
  * with a KeyStore-held key, because DataStore files are plain XML/proto on disk.
  */
@@ -36,6 +48,14 @@ data class PrefsSnapshot(
     val lastErrorAt: Long,
     val lastError: String?,
     val probeVerdict: String?,
+    // ---- phone events (build step 6) ----------------------------------
+    /** High-water CallLog._ID; advanced only after the server answered 200. */
+    val lastCallLogId: Long,
+    /** High-water Sms._ID; same discipline. */
+    val lastSmsId: Long,
+    val uploadCallLog: Boolean,
+    /** One of [SmsMode]. */
+    val smsMode: String,
 ) {
     val serverConfigured: Boolean get() = serverUrl.isNotBlank()
 }
@@ -59,6 +79,10 @@ class Prefs(private val context: Context) {
         val LAST_ERROR_AT = longPreferencesKey("last_error_at")
         val LAST_ERROR = stringPreferencesKey("last_error")
         val PROBE_VERDICT = stringPreferencesKey("probe_verdict")
+        val LAST_CALL_LOG_ID = longPreferencesKey("last_call_log_id")
+        val LAST_SMS_ID = longPreferencesKey("last_sms_id")
+        val UPLOAD_CALL_LOG = booleanPreferencesKey("upload_call_log")
+        val SMS_MODE = stringPreferencesKey("sms_mode")
     }
 
     val flow: Flow<PrefsSnapshot> = context.dataStore.data.map { it.toSnapshot() }
@@ -80,6 +104,10 @@ class Prefs(private val context: Context) {
         lastErrorAt = this[K.LAST_ERROR_AT] ?: 0L,
         lastError = this[K.LAST_ERROR],
         probeVerdict = this[K.PROBE_VERDICT],
+        lastCallLogId = this[K.LAST_CALL_LOG_ID] ?: 0L,
+        lastSmsId = this[K.LAST_SMS_ID] ?: 0L,
+        uploadCallLog = this[K.UPLOAD_CALL_LOG] ?: true,
+        smsMode = this[K.SMS_MODE] ?: SmsMode.PAYMENTS,
     )
 
     suspend fun snapshot(): PrefsSnapshot = flow.first()
@@ -114,6 +142,28 @@ class Prefs(private val context: Context) {
     suspend fun setAuthFailed(value: Boolean) = update { it[K.AUTH_FAILED] = value }
     suspend fun setProbeVerdict(value: String?) = update {
         if (value == null) it.remove(K.PROBE_VERDICT) else it[K.PROBE_VERDICT] = value
+    }
+
+    // ---- phone events (build step 6) --------------------------------------
+
+    /**
+     * The high-water marks advance ONLY after the server answered 200 for
+     * everything harvested below them; EventSyncWorker owns that discipline.
+     * They only ever move forward — a concurrent reset to zero (a "re-send
+     * everything" someday) should not be silently undone by a late worker.
+     */
+    suspend fun setLastCallLogId(value: Long) = update {
+        if (value > (it[K.LAST_CALL_LOG_ID] ?: 0L)) it[K.LAST_CALL_LOG_ID] = value
+    }
+    suspend fun setLastSmsId(value: Long) = update {
+        if (value > (it[K.LAST_SMS_ID] ?: 0L)) it[K.LAST_SMS_ID] = value
+    }
+    suspend fun setUploadCallLog(value: Boolean) = update { it[K.UPLOAD_CALL_LOG] = value }
+    suspend fun setSmsMode(value: String) = update {
+        it[K.SMS_MODE] = when (value) {
+            SmsMode.OFF, SmsMode.PAYMENTS, SmsMode.ALL -> value
+            else -> SmsMode.PAYMENTS
+        }
     }
 
     suspend fun setMediaGeneration(version: String, generation: Long) = update {

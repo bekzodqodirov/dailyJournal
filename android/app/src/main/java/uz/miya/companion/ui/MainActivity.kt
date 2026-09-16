@@ -126,6 +126,17 @@ fun defaultPermissionSet(): Array<String> {
     return list.toTypedArray()
 }
 
+/**
+ * Build step 6: the call-log and SMS streams. Requested as their own
+ * onboarding step because they are a separate decision — the owner is saying
+ * "my missed calls and my bank SMS go to my server" — not plumbing.
+ */
+fun phoneEventPermissionSet(): Array<String> = arrayOf(
+    Manifest.permission.READ_CALL_LOG,
+    Manifest.permission.RECEIVE_SMS,
+    Manifest.permission.READ_SMS,
+)
+
 fun handleHealthAction(
     item: HealthItem,
     vm: MainViewModel,
@@ -150,6 +161,10 @@ fun handleHealthAction(
             actions.requestPermissions(arrayOf(Manifest.permission.READ_PHONE_STATE))
         HealthAction.CALL_LOG_PERMISSION ->
             actions.requestPermissions(arrayOf(Manifest.permission.READ_CALL_LOG))
+        HealthAction.SMS_PERMISSION ->
+            actions.requestPermissions(
+                arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)
+            )
         HealthAction.PICK_FOLDER -> actions.pickFolder()
         HealthAction.RUN_PROBE -> vm.runProbe()
         HealthAction.BATTERY -> actions.openIntent(OemHints.batteryExemptionIntent(context))

@@ -27,6 +27,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import uz.miya.companion.data.SmsMode
 import uz.miya.companion.oem.OemHints
 import uz.miya.companion.util.StorageAccess
 
@@ -164,6 +165,33 @@ fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
             ) { Text("Save preferences") }
         }
 
+        SectionCard("Phone events") {
+            ToggleRow(
+                title = "Upload call log",
+                subtitle = "Every call — missed ones included — becomes an event on your " +
+                    "server: number, time, duration. Metadata only, never audio. A missed " +
+                    "call shows up as an open loop in the morning brief.",
+                checked = prefs.uploadCallLog,
+                onChange = vm::setUploadCallLog,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("SMS upload", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                "SMS goes to your own server and nowhere else. \"Payments\" sends only " +
+                    "messages from banks and payment services (Payme, Click, …), which the " +
+                    "server turns into transactions; the server checks the sender again " +
+                    "either way.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            ButtonRow {
+                SmsModeChoice("Off", SmsMode.OFF, prefs.smsMode, vm::setSmsMode)
+                SmsModeChoice("Payments", SmsMode.PAYMENTS, prefs.smsMode, vm::setSmsMode)
+                SmsModeChoice("All SMS", SmsMode.ALL, prefs.smsMode, vm::setSmsMode)
+            }
+        }
+
         SectionCard("Device") {
             KeyValue("Device id", prefs.deviceId.take(8) + "…")
             KeyValue("Dialer", uz.miya.companion.discover.FolderProbe.defaultDialerPackage(context) ?: "unknown")
@@ -179,6 +207,21 @@ fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
                 Text("App info")
             }
         }
+    }
+}
+
+/** One of the three SMS modes; the selected one renders filled. */
+@Composable
+private fun SmsModeChoice(
+    label: String,
+    mode: String,
+    current: String,
+    onSelect: (String) -> Unit,
+) {
+    if (mode == current) {
+        Button(onClick = { onSelect(mode) }) { Text(label) }
+    } else {
+        OutlinedButton(onClick = { onSelect(mode) }) { Text(label) }
     }
 }
 

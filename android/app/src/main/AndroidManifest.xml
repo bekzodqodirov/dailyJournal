@@ -22,6 +22,14 @@
     <!-- Name for a number the call log did not cache. -->
     <uses-permission android:name="android.permission.READ_CONTACTS" />
 
+    <!-- Phone events (build step 6): payment SMS become transactions on the
+         owner's OWN server; nothing goes to any third party. Both are in the
+         same hard-restricted group as READ_CALL_LOG, so a sideload may never
+         hold them — the app degrades (no SMS upload), never breaks.
+         RECEIVE_SMS only wakes the sync worker; READ_SMS is what it reads. -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -120,6 +128,20 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Wake-up only: enqueues EventSyncWorker and returns. The
+             BROADCAST_SMS sender permission means only the system's telephony
+             stack can fire it. Delivery requires this app to hold RECEIVE_SMS;
+             the worker reads the SMS provider itself, so a missed broadcast
+             (force-stop, Doze) costs latency, never a message. -->
+        <receiver
+            android:name=".watch.SmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
             </intent-filter>
         </receiver>
     </application>

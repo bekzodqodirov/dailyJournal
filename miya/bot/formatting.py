@@ -27,6 +27,7 @@ from miya.db.enums import (
 if TYPE_CHECKING:  # annotations only: formatting never imports the services
     from miya.services.claims import ClaimView
     from miya.services.loops import (
+        MissedCall,
         QuietCounterparty,
         StaleCommitment,
         UnansweredQuestion,
@@ -384,6 +385,26 @@ def quiet_line(q: QuietCounterparty, *, markup: bool = True) -> str:
     return f"{q.person_name}: {q.days_quiet} kun jim — {items}"
 
 
+def missed_line(m: MissedCall, *, markup: bool = True) -> str:
+    """One missed call nobody dealt with: who rang, how long ago, how often.
+
+        📵 <b>Akmal</b> qo'ng'iroq qildi — javobsiz · 2 soat oldin (2 marta)
+
+    An unknown caller renders as the number the phone reported. The name and
+    the number both come off the handset, so they are escaped like any other
+    counterparty-controlled text; ``markup=False`` is the plain form for the
+    report's data block, which escapes the finished line itself.
+    """
+    if m.person is not None:
+        who = _name(m.person_name, markup)
+    else:
+        who = _text(m.phone or "noma'lum raqam", markup)
+    tail = f" ({m.attempts} marta)" if m.attempts > 1 else ""
+    if markup:
+        return f"📵 {who} qo'ng'iroq qildi — javobsiz · {age_label(m.age)} oldin{tail}"
+    return f"📵 {who} qo'ng'iroq qildi — javobsiz, {age_label(m.age)} oldin{tail}"
+
+
 # --- a counterparty's claim: one question line ---------------------------------
 #
 # What someone *else* asserted — "you owe me", "I paid you back", "you
@@ -463,6 +484,7 @@ def claim_line(view: ClaimView, *, markup: bool = True) -> str:
 
 SOURCE_EMOJI = {
     InteractionSource.phone_call: "📞",
+    InteractionSource.phone_sms: "✉️",
     InteractionSource.telegram_userbot: "💬",
     InteractionSource.assistant_bot: "✍️",
     InteractionSource.manual: "✍️",
@@ -472,6 +494,7 @@ SOURCE_EMOJI = {
 
 SOURCE_WORD = {
     InteractionSource.phone_call: "qo'ng'iroq",
+    InteractionSource.phone_sms: "sms",
     InteractionSource.telegram_userbot: "telegram",
     InteractionSource.assistant_bot: "yozuv",
     InteractionSource.manual: "yozuv",

@@ -36,6 +36,10 @@ class ScanWorker(
                 "Scan: inspected=${result.inspected} enqueued=${result.enqueued} " +
                     "unstable=${result.skippedUnstable} tooShort=${result.skippedTooShort}"
             )
+            // Build step 6: the phone-event sync rides this sweep as its own
+            // safety net — a missed SMS_RECEIVED broadcast or a swallowed
+            // call-end trigger costs at most 15 minutes, never the event.
+            Scheduling.enqueueEventSync(applicationContext)
             checkForSilence()
             Result.success()
         } catch (c: CancellationException) {

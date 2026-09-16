@@ -302,7 +302,10 @@ async def cmd_brief(message: Message) -> None:
         body = replies.morning_brief(data)
         due, stale = replies.morning_brief_refs(data)
         keyboard = keyboards.brief_actions(
-            due, stale, claim_ids=replies.morning_brief_claim_ids(data)
+            due,
+            stale,
+            claim_ids=replies.morning_brief_claim_ids(data),
+            missed_ids=replies.morning_brief_missed_ids(data),
         )
         _ask(data.claims, keyboard)
     await _safe_answer(message, body, reply_markup=keyboard)
@@ -843,6 +846,31 @@ async def _answer_nudge(session, action: str, handle: str) -> str:
     return replies.nudge_snoozed(until)
 
 
+async def _answer_missed(session, action: str, handle: str) -> str:
+    """✅ Bog'landim / ⏰ Ertalab eslat on one missed-call loop (build step 6).
+
+    The marks live on the loop's own interaction, exactly as they do for a
+    nudged question: "Bog'landim" is final for every ring at or before it
+    (loops.missed_calls reads the mark's timestamp as the floor for that
+    number), "Ertalab" only snoozes the nudge — the loop itself stays open
+    and listed until a real contact or the ✅ closes it.
+    """
+    interaction_id = keyboards.parse_missed_ref(handle)
+    interaction = (
+        await session.get(Interaction, interaction_id)
+        if interaction_id is not None
+        else None
+    )
+    if interaction is None:
+        return replies.MISSED_GONE
+    if action == keyboards.ACTION_MISSED_ANSWERED:
+        nudges.mark_answered(interaction, by=records.BY_BUTTON)
+        return replies.MISSED_ANSWERED
+    until = nudges.next_morning()
+    nudges.snooze(interaction, until=until)
+    return replies.nudge_snoozed(until)
+
+
 async def _follow_ups(session, question: Interaction) -> list[Interaction]:
     """Every incoming userbot message in the question's chat since it, oldest
     first.
@@ -895,6 +923,26 @@ async def on_record_button(callback: CallbackQuery) -> None:
         async with session_scope() as session:
             text = await _answer_nudge(session, action, handle)
         await _edit_callback(callback, text)
+        return
+    if action in keyboards.MISSED_ANSWERS:
+        # A missed-call loop, not a record: "m<interaction id>". Unlike a
+        # question nudge, its row also rides the morning brief, so the
+        # outcome goes out as its own message and only the tapped row leaves
+        # the keyboard — the brief's other buttons still have work to do.
+        async with session_scope() as session:
+            text = await _answer_missed(session, action, handle)
+        if callback.message is not None:
+            try:
+                await callback.message.edit_reply_markup(
+                    reply_markup=keyboards.without(callback.message.reply_markup, handle)
+                )
+            except Exception:
+                log.debug("could not trim the missed-call keyboard", exc_info=True)
+            await _safe_answer(callback.message, text)
+        try:
+            await callback.answer()
+        except Exception:
+            log.debug("could not acknowledge the callback", exc_info=True)
         return
 
     async with session_scope() as session:

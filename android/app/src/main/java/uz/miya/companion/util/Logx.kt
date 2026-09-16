@@ -58,5 +58,13 @@ object Logx {
         return "«$digest»$ext"
     }
 
+    /**
+     * An SMS body is money data — an amount, a card mask, a balance — and it
+     * must NEVER be logged, redacted or otherwise (build step 6). Nothing in
+     * the app logs one today; this is the only representation allowed if a
+     * future log line ever needs to reference a message at all.
+     */
+    fun redactSmsBody(body: String?): String = "«sms ${body?.length ?: 0} chars»"
+
     fun shortSha(sha: String?): String = sha?.take(12) ?: "null"
 }

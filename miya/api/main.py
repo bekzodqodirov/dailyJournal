@@ -34,7 +34,15 @@ from miya.db.enums import (
 )
 from miya.db.models import Debt, DebtPayment, Interaction, Person
 from miya.db.session import SessionLocal, engine, get_session
-from miya.services import call_recordings, health, planner, queries, rag, reports
+from miya.services import (
+    call_recordings,
+    health,
+    phone_events,
+    planner,
+    queries,
+    rag,
+    reports,
+)
 from miya.services.embeddings import EmbeddingError, get_local_embedder
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -766,6 +774,119 @@ def _staged_hash_prefixes(directory: Path) -> set[str]:
         for name in names
         if Path(name).suffix.lower() in call_recordings.AUDIO_SUFFIXES
     }
+
+
+# --- phone events from the Android companion (build step 6) ------------------
+#
+# Two metadata streams next to the recordings: call-log events (who rang,
+# when, how long — never audio) and SMS, mostly the banks' payment notices.
+# The heavy thinking lives in services/phone_events.py; these handlers only
+# validate the envelope, hand the events over, commit, and answer with the
+# per-event outcome — 200 for every well-formed batch, so a partial failure
+# never makes the phone re-send what already landed.
+
+
+class CallEventIn(BaseModel):
+    """One CallLog row as the companion reports it (metadata only).
+
+    ``started_at`` stays a string when it does not parse as a datetime:
+    the ingester validates it per event and answers with an indexed reason,
+    so one bad clock cannot 422 the 199 good events around it. Unknown keys
+    are ignored — a newer app must not start failing against an older server.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    call_log_id: int = Field(ge=0)
+    started_at: datetime | str
+    duration_seconds: int = Field(ge=0)
+    type: str = Field(min_length=1, max_length=32)
+    number: str | None = Field(default=None, max_length=64)
+    contact_name: str | None = Field(default=None, max_length=200)
+    sim_slot: int | None = None
+
+
+class SmsIn(BaseModel):
+    """One SMS. The body cap matches phone_events.SMS_BODY_MAX_CHARS."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    sms_id: int = Field(ge=0)
+    sender: str = Field(min_length=1, max_length=64)
+    received_at: datetime | str
+    body: str = Field(max_length=4096)
+    sim_slot: int | None = None
+
+
+class CallEventsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str = Field(min_length=1, max_length=128)
+    events: list[CallEventIn] = Field(max_length=phone_events.MAX_BATCH)
+
+
+class SmsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str = Field(min_length=1, max_length=128)
+    messages: list[SmsIn] = Field(max_length=phone_events.MAX_BATCH)
+
+
+def _outcome_json(outcome: phone_events.EventOutcome) -> dict[str, Any]:
+    """The response shape the app's classify() reads; nothing is dropped
+    silently — every event is counted or named with its reason."""
+    return {
+        "accepted": outcome.accepted,
+        "duplicates": outcome.duplicates,
+        "rejected": [
+            {"index": index, "reason": reason} for index, reason in outcome.rejected
+        ],
+    }
+
+
+async def _phone_beat(
+    session: AsyncSession, device_id: str, kind: str, count: int
+) -> None:
+    """Best-effort `phone` heartbeat so /holat can show the last upload.
+
+    Its own commit, after the batch's: a failure here (or a hiccup in the
+    liveness ledger) must never cost the phone a 200 it has already earned.
+    """
+    try:
+        await health.beat(session, "phone", detail={"device_id": device_id, kind: count})
+        await session.commit()
+    except Exception:
+        log.warning("could not record the phone heartbeat", exc_info=True)
+
+
+@api.post("/phone/calls", tags=["phone"])
+async def upload_call_events(
+    body: CallEventsRequest, session: SessionDep
+) -> dict[str, Any]:
+    """One batch of call-log events → interactions, idempotently.
+
+    An empty batch is the app's connection test, like an empty probe.
+    """
+    outcome = await phone_events.ingest_call_events(
+        session, body.device_id, [event.model_dump() for event in body.events]
+    )
+    await session.commit()
+    if outcome.accepted:
+        await _phone_beat(session, body.device_id, "calls", outcome.accepted)
+    return _outcome_json(outcome)
+
+
+@api.post("/phone/sms", tags=["phone"])
+async def upload_sms(body: SmsRequest, session: SessionDep) -> dict[str, Any]:
+    """One batch of SMS → interactions; a money SMS becomes one transaction,
+    deterministically (services/sms_money.py) — no model call, no claim."""
+    outcome = await phone_events.ingest_sms(
+        session, body.device_id, [message.model_dump() for message in body.messages]
+    )
+    await session.commit()
+    if outcome.accepted:
+        await _phone_beat(session, body.device_id, "sms", outcome.accepted)
+    return _outcome_json(outcome)
 
 
 app.include_router(api)

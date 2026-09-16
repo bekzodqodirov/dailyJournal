@@ -22,6 +22,9 @@ Jobs:
                    and every open loop, deterministic, never skipped
   * nudges       — every 30 min; one short message per question nobody
                    answered, with ✅ Javob berdim / ⏰ Ertaga (quiet-hours aware)
+  * missed_call_nudge — every 30 min; one "📵 … qo'ng'iroq qildi — javobsiz"
+                   per missed-call loop the companion app uploaded, with
+                   ✅ Bog'landim / ⏰ Ertaga (quiet-hours aware; build step 6)
   * new_chat_ask — every 2 min; "Yangi guruh: … — o'qiymi?" once per new
                    group or channel (quiet-hours aware)
   * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
@@ -281,7 +284,12 @@ async def brief_job(bot: Bot) -> bool:
         body = replies.morning_brief(data)
         due, stale = replies.morning_brief_refs(data)
         claim_ids = replies.morning_brief_claim_ids(data)
-        keyboard = keyboards.brief_actions(due, stale, claim_ids=claim_ids)
+        keyboard = keyboards.brief_actions(
+            due,
+            stale,
+            claim_ids=claim_ids,
+            missed_ids=replies.morning_brief_missed_ids(data),
+        )
     sent = await notify(bot, body, reply_markup=keyboard)
     if sent:
         async with session_scope() as session:
@@ -362,6 +370,43 @@ async def nudge_job(bot: Bot) -> None:
             await notify(bot, replies.nudge_overflow(len(tail)))
 
     log.info("sent %d nudge(s), %d more waiting", len(sent), len(tail))
+
+
+async def missed_call_nudge_job(bot: Bot) -> None:
+    """Nudge the owner about calls nobody returned (every 30 minutes).
+
+    The companion app uploads the call log; loops.missed_calls turns the
+    rings nobody dealt with into loops, and nudges.collect_missed applies
+    the questions' own discipline: one nudge per number ever, plus one more
+    after "⏰ Ertaga" expires — from then on only the brief and the report
+    carry it. At most nudges.MAX_PER_SWEEP per sweep, the tail simply
+    qualifies again next sweep; nothing is dropped. Quiet-hours aware: a
+    missed call at 02:00 keeps until morning. Marked nudged only for what
+    notify() actually delivered, committed at once, so a crash mid-sweep
+    repeats at most one nudge and loses none.
+    """
+    if reminders.in_quiet_hours():
+        return
+
+    async with session_scope() as session:
+        due = await nudges.collect_missed(session)
+        if not due:
+            return
+        sent: list = []
+        for missed in due[: nudges.MAX_PER_SWEEP]:
+            if not await notify(
+                bot,
+                replies.missed_nudge(missed),
+                reply_markup=keyboards.missed_actions(missed.interaction_id),
+            ):
+                break
+            sent.append(missed)
+        nudges.mark_missed_nudged(session, sent)
+        await session.commit()
+
+    log.info(
+        "sent %d missed-call nudge(s), %d more waiting", len(sent), len(due) - len(sent)
+    )
 
 
 async def new_chat_ask_job(bot: Bot) -> None:
@@ -1055,6 +1100,14 @@ async def run() -> None:
         IntervalTrigger(minutes=30),
         args=[bot],
         id="nudges",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        missed_call_nudge_job,
+        IntervalTrigger(minutes=30),
+        args=[bot],
+        id="missed_call_nudge",
         max_instances=1,
         coalesce=True,
     )

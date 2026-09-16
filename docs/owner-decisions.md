@@ -60,4 +60,6 @@ happened*, it answers."
 3. Ask-before-writing for counterparty claims — done
 4. Per-person memory — done (`/kim`, `/tarix`, `/eslab`; profiles refresh every 30 min)
 5. Self-monitoring (/holat, heartbeat, backups to Telegram) — done
-6. Phone app, missed calls, SMS — later
+6. Phone app, missed calls, SMS — done (the owner un-deferred it; the app
+   uploads call-log events and payment SMS, missed calls become open loops,
+   Payme/bank SMS become transactions without a model call)

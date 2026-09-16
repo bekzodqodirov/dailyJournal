@@ -20,6 +20,20 @@ object TimeFmt {
             .withNano(0)
             .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
 
+    /**
+     * Like [isoOffset], but byte-for-byte what Python's datetime.isoformat()
+     * echoes after a fromisoformat round trip: seconds ALWAYS printed (the
+     * ISO formatter above drops ":00") and the offset always numeric
+     * ("+05:00", never "Z"). The SMS event key hashes this string on both
+     * sides (build step 6), so "close enough" is not enough here.
+     */
+    fun isoOffsetExact(epochMillis: Long, zone: ZoneId = ZoneId.systemDefault()): String =
+        OffsetDateTime.ofInstant(Instant.ofEpochMilli(epochMillis), zone)
+            .withNano(0)
+            .format(PY_ISO)
+
+    private val PY_ISO = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssxxx")
+
     fun nowIso(): String = isoOffset(System.currentTimeMillis())
 
     /** Human-readable, local, for the UI only. Never sent to the server. */

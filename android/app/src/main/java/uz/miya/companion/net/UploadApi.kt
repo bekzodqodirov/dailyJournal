@@ -48,6 +48,31 @@ data class ProbeResult(
     val knownCallId: Set<String>,
 )
 
+/**
+ * What one POST to /v1/phone/calls or /v1/phone/sms became (build step 6).
+ * The server answers 200 for every well-formed batch, with per-event
+ * accepted/duplicate/rejected counts inside — a partial failure must not make
+ * the phone re-send the whole batch, so 200 is ALWAYS success here and the
+ * caller marks every event of the batch done.
+ */
+sealed class EventPostOutcome {
+    /** 200. The batch is settled, whatever the per-event split was. */
+    data class Delivered(
+        val accepted: Int,
+        val duplicates: Int,
+        val rejected: Int,
+    ) : EventPostOutcome()
+
+    /** 401. Stop everything and shout; retrying a bad token forever is useless. */
+    data class AuthFailed(val detail: String) : EventPostOutcome()
+
+    /** 4xx that will never succeed (bad shape, oversize). Never retry. */
+    data class Permanent(val detail: String) : EventPostOutcome()
+
+    /** 5xx / timeout / reset. Exponential backoff. */
+    data class Retry(val detail: String) : EventPostOutcome()
+}
+
 class UploadApi(
     private val context: Context,
     private val client: OkHttpClient,
@@ -93,6 +118,86 @@ class UploadApi(
                     knownCallId = body.optJSONArray("known_call_id").toStringSet(),
                 )
             }
+        }
+    }
+
+    /**
+     * POST one batch of call-log events to /v1/phone/calls (build step 6).
+     * JSON sibling of [probe]: same client, same Authorization interceptor,
+     * same failure classification. Each element of [events] is the exact
+     * event object the contract names (call_log_id, started_at, ...).
+     */
+    suspend fun postCalls(
+        baseUrl: String,
+        deviceId: String,
+        events: List<JSONObject>,
+    ): EventPostOutcome = postEvents(baseUrl, "/v1/phone/calls", deviceId, "events", events)
+
+    /** POST one batch of SMS to /v1/phone/sms. See [postCalls]. */
+    suspend fun postSms(
+        baseUrl: String,
+        deviceId: String,
+        messages: List<JSONObject>,
+    ): EventPostOutcome = postEvents(baseUrl, "/v1/phone/sms", deviceId, "messages", messages)
+
+    private suspend fun postEvents(
+        baseUrl: String,
+        path: String,
+        deviceId: String,
+        field: String,
+        items: List<JSONObject>,
+    ): EventPostOutcome = withContext(Dispatchers.IO) {
+        // Everything inside the try, including building the request: a bad
+        // URL must become a classified outcome, never an escape from doWork()
+        // — the same lesson upload() learned.
+        try {
+            val payload = JSONObject()
+                .put("device_id", deviceId)
+                .put(field, JSONArray(items))
+            val request = Request.Builder()
+                .url(join(baseUrl, path))
+                .post(payload.toString().toRequestBody(jsonType))
+                .build()
+            client.newCall(request).execute().use { r -> classifyEvents(r) }
+        } catch (cleartext: UnknownServiceException) {
+            EventPostOutcome.Permanent(cleartextMessage(baseUrl, cleartext))
+        } catch (bad: IllegalArgumentException) {
+            EventPostOutcome.Permanent(
+                "Bad server URL \"$baseUrl\": ${bad.message ?: "not a valid http/https URL"}. " +
+                    "Fix it in Settings."
+            )
+        } catch (io: IOException) {
+            EventPostOutcome.Retry(io.message ?: io.javaClass.simpleName)
+        } catch (t: Throwable) {
+            EventPostOutcome.Permanent(t.message ?: t.javaClass.simpleName)
+        }
+    }
+
+    private fun classifyEvents(r: Response): EventPostOutcome {
+        return when (r.code) {
+            200 -> {
+                val body = try {
+                    JSONObject(MiyaClient.safeBody(r, 1 shl 20))
+                } catch (t: Throwable) {
+                    JSONObject()
+                }
+                EventPostOutcome.Delivered(
+                    accepted = body.optInt("accepted", 0),
+                    duplicates = body.optInt("duplicates", 0),
+                    rejected = body.optJSONArray("rejected")?.length() ?: 0,
+                )
+            }
+            401 -> EventPostOutcome.AuthFailed(
+                detailOf(r).ifBlank { "Invalid or missing bearer token" }
+            )
+            // A phone updated before its server: the /v1/phone routes are not
+            // deployed yet. Parking the batch as permanent would let the
+            // high-water mark advance past real events, so this waits.
+            404, 405 -> EventPostOutcome.Retry(
+                "HTTP ${r.code}: the server has no /v1/phone routes yet (update it)"
+            )
+            in 500..599, 408, 429 -> EventPostOutcome.Retry("HTTP ${r.code}: ${detailOf(r)}")
+            else -> EventPostOutcome.Permanent("HTTP ${r.code}: ${detailOf(r)}")
         }
     }
 

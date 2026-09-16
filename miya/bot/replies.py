@@ -17,6 +17,7 @@ from miya.bot.formatting import (
     debt_line,
     escape,
     full_date,
+    missed_line,
     money,
     question_line,
     quiet_line,
@@ -34,7 +35,7 @@ from miya.config import settings
 from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
 from miya.services import claims, health
 from miya.services.brief import MorningBrief
-from miya.services.loops import UnansweredQuestion
+from miya.services.loops import MissedCall, UnansweredQuestion
 from miya.services.people import Match
 from miya.services.persistence import Applied
 from miya.services.queries import (
@@ -1121,6 +1122,8 @@ SOURCE_LABEL = {
     "assistant_bot": "xabar",
     "telegram_userbot": "telegram",
     "phone_call": "qo'ng'iroq",
+    # A low-confidence money SMS waits in /tekshir; it must name itself.
+    "phone_sms": "sms",
     "manual": "qo'lda",
     "receipt_photo": "rasm",
     "calendar": "kalendar",
@@ -1166,6 +1169,9 @@ BRIEF_ALL_CLEAR = "✅ Hammasi joyida — bugun uchrashuv ham, ochiq qolgan nars
 BRIEF_EVENTS = "📅 <b>Bugungi uchrashuvlar</b>"
 BRIEF_DUE = "⏰ <b>Muddati bugun va kechikkanlar</b>"
 BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
+# After the questions and before the claims: an unanswered ring outranks a
+# decision the owner still has time to make.
+BRIEF_MISSED = "📵 <b>Javobsiz qo'ng'iroqlar</b>"
 BRIEF_CLAIMS = "❓ Tasdiqlanmagan da'volar"
 BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
 BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
@@ -1206,6 +1212,10 @@ def morning_brief(brief: MorningBrief) -> str:
     if loops is not None and loops.questions:
         lines = [question_line(q) for q in loops.questions]
         parts.append(f"{BRIEF_QUESTIONS}\n" + bullet_list(lines, empty="—"))
+    missed = _brief_missed(brief)
+    if missed:
+        lines = [missed_line(m) for m in missed]
+        parts.append(f"{BRIEF_MISSED}\n" + bullet_list(lines, empty="—"))
     shown, hidden = _brief_claims(brief)
     if shown:
         lines = [claim_line(claims.view(c)) for c in shown]
@@ -1257,6 +1267,24 @@ def morning_brief_claim_ids(brief: MorningBrief) -> list[int]:
     return [c.id for c in shown]
 
 
+def _brief_missed(brief: MorningBrief) -> list[MissedCall]:
+    """The missed-call loops the brief shows (build step 6).
+
+    Read defensively, like the claims above: a brief built before the loops
+    engine learned about missed calls simply has none.
+    """
+    loops = brief.loops
+    if loops is None:
+        return []
+    return list(getattr(loops, "missed", None) or [])
+
+
+def morning_brief_missed_ids(brief: MorningBrief) -> list[int]:
+    """The missed calls whose line the brief carries, in line order — the
+    interactions the ✅ Bog'landim / ⏰ rows act on."""
+    return [m.interaction_id for m in _brief_missed(brief)]
+
+
 NUDGE_HEADER = "❓ <b>Javobsiz savol</b>"
 NUDGE_ANSWERED = "✅ Javob berilgan deb yozib qo'ydim — boshqa eslatmayman."
 
@@ -1293,6 +1321,30 @@ def nudge_overflow(count: int) -> str:
         f"❓ <i>… va yana {count} ta javobsiz savol — keyingi safar eslataman "
         f"(to'liq ro'yxat: /ertalab).</i>"
     )
+
+
+# --- missed calls (build step 6) ---------------------------------------------
+#
+# The companion app uploads the call log; a missed or rejected ring nobody
+# dealt with is an open loop (loops.missed_calls). The nudge mirrors the
+# question nudge: once, plus once more after an "⏰ Ertalab eslat" snooze.
+
+MISSED_NUDGE_HEADER = "📵 <b>Javobsiz qo'ng'iroq</b>"
+MISSED_ANSWERED = "✅ Yozib qo'ydim — bog'landing."
+MISSED_GONE = "⚠️ Bu qo'ng'iroq eskirgan yoki yozuvi o'chirilgan."
+
+
+def missed_nudge(m: MissedCall) -> str:
+    """One short message per missed call: who rang, how long ago, how often."""
+    who = m.person_name if m.person is not None else (m.phone or "Noma'lum raqam")
+    lines = [
+        MISSED_NUDGE_HEADER,
+        f"<b>{escape(who)}</b> · {age_label(m.age)} oldin qo'ng'iroq qildi — "
+        "javob berilmadi.",
+    ]
+    if m.attempts > 1:
+        lines.append(f"<i>Jami {m.attempts} marta urindi.</i>")
+    return clip("\n".join(lines))
 
 
 NEW_GROUP_GONE = "⚠️ Bu chat endi ro'yxatda yo'q."
@@ -1467,6 +1519,25 @@ def _anthropic_line(status: health.Status) -> str:
     return f"✅ Anthropic — oxirgi muvaffaqiyat: {last}"
 
 
+def _phone_line(status: health.Status) -> str | None:
+    """The companion app's last accepted batch — informational, never a fault.
+
+    None (no line at all) when no phone has ever uploaded: a phone-less
+    install is healthy and should not read as missing something.
+    """
+    phone = getattr(status, "phone", None)
+    if phone is None:
+        return None
+    detail = phone.detail or {}
+    parts = []
+    if detail.get("calls"):
+        parts.append(f"{detail['calls']} qo'ng'iroq")
+    if detail.get("sms"):
+        parts.append(f"{detail['sms']} sms")
+    tail = f" ({', '.join(parts)})" if parts else ""
+    return f"📱 Telefon — oxirgi yuklash: {_ago(phone.age)}{tail}"
+
+
 def status_report(status: health.Status, problems: list[health.Problem]) -> str:
     """`/holat`: every part of MIYA on one line each, then what to do."""
     now = status.now.astimezone(settings.tz)
@@ -1479,6 +1550,7 @@ def status_report(status: health.Status, problems: list[health.Problem]) -> str:
         _disk_line(status),
         _backup_line(status),
         _anthropic_line(status),
+        *([line] if (line := _phone_line(status)) else []),
         "<b>Navbatda</b>: "
         f"kutayotgan suhbatlar {status.windows_pending} · "
         f"batch'da {status.windows_submitted} · "

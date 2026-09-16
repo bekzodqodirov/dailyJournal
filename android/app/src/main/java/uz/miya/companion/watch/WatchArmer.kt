@@ -200,6 +200,12 @@ class WatchArmer(
         // Re-arm first: the folder may have just been created by this very call.
         rearm()
 
+        // Build step 6: the call-log row for this call (a missed one
+        // especially — there is no recording to find for it) should reach the
+        // server within a minute of the ring. The worker's own 10 s delay
+        // gives the dialer time to commit the row.
+        Scheduling.enqueueEventSync(context)
+
         // Do not even attempt the foreground start when the platform is known
         // to refuse it. From Android 12 a background FGS start needs an
         // enumerated exemption, and the battery-optimisation exemption is the

@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import uz.miya.companion.Graph
 import uz.miya.companion.data.PrefsSnapshot
+import uz.miya.companion.data.SmsMode
 import uz.miya.companion.data.UploadEntity
 import uz.miya.companion.data.UploadState
 import uz.miya.companion.discover.FolderProbe
@@ -165,7 +166,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             critical = false,
         )
 
-        val callLog = StorageAccess.granted(context, Manifest.permission.READ_CALL_LOG)
+        val callLog = StorageAccess.hasCallLog(context)
         items += HealthItem(
             title = "Call log (optional)",
             ok = callLog,
@@ -179,6 +180,41 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             },
             action = HealthAction.CALL_LOG_PERMISSION,
             actionLabel = "Try anyway",
+            critical = false,
+        )
+
+        // ---- phone events (build step 6) ----------------------------------
+        items += HealthItem(
+            title = "Call-log upload",
+            ok = !prefs.uploadCallLog || callLog,
+            detail = when {
+                !prefs.uploadCallLog -> "Off in Settings. Missed calls will not reach the server."
+                callLog -> "On. Every call — missed ones included — becomes an event on " +
+                    "your server: number, time, duration. Metadata only, never audio."
+                else -> "On in Settings, but the call-log permission is not granted, so " +
+                    "nothing is uploaded."
+            },
+            action = HealthAction.CALL_LOG_PERMISSION,
+            actionLabel = "Grant",
+            critical = false,
+        )
+
+        val sms = StorageAccess.hasSms(context)
+        items += HealthItem(
+            title = "SMS upload",
+            ok = prefs.smsMode == SmsMode.OFF || sms,
+            detail = when {
+                prefs.smsMode == SmsMode.OFF ->
+                    "Off in Settings. Payme and bank SMS stay on the phone."
+                sms && prefs.smsMode == SmsMode.PAYMENTS ->
+                    "On, payment senders only (Payme, Click, banks). Messages go to your " +
+                        "own server and nowhere else."
+                sms -> "On, ALL incoming SMS. Messages go to your own server and nowhere else."
+                else -> "On in Settings, but READ_SMS/RECEIVE_SMS is not granted, so nothing " +
+                    "is uploaded. Like the call log, these are hard-restricted on a sideload."
+            },
+            action = HealthAction.SMS_PERMISSION,
+            actionLabel = "Grant",
             critical = false,
         )
 
@@ -371,6 +407,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             // The configuration just changed, so everything parked for want of
             // one gets another chance — including the rows the 401 latch failed.
             Graph.repository.retryAllFailed()
+            // The phone-event queue waits on the same configuration.
+            Scheduling.enqueueEventSync(context)
 
             local.value = local.value.copy(message = message)
             refresh()
@@ -435,6 +473,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 // Proven reachable and authorised: release everything that was
                 // parked while it was not.
                 Graph.repository.retryAllFailed()
+                Scheduling.enqueueEventSync(context)
                 local.value = local.value.copy(
                     busy = false,
                     message = "Connection and token are good. Anything that was blocked " +
@@ -486,12 +525,34 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { Graph.prefs.setMinDurationSeconds(seconds.coerceIn(0, 600)) }
     }
 
+    // ---- phone events (build step 6) --------------------------------------
+
+    fun setUploadCallLog(value: Boolean) {
+        viewModelScope.launch {
+            Graph.prefs.setUploadCallLog(value)
+            // Switching it on should show results within a minute, not at the
+            // next call — kick a sync so the backlog starts moving now.
+            if (value) Scheduling.enqueueEventSync(context)
+            refresh()
+        }
+    }
+
+    fun setSmsMode(value: String) {
+        viewModelScope.launch {
+            Graph.prefs.setSmsMode(value)
+            if (value != SmsMode.OFF) Scheduling.enqueueEventSync(context)
+            refresh()
+        }
+    }
+
     fun completeOnboarding() {
         viewModelScope.launch {
             Graph.prefs.setOnboardingComplete(true)
             Graph.watchArmer.start()
             Scheduling.ensurePeriodicScan(context)
             Scheduling.enqueueImmediateScan(context)
+            // First harvest of the call log and SMS (build step 6).
+            Scheduling.enqueueEventSync(context)
             refresh()
         }
     }

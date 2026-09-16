@@ -38,8 +38,68 @@ object CallLogMatcher {
     /** How far back to look for candidate rows. */
     private const val LOOKBACK_MILLIS = 12 * 60 * 60 * 1000L
 
-    fun available(context: Context): Boolean =
-        StorageAccess.granted(context, Manifest.permission.READ_CALL_LOG)
+    fun available(context: Context): Boolean = StorageAccess.hasCallLog(context)
+
+    /**
+     * Build step 6: the call-log rows themselves become events. Everything
+     * newer than [afterId], oldest first, at most [limit] rows (the server
+     * caps a batch at 200). The caller advances its high-water mark only
+     * after the server has confirmed the batch, so re-reading the same rows
+     * after a failed post is normal and cheap — the queue dedupes on the
+     * event key.
+     */
+    fun since(context: Context, afterId: Long, limit: Int = 200): List<Match> {
+        if (!available(context)) return emptyList()
+
+        val projection = arrayOf(
+            CallLog.Calls._ID,
+            CallLog.Calls.NUMBER,
+            CallLog.Calls.DATE,
+            CallLog.Calls.DURATION,
+            CallLog.Calls.TYPE,
+            CallLog.Calls.CACHED_NAME,
+            CallLog.Calls.PHONE_ACCOUNT_ID,
+        )
+        val out = ArrayList<Match>()
+        try {
+            context.contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                projection,
+                "${CallLog.Calls._ID} > ?",
+                arrayOf(afterId.toString()),
+                "${CallLog.Calls._ID} ASC",
+            )?.use { c ->
+                val idIdx = c.getColumnIndexOrThrow(CallLog.Calls._ID)
+                val numIdx = c.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+                val dateIdx = c.getColumnIndexOrThrow(CallLog.Calls.DATE)
+                val durIdx = c.getColumnIndexOrThrow(CallLog.Calls.DURATION)
+                val typeIdx = c.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+                val nameIdx = c.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+                val acctIdx = c.getColumnIndex(CallLog.Calls.PHONE_ACCOUNT_ID)
+
+                while (c.moveToNext() && out.size < limit) {
+                    out.add(
+                        Match(
+                            callLogId = c.getLong(idIdx),
+                            startedAtMillis = c.getLong(dateIdx),
+                            durationSeconds = c.getLong(durIdx).toInt(),
+                            direction = directionOf(c.getInt(typeIdx)),
+                            number = c.getString(numIdx),
+                            cachedName = c.getString(nameIdx)?.takeIf { it.isNotBlank() },
+                            simSlot = if (acctIdx >= 0) {
+                                slotFor(context, c.getString(acctIdx))
+                            } else {
+                                null
+                            },
+                        )
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            Logx.w("CallLog since($afterId) failed: ${t.message}")
+        }
+        return out
+    }
 
     /**
      * The file's mtime is the best proxy we have for call END, so the row we

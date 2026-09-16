@@ -6,8 +6,9 @@ whatever call metadata the phone can honestly supply, to your self-hosted MIYA
 server.
 
 It is the phone half of the design in the architecture document. The server half
-(`POST /v1/recordings`, `POST /v1/recordings/probe`) is built separately; the
-wire contract below is implemented here exactly as specified.
+(`POST /v1/recordings`, `POST /v1/recordings/probe`, and since build step 6
+`POST /v1/phone/calls` and `POST /v1/phone/sms`) is built separately; the wire
+contract below is implemented here exactly as specified.
 
 ---
 
@@ -264,6 +265,69 @@ succeeds.
 
 ---
 
+## Phone events (call log and SMS) — build step 6
+
+Beside the recordings, the app uploads two **metadata** streams, so the phone
+becomes a second source even where there is no audio at all:
+
+- **Call-log events** — `POST /v1/phone/calls`. Every call: incoming, outgoing,
+  **missed**, rejected. What leaves the phone per call: the `CallLog._ID`, the
+  start time (ISO-8601 with offset), the duration, the type, the number
+  (normalised to E.164 where possible), the contact name from the phone's own
+  address book, and the SIM slot. **Never audio.** On the server a missed call
+  becomes an open loop — "Akmal qo'ng'iroq qildi — javobsiz" — that nudges once
+  and rides the morning brief until he calls back.
+- **SMS** — `POST /v1/phone/sms`. Three modes in Settings:
+  - `off` — nothing leaves the phone;
+  - `payments` (**default**) — only messages whose sender is on the payment
+    allow-list (`ingest/PaymentSenders.kt`, mirroring the server's
+    `sms_money.DEFAULT_SENDERS`: Payme, Click, Uzcard, Humo, the banks, 8600,
+    9860 …). The server re-checks the sender either way — the client filter
+    only limits what leaves the phone;
+  - `all` — every incoming SMS.
+
+  A payment SMS is parsed **deterministically on the server** into a
+  transaction (no model, no tokens, and never a Person named "PAYME"); other
+  SMS are stored as plain interactions. Either way the SMS goes to the owner's
+  own server and nowhere else.
+
+How it moves: `SmsReceiver` (a read-only `SMS_RECEIVED` receiver — no
+default-SMS role) and the call-end trigger both just enqueue
+`EventSyncWorker`; the 15-minute `ScanWorker` sweep enqueues it too as the
+safety net. The worker reads the providers **by `_ID` high-water mark**, so a
+missed broadcast or a force-stop costs latency, never an event. Each event is
+frozen as one JSON payload in the Room queue (`phone_events`, database
+version 2 — a real `Migration(1,2)`, never destructive), keyed by the same
+`event_key` the server dedupes on:
+
+```
+call: <device_id>:call:<CallLog._ID>
+sms:  <device_id>:sms:<Sms._ID>:<sha256(sender|received_at|body)[:16]>
+```
+
+(the SMS key hashes the content because Android's `Sms._ID` restarts after a
+wipe). Batches of at most 200 are POSTed; the server answers `200` for every
+well-formed batch with per-event `accepted` / `duplicates` / `rejected`
+counts, and a `200` settles the whole batch on the phone. The high-water marks
+advance **only after** that `200`, so nothing is skipped by a lost response —
+the queue's primary key absorbs the re-read.
+
+The upload tokens from `UPLOAD_TOKENS` open `/v1/phone/calls` and
+`/v1/phone/sms` exactly as they open `/v1/recordings` — nothing else.
+
+**Google-Dialer phones**: recordings are unreachable there (share-only mode),
+but the call log and SMS work exactly the same — so even that phone gets
+missed-call loops and automatic transactions.
+
+Permissions: `READ_CALL_LOG` (already requested for correlation), plus
+`RECEIVE_SMS` and `READ_SMS`. All three are **hard-restricted** on Android
+10+, so a plain sideload may never be able to hold them (see *Installing*);
+the Health screen shows each stream's real state and the app degrades rather
+than breaks. SMS bodies are never logged, not even redacted
+(`Logx.redactSmsBody` exists for the day a log line must reference one).
+
+---
+
 ## Building it
 
 Requirements: **Android Studio Ladybug (2024.2) or newer, and JDK 17.**
@@ -496,7 +560,8 @@ mistake.
   KeyStore refuses the key, Settings says so instead of reporting "Saved."),
   folder re-detect/re-pick, all-files opt-in, Wi-Fi-only,
   delete-local-after-upload (default **off**), language hint, minimum call
-  duration.
+  duration — and, since build step 6, the call-log upload toggle and the
+  three-way SMS mode (off / payments / all, default payments).
 
 ### What reaches logcat
 
@@ -518,8 +583,9 @@ exception text only.
 | `INTERNET`, `ACCESS_NETWORK_STATE` | Upload. |
 | `READ_MEDIA_AUDIO` (33+) / `READ_EXTERNAL_STORAGE` (≤32) | Read the files the dialer wrote. Android 14's partial media access is visual-only, so audio stays all-or-nothing — which here is good news. |
 | `READ_PHONE_STATE` | `CALL_STATE_IDLE` → the cheapest reliable "go look now" trigger. |
-| `READ_CALL_LOG` | Direction, exact start time, duration, contact name. **Hard-restricted; often ungrantable on a sideload.** The app degrades to filename + mtime. |
+| `READ_CALL_LOG` | Direction, exact start time, duration, contact name — and, in build step 6, the call-log event stream itself (missed calls become open loops). **Hard-restricted; often ungrantable on a sideload.** The recordings path degrades to filename + mtime. |
 | `READ_CONTACTS` | A display name for a number the call log did not cache. |
+| `RECEIVE_SMS`, `READ_SMS` | Build step 6: payment SMS become transactions on the owner's own server. `RECEIVE_SMS` only wakes the sync worker; `READ_SMS` is what it reads. Same hard-restricted group as the call log; the app works without them (no SMS upload). |
 | `POST_NOTIFICATIONS` | Without it the foreground-service notification is suppressed, which makes the app invisible and much likelier to be killed. |
 | `RECEIVE_BOOT_COMPLETED` | Re-arm observers after a reboot. |
 | `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_DATA_SYNC` | `dataSync` is the honest type — its documented use cases are literally "local file processing" and "transfer data between a device and the cloud". `microphone` is deliberately **not** declared: we do not capture, and on Android 14+ it is a while-in-use type that cannot be started from the background at all. |
@@ -568,10 +634,12 @@ app/src/main/java/uz/miya/companion/
   data/
     Prefs.kt                  DataStore: server URL, folder, device_id, flags
     TokenStore.kt             bearer token, AES-GCM via Android KeyStore
-    AppDatabase.kt            Room, version 1
+    AppDatabase.kt            Room, version 2 (real Migration(1,2), never destructive)
     UploadEntity.kt           one row per recording; PK = sha256
     UploadDao.kt              insertIgnore, nextPending, observable queue
-    RecordingRepository.kt    the only writer of queue state
+    PhoneEventEntity.kt       one row per call-log/SMS event; PK = server event_key
+    PhoneEventDao.kt          insertIgnore, nextBatch, markDone, counts
+    RecordingRepository.kt    the only writer of recording queue state
     RecordingRef.kt           file / MediaStore row / SAF doc, unified
   discover/
     OemCandidates.kt          manufacturer-ordered candidate paths (a hint, not truth)
@@ -582,6 +650,7 @@ app/src/main/java/uz/miya/companion/
     RecordingFileObserver.kt  CLOSE_WRITE | MOVED_TO, multi-directory
     MediaStoreWatcher.kt      ContentObserver, notifyForDescendants = true
     CallStateWatcher.kt       TelephonyCallback (31+) / PhoneStateListener
+    SmsReceiver.kt            SMS_RECEIVED wake-up; only enqueues EventSyncWorker
     WatchArmer.kt             the one place that re-registers everything
     BootReceiver.kt           BOOT_COMPLETED / MY_PACKAGE_REPLACED
   service/
@@ -589,20 +658,22 @@ app/src/main/java/uz/miya/companion/
   ingest/
     StabilityGate.kt          name + size + container gates
     Hasher.kt                 streaming SHA-256, 1 MiB buffer
-    CallLogMatcher.kt         time-window correlation, degrades to null
+    CallLogMatcher.kt         time-window correlation + since(id) event harvest
     FilenameParser.kt         digit-anchored, never English-literal
     PhoneNormalizer.kt        libphonenumber → E.164, last-9-digit fallback
+    PaymentSenders.kt         client mirror of the server's payment-sender list
     RecordingScanner.kt       one scan, end to end
   net/
     MetaJson.kt               the §2.5 metadata object, literally
     MiyaClient.kt             OkHttp, auth interceptor, no call timeout
     StreamingRequestBody.kt   streams from ContentResolver, never readBytes()
-    UploadApi.kt              probe + upload, status → UploadOutcome
+    UploadApi.kt              probe + upload + postCalls/postSms, status → outcome
   work/
-    Scheduling.kt             periodic / burst / immediate / drain
+    Scheduling.kt             periodic / burst / immediate / drain / event sync
     ScanWorker.kt             15-min reconciliation + "we have gone quiet" alarm
     UploadWorker.kt           one attempt per run, maps §2.7 exactly
     DrainWorker.kt            re-arms pending rows after reboot/force-stop
+    EventSyncWorker.kt        harvest call log + SMS, POST batches, advance marks
   ui/                         Compose: Onboarding, Health, Queue, Settings, share target
   oem/OemHints.kt             per-manufacturer deep links (dontkillmyapp.com)
   util/                       Notifications, StorageAccess, TimeFmt, Logx
@@ -653,6 +724,12 @@ Android SDK available to compile against:
 - The `mtimeMillis / 1000` comparison in `UploadDao.countBySource` is valid
   SQLite integer division and Room compiles the query at build time; without an
   SDK that compilation has not been run. Same for the new `nextRetryable` query.
+- The `Migration(1,2)` SQL in `AppDatabase` must stay byte-equivalent to what
+  Room generates for `PhoneEventEntity` (columns, NOT NULL, PK, the
+  `index_phone_events_state_kind_createdAt` name): Room validates at open and
+  crashes on a mismatch. If a column is ever added to that entity, bump the
+  version and write the next migration — never `fallbackToDestructiveMigration`,
+  the queue must survive updates.
 - The 50-new-files-per-sweep cap and the 5-minute freshness window on the
   stability gate are judgement calls about I/O cost on a slow eMMC, not measured
   numbers. They bound the work; they have not been timed on hardware.

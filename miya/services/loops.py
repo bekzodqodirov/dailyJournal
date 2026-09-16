@@ -7,7 +7,7 @@ system already stores — SQL and a few pure rules, no model call anywhere —
 and hands them to the morning brief and the report as typed rows, each with
 a stable ref and an age.
 
-Three detectors and one aggregate:
+Four detectors and one aggregate:
 
   * ``unanswered_questions`` — in a private chat, an incoming message that
     looks like a question, older than LOOP_QUESTION_HOURS, with nothing
@@ -26,12 +26,17 @@ Three detectors and one aggregate:
   * ``quiet_counterparties`` — people with an open debt or promise in either
     direction and no contact of any kind — message, transaction, debt,
     payment or promise — for LOOP_QUIET_DAYS.
+  * ``missed_calls`` — a missed or rejected ring (build step 6, uploaded by
+    the companion app as a call-log event) that no later contact discharged,
+    older than LOOP_MISSED_CALL_MINUTES and younger than
+    LOOP_MISSED_CALL_MAX_DAYS. One loop per number.
 
-``open_loops`` runs all three and orders the union by urgency: money at
+``open_loops`` runs all four and orders the union by urgency: money at
 stake first (larger first), then age.
 
 Refs: a question is ``q<interaction id>``, a commitment is its d/p/t ref, a
-quiet person is ``k<person id>``. Text comes back raw; the renderer escapes.
+quiet person is ``k<person id>``, a missed call is ``m<interaction id>``.
+Text comes back raw; the renderer escapes.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ from decimal import Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from miya.bot.formatting import ref as record_ref
 from miya.config import settings
@@ -67,7 +72,7 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import queries
+from miya.services import phone_events, queries
 from miya.services.queries import DebtBalance
 from miya.services.text import fold_apostrophes
 
@@ -285,6 +290,7 @@ ANSWERED_KEY = "answered"
 KIND_QUESTION = "question"
 KIND_UNDATED = "undated"
 KIND_QUIET = "quiet"
+KIND_MISSED = "missed_call"
 
 
 def rank_stake(amount: Decimal | None, currency: Currency | None) -> Decimal:
@@ -349,10 +355,26 @@ class QuietCounterparty(Loop):
     promises: list[Promise]
 
 
+@dataclass(slots=True, kw_only=True)
+class MissedCall(Loop):
+    """Someone rang and nobody has been in touch since (build step 6).
+
+    One per number: ``interaction_id`` and ``called_at`` are the oldest open
+    missed call from it, ``attempts`` counts the missed/rejected rings from
+    the same number since that one — the follow_ups analogue.
+    """
+
+    interaction_id: int
+    called_at: datetime
+    phone: str | None
+    attempts: int
+
+
 @dataclass(slots=True)
 class OpenLoops:
     now: datetime
     questions: list[UnansweredQuestion] = field(default_factory=list)
+    missed: list[MissedCall] = field(default_factory=list)
     stale: list[StaleCommitment] = field(default_factory=list)
     quiet: list[QuietCounterparty] = field(default_factory=list)
     # The union, most urgent first: bigger stake, then older.
@@ -756,22 +778,196 @@ async def quiet_counterparties(
     return out
 
 
-# --- 4. all of it, by urgency -----------------------------------------------------
+# --- 4. missed calls (build step 6) -----------------------------------------------
+
+MISSED_CALL_TYPES = ("missed", "rejected")
+
+
+def _phone_tail(phone: str | None) -> str | None:
+    """The last 9 digits, as find_by_phone compares numbers."""
+    digits = re.sub(r"\D", "", phone or "")
+    return digits[-9:] if digits else None
+
+
+def _tail_expr(column):
+    """The same 9-digit tail in SQL, on a JSONB ``->> 'phone'`` value."""
+    return sa.func.right(sa.func.regexp_replace(column, r"\D", "", "g"), 9)
+
+
+def _is_missed_call_row(cls=Interaction):
+    """A call-log event row for a ring nobody answered.
+
+    Coalesced so a phone_call row with other media (a recording, or none at
+    all) is a clean False, never SQL NULL — the predicate is negated below.
+    """
+    return sa.and_(
+        cls.source == InteractionSource.phone_call,
+        sa.func.coalesce(cls.media["type"].astext, "") == phone_events.MEDIA_CALL_LOG,
+        sa.func.coalesce(cls.media["call_type"].astext, "").in_(MISSED_CALL_TYPES),
+    )
+
+
+def _answered_floor(rows: list[Interaction]) -> datetime | None:
+    """When the owner last said "✅ Bog'landim" about this number.
+
+    The mark resets the number the way an outgoing reply resets a chat in
+    ``unanswered_questions``: every ring at or before it is handled, and the
+    next ring after it opens a new loop.
+    """
+    floor: datetime | None = None
+    for row in rows:
+        if not is_answered(row):
+            continue
+        mark = (row.meta or {}).get(ANSWERED_KEY) or {}
+        try:
+            at = datetime.fromisoformat(str(mark.get("at")))
+        except (TypeError, ValueError):
+            at = None
+        if at is not None and at.tzinfo is None:
+            at = at.replace(tzinfo=settings.tz)
+        candidate = row.occurred_at if at is None else max(at, row.occurred_at)
+        if floor is None or candidate > floor:
+            floor = candidate
+    return floor
+
+
+async def missed_calls(
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+    minutes: int | None = None,
+    max_days: int | None = None,
+) -> list[MissedCall]:
+    """Missed and rejected rings nobody has dealt with, oldest first.
+
+    Note the difference from ``unanswered_questions``, which only an
+    outgoing message in that same chat (or the ✅ mark) discharges: a missed
+    call is closed by ANY later interaction with the same person, whatever
+    its source or direction — a call back, an answered incoming call, a
+    Telegram message, an SMS all prove the two were in touch. When the
+    number matched nobody, any later phone_call interaction whose
+    ``media->>'phone'`` carries the same 9-digit tail closes it instead
+    (calling a stranger back still counts). A later missed or rejected ring
+    never closes anything — it joins the loop as another attempt. The
+    owner's ✅ ("Bog'landim") closes the number like the questions' mark.
+
+    Bounded like ``question_floor``: nothing older than
+    LOOP_MISSED_CALL_MAX_DAYS is read — so the occurred_at indexes drive the
+    scan — and nothing younger than LOOP_MISSED_CALL_MINUTES is a loop yet;
+    a fresh missed call may just mean he is on another call. One loop per
+    number: the oldest open ring carries the count.
+    """
+    now = _now(now)
+    minutes = settings.loop_missed_call_minutes if minutes is None else minutes
+    max_days = settings.loop_missed_call_max_days if max_days is None else max_days
+    cutoff = now - timedelta(minutes=minutes)
+    floor = now - timedelta(days=max_days)
+
+    later = aliased(Interaction)
+    not_a_missed_ring = sa.not_(_is_missed_call_row(later))
+    closed_by_person = sa.exists().where(
+        later.person_id == Interaction.person_id,
+        later.occurred_at > Interaction.occurred_at,
+        not_a_missed_ring,
+    )
+    closed_by_tail = sa.exists().where(
+        later.source == InteractionSource.phone_call,
+        later.media["phone"].astext.isnot(None),
+        _tail_expr(later.media["phone"].astext)
+        == _tail_expr(Interaction.media["phone"].astext),
+        later.occurred_at > Interaction.occurred_at,
+        not_a_missed_ring,
+    )
+
+    rows = list(
+        await session.scalars(
+            sa.select(Interaction)
+            .options(selectinload(Interaction.person))
+            .where(_is_missed_call_row())
+            .where(Interaction.occurred_at >= floor)
+            .where(Interaction.occurred_at <= cutoff)
+            .where(
+                sa.or_(
+                    sa.and_(Interaction.person_id.isnot(None), sa.not_(closed_by_person)),
+                    sa.and_(Interaction.person_id.is_(None), sa.not_(closed_by_tail)),
+                )
+            )
+            .order_by(Interaction.occurred_at, Interaction.id)
+        )
+    )
+    if not rows:
+        return []
+
+    groups: dict[object, list[Interaction]] = {}
+    for row in rows:
+        key: object = (
+            ("person", row.person_id)
+            if row.person_id is not None
+            else ("tail", _phone_tail((row.media or {}).get("phone")) or f"i{row.id}")
+        )
+        groups.setdefault(key, []).append(row)
+
+    # The person's open-debt stake, exactly as quiet_counterparties ranks it.
+    stakes: dict[int, Decimal] = {}
+    if any(row.person_id is not None for row in rows):
+        for balance in await queries.open_debts(session):
+            stakes[balance.person.id] = stakes.get(
+                balance.person.id, Decimal(0)
+            ) + rank_stake(balance.outstanding, balance.currency)
+
+    out: list[MissedCall] = []
+    for group in groups.values():
+        answered_floor = _answered_floor(group)
+        open_rows = [
+            row
+            for row in group
+            if not is_answered(row)
+            and (answered_floor is None or row.occurred_at > answered_floor)
+        ]
+        if not open_rows:
+            continue
+        oldest = open_rows[0]
+        out.append(
+            MissedCall(
+                kind=KIND_MISSED,
+                ref=f"m{oldest.id}",
+                age=now - oldest.occurred_at,
+                stake_rank=(
+                    stakes.get(oldest.person_id, Decimal(0))
+                    if oldest.person_id is not None
+                    else Decimal(0)
+                ),
+                person=oldest.person,
+                interaction_id=oldest.id,
+                called_at=oldest.occurred_at,
+                phone=(oldest.media or {}).get("phone"),
+                attempts=len(open_rows),
+            )
+        )
+    out.sort(key=lambda m: (m.called_at, m.ref))
+    return out
+
+
+# --- 5. all of it, by urgency -----------------------------------------------------
 
 
 async def open_loops(session: AsyncSession, now: datetime | None = None) -> OpenLoops:
     """Every open loop, with ``ordered`` ranked by stake then age.
 
     The stake of a quiet counterparty is everything open with them; of a
-    stale debt its outstanding row; questions and promises carry none, so
-    they follow the money and sort among themselves by age.
+    stale debt its outstanding row; of a missed call the caller's own open
+    debts. Questions and promises carry none, so they follow the money and
+    sort among themselves by age.
     """
     now = _now(now)
     loops = OpenLoops(
         now=now,
         questions=await unanswered_questions(session, now=now),
+        missed=await missed_calls(session, now=now),
         stale=await stale_undated(session, now=now),
         quiet=await quiet_counterparties(session, now=now),
     )
-    loops.ordered = sorted([*loops.questions, *loops.stale, *loops.quiet], key=urgency)
+    loops.ordered = sorted(
+        [*loops.questions, *loops.missed, *loops.stale, *loops.quiet], key=urgency
+    )
     return loops

@@ -226,6 +226,16 @@ class Interaction(Base):
             sa.text("(media ->> 'sha256')"),
             postgresql_where=sa.text("source = 'phone_call'"),
         ),
+        # Phone-event dedupe (build step 6): one row per call-log entry or
+        # SMS, ever. The key is minted on the phone, so a retried batch lands
+        # here instead of becoming a second interaction — the unique index,
+        # not the ingester's pre-select, is the idempotency guarantee.
+        sa.Index(
+            "ux_interactions_event_key",
+            sa.text("(media ->> 'event_key')"),
+            unique=True,
+            postgresql_where=sa.text("media ->> 'event_key' IS NOT NULL"),
+        ),
     )
 
 

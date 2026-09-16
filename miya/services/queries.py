@@ -286,13 +286,15 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
 
 # --- one person's history (build step 4) ------------------------------------
 
-# Sources whose every row is one contact worth a timeline line: a call, a
-# note the owner typed or spoke into the bot, a receipt. The userbot is
-# different — its member messages are one-liners, and the row worth showing
-# is the window's own synthetic interaction (meta.kind == "window"), which
-# carries the summary of the whole conversation.
+# Sources whose every row is one contact worth a timeline line: a call, an
+# SMS (a money SMS must appear in /tarix), a note the owner typed or spoke
+# into the bot, a receipt. The userbot is different — its member messages
+# are one-liners, and the row worth showing is the window's own synthetic
+# interaction (meta.kind == "window"), which carries the summary of the
+# whole conversation.
 TIMELINE_SOURCES: tuple[InteractionSource, ...] = (
     InteractionSource.phone_call,
+    InteractionSource.phone_sms,
     InteractionSource.assistant_bot,
     InteractionSource.manual,
     InteractionSource.receipt_photo,

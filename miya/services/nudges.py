@@ -37,16 +37,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.models import Interaction, ReminderLog
 from miya.services import loops
-from miya.services.loops import ANSWERED_KEY, OpenLoops, UnansweredQuestion, is_answered
+from miya.services.loops import (
+    ANSWERED_KEY,
+    MissedCall,
+    OpenLoops,
+    UnansweredQuestion,
+    is_answered,
+)
 
 __all__ = [
     "ANSWERED_KEY",
     "MAX_PER_SWEEP",
+    "MISSED_KIND",
     "NUDGE_KIND",
     "SNOOZED_KEY",
     "collect",
+    "collect_missed",
     "is_answered",
     "mark_answered",
+    "mark_missed_nudged",
     "mark_nudged",
     "next_morning",
     "open_loops",
@@ -59,6 +68,8 @@ log = logging.getLogger(__name__)
 
 # reminder_log kind for one nudge sent; the ref is the interaction id.
 NUDGE_KIND = "nudge:q"
+# The same, for a missed-call nudge (build step 6); same ref, same cadence.
+MISSED_KIND = "nudge:m"
 # One sweep sends this many nudges; the rest is one summary line and comes
 # on a later sweep — the owner tolerates twenty-odd pings a day, not a burst.
 MAX_PER_SWEEP = 5
@@ -128,13 +139,15 @@ async def open_loops(session: AsyncSession, now: datetime | None = None) -> Open
 # --- the sweep ---------------------------------------------------------------
 
 
-async def _last_nudged(session: AsyncSession, ids: list[int]) -> dict[int, datetime]:
-    """When each question was last nudged, for those that ever were."""
+async def _last_nudged(
+    session: AsyncSession, ids: list[int], *, kind: str = NUDGE_KIND
+) -> dict[int, datetime]:
+    """When each interaction was last nudged under ``kind``, if ever."""
     if not ids:
         return {}
     rows = await session.execute(
         sa.select(ReminderLog.ref, sa.func.max(ReminderLog.sent_at))
-        .where(ReminderLog.kind == NUDGE_KIND)
+        .where(ReminderLog.kind == kind)
         .where(ReminderLog.ref.in_([str(i) for i in ids]))
         .group_by(ReminderLog.ref)
     )
@@ -188,3 +201,46 @@ def mark_nudged(session: AsyncSession, questions: list[UnansweredQuestion]) -> N
     """Only what actually went out — the summarised tail qualifies next sweep."""
     for question in questions:
         session.add(ReminderLog(kind=NUDGE_KIND, ref=str(question.interaction_id)))
+
+
+# --- the missed-call sweep (build step 6) ------------------------------------
+
+
+async def collect_missed(
+    session: AsyncSession, *, now: datetime | None = None
+) -> list[MissedCall]:
+    """Missed calls due a nudge this sweep, oldest first.
+
+    The same contract as questions, through the same ``is_due``: one nudge
+    per missed-call loop ever, plus one more after a "⏰ Ertaga" snooze
+    expires. The ✅/snooze marks live on the loop's own interaction, exactly
+    as they do for a question.
+    """
+    now = _now(now)
+    missed = await loops.missed_calls(session, now=now)
+    if not missed:
+        return []
+    interactions = {
+        row.id: row
+        for row in await session.scalars(
+            sa.select(Interaction).where(
+                Interaction.id.in_([m.interaction_id for m in missed])
+            )
+        )
+    }
+    nudged = await _last_nudged(session, list(interactions), kind=MISSED_KIND)
+    return [
+        item
+        for item in missed
+        if is_due(
+            nudged.get(item.interaction_id),
+            snoozed_until(interactions[item.interaction_id]),
+            now=now,
+        )
+    ]
+
+
+def mark_missed_nudged(session: AsyncSession, missed: list[MissedCall]) -> None:
+    """Only what notify() actually delivered, as everywhere else."""
+    for item in missed:
+        session.add(ReminderLog(kind=MISSED_KIND, ref=str(item.interaction_id)))
