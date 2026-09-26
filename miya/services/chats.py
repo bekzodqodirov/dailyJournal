@@ -213,7 +213,11 @@ def _now(now: datetime | None) -> datetime:
 
 
 async def awaiting_join_question(
-    session: AsyncSession, *, limit: int = 5
+    session: AsyncSession,
+    *,
+    now: datetime | None = None,
+    limit: int = 8,
+    for_push: bool = True,
 ) -> list[ChatMonitor]:
     """Groups and channels switched off that the owner was never asked about.
 
@@ -236,6 +240,19 @@ async def awaiting_join_question(
 def mark_asked(monitor: ChatMonitor, *, now: datetime | None = None) -> None:
     """The question went out (or is about to): never ask this chat again."""
     monitor.asked_at = _now(now)
+
+
+def mark_offered(monitor: ChatMonitor, *, now: datetime) -> None:
+    """One more digest listed this group (WP-17)."""
+    monitor.asked_at = monitor.asked_at or now
+    monitor.offered_at = now
+    monitor.digest_shows = (monitor.digest_shows or 0) + 1
+
+
+async def apply_default_rules(session: AsyncSession, *, now: datetime) -> int:
+    """Decide the groups no digest needs to ask about (the rules land in
+    WP-20); returns how many were decided."""
+    return 0
 
 
 async def _answerable(session: AsyncSession, monitor_id: int) -> ChatMonitor | None:

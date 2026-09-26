@@ -78,7 +78,7 @@ def _state_matches(*states: str):
 
 
 async def awaiting_question(
-    session: AsyncSession, *, limit: int = 20
+    session: AsyncSession, *, limit: int = 20, pushable_only: bool = True
 ) -> list[Interaction]:
     """Media the owner has not been asked about yet, oldest first."""
     return list(

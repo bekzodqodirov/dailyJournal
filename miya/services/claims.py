@@ -216,6 +216,49 @@ async def unasked(
     )
 
 
+async def askable(
+    session: AsyncSession, *, now: datetime | None = None, for_push: bool = True
+) -> list[Claim]:
+    """Pending claims the question queue may put in front of the owner (WP-17).
+
+    Pull (``for_push=False``): every pending claim that is not a repeat.
+    Push: only once old enough to have missed its receipt, not shown today
+    anywhere (a receipt, /davolar or /savollar stamps ``asked_at`` without a
+    question_log row), and within the re-offer rule — never offered, offered
+    once before today, or last offered a week ago (LOOP_UNDATED_DAYS, the
+    owner's "re-remind after one week").
+    """
+    from miya.services import questions, reminders  # the queue imports this module
+
+    now = now or datetime.now(settings.tz)
+    stmt = _pending_stmt().where(Claim.duplicate_of.is_(None))
+    if not for_push:
+        return list(await session.scalars(stmt))
+    today = reminders.day_start(now)
+    rows = list(
+        await session.scalars(
+            stmt.where(
+                Claim.created_at
+                <= now - timedelta(minutes=settings.claim_ask_after_minutes)
+            ).where(sa.or_(Claim.asked_at.is_(None), Claim.asked_at < today))
+        )
+    )
+    offers = await questions.offers_of(
+        session, questions.KIND_CLAIM, [ref(c.id) for c in rows]
+    )
+    week = timedelta(days=settings.loop_undated_days)
+    eligible = []
+    for claim in rows:
+        count, last = offers.get(ref(claim.id), (0, None))
+        if (
+            count == 0
+            or (count == 1 and last < today)
+            or (last is not None and last <= now - week)
+        ):
+            eligible.append(claim)
+    return eligible
+
+
 def mark_asked(claim: Claim, *, now: datetime | None = None) -> None:
     """Record that the question was shown. Only after it really was."""
     if claim.asked_at is None:

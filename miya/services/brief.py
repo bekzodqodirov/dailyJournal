@@ -22,6 +22,9 @@ from miya.db.models import Claim, Event
 from miya.services import claims, nudges, queries
 from miya.services.loops import OpenLoops
 
+# The reminder_log kind the morning brief is logged under, one row per day.
+BRIEF_KIND = "brief"
+
 
 @dataclass(slots=True)
 class MorningBrief:

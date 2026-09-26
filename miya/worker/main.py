@@ -275,7 +275,7 @@ async def window_job(bot: Bot) -> None:
 
 # reminder_log kind for one morning brief sent; the ref is the day. This is
 # what lets a restart spanning 09:00 know the brief never went out.
-BRIEF_KIND = "brief"
+BRIEF_KIND = brief.BRIEF_KIND
 
 
 async def brief_job(bot: Bot) -> bool:

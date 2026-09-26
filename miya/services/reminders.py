@@ -210,6 +210,79 @@ def decide(
     return ASK if today >= fire_on else None
 
 
+async def collect_questions(
+    session: AsyncSession, *, now: datetime | None = None, due: dict | None = None
+) -> list[Question]:
+    """Every "Hali ochiqmi?" question due now, uncapped (WP-17): dated items
+    past their pings, and undated promises and tasks gone stale."""
+    now = now or datetime.now(settings.tz)
+    if due is None:
+        due = await queries.due_items(session, horizon_days=0)
+    questions: list[Question] = []
+    for balance in due["debts"]:
+        ref = debt_ref(balance.person.id, balance.direction, balance.currency)
+        verdict = decide(
+            "debt",
+            await _history(session, "debt", ref),
+            due=balance.earliest_due,
+            created_at=None,
+            now=now,
+        )
+        if verdict == ASK:
+            questions.append(
+                Question(
+                    "debt",
+                    ref,
+                    [("debt", i) for i in balance.ids],
+                    person=balance.person,
+                    balance=balance,
+                )
+            )
+    for promise, person in due["promises"]:
+        ref = str(promise.id)
+        verdict = decide(
+            "promise",
+            await _history(session, "promise", ref),
+            due=promise.due_date,
+            created_at=promise.created_at,
+            now=now,
+        )
+        if verdict == ASK:
+            questions.append(
+                Question("promise", ref, [("promise", promise.id)], promise, person)
+            )
+    for task in due["tasks"]:
+        ref = str(task.id)
+        verdict = decide(
+            "task",
+            await _history(session, "task", ref),
+            due=task.due_date,
+            created_at=task.created_at,
+            now=now,
+        )
+        if verdict == ASK:
+            questions.append(Question("task", ref, [("task", task.id)], task))
+
+    # Undated promises and tasks: the weekly question comes from the open-loops
+    # selection, so the sweep and the morning brief never disagree about what
+    # "undated and stale" means (loops.stale_undated: a week since it was made,
+    # last pinged, answered or corrected — whichever is latest). Undated debts
+    # are in that selection too; the brief shows them, the sweep does not ask.
+    for stale in await loops.stale_undated(session, now=now, kinds=("promise", "task")):
+        record = stale.record
+        ref = ref_for(stale.record_kind, record)
+        questions.append(
+            Question(
+                stale.record_kind,
+                ref,
+                [(stale.record_kind, record.id)],
+                record,
+                stale.person,
+            )
+        )
+    return questions
+
+
 async def collect_due(
     session: AsyncSession, *, now: datetime | None = None, horizon_days: int = 0
 ) -> DueBundle:
@@ -232,16 +305,6 @@ async def collect_due(
         if verdict == PING and not await _already_sent(session, "debt", ref, now):
             bundle.debts.append(balance)
             bundle.keys.append(("debt", ref))
-        elif verdict == ASK:
-            bundle.questions.append(
-                Question(
-                    "debt",
-                    ref,
-                    [("debt", i) for i in balance.ids],
-                    person=balance.person,
-                    balance=balance,
-                )
-            )
 
     for promise, person in due["promises"]:
         ref = str(promise.id)
@@ -255,10 +318,6 @@ async def collect_due(
         if verdict == PING and not await _already_sent(session, "promise", ref, now):
             bundle.promises.append((promise, person))
             bundle.keys.append(("promise", ref))
-        elif verdict == ASK:
-            bundle.questions.append(
-                Question("promise", ref, [("promise", promise.id)], promise, person)
-            )
 
     for task in due["tasks"]:
         ref = str(task.id)
@@ -272,26 +331,10 @@ async def collect_due(
         if verdict == PING and not await _already_sent(session, "task", ref, now):
             bundle.tasks.append(task)
             bundle.keys.append(("task", ref))
-        elif verdict == ASK:
-            bundle.questions.append(Question("task", ref, [("task", task.id)], task))
 
-    # Undated promises and tasks: the weekly question comes from the open-loops
-    # selection, so the sweep and the morning brief never disagree about what
-    # "undated and stale" means (loops.stale_undated: a week since it was made,
-    # last pinged, answered or corrected — whichever is latest). Undated debts
-    # are in that selection too; the brief shows them, the sweep does not ask.
-    for stale in await loops.stale_undated(session, now=now, kinds=("promise", "task")):
-        record = stale.record
-        ref = ref_for(stale.record_kind, record)
-        bundle.questions.append(
-            Question(
-                stale.record_kind,
-                ref,
-                [(stale.record_kind, record.id)],
-                record,
-                stale.person,
-            )
-        )
+    bundle.questions = (await collect_questions(session, now=now, due=due))[
+        :MAX_QUESTIONS
+    ]
 
     for event in await queries.upcoming_events(session, within_minutes=60):
         ref = str(event.id)
@@ -300,7 +343,6 @@ async def collect_due(
         bundle.events.append(event)
         bundle.keys.append(("event", ref))
 
-    bundle.questions = bundle.questions[:MAX_QUESTIONS]
     return bundle
 
 
