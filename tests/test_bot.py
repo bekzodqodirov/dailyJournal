@@ -245,6 +245,9 @@ async def test_polling_keeps_updates_queued_while_the_bot_was_down(monkeypatch):
         async def get_me(self):
             return _Me()
 
+        async def set_my_commands(self, commands):
+            seen["menu"] = [c.command for c in commands]
+
     class _Dispatcher:
         async def start_polling(self, bot, **kwargs):
             seen.update(kwargs)
@@ -263,3 +266,4 @@ async def test_polling_keeps_updates_queued_while_the_bot_was_down(monkeypatch):
     await bot_main.run()
 
     assert seen.get("drop_pending_updates") is False
+    assert {"pul", "ochir"} <= set(seen["menu"])

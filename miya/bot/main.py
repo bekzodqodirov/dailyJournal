@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import BotCommand
 from aiogram.types.error_event import ErrorEvent
 from sqlalchemy import exc as sa_exc
 
@@ -206,6 +208,13 @@ async def run() -> None:
         "assistant bot @%s ready (owner=%s)", me.username, settings.owner_telegram_id
     )
     _identity["username"] = me.username
+    try:
+        await bot.set_my_commands(
+            [BotCommand(command=c, description=d) for c, d in replies.COMMAND_MENU]
+        )
+    except TelegramAPIError:
+        # The menu is a convenience; a network blip must not stop the bot.
+        log.warning("could not set the command menu", exc_info=True)
     try:
         await _beat()
     except Exception:

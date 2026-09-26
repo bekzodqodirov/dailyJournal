@@ -32,7 +32,7 @@ from miya.db.enums import (
     InteractionSource,
     PromiseStatus,
 )
-from miya.db.models import Debt, DebtPayment, Interaction, Person
+from miya.db.models import Debt, DebtPayment, Interaction, Person, Transaction
 from miya.db.session import SessionLocal, engine, get_session
 from miya.services import (
     call_recordings,
@@ -41,6 +41,7 @@ from miya.services import (
     planner,
     queries,
     rag,
+    records,
     reports,
 )
 from miya.services.embeddings import EmbeddingError, get_local_embedder
@@ -364,6 +365,57 @@ async def list_transactions(
             for c, cur, total in summary.by_category
         ],
     }
+
+
+class VoidRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=200)
+
+
+def _transaction_json(txn: Transaction) -> dict[str, Any]:
+    return {
+        "id": txn.id,
+        "type": txn.type.value,
+        "amount": str(txn.amount),
+        "currency": txn.currency.value,
+        "category": txn.category,
+        "description": txn.description,
+        "occurred_at": txn.occurred_at.isoformat(),
+        "card_last4": txn.card_last4,
+        "channel": txn.channel,
+        "voided_at": txn.voided_at.isoformat() if txn.voided_at else None,
+        "void_reason": txn.void_reason,
+    }
+
+
+async def _locked_transaction(session: AsyncSession, txn_id: int) -> Transaction:
+    txn = await records.load(session, "transaction", txn_id)
+    if txn is None:
+        raise HTTPException(status_code=404, detail="transaction not found")
+    return txn
+
+
+@api.post("/transactions/{txn_id}/void", tags=["money"])
+async def void_transaction(
+    txn_id: int, session: SessionDep, body: VoidRequest | None = None
+) -> dict[str, Any]:
+    """Take one money row out of every total (owner token only)."""
+    txn = await _locked_transaction(session, txn_id)
+    reason = body.reason if body is not None else None
+    try:
+        await records.void(session, txn, by="api", reason=reason)
+    except records.NotOpen:
+        raise HTTPException(status_code=409, detail="already voided") from None
+    return _transaction_json(txn)
+
+
+@api.post("/transactions/{txn_id}/unvoid", tags=["money"])
+async def unvoid_transaction(txn_id: int, session: SessionDep) -> dict[str, Any]:
+    txn = await _locked_transaction(session, txn_id)
+    try:
+        await records.reopen(session, txn, by="api")
+    except records.AlreadyOpen:
+        raise HTTPException(status_code=409, detail="not voided") from None
+    return _transaction_json(txn)
 
 
 @api.get("/people/{person_id}/summary", tags=["people"])

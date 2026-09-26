@@ -131,6 +131,8 @@ ACTION_FLIP = "f"
 ACTION_CLOSE = "c"
 ACTION_OPEN = "o"
 ACTION_REOPEN = "r"
+# rec:v:x<id>  🗑 O'chir — void a money row (WP-13); ↩️ Qaytar undoes it
+ACTION_VOID = "v"
 # rec:py:<ref>:<n> / rec:pn:<ref>:<n>  Ha / Yo'q to "Yangi odam … yaratilsinmi?"
 # after /tuzat named someone MIYA does not know. The name itself would not
 # always fit in 64 bytes, so <n> indexes the history entry that holds it.
@@ -168,6 +170,16 @@ def record_row(
     """
     handle = ref(kind, record_id)
     suffix = f" {handle}" if labelled else ""
+    if kind == "transaction":
+        # A money row is corrected or voided, never "done".
+        return [
+            InlineKeyboardButton(
+                text=f"✏️ Tuzat{suffix}", callback_data=f"rec:{ACTION_EDIT}:{handle}"
+            ),
+            InlineKeyboardButton(
+                text=f"🗑 O'chir{suffix}", callback_data=f"rec:{ACTION_VOID}:{handle}"
+            ),
+        ]
     row = [
         InlineKeyboardButton(
             text=f"✅ Bajarildi{suffix}", callback_data=f"rec:{ACTION_DONE}:{handle}"

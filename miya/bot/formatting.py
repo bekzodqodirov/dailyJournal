@@ -198,10 +198,10 @@ def debt_line(
 # The letter is the kind, the number is the row's primary key: stable across
 # restarts and never reused, unlike a position in a list.
 
-REF_PREFIX = {"debt": "d", "promise": "p", "task": "t"}
+REF_PREFIX = {"debt": "d", "promise": "p", "task": "t", "transaction": "x"}
 KIND_OF_PREFIX = {prefix: kind for kind, prefix in REF_PREFIX.items()}
 
-_REF = re.compile(r"^\s*#?([dpt])(\d{1,9})\s*$", re.IGNORECASE)
+_REF = re.compile(r"^\s*#?([dptx])(\d{1,9})\s*$", re.IGNORECASE)
 
 
 def ref(kind: str, record_id: int | None) -> str:
@@ -217,7 +217,12 @@ def ref_of(record) -> str:
 
 
 def kind_of(record) -> str:
-    return {"debts": "debt", "promises": "promise", "tasks": "task"}[record.__tablename__]
+    return {
+        "debts": "debt",
+        "promises": "promise",
+        "tasks": "task",
+        "transactions": "transaction",
+    }[record.__tablename__]
 
 
 def parse_ref(text: str) -> tuple[str, int] | None:
@@ -315,6 +320,8 @@ def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
             name, record.direction, record.amount, record.currency, record.due_date
         )
         return f"💰 {handle}{body}{_DEBT_STATUS.get(record.status, '')}"
+    if kind == "transaction":
+        return transaction_line(record, person, handle=handle, markup=markup)
     if kind == "promise":
         who = "Men" if record.made_by is PromiseMadeBy.me else "U"
         due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
@@ -325,6 +332,21 @@ def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
     due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
     status = _TASK_STATUS.get(record.status, "")
     return f"✔️ {handle}{_text(record.description, markup)}{due}{status}"
+
+
+def transaction_line(txn, person=None, *, handle: str = "", markup: bool = True) -> str:
+    """One money row: direction, amount, what, when, card, who, and 🗑 when
+    it was voided (WP-13)."""
+    income = txn.type.value == "income"
+    what = txn.description or txn.category or "—"
+    card = f" · karta *{txn.card_last4}" if txn.card_last4 else ""
+    who = f" · 👤 {_text(person.display_name, markup)}" if person is not None else ""
+    void = " · 🗑 o'chirilgan" if txn.voided_at is not None else ""
+    return (
+        f"{'📈' if income else '📉'} {handle}{'Kirim' if income else 'Chiqim'}: "
+        f"{money(txn.amount, txn.currency)} · {_text(what, markup)} · "
+        f"{day_label(txn.occurred_at)} {clock(txn.occurred_at)}{card}{who}{void}"
+    )
 
 
 # --- open loops: one line each ----------------------------------------------

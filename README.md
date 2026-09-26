@@ -169,6 +169,9 @@ it recorded:
 | `/qarz` | Open balances, split into who owes you and who you owe |
 | `/vada` | Open promises, split into yours and theirs |
 | `/bugun` | Today: money in and out, people spoken to, new debts and promises |
+| `/pul [kecha\|YYYY-MM-DD]` | One day's money rows by ref (`x12`), each with ✏️ Tuzat and 🗑 O'chir; voided rows marked 🗑 |
+| `/ochir x12` | Void one wrong money row: it leaves every total, stays in the history, and ↩️ Qaytar (or `/qaytar x12`) restores it |
+| `/tuzat x12 …` | Correct a money row: amount, currency, `kirim`/`chiqim`/`teskari`, `kim <ism>`, `sana kecha`, `izoh …`, `turkum …` |
 | `/kim <ism>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
 | `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
 | `/eslab <ism>: <matn>` | Remember a fact about a person by hand |

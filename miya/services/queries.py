@@ -517,6 +517,23 @@ class SpendingSummary:
     biggest: list[Transaction] = field(default_factory=list)
 
 
+async def transactions_on(
+    session: AsyncSession, day: date, *, include_voided: bool = False
+) -> list[Transaction]:
+    """One local day's money rows, oldest first (`/pul`). Voided rows are
+    listed only on request — they are shown, never counted."""
+    start, end = day_bounds(day)
+    stmt = (
+        sa.select(Transaction)
+        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .options(selectinload(Transaction.counterparty))
+        .order_by(Transaction.occurred_at, Transaction.id)
+    )
+    if not include_voided:
+        stmt = stmt.where(Transaction.voided_at.is_(None))
+    return list(await session.scalars(stmt))
+
+
 async def spending_summary(
     session: AsyncSession, date_from: date, date_to: date
 ) -> SpendingSummary:

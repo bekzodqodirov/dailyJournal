@@ -628,6 +628,9 @@ async def test_startup_beats_bot_and_the_watchdog_task_is_cancelled(session, mon
         async def get_me(self):
             return _Me()
 
+        async def set_my_commands(self, commands):
+            pass
+
     class _Dispatcher:
         async def start_polling(self, bot, **kwargs):
             seen["tasks"] = {t.get_name() for t in asyncio.all_tasks()}
@@ -671,6 +674,9 @@ async def test_startup_survives_a_database_that_is_down(monkeypatch):
 
         async def get_me(self):
             return _Me()
+
+        async def set_my_commands(self, commands):
+            pass
 
     polled = {}
 

@@ -97,6 +97,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
 /tuzat &lt;id&gt; &lt;nima&gt; — yozuvni tuzatish (summa, valyuta, teskari, ism, muddat)
+/tuzat x12 … — summa, valyuta, kirim/chiqim, odam, izoh
+/pul — bugungi to'lovlar (x12 raqamlari bilan)
+/ochir x12 — noto'g'ri pul yozuvini o'chirish (↩️ bilan qaytadi)
 /davolar — tasdiqlanmagan da'volar
 /unut — ma'lumotni butunlay o'chirish
 /menga — guruhlarda menga yozilganlar
@@ -105,6 +108,38 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /qayta — ularni qaytadan ajratishga urinish
 /yordam — shu ro'yxat
 """
+
+# The bot's command menu (Telegram's "/" list), one short Uzbek phrase per
+# command the owner types. Every package that adds a command appends one
+# entry; tests/test_command_menu.py fails when a command has none.
+COMMAND_MENU: tuple[tuple[str, str], ...] = (
+    ("yordam", "Buyruqlar ro'yxati"),
+    ("qarz", "Ochiq qarzlar"),
+    ("vada", "Ochiq va'dalar"),
+    ("bugun", "Bugungi holat"),
+    ("menga", "Guruhlarda menga yozilganlar"),
+    ("guruhlar", "Guruhlarda nima gaplashildi"),
+    ("tekshir", "Qayta ishlanmagan yozuvlar"),
+    ("qayta", "Ularni qaytadan ajratish"),
+    ("qidir", "Xotiradan qidirish"),
+    ("hisobot", "Kunlik hisobot"),
+    ("ertalab", "Ertalabki xulosa"),
+    ("reja", "Ertangi reja"),
+    ("chats", "Qaysi chatlar o'qilishi"),
+    ("xarajat", "MIYA'ning API xarajati"),
+    ("holat", "MIYA'ning ahvoli"),
+    ("unut", "Ma'lumotni butunlay o'chirish"),
+    ("bajarildi", "Va'da yoki vazifa bajarildi"),
+    ("yop", "Bajarilmagan holda yopish"),
+    ("qaytar", "Yopilgan yozuvni qayta ochish"),
+    ("tuzat", "Yozuvni tuzatish"),
+    ("davolar", "Tasdiqlanmagan da'volar"),
+    ("kim", "Odam haqida hamma narsa"),
+    ("tarix", "Odam bilan aloqa tarixi"),
+    ("eslab", "Odam haqida eslab qolish"),
+    ("pul", "bugungi to'lovlar ro'yxati"),
+    ("ochir", "noto'g'ri pul yozuvini o'chirish"),
+)
 
 CHATS_HEADER = (
     "💬 <b>Kuzatilayotgan chatlar</b>\n"
@@ -344,7 +379,7 @@ def confirmation(applied: Applied) -> str:
         detail = f" ({escape(txn.description)})" if txn.description else ""
         lines.append(
             f"{icon} {label}: {money(txn.amount, txn.currency)} · "
-            f"{escape(txn.category or 'boshqa')}{detail}"
+            f"{escape(txn.category or 'boshqa')}{detail}" + tag("transaction", txn.id)
         )
 
     for event in applied.events:
@@ -377,6 +412,7 @@ def confirmation_refs(applied: Applied) -> list[tuple[str, int]]:
     refs: list[tuple[str, int]] = []
     refs += [("debt", d.id) for d in applied.debts if d.id is not None]
     refs += [("promise", p.id) for p in applied.promises if p.id is not None]
+    refs += [("transaction", t.id) for t in applied.transactions if t.id is not None]
     refs += [("task", t.id) for t in applied.tasks if t.id is not None]
     return refs
 
@@ -492,8 +528,11 @@ def day_report(summary: DaySummary) -> str:
             "🧾 <b>Yangi qarz va va'dalar</b>\n" + bullet_list(new_lines, empty="—")
         )
 
-    parts.append(f"\n<i>{summary.interactions} ta yozuv</i>")
+    parts.append(f"\n<i>{summary.interactions} ta yozuv</i>\n{DAY_REPORT_MONEY_HINT}")
     return clip("\n\n".join(parts))
+
+
+DAY_REPORT_MONEY_HINT = "Har bir to'lov: /pul"
 
 
 PROFILE_MISSING = "📝 Profil hali yozilmagan."
@@ -812,11 +851,47 @@ _TUZAT_EXAMPLES = {
     "debt": ("6 mln", "300 $", "teskari", "Sardor", "ertaga"),
     "promise": ("Sardor", "ertaga"),
     "task": ("ertaga",),
+    "transaction": (
+        "250 ming",
+        "valyuta $",
+        "teskari",
+        "kim Akmal",
+        "izoh yuk uchun",
+        "sana kecha",
+    ),
 }
+
+TXN_TUZAT_HINT = (
+    "✏️ <code>{ref}</code> ni tuzatish uchun yozing:\n"
+    "<code>/tuzat {ref} 250 ming</code> — summa · "
+    "<code>/tuzat {ref} valyuta $</code> — valyuta · "
+    "<code>/tuzat {ref} teskari</code> — kirim ↔ chiqim · "
+    "<code>/tuzat {ref} kim Akmal</code> — kim bilan · "
+    "<code>/tuzat {ref} izoh yuk uchun</code> — izoh · "
+    "<code>/tuzat {ref} sana kecha</code> — sana · "
+    "<code>/ochir {ref}</code> — noto'g'ri yozilgan bo'lsa"
+)
+TXN_NOT_DOABLE = (
+    "<code>{ref}</code> — pul harakati, uni «bajarildi» qilib bo'lmaydi. "
+    "Noto'g'ri bo'lsa: <code>/ochir {ref}</code>, xato joyi bo'lsa: "
+    "<code>/tuzat {ref} …</code>"
+)
+TXN_VOIDED_LOCKED = (
+    "<code>{ref}</code> o'chirilgan. Tuzatish uchun avval <code>/qaytar {ref}</code>."
+)
+OCHIR_USAGE = (
+    "Qaysi yozuvni? Masalan: <code>/ochir x12</code> — raqamlar /pul ro'yxatida."
+)
+OCHIR_ONLY_MONEY = (
+    "<code>/ochir</code> faqat pul harakatlari uchun (<code>x12</code>). "
+    "Va'da yoki vazifani yopish: <code>/yop p7</code>."
+)
 
 
 def tuzat_hint(kind: str, handle: str) -> str:
     """What the ✏️ button says: the syntax, with this row's ref filled in."""
+    if kind == "transaction":
+        return TXN_TUZAT_HINT.format(ref=handle)
     examples = " · ".join(
         f"<code>/tuzat {handle} {example}</code>" for example in _TUZAT_EXAMPLES[kind]
     )
@@ -829,12 +904,18 @@ _FIELD_LABEL = {
     "direction": "yo'nalish",
     "person": "odam",
     "due": "muddat",
+    "note": "izoh",
+    "category": "turkum",
 }
 
 FIELD_NOT_EDITABLE = {
     "debt": "Qarzda bunday maydon yo'q.",
     "promise": "Va'dada faqat odam va muddatni tuzatish mumkin.",
     "task": "Vazifada faqat muddatni tuzatish mumkin.",
+    "transaction": (
+        "Pul harakatida faqat summa, valyuta, tomon (kirim/chiqim), odam, sana, "
+        "izoh va turkumni tuzatish mumkin."
+    ),
 }
 
 DEBT_CURRENCY_LOCKED = (
@@ -890,6 +971,63 @@ def record_edited(change) -> str:
     label = _FIELD_LABEL.get(change.field, change.field)
     line = record_line(change.kind, change.record, change.person)
     return f"✏️ <b>Tuzatildi</b> ({label})\n{line}"
+
+
+def _txn_short(txn) -> str:
+    income = txn.type.value == "income"
+    return f"{'📈' if income else '📉'} {'Kirim' if income else 'Chiqim'} " + money(
+        txn.amount, txn.currency
+    )
+
+
+def record_voided(change) -> str:
+    txn = change.record
+    what = txn.description or txn.category
+    tail = f" · {escape(what)}" if what else ""
+    return (
+        f"🗑 <code>x{txn.id}</code> o'chirildi: {_txn_short(txn)}{tail}. "
+        "Endi hisobotlarga kirmaydi."
+    )
+
+
+def record_unvoided(change) -> str:
+    txn = change.record
+    return f"↩️ <code>x{txn.id}</code> qaytarildi — yana hisobda: {_txn_short(txn)}."
+
+
+PUL_USAGE = (
+    "Qaysi kun? <code>/pul</code> — bugun · <code>/pul kecha</code> · "
+    "<code>/pul 2026-09-20</code>"
+)
+TXN_LIST_EMPTY = "Bu kunda pul harakati yo'q."
+TXN_LIST_FOOTER = (
+    "Tuzatish: <code>/tuzat x12 …</code> · O'chirish: <code>/ochir x12</code>"
+)
+
+
+def _channel_icon(channel: str | None) -> str:
+    if channel is None:
+        return "✍️"
+    return "🔔" if channel.startswith("app:") else "✉️"
+
+
+def transactions_list(day, rows) -> str:
+    """`/pul`: one day's money rows by x-ref, voided ones marked."""
+    header = f"💳 <b>{short_date(day)} — pul harakatlari</b>"
+    if not rows:
+        return f"{header}\n{TXN_LIST_EMPTY}"
+    lines = []
+    for txn in rows:
+        icon = "📈" if txn.type.value == "income" else "📉"
+        what = txn.description or txn.category
+        void = " · 🗑 o'chirilgan" if txn.voided_at is not None else ""
+        lines.append(
+            f"{icon} <code>x{txn.id}</code> {clock(txn.occurred_at)} · "
+            f"{money(txn.amount, txn.currency)}"
+            + (f" · {escape(what)}" if what else "")
+            + f" · {_channel_icon(txn.channel)}{void}"
+        )
+    return clip(f"{header}\n" + "\n".join(lines) + f"\n\n{TXN_LIST_FOOTER}")
 
 
 def record_still_open(kind: str, records, person) -> str:

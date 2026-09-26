@@ -29,7 +29,7 @@ from aiogram.types import (
 )
 
 from miya.bot import keyboards, replies
-from miya.bot.formatting import clip, escape, ref_of
+from miya.bot.formatting import clip, escape, parse_ref, ref_of
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
@@ -648,6 +648,49 @@ async def cmd_reopen(message: Message, command: CommandObject) -> None:
     await _safe_answer(message, outcome.text)
 
 
+@router.message(Command("ochir"))
+async def cmd_void(message: Message, command: CommandObject) -> None:
+    """`/ochir x12` — take one wrong money row out of every total; ↩️ undoes."""
+    handle = (command.args or "").strip()
+    if not handle:
+        await _safe_answer(message, replies.OCHIR_USAGE)
+        return
+    parsed = parse_ref(handle)
+    if parsed is not None and parsed[0] != "transaction":
+        await _safe_answer(message, replies.OCHIR_ONLY_MONEY)
+        return
+    async with session_scope() as session:
+        outcome = await _act(
+            session, keyboards.ACTION_VOID, handle, by=records.BY_COMMAND
+        )
+    await _safe_answer(message, outcome.text, reply_markup=outcome.keyboard)
+
+
+@router.message(Command("pul"))
+async def cmd_money_day(message: Message, command: CommandObject) -> None:
+    """`/pul`, `/pul kecha`, `/pul 2026-09-20` — one day's money rows by ref."""
+    arg = (command.args or "").strip().lower()
+    today = datetime.now(settings.tz).date()
+    if not arg:
+        day = today
+    elif arg == "kecha":
+        day = today - timedelta(days=1)
+    else:
+        try:
+            day = date.fromisoformat(arg)
+        except ValueError:
+            await _safe_answer(message, replies.PUL_USAGE)
+            return
+    async with session_scope() as session:
+        rows = await queries.transactions_on(session, day, include_voided=True)
+    active = [("transaction", t.id) for t in rows if t.voided_at is None]
+    await _safe_answer(
+        message,
+        replies.transactions_list(day, rows),
+        reply_markup=keyboards.record_actions(active[: keyboards.MAX_ROWS]),
+    )
+
+
 @router.message(Command("tuzat"))
 async def cmd_edit(message: Message, command: CommandObject) -> None:
     """`/tuzat d12 6 mln` — one field of one row; the old value is kept.
@@ -685,6 +728,9 @@ async def cmd_edit(message: Message, command: CommandObject) -> None:
                 body = replies.record_edited(change)
             except records.NotEditable:
                 body = replies.FIELD_NOT_EDITABLE[kind]
+            except records.NotOpen:
+                # Only a voided money row is locked against edits.
+                body = replies.TXN_VOIDED_LOCKED.format(ref=ref_of(record))
             except records.PaymentsExceed as exc:
                 body = replies.debt_payments_exceed(ref_of(record), exc)
             except records.PaymentsExist:
@@ -743,6 +789,8 @@ async def _answer_new_person(session, action: str, handle: str, index: int) -> s
         )
     except records.NotEditable:
         return replies.FIELD_NOT_EDITABLE[kind]
+    except records.NotOpen:
+        return replies.TXN_VOIDED_LOCKED.format(ref=ref_of(record))
     return replies.record_edited(change)
 
 
@@ -768,6 +816,8 @@ async def _act(session, action: str, handle: str, *, by: str) -> _Outcome:
     person = records.person_of(record)
     undo = keyboards.reopen_actions([(kind, record.id)])
     try:
+        if kind == "transaction":
+            return await _act_on_transaction(session, action, record, by=by)
         if action == keyboards.ACTION_DONE or (
             action == keyboards.ACTION_SETTLE_BALANCE and kind != "debt"
         ):
@@ -814,6 +864,24 @@ async def _act(session, action: str, handle: str, *, by: str) -> _Outcome:
         return _Outcome(replies.DEBT_NOT_REOPENABLE.format(ref=ref_of(record)), True)
     except records.NotClosable:
         return _Outcome(replies.DEBT_NOT_CLOSABLE.format(ref=ref_of(record)), False)
+
+
+async def _act_on_transaction(session, action: str, txn, *, by: str) -> _Outcome:
+    """A money row (WP-13): voided or restored, never "done"."""
+    handle = ref_of(txn)
+    if action == keyboards.ACTION_DONE:
+        return _Outcome(replies.TXN_NOT_DOABLE.format(ref=handle), False)
+    if action in (keyboards.ACTION_VOID, keyboards.ACTION_CLOSE):
+        change = await records.void(session, txn, by=by)
+        return _Outcome(
+            replies.record_voided(change),
+            True,
+            keyboards.reopen_actions([("transaction", txn.id)]),
+        )
+    if action == keyboards.ACTION_REOPEN:
+        change = await records.reopen(session, txn, by=by)
+        return _Outcome(replies.record_unvoided(change), True)
+    return _Outcome(replies.tuzat_hint("transaction", handle), False)
 
 
 async def _answer_nudge(session, action: str, handle: str) -> str:

@@ -37,13 +37,14 @@ from miya.db.enums import (
     DebtStatus,
     PromiseStatus,
     TaskStatus,
+    TransactionType,
 )
-from miya.db.models import Debt, DebtPayment, Person, Promise, Task
+from miya.db.models import Debt, DebtPayment, Person, Promise, Task, Transaction
 from miya.services.people import resolve_person
 
-Record = Debt | Promise | Task
+Record = Debt | Promise | Task | Transaction
 
-MODEL_OF = {"debt": Debt, "promise": Promise, "task": Task}
+MODEL_OF = {"debt": Debt, "promise": Promise, "task": Task, "transaction": Transaction}
 
 # Which field each kind of row can have corrected. A task has no person and a
 # promise has no amount; asking for either is answered, not guessed at.
@@ -51,7 +52,21 @@ EDITABLE = {
     "debt": ("amount", "currency", "direction", "person", "due"),
     "promise": ("person", "due"),
     "task": ("due",),
+    # A money row (WP-13): "due" is the day it happened, "note" its
+    # description. It is never "done" — it is voided or corrected.
+    "transaction": (
+        "amount",
+        "currency",
+        "direction",
+        "person",
+        "due",
+        "note",
+        "category",
+    ),
 }
+# The longest description and category a correction may write.
+NOTE_MAX = 500
+CATEGORY_MAX = 64
 
 # Who or what made the change — the history's "by" value.
 BY_COMMAND = "command"
@@ -78,6 +93,11 @@ class NotReopenable(RecordError):
 
 class NotClosable(RecordError):
     """`/yop` on a debt: money is settled or corrected, never voided."""
+
+
+class NotDoable(RecordError):
+    """`/bajarildi x12`: a money row is not a promise — it is voided
+    (`/ochir`) or corrected (`/tuzat`), never "done"."""
 
 
 class NotEditable(RecordError):
@@ -150,7 +170,9 @@ async def load(session: AsyncSession, kind: str, record_id: int) -> Record | Non
     """
     model = MODEL_OF[kind]
     stmt = sa.select(model).where(model.id == record_id).with_for_update()
-    if kind != "task":
+    if kind == "transaction":
+        stmt = stmt.options(selectinload(Transaction.counterparty))
+    elif kind != "task":
         stmt = stmt.options(selectinload(model.person))
     return await session.scalar(stmt)
 
@@ -168,6 +190,8 @@ async def find(session: AsyncSession, text: str) -> tuple[str, Record] | None:
 
 
 def person_of(record: Record) -> Person | None:
+    if isinstance(record, Transaction):
+        return record.counterparty
     return None if isinstance(record, Task) else record.person
 
 
@@ -178,6 +202,14 @@ async def _with_person(session: AsyncSession, record: Record) -> None:
     or one a test handed over, does not — and a Change must always be able
     to render its line.
     """
+    if isinstance(record, Transaction):
+        if "counterparty" in sa.inspect(record).unloaded:
+            record.counterparty = (
+                await session.get(Person, record.counterparty_person_id)
+                if record.counterparty_person_id is not None
+                else None
+            )
+        return
     if isinstance(record, Task) or "person" not in sa.inspect(record).unloaded:
         return
     record.person = await session.get(Person, record.person_id)
@@ -195,11 +227,18 @@ async def _lock(session: AsyncSession, record: Record) -> None:
     await session.flush()
     if sa.inspect(record).pending:
         return  # not in the database yet; nothing to lock against
-    names = ["status", "amount", "currency"] if isinstance(record, Debt) else ["status"]
+    if isinstance(record, Debt):
+        names = ["status", "amount", "currency"]
+    elif isinstance(record, Transaction):
+        names = ["voided_at", "amount", "currency", "type"]
+    else:
+        names = ["status"]
     await session.refresh(record, attribute_names=names, with_for_update=True)
 
 
 def is_open(record: Record) -> bool:
+    if isinstance(record, Transaction):
+        return record.voided_at is None
     if isinstance(record, Debt):
         return record.status is not DebtStatus.settled
     if isinstance(record, Promise):
@@ -308,6 +347,8 @@ async def mark_done(
     NotOpen and writes no second payment.
     """
     now = now or datetime.now(settings.tz)
+    if isinstance(record, Transaction):
+        raise NotDoable()
     await _lock(session, record)
     if not is_open(record):
         raise NotOpen()
@@ -355,6 +396,8 @@ async def close(
     now = now or datetime.now(settings.tz)
     if isinstance(record, Debt):
         raise NotClosable()
+    if isinstance(record, Transaction):
+        return await void(session, record, by=by, now=now)
     await _lock(session, record)
     if not is_open(record):
         raise NotOpen()
@@ -367,6 +410,32 @@ async def close(
     record.status = target
     await session.flush()
     return Change(kind, record, person_of(record), "status", old, new)
+
+
+async def void(
+    session: AsyncSession,
+    txn: Transaction,
+    *,
+    by: str,
+    reason: str | None = None,
+    now: datetime | None = None,
+) -> Change:
+    """Take a money row out of every total without deleting it (WP-13).
+
+    Locked and re-read first, so a second tap raises NotOpen and leaves one
+    history entry; ``reopen`` undoes it.
+    """
+    now = now or datetime.now(settings.tz)
+    await _lock(session, txn)
+    if txn.voided_at is not None:
+        raise NotOpen()
+    await _with_person(session, txn)
+    extra = {"reason": reason} if reason else {}
+    old, new = _note(txn, "status", "active", "void", by, now, **extra)
+    txn.voided_at = now
+    txn.void_reason = reason
+    await session.flush()
+    return Change("transaction", txn, person_of(txn), "status", old, new)
 
 
 def _balance_rows(debt: Debt, *, open_only: bool = True) -> sa.Select:
@@ -456,6 +525,10 @@ async def reopen(
         old, new = await _restate(session, record, by, now)
         if old is None:  # cannot happen: the real payments are below the amount
             raise NotReopenable()
+    elif isinstance(record, Transaction):
+        old, new = _note(record, "status", "void", "active", by, now)
+        record.voided_at = None
+        record.void_reason = None
     elif isinstance(record, Promise):
         old, new = _note(record, "status", record.status, PromiseStatus.open, by, now)
         record.status = PromiseStatus.open
@@ -500,8 +573,19 @@ async def set_field(
     kind = kind_of(record)
     if field not in EDITABLE[kind]:
         raise NotEditable(field)
+    if isinstance(record, Debt) and field == "direction" and value is not None:
+        raise NotEditable(field)  # "kirim"/"chiqim" is a money row's word
     await _lock(session, record)
     await _with_person(session, record)
+
+    if isinstance(record, Transaction):
+        if record.voided_at is not None:
+            raise NotOpen()  # a voided row is locked until /qaytar
+        old, new = await _set_transaction_field(
+            session, record, field, value, by, now, create_person
+        )
+        await session.flush()
+        return Change(kind, record, person_of(record), field, old, new)
 
     if field == "direction":
         debt: Debt = record  # type: ignore[assignment]
@@ -537,6 +621,66 @@ async def set_field(
 
     await session.flush()
     return Change(kind, record, person_of(record), field, old, new)
+
+
+async def _set_transaction_field(
+    session: AsyncSession,
+    txn: Transaction,
+    field: str,
+    value: object,
+    by: str,
+    now: datetime,
+    create_person: bool,
+) -> tuple[str | None, str | None]:
+    """One field of a money row; every change is a history entry."""
+    if field == "amount":
+        amount, currency = value  # type: ignore[misc]
+        old, new = _note(txn, "amount", txn.amount, amount, by, now)
+        txn.amount = amount
+        if currency is not None and currency is not txn.currency:
+            _note(txn, "currency", txn.currency, currency, by, now)
+            txn.currency = currency
+        return old, new
+    if field == "currency":
+        old, new = _note(txn, field, txn.currency, value, by, now)
+        txn.currency = value  # type: ignore[assignment]
+        return old, new
+    if field == "direction":
+        if value is None:
+            target = (
+                TransactionType.expense
+                if txn.type is TransactionType.income
+                else TransactionType.income
+            )
+        else:
+            target = value  # type: ignore[assignment]
+        old, new = _note(txn, field, txn.type, target, by, now)
+        txn.type = target
+        return old, new
+    if field == "person":
+        person = await _person_named(session, str(value), create=create_person)
+        old, new = _note(txn, field, txn.counterparty_person_id, person.id, by, now)
+        txn.counterparty_person_id = person.id
+        txn.counterparty = person
+        return old, new
+    if field == "due":
+        if not isinstance(value, date):
+            raise NotEditable("due")  # a payment always happened on some day
+        local = txn.occurred_at.astimezone(settings.tz)
+        moved = datetime.combine(value, local.timetz())
+        old, new = _note(txn, "due", txn.occurred_at, moved, by, now)
+        txn.occurred_at = moved
+        return old, new
+    if field == "note":
+        text = str(value).strip()[:NOTE_MAX]
+        old, new = _note(txn, field, txn.description, text, by, now)
+        txn.description = text
+        return old, new
+    # category
+    text = str(value).strip().lower()[:CATEGORY_MAX]
+    old, new = _note(txn, field, txn.category, text, by, now)
+    txn.category = text
+    return old, new
 
 
 async def _set_amount(
@@ -728,7 +872,14 @@ _PREFIXES = {
     "valyuta": "currency",
     "muddat": "due",
     "sana": "due",
+    "tomon": "direction",
+    "izoh": "note",
+    "turkum": "category",
+    "kategoriya": "category",
 }
+
+# A money row's direction words (WP-13).
+_TXN_DIRECTION = {"kirim": TransactionType.income, "chiqim": TransactionType.expense}
 
 CLEAR_DUE = {"muddatsiz", "muddat yo'q", "yo'q", "-"}
 
@@ -746,6 +897,10 @@ KEYWORDS = frozenset(
         "teskari",
         "aksincha",
         "teskarisi",
+        "kirim",
+        "chiqim",
+        "tomon",
+        "izoh",
         *CLEAR_DUE,
         *_RELATIVE_DAYS,
         "kun",
@@ -845,6 +1000,8 @@ def parse_edit(text: str, *, today: date | None = None) -> Edit | None:
     lowered = raw.lower()
     if lowered in ("teskari", "aksincha", "teskarisi"):
         return Edit("direction", None)
+    if lowered in _TXN_DIRECTION:
+        return Edit("direction", _TXN_DIRECTION[lowered])
     when = parse_date(raw, today=today)
     if when is not False:
         return Edit("due", when)
@@ -868,5 +1025,14 @@ def _parse_as(field: str, value: str, today: date | None) -> Edit | None:
     if field == "currency":
         currency = _CURRENCY_OF.get(value.lower())
         return Edit("currency", currency) if currency else None
+    if field == "direction":
+        lowered = value.lower()
+        if lowered in _TXN_DIRECTION:
+            return Edit("direction", _TXN_DIRECTION[lowered])
+        if lowered in ("teskari", "aksincha"):
+            return Edit("direction", None)
+        return None
+    if field in ("note", "category"):
+        return Edit(field, value) if value else None
     when = parse_date(value, today=today)
     return None if when is False else Edit("due", when)
