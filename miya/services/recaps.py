@@ -908,6 +908,9 @@ async def build_evening(
             .on_conflict_do_update(constraint="uq_daily_reports_date_kind", set_=values)
         )
         await session.flush()
+        if existing is not None:
+            # The upsert bypassed the ORM; a row loaded above is stale now.
+            session.expire(existing)
     return RecapResult(
         parts=parts,
         stats=stats,
