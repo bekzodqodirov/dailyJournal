@@ -324,7 +324,10 @@ async def apply_default_rules(session: AsyncSession, *, now: datetime) -> int:
         .where(ChatMonitor.decided_by.is_(None))
         .where(ChatMonitor.digest_shows >= settings.question_group_max_shows)
         .where(ChatMonitor.offered_at < reminders.day_start(now))
-        .values(decided_by="rule:ignored")
+        .values(
+            decided_by="rule:ignored",
+            asked_at=sa.func.coalesce(ChatMonitor.asked_at, now),
+        )
     )
     decided += result.rowcount or 0
     return decided

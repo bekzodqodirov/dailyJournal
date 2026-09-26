@@ -122,5 +122,5 @@ async def expire_stale(session: AsyncSession, *, now: datetime | None = None) ->
         )
     )
     for interaction in stale:
-        set_state(interaction, EXPIRED)
+        set_state(interaction, EXPIRED, expired_at=now.isoformat())
     return len(stale)

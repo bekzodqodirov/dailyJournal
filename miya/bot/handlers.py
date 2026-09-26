@@ -485,11 +485,29 @@ async def _savollar_page(session, page: int) -> tuple[str, InlineKeyboardMarkup 
 
 
 @router.message(Command("savollar"))
-async def cmd_questions(message: Message) -> None:
+async def cmd_questions(message: Message, command: CommandObject | None = None) -> None:
     """`/savollar` — every question waiting for the owner, ranked, paged.
-    Answering here spends none of the day's budget."""
+    Answering here spends none of the day's budget. `/savollar hal` lists
+    what MIYA settled by itself in the last week, each with its undo."""
+    args = ((command.args if command else None) or "").strip().lower()
     async with session_scope() as session:
-        body, keyboard = await _savollar_page(session, 1)
+        if args == "hal":
+            since = datetime.now(settings.tz) - timedelta(days=7)
+            resolved = await questions.auto_resolved_since(session, since)
+            ids = {i.person_id for i in resolved.media if i.person_id}
+            people = {
+                p.id: p
+                for p in await session.scalars(
+                    sa.select(Person).where(Person.id.in_(ids))
+                )
+            }
+            body = replies.auto_resolved_report(resolved, people)
+            keyboard = keyboards.auto_resolved_keyboard(
+                [c.id for c in resolved.claims[: replies.AUTO_RESOLVED_MAX]],
+                [m.id for m in resolved.groups],
+            )
+        else:
+            body, keyboard = await _savollar_page(session, 1)
     await _safe_answer(message, body, reply_markup=keyboard)
 
 
@@ -1377,6 +1395,15 @@ async def _answer_claim(session, action: str, claim_id: int) -> _Outcome | None:
             if claim.state != claims.PENDING:
                 return _Outcome(replies.CLAIM_ALREADY, True)
             return _Outcome(replies.claim_tuzat_hint(claims.view(claim)), False)
+        if action == keyboards.ACTION_CLAIM_UNDO:
+            claim = await claims.reopen_auto(session, claim_id, by=claims.BY_BUTTON)
+            if claim is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            return _Outcome(
+                replies.claim_reopened(claims.view(claim)),
+                True,
+                keyboards.claim_actions([claim.id]),
+            )
     except claims.AlreadyAnswered:
         return _Outcome(replies.CLAIM_ALREADY, True)
     return None

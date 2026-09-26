@@ -1060,3 +1060,29 @@ async def load_evidence(session: AsyncSession, rows) -> None:
     for c in rows:
         if c.evidence_txn_id in found:
             c._evidence_txn = found[c.evidence_txn_id]
+
+
+# --- undoing what resolved itself (WP-45) ---------------------------------------
+
+
+async def reopen_auto(session: AsyncSession, claim_id: int, *, by: str) -> Claim | None:
+    """Put an automatically closed claim back in the queue, unchanged; no
+    automatic rule touches it again."""
+    claim = await get(session, claim_id, for_update=True)
+    if claim is None:
+        return None
+    if claim.state != AUTO:
+        raise AlreadyAnswered(claim.state)
+    claim.state = PENDING
+    claim.answered_at = None
+    claim.answered_by = None
+    claim.result_kind = None
+    claim.result_id = None
+    claim.evidence_txn_id = None
+    claim.duplicate_of = None
+    claim.history = [
+        *(claim.history or []),
+        {"at": datetime.now(settings.tz).isoformat(), "field": "auto_undone", "by": by},
+    ]
+    await session.flush()
+    return claim

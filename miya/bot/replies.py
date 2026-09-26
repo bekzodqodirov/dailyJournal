@@ -2349,3 +2349,72 @@ def money_typed_confirmed(txn) -> str:
 
 
 MONEY_SPLIT_GONE = "Bu to'lov allaqachon alohida yozilgan yoki topilmadi."
+
+
+# --- what MIYA resolved by itself (WP-45) -------------------------------------------
+
+AUTO_RESOLVED_LINE = "🤖 Bugun {n} ta savolni o'zim hal qildim — /savollar hal"
+AUTO_RESOLVED_HEADER = "🤖 <b>O'zim hal qilganlarim</b> — oxirgi 7 kun"
+AUTO_RESOLVED_EMPTY = "🤖 Oxirgi 7 kunda o'zim hal qilgan savol yo'q."
+AUTO_RESOLVED_MAX = 25
+
+
+def _claim_what(view) -> str:
+    if view.amount is not None and view.currency is not None:
+        return money(view.amount, view.currency)
+    return escape(view.description or "—")
+
+
+def auto_claim_line(claim) -> str:
+    view = claims.view(claim)
+    head = f"🤖 <code>{claim_ref(claim.id)}</code> {escape(view.person_name or '?')}"
+    what = _claim_what(view)
+    if claim.answered_by == claims.BY_AUTO_BANK and view.evidence is not None:
+        when = view.evidence.occurred_at.astimezone(settings.tz)
+        tail = f"bank SMS bilan tasdiqlandi ({short_date(when.date())} {clock(when)})"
+    elif claim.answered_by == claims.BY_AUTO_DUPLICATE and claim.duplicate_of:
+        primary = claim_ref(claim.duplicate_of)
+        tail = f"takror da'vo, <code>{primary}</code> javobi bilan yopildi"
+    else:
+        handle = next(
+            (
+                h.get("new")
+                for h in reversed(claim.history or [])
+                if h.get("field") == "auto"
+            ),
+            None,
+        )
+        tail = "buni o'zing allaqachon yozgansan" + (
+            f" (<code>{escape(handle)}</code>)" if handle else ""
+        )
+    return f"{head}: {what} — {tail}"
+
+
+def auto_group_line(monitor) -> str:
+    title = escape(monitor.title or str(monitor.tg_chat_id))
+    if monitor.decided_by == "rule:channel":
+        return f"📢 {title} — kanal, so'ramadim (o'chiq)"
+    return f"👥 {title} — ikki marta javobsiz qoldi, o'chiq qoldirdim"
+
+
+def auto_media_line(interaction, people: dict | None = None) -> str:
+    media = dict(interaction.media or {})
+    person = (people or {}).get(interaction.person_id)
+    who = escape(person.display_name) if person is not None else "Nomaʼlum"
+    kind = MEDIA_ASK_LABELS.get(
+        approvals_reason(interaction), str(media.get("type") or "fayl")
+    )
+    return f"📎 {who} {escape(kind)} — so'ralmay eskirdi"
+
+
+def auto_resolved_report(resolved, people: dict | None = None) -> str:
+    if not resolved.total:
+        return AUTO_RESOLVED_EMPTY
+    lines = [auto_claim_line(c) for c in resolved.claims[:AUTO_RESOLVED_MAX]]
+    lines += [auto_group_line(m) for m in resolved.groups]
+    lines += [auto_media_line(i, people) for i in resolved.media]
+    return clip(AUTO_RESOLVED_HEADER + "\n" + "\n".join(lines))
+
+
+def claim_reopened(view) -> str:
+    return f"↩️ <b>{claim_ref(view.id)} yana ochiq</b> — javob ber:\n{claim_line(view)}"

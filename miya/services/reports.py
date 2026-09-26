@@ -41,6 +41,7 @@ MONEY_REVIEW_LINE = "🔎 {n} ta pul xabari tekshiruv kutmoqda — /tekshir"
 REPORT_IGNORED_LINE = (
     "🙈 Bugun {n} ta pul xabari e'tiborsiz qoldirildi (kod, reklama) — /tekshir hammasi"
 )
+AUTO_RESOLVED_LINE = "🤖 Bugun {n} ta savolni o'zim hal qildim — /savollar hal"
 H_PEOPLE = "👥 <b>Muloqotlar</b>"
 H_NEW = "🧾 <b>Yangi qarz va va'dalar</b>"
 H_DUE = "⏰ <b>Ochiq va muddati o'tganlar</b>"
@@ -91,6 +92,8 @@ class ReportData:
     # adverts) — counts only, so the owner knows both exist.
     money_review: int = 0
     money_ignored: int = 0
+    # Questions MIYA settled itself today (WP-45): said, never silent.
+    auto_resolved: int = 0
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -161,6 +164,8 @@ def render_data_block(data: ReportData) -> str:
         lines.append(MONEY_REVIEW_LINE.format(n=data.money_review))
     if data.money_ignored:
         lines.append(REPORT_IGNORED_LINE.format(n=data.money_ignored))
+    if data.auto_resolved:
+        lines.append(AUTO_RESOLVED_LINE.format(n=data.auto_resolved))
 
     lines.append("\n" + H_PEOPLE)
     lines.append(f"- jami {s.interactions} ta yozuv")
@@ -292,6 +297,9 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         money_ignored=await queries.ignored_money_count(
             session, *queries.day_bounds(day)
         ),
+        auto_resolved=(
+            await questions.auto_resolved_since(session, queries.day_bounds(day)[0])
+        ).total,
     )
 
 

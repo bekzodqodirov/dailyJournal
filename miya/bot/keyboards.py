@@ -462,6 +462,7 @@ def new_group_question(monitor_id: int) -> InlineKeyboardMarkup:
 ACTION_CLAIM_YES = "y"
 ACTION_CLAIM_NO = "n"
 ACTION_CLAIM_EDIT = "e"
+ACTION_CLAIM_UNDO = "u"
 CLAIM_PREFIX = "cl"
 
 
@@ -841,3 +842,22 @@ def with_money_splits(
         for iid, index in splits
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def undo_row(claim_id: int) -> list[InlineKeyboardButton]:
+    """↩️ Qayta so'ra c12: an automatic answer undone (WP-45)."""
+    return [
+        InlineKeyboardButton(
+            text=f"↩️ Qayta so'ra {claim_ref(claim_id)}",
+            callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_UNDO}:{claim_id}",
+        )
+    ]
+
+
+def auto_resolved_keyboard(claim_ids, monitor_ids) -> InlineKeyboardMarkup | None:
+    rows = [undo_row(i) for i in list(claim_ids)[:MAX_ROWS]]
+    rows += [
+        [InlineKeyboardButton(text=f"✅ O'qiy boshla #{i}", callback_data=f"ng:y:{i}")]
+        for i in monitor_ids
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None

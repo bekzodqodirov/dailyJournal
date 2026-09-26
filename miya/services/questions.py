@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.enums import Currency
-from miya.db.models import Claim, Interaction, QuestionLog, ReminderLog
+from miya.db.models import ChatMonitor, Claim, Interaction, QuestionLog, ReminderLog
 from miya.services import approvals, chats, claims, loops, nudges, queries, reminders
 from miya.services.brief import BRIEF_KIND
 
@@ -438,3 +438,51 @@ async def auto_resolve(session: AsyncSession, *, now: datetime) -> dict[str, int
         "claims_superseded": len(await claims.resolve_superseded(session, now=now)),
         "claims_bank": len(await claims.match_bank_evidence(session, now=now)),
     }
+
+
+# --- what resolved itself (WP-45) -------------------------------------------------
+
+
+@dataclass(slots=True)
+class AutoResolved:
+    claims: list
+    groups: list
+    media: list
+
+    @property
+    def total(self) -> int:
+        return len(self.claims) + len(self.groups) + len(self.media)
+
+
+async def auto_resolved_since(session: AsyncSession, since: datetime) -> AutoResolved:
+    closed = list(
+        await session.scalars(
+            sa.select(Claim)
+            .where(Claim.state == claims.AUTO, Claim.answered_at >= since)
+            .order_by(Claim.answered_at.desc())
+        )
+    )
+    await claims.load_evidence(session, closed)
+    groups = list(
+        await session.scalars(
+            sa.select(ChatMonitor)
+            .where(
+                ChatMonitor.decided_by.like("rule:%"),
+                ChatMonitor.decided_by != "rule:legacy",
+                ChatMonitor.asked_at >= since,
+            )
+            .order_by(ChatMonitor.asked_at.desc())
+        )
+    )
+    expired_at = sa.cast(
+        Interaction.media["approval"]["expired_at"].astext, sa.DateTime(timezone=True)
+    )
+    media = list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.media["approval"]["expired_at"].astext.isnot(None))
+            .where(expired_at >= since)
+            .order_by(expired_at.desc())
+        )
+    )
+    return AutoResolved(claims=closed, groups=groups, media=media)
