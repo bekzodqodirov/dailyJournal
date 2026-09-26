@@ -728,7 +728,9 @@ async def quiet_counterparties(
     last_contact = sa.func.greatest(
         _last_of(Interaction.occurred_at, Interaction.person_id == Person.id),
         _last_of(
-            Transaction.occurred_at, Transaction.counterparty_person_id == Person.id
+            Transaction.occurred_at,
+            Transaction.counterparty_person_id == Person.id,
+            Transaction.voided_at.is_(None),
         ),
         _last_of(Debt.created_at, Debt.person_id == Person.id),
         _last_of(Promise.created_at, Promise.person_id == Person.id),

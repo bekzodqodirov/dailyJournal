@@ -275,12 +275,16 @@ async def test_a_one_time_code_is_stored_but_never_asks(session, device):
 async def test_the_heartbeat_rides_an_accepted_batch_only(session, device):
     from miya.services import health
 
-    device.post("/v1/phone/calls", json=_calls_payload(_call(1), _call(2)))
+    device.post(
+        "/v1/phone/calls", json=_calls_payload(_call(1), _call(2, at=_ago(hours=3)))
+    )
     beats = await health.beats(session)
     assert beats["phone"].detail == {"device_id": DEVICE, "calls": 2}
 
     # All-duplicate: nothing new arrived, so the ledger is left alone.
-    device.post("/v1/phone/calls", json=_calls_payload(_call(1), _call(2)))
+    device.post(
+        "/v1/phone/calls", json=_calls_payload(_call(1), _call(2, at=_ago(hours=3)))
+    )
     beats = await health.beats(session)
     assert beats["phone"].detail == {"device_id": DEVICE, "calls": 2}
 

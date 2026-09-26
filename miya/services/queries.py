@@ -101,6 +101,13 @@ def day_bounds(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+# The rows that count as money (WP-11). Every total over transactions MUST
+# carry this filter: a voided row (a correction, a reinstall duplicate) and
+# an internal transfer between the owner's own accounts are not income or
+# expense. A test fails when a sum over Transaction.amount lacks it.
+ACTIVE_TXN = sa.and_(Transaction.voided_at.is_(None), Transaction.is_internal.is_(False))
+
+
 # `debts.amount` minus everything paid against it — the outstanding balance.
 # Public: loops.py ranks open loops by this same figure, so there is one
 # definition of "what is still owed" in the codebase.
@@ -203,6 +210,7 @@ async def _top_expenses(
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .subquery()
     )
     return list(
@@ -228,6 +236,7 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
             sa.func.sum(Transaction.amount),
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(ACTIVE_TXN)
         .group_by(Transaction.type, Transaction.currency)
     )
     for txn_type, currency, total in totals.all():
@@ -242,6 +251,7 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .group_by(Transaction.category, Transaction.currency)
         .order_by(sa.desc("total"))
         .limit(10)
@@ -398,8 +408,11 @@ def last_contact_expr(person_id):
     """
     return sa.func.greatest(
         _last_of(Interaction.occurred_at, Interaction.person_id == person_id),
+        # A voided row proves nothing; an internal transfer is still contact.
         _last_of(
-            Transaction.occurred_at, Transaction.counterparty_person_id == person_id
+            Transaction.occurred_at,
+            Transaction.counterparty_person_id == person_id,
+            Transaction.voided_at.is_(None),
         ),
         _last_of(Debt.created_at, Debt.person_id == person_id),
         _last_of(Promise.created_at, Promise.person_id == person_id),
@@ -515,6 +528,7 @@ async def spending_summary(
     totals = await session.execute(
         sa.select(Transaction.type, Transaction.currency, sa.func.sum(Transaction.amount))
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(ACTIVE_TXN)
         .group_by(Transaction.type, Transaction.currency)
     )
     for txn_type, currency, total in totals.all():
@@ -529,6 +543,7 @@ async def spending_summary(
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .group_by(Transaction.category, Transaction.currency)
         .order_by(sa.desc("total"))
         .limit(10)

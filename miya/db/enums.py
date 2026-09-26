@@ -27,6 +27,8 @@ class InteractionSource(str, enum.Enum):
     # Added by 0012 via ALTER TYPE ... ADD VALUE (build step 6): SMS the
     # companion app uploads, mostly payment notifications from banks.
     phone_sms = "phone_sms"
+    # Added by 0013: payment-app notifications the companion forwards.
+    phone_notification = "phone_notification"
 
 
 class Direction(str, enum.Enum):

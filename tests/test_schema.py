@@ -22,6 +22,7 @@ def test_all_spec_tables_present():
         "debt_payments",
         "promises",
         "transactions",
+        "transaction_evidence",
         "events",
         "tasks",
         "memories",
@@ -61,6 +62,15 @@ def test_derived_rows_cascade_from_their_interaction():
         fks = list(table.__table__.c["source_interaction_id"].foreign_keys)
         assert fks, table.__name__
         assert fks[0].ondelete == "CASCADE", table.__name__
+    # Evidence goes with its transaction and with its interaction.
+    for column in ("transaction_id", "interaction_id"):
+        [fk] = m.TransactionEvidence.__table__.c[column].foreign_keys
+        assert fk.ondelete == "CASCADE", column
+
+
+def test_transaction_history_defaults_to_an_empty_list():
+    default = m.Transaction.__table__.c["history"].server_default
+    assert "'[]'" in str(default.arg)
 
 
 def test_memories_embedding_matches_configured_dim():

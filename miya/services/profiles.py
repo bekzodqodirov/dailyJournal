@@ -194,7 +194,10 @@ def _has_signal():
         timeline_rows >= PROFILE_MIN_SIGNAL,
         sa.exists().where(Debt.person_id == Person.id),
         sa.exists().where(Promise.person_id == Person.id),
-        sa.exists().where(Transaction.counterparty_person_id == Person.id),
+        sa.exists().where(
+            Transaction.counterparty_person_id == Person.id,
+            Transaction.voided_at.is_(None),
+        ),
     )
 
 

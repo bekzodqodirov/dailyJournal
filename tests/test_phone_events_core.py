@@ -11,7 +11,7 @@ contact — or the owner's ✅ — discharges it.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import sqlalchemy as sa
@@ -133,11 +133,13 @@ async def test_the_savepoint_catches_the_race_the_preselect_missed(session, monk
     await phone_events.ingest_call_events(session, DEVICE, [_call(1)])
     await session.commit()
 
-    async def blind(session_, keys):
+    async def blind(session_, keys, content_keys):
         return set()
 
-    monkeypatch.setattr(phone_events, "_existing_event_keys", blind)
-    outcome = await phone_events.ingest_call_events(session, DEVICE, [_call(1), _call(2)])
+    monkeypatch.setattr(phone_events, "_existing_keys", blind)
+    outcome = await phone_events.ingest_call_events(
+        session, DEVICE, [_call(1), _call(2, at=_ago(hours=5))]
+    )
     await session.commit()
 
     assert (outcome.accepted, outcome.duplicates) == (1, 1)
@@ -159,6 +161,88 @@ async def test_sms_ids_survive_a_provider_wipe_via_the_content_hash(session):
     assert len(await _rows(session)) == 2
     key = phone_events.sms_event_key(DEVICE, 1, "Payme", _now(), "matn")
     assert re.fullmatch(rf"{re.escape(DEVICE)}:sms:1:[0-9a-f]{{16}}", key)
+
+
+# --- reinstall-safe content keys (WP-11) -----------------------------------------
+
+OTHER_DEVICE = "b7f1c2e0-0000-4000-8000-000000000002"
+BOOKED = "Oplata 25 000 sum\nKarta *1234"
+
+
+async def test_a_reinstall_with_a_new_device_id_is_all_duplicates(session):
+    at = _ago(hours=3)
+    first = await phone_events.ingest_sms(session, DEVICE, [_sms(5, at=at, body=BOOKED)])
+    await session.commit()
+    again = await phone_events.ingest_sms(
+        session, OTHER_DEVICE, [_sms(1, at=at, body=BOOKED)]
+    )
+    await session.commit()
+
+    assert first.accepted == 1
+    assert (again.accepted, again.duplicates) == (0, 1)
+    assert len(await _rows(session)) == 1
+    assert await session.scalar(sa.select(sa.func.count(m.Transaction.id))) == 1
+    [row] = await _rows(session)
+    assert row.media["content_key"].startswith("smsc:")
+
+
+async def test_one_second_later_is_a_new_sms(session):
+    at = _ago(hours=3)
+    await phone_events.ingest_sms(session, DEVICE, [_sms(5, at=at, body=BOOKED)])
+    later = await phone_events.ingest_sms(
+        session, OTHER_DEVICE, [_sms(1, at=at + timedelta(seconds=1), body=BOOKED)]
+    )
+    await session.commit()
+    assert later.accepted == 1
+    assert len(await _rows(session)) == 2
+
+
+async def test_the_same_instant_in_another_offset_is_one_sms(session):
+    at = _ago(hours=3).replace(microsecond=0)
+    await phone_events.ingest_sms(session, DEVICE, [_sms(5, at=at, body=BOOKED)])
+    utc = await phone_events.ingest_sms(
+        session,
+        OTHER_DEVICE,
+        [_sms(1, received_at=at.astimezone(UTC).isoformat(), body=BOOKED)],
+    )
+    await session.commit()
+    assert utc.duplicates == 1
+    assert len(await _rows(session)) == 1
+
+
+async def test_a_duplicate_inside_one_batch_is_caught_by_content(session):
+    at = _ago(hours=3)
+    outcome = await phone_events.ingest_sms(
+        session, OTHER_DEVICE, [_sms(1, at=at, body=BOOKED), _sms(2, at=at, body=BOOKED)]
+    )
+    await session.commit()
+    assert (outcome.accepted, outcome.duplicates) == (1, 1)
+
+
+async def test_a_call_log_reinstall_is_a_duplicate(session):
+    at = _ago(hours=4)
+    event = {"at": at, "type": "incoming", "duration_seconds": 42}
+    await phone_events.ingest_call_events(session, DEVICE, [_call(7, **event)])
+    await session.commit()
+    again = await phone_events.ingest_call_events(
+        session, OTHER_DEVICE, [_call(1, **event)]
+    )
+    await session.commit()
+    assert again.duplicates == 1
+    [row] = await _rows(session)
+    assert row.media["content_key"].startswith("callc:")
+
+
+async def test_a_booked_sms_carries_its_channel_card_and_evidence(session):
+    await phone_events.ingest_sms(
+        session, DEVICE, [_sms(1, sender="Kapital Bank", body=BOOKED)]
+    )
+    await session.commit()
+    txn = await session.scalar(sa.select(m.Transaction))
+    assert (txn.channel, txn.card_last4) == ("sms:kapitalbank", "1234")
+    [evidence] = list(await session.scalars(sa.select(m.TransactionEvidence)))
+    assert evidence.transaction_id == txn.id
+    assert evidence.channel == "sms:kapitalbank"
 
 
 # --- who the row belongs to ---------------------------------------------------

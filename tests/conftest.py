@@ -75,6 +75,7 @@ async def _truncate(session) -> None:
         m.Memory,
         m.Task,
         m.Event,
+        m.TransactionEvidence,
         m.Transaction,
         m.Promise,
         m.DebtPayment,

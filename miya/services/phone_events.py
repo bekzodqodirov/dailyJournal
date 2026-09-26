@@ -33,7 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.db.enums import Direction, InteractionSource
-from miya.db.models import Interaction, Transaction
+from miya.db.models import Interaction, Transaction, TransactionEvidence
 from miya.services import sms_money
 from miya.services.people import find_by_phone, resolve_person
 
@@ -79,6 +79,52 @@ def sms_event_key(
         f"{sender}|{received_at.isoformat()}|{body}".encode()
     ).hexdigest()[:16]
     return f"{device_id}:sms:{sms_id}:{digest}"
+
+
+# --- reinstall-safe content keys (WP-11) ---------------------------------------
+#
+# The event key carries the device id, and a reinstall (allowBackup=false)
+# mints a new one and resets the SMS cursor — the whole inbox comes back.
+# The content key is the event itself, so the server answers that
+# re-harvest with "duplicates". Timestamps enter as UTC epoch seconds: a
+# changed phone time zone or millisecond rounding in a backup app cannot
+# move them. The migration 0013 carries frozen copies of both functions;
+# a test keeps them equal.
+
+CONTENT_KEY_VERSION = "v1"
+CONTENT_KEY_CONSTRAINTS = frozenset(
+    {"ux_interactions_event_key", "ux_interactions_content_key"}
+)
+
+
+def _norm_body(body: str) -> str:
+    """Whitespace runs collapsed (CRLF, NBSP, trailing spaces); case kept."""
+    return " ".join(body.split())
+
+
+def _epoch(moment: datetime | str) -> int:
+    if isinstance(moment, str):
+        moment = datetime.fromisoformat(moment)
+    return int(moment.timestamp())
+
+
+def sms_content_key(sender: str, received_at: datetime | str, body: str) -> str:
+    material = (
+        f"{CONTENT_KEY_VERSION}|{sms_money.normalise_sender(sender)}|"
+        f"{_epoch(received_at)}|{_norm_body(body)}"
+    )
+    return "smsc:" + hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def call_content_key(
+    number: str | None, started_at: datetime | str, duration_seconds: int, call_type: str
+) -> str:
+    digits = re.sub(r"\D", "", number or "")[-9:]
+    material = (
+        f"{CONTENT_KEY_VERSION}|{digits}|{_epoch(started_at)}|"
+        f"{duration_seconds}|{call_type}"
+    )
+    return "callc:" + hashlib.sha256(material.encode()).hexdigest()[:32]
 
 
 @dataclass(slots=True)
@@ -189,49 +235,68 @@ def _validate_sms(message: dict) -> tuple[dict | None, str | None]:
 # --- shared mechanics ---------------------------------------------------------
 
 
-async def _existing_event_keys(session: AsyncSession, keys: list[str]) -> set[str]:
-    """Which of these keys are already interactions — one IN query, so a
-    fully-duplicate retry batch costs a single index scan."""
-    if not keys:
+async def _existing_keys(
+    session: AsyncSession, keys: list[str], content_keys: list[str]
+) -> set[str]:
+    """Which of these event or content keys are already interactions — one
+    query, so a fully-duplicate retry batch costs a single pair of index
+    scans."""
+    if not keys and not content_keys:
         return set()
-    rows = await session.scalars(
-        sa.select(Interaction.media["event_key"].astext).where(
-            Interaction.media["event_key"].astext.in_(keys)
+    event_key = Interaction.media["event_key"].astext
+    content_key = Interaction.media["content_key"].astext
+    rows = await session.execute(
+        sa.select(event_key, content_key).where(
+            sa.or_(event_key.in_(keys), content_key.in_(content_keys))
         )
     )
-    return set(rows)
+    return {key for row in rows.all() for key in row if key is not None}
 
 
 async def _ingest_batch(
-    session: AsyncSession, device_id: str, events: list[dict], validate, key_of, insert
+    session: AsyncSession,
+    device_id: str,
+    events: list[dict],
+    validate,
+    key_of,
+    insert,
+    content_key_of=None,
 ) -> EventOutcome:
     """Validate, pre-select, then insert each event under its own SAVEPOINT.
 
     The savepoint (session.begin_nested) catching IntegrityError is the real
     race guard: two workers posting the same event both pass the pre-select,
     and the second one's insert lands on ux_interactions_event_key and is
-    counted a duplicate instead of failing the batch. The caller commits.
+    counted a duplicate instead of failing the batch. An event is a
+    duplicate when either its event key or its content key is known; the
+    content key rides in ``fields["content_key"]`` for the insert to store.
+    The caller commits.
     """
     if len(events) > MAX_BATCH:
         raise ValueError(f"batch of {len(events)} exceeds MAX_BATCH={MAX_BATCH}")
     outcome = EventOutcome()
     prepared: list[tuple[int, dict | None, str | None, str | None]] = []
     keys: list[str] = []
+    content_keys: list[str] = []
     for index, event in enumerate(events):
         fields, error = validate(event)
         if error is not None or fields is None:
             prepared.append((index, None, None, error or "invalid"))
             continue
         key = key_of(device_id, fields)
+        if content_key_of is not None:
+            fields["content_key"] = content_key_of(fields)
+            content_keys.append(fields["content_key"])
         prepared.append((index, fields, key, None))
         keys.append(key)
 
-    existing = await _existing_event_keys(session, keys)
+    existing = await _existing_keys(session, keys, content_keys)
     for index, fields, key, error in prepared:
         if error is not None:
             outcome.rejected.append((index, error))
             continue
-        if key in existing:
+        content_key = fields.get("content_key")
+        if key in existing or (content_key is not None and content_key in existing):
             outcome.duplicates += 1
             continue
         try:
@@ -245,13 +310,16 @@ async def _ingest_batch(
                 "constraint_name",
                 None,
             )
-            if constraint is not None and constraint != "ux_interactions_event_key":
+            if constraint is not None and constraint not in CONTENT_KEY_CONSTRAINTS:
                 raise
             if constraint is None:
                 log.debug("integrity error taken as a duplicate for %s", key)
             outcome.duplicates += 1
             continue
-        existing.add(key)  # the same batch may carry the same event twice
+        # The same batch may carry the same event twice.
+        existing.add(key)
+        if content_key is not None:
+            existing.add(content_key)
         outcome.accepted += 1
     return outcome
 
@@ -299,6 +367,7 @@ async def _insert_call_event(
         media={
             "type": MEDIA_CALL_LOG,
             "event_key": key,
+            "content_key": fields.get("content_key"),
             "call_type": fields["type"],
             "phone": number,
             "contact_name": contact_name,
@@ -331,6 +400,12 @@ async def ingest_call_events(
         _validate_call,
         lambda device, fields: call_event_key(device, fields["call_log_id"]),
         _insert_call_event,
+        content_key_of=lambda fields: call_content_key(
+            fields["number"],
+            fields["started_at"],
+            fields["duration_seconds"],
+            fields["type"],
+        ),
     )
 
 
@@ -366,6 +441,7 @@ async def _insert_sms(
     media: dict = {
         "type": MEDIA_SMS,
         "event_key": key,
+        "content_key": fields.get("content_key"),
         "sender": sender,
         "sim_slot": fields["sim_slot"],
         "device_id": device_id,
@@ -414,16 +490,27 @@ async def _insert_sms(
             .limit(1)
         )
         if already is None:
+            channel = "sms:" + sms_money.normalise_sender(sender)
+            txn = Transaction(
+                type=parsed.type,
+                amount=parsed.amount,
+                currency=parsed.currency,
+                category=sms_money.category_of(parsed.merchant, body),
+                description=f"{sender}: {parsed.merchant or body[:80]}",
+                counterparty_person_id=None,  # a bank is not a counterparty
+                occurred_at=fields["received_at"],
+                source_interaction_id=interaction.id,
+                channel=channel,
+                card_last4=parsed.card_last4,
+            )
+            session.add(txn)
+            await session.flush()
             session.add(
-                Transaction(
-                    type=parsed.type,
-                    amount=parsed.amount,
-                    currency=parsed.currency,
-                    category=sms_money.category_of(parsed.merchant, body),
-                    description=f"{sender}: {parsed.merchant or body[:80]}",
-                    counterparty_person_id=None,  # a bank is not a counterparty
-                    occurred_at=fields["received_at"],
-                    source_interaction_id=interaction.id,
+                TransactionEvidence(
+                    transaction_id=txn.id,
+                    interaction_id=interaction.id,
+                    channel=channel,
+                    card_last4=parsed.card_last4,
                 )
             )
             await session.flush()
@@ -452,4 +539,7 @@ async def ingest_sms(
             fields["body"],
         ),
         _insert_sms,
+        content_key_of=lambda fields: sms_content_key(
+            fields["sender"], fields["received_at"], fields["body"]
+        ),
     )

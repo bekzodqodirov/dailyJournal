@@ -236,6 +236,21 @@ class Interaction(Base):
             unique=True,
             postgresql_where=sa.text("media ->> 'event_key' IS NOT NULL"),
         ),
+        # Reinstall-safe dedupe (WP-11): the event key carries the device id,
+        # which a reinstall re-mints; the content key is the message itself.
+        sa.Index(
+            "ux_interactions_content_key",
+            sa.text("(media ->> 'content_key')"),
+            unique=True,
+            postgresql_where=sa.text("media ->> 'content_key' IS NOT NULL"),
+        ),
+        sa.Index(
+            "ix_interactions_money_notice_pending",
+            "occurred_at",
+            postgresql_where=sa.text(
+                "(metadata ? 'money_notice') AND NOT (metadata ? 'money_notified')"
+            ),
+        ),
     )
 
 
@@ -353,13 +368,67 @@ class Transaction(Base):
         sa.ForeignKey("interactions.id", ondelete="CASCADE")
     )
     created_at: Mapped[datetime] = created_at_column()
+    # The ledger (WP-11, 0013). A row is never deleted to correct it: it is
+    # voided with a reason, and every change is appended to ``history``.
+    # Money totals filter on queries.ACTIVE_TXN.
+    voided_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    void_reason: Mapped[str | None] = mapped_column(sa.Text)
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    # 'sms:<normalised sender>' | 'app:<package>' | NULL for typed/extracted
+    channel: Mapped[str | None] = mapped_column(sa.Text)
+    # A transfer between the owner's own accounts: not income, not expense.
+    is_internal: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
 
     counterparty: Mapped[Person | None] = relationship(lazy="raise")
+    # Every text (SMS, app notification) that reported this one payment.
+    evidence: Mapped[list[TransactionEvidence]] = relationship(
+        lazy="raise", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         sa.CheckConstraint("amount > 0", name="ck_transactions_amount_positive"),
+        sa.CheckConstraint(
+            "card_last4 IS NULL OR card_last4 ~ '^[0-9]{4}$'",
+            name="ck_transactions_card_last4",
+        ),
         sa.Index("ix_transactions_occurred_type", "occurred_at", "type"),
         sa.Index("ix_transactions_category", "category"),
+        # The cross-channel match: the same payment seen twice.
+        sa.Index(
+            "ix_transactions_money_match", "currency", "type", "amount", "occurred_at"
+        ),
+        sa.Index("ix_transactions_counterparty", "counterparty_person_id"),
+    )
+
+
+class TransactionEvidence(Base):
+    """One text that reported a transaction. A payment seen through two
+    channels (the bank SMS and the Payme push) is one transaction with two
+    evidence rows; each interaction backs at most one transaction."""
+
+    __tablename__ = "transaction_evidence"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("transactions.id", ondelete="CASCADE"), nullable=False
+    )
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    channel: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.UniqueConstraint("interaction_id", name="ux_transaction_evidence_interaction"),
+        sa.UniqueConstraint(
+            "transaction_id", "channel", name="ux_transaction_evidence_txn_channel"
+        ),
     )
 
 
@@ -602,5 +671,6 @@ __all__ = [
     "ReminderLog",
     "Task",
     "Transaction",
+    "TransactionEvidence",
     "UsageLog",
 ]
