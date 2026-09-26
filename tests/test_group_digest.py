@@ -59,9 +59,14 @@ async def _msg(
     window_id=None,
     summary=None,
     at=None,
+    window_row=False,
 ):
     # Unique per chat, as Telegram numbers them (ux_interactions_tg_message).
     meta = {"tg_message_id": next(_MESSAGE_IDS)}
+    if window_row:
+        # The row the batch writes for a closed window (WP-48): told apart
+        # from its members by metadata, since members keep window_id too.
+        meta = {"kind": "window"}
     if to_me:
         meta["to_me"] = True
     interaction = Interaction(
@@ -156,7 +161,11 @@ async def test_a_digest_counts_messages_and_carries_the_summaries(session):
     # The window row: written by the extractor, holding the summary.
     window = await _window(session)
     await _msg(
-        session, text="(window)", window_id=window.id, summary="Yuk narxi kelishildi"
+        session,
+        text="(window)",
+        window_id=window.id,
+        summary="Yuk narxi kelishildi",
+        window_row=True,
     )
 
     digests = await queries.chat_digests(session)
@@ -231,3 +240,40 @@ def test_chat_titles_are_escaped():
 def test_quiet_days_say_so():
     assert "yozilmadi" in replies.to_me_report([], {})
     assert "bo'lmadi" in replies.chat_digest_report([])
+
+
+# --- WP-48: members keep window_id after the flush ------------------------------
+
+
+async def test_a_windowed_conversation_still_counts(session):
+    await _monitor(session)
+    window = await _window(session)
+    for _ in range(3):
+        await _msg(session, window_id=window.id)
+    await _msg(
+        session,
+        text="(window)",
+        window_id=window.id,
+        summary="Yuk narxi kelishildi",
+        window_row=True,
+    )
+    [digest] = await queries.chat_digests(session)
+    assert digest.messages == 3
+    assert digest.summaries == ["Yuk narxi kelishildi"]
+
+
+async def test_a_fully_windowed_chat_is_not_dropped(session):
+    await _monitor(session)
+    window = await _window(session)
+    await _msg(session, window_id=window.id)
+    assert [d.messages for d in await queries.chat_digests(session)] == [1]
+
+
+async def test_the_window_row_is_never_counted_as_a_message(session):
+    await _monitor(session)
+    window = await _window(session)
+    await _msg(
+        session, text="(window)", window_id=window.id, summary="x", window_row=True
+    )
+    [digest] = await queries.chat_digests(session)
+    assert digest.messages == 0 and digest.summaries == ["x"]

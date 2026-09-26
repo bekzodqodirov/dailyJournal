@@ -267,3 +267,32 @@ async def test_polling_keeps_updates_queued_while_the_bot_was_down(monkeypatch):
 
     assert seen.get("drop_pending_updates") is False
     assert {"pul", "ochir"} <= set(seen["menu"])
+
+
+async def test_day_summary_does_not_count_the_window_row(session):
+    """WP-48: two member messages and their window row are two contacts."""
+    from miya.db.enums import Direction, InteractionSource
+    from miya.services import queries
+
+    person = m.Person(display_name="P", aliases=[])
+    session.add(person)
+    await session.flush()
+    now = datetime.now(settings.tz)
+    for n, meta in enumerate(
+        ({"tg_message_id": 1}, {"tg_message_id": 2}, {"kind": "window"})
+    ):
+        session.add(
+            m.Interaction(
+                source=InteractionSource.telegram_userbot,
+                direction=Direction.in_,
+                person_id=person.id,
+                tg_chat_id=-7,
+                occurred_at=now,
+                raw_text=f"m{n}",
+                meta=meta,
+            )
+        )
+    await session.flush()
+    summary = await queries.day_summary(session, now.date())
+    assert [(p.id, n) for p, n in summary.people_seen] == [(person.id, 2)]
+    assert summary.interactions == 2

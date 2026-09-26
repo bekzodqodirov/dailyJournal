@@ -266,6 +266,7 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
         sa.select(Person, sa.func.count(Interaction.id).label("n"))
         .join(Interaction, Interaction.person_id == Person.id)
         .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        .where(_not_window_row())
         .group_by(Person.id)
         .order_by(sa.desc("n"))
     )
@@ -290,9 +291,9 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
         )
     )
     summary.interactions = await session.scalar(
-        sa.select(sa.func.count(Interaction.id)).where(
-            Interaction.occurred_at >= start, Interaction.occurred_at < end
-        )
+        sa.select(sa.func.count(Interaction.id))
+        .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        .where(_not_window_row())
     )
     summary.biggest = await _top_expenses(session, start, end)
     return summary
@@ -322,6 +323,26 @@ def _is_window_row():
     return sa.and_(
         Interaction.source == InteractionSource.telegram_userbot,
         Interaction.meta["kind"].astext == "window",
+    )
+
+
+def _not_window_row():
+    """Every row but a window's own; a NULL kind is not a window (WP-48)."""
+    return sa.or_(
+        Interaction.source != InteractionSource.telegram_userbot,
+        sa.func.coalesce(Interaction.meta["kind"].astext, "") != "window",
+    )
+
+
+def is_member_message():
+    """A userbot message as it was sent — not the window row summarising it.
+
+    Members keep ``window_id`` after the flush, so ``window_id`` cannot tell
+    the two apart; the window row's metadata can.
+    """
+    return sa.and_(
+        Interaction.source == InteractionSource.telegram_userbot,
+        sa.func.coalesce(Interaction.meta["kind"].astext, "") != "window",
     )
 
 
@@ -958,7 +979,8 @@ async def chat_digests(
     Two different rows feed this. The window interactions carry the summaries
     the extractor wrote — one per closed conversation — while the member
     messages are what gets counted. Counting the windows instead would report
-    "3 messages" for a chat that saw ninety.
+    "3 messages" for a chat that saw ninety. Members keep ``window_id`` once
+    their window is flushed, so the two are told apart by metadata (WP-48).
     """
     start, end = day_bounds(day or datetime.now(settings.tz).date())
     in_day = (Interaction.occurred_at >= start, Interaction.occurred_at < end)
@@ -973,7 +995,7 @@ async def chat_digests(
         await session.execute(
             sa.select(Interaction.tg_chat_id, sa.func.count(Interaction.id))
             .where(Interaction.tg_chat_id.isnot(None))
-            .where(Interaction.window_id.is_(None))  # members, not the window row
+            .where(is_member_message())
             .where(*in_day)
             .group_by(Interaction.tg_chat_id)
         )
@@ -982,7 +1004,7 @@ async def chat_digests(
     summaries: dict[int, list[str]] = {}
     rows = await session.execute(
         sa.select(Interaction.tg_chat_id, Interaction.summary)
-        .where(Interaction.window_id.isnot(None))
+        .where(_is_window_row())
         .where(Interaction.summary.isnot(None))
         .where(*in_day)
         .order_by(Interaction.occurred_at)
@@ -997,15 +1019,16 @@ async def chat_digests(
     ):
         addressed.setdefault(interaction.tg_chat_id or 0, []).append(interaction)
 
+    counted = dict(counts)
     digests = [
         ChatDigest(
             tg_chat_id=chat_id,
             title=titles.get(chat_id) or str(chat_id),
-            messages=count,
+            messages=counted.get(chat_id, 0),
             summaries=summaries.get(chat_id, []),
             to_me=addressed.get(chat_id, []),
         )
-        for chat_id, count in counts
+        for chat_id in sorted(set(counted) | set(summaries))
     ]
     digests.sort(key=lambda d: d.messages, reverse=True)
     return digests
