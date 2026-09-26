@@ -188,7 +188,9 @@ async def test_chats_toggle_sets_decided_by_owner(session):
     assert group.decided_by == "owner" and group.monitor_enabled
 
 
-async def test_userbot_counts_a_switched_off_group_without_storing_it(monkeypatch):
+async def test_userbot_counts_a_switched_off_group_without_storing_it(
+    session, monkeypatch
+):  # session: needs the database (and cleans up after)
     from miya.db.session import session_scope
 
     monkeypatch.setattr(settings, "owner_aliases", "Bekzod, Bekzod aka")
