@@ -2,15 +2,43 @@
 
 Database-backed tests skip automatically when nothing is listening on
 ``DATABASE_URL``, so `make test` works on a laptop with no containers running.
+Set ``MIYA_REQUIRE_DB=1`` (CI does) to turn that skip into a failure, so a
+suite that silently ran without its database cannot pass.
+
+``MIYA_TIME_TRAVEL=newyear`` or ``=+Nd`` runs the whole suite at another
+moment (see tests/timetravel.py); it is for runs without a database.
+
+Dates in tests: hard-code a calendar date only when the test passes it to the
+code under test (``now=`` / ``today=``). Anything compared against code that
+reads the real clock must be derived from the real clock, or the test starts
+failing on a date nobody chose.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 import sqlalchemy as sa
 
 from miya.db import models as m
 from miya.db.session import SessionLocal, engine
+
+
+def pytest_configure(config) -> None:
+    # Runs before any test module is imported, so module-level stamps such as
+    # test_health_worker.STAMP are taken in the travelled time.
+    if os.environ.get("MIYA_TIME_TRAVEL"):
+        from tests import timetravel
+
+        timetravel.start()
+
+
+def pytest_unconfigure(config) -> None:
+    if os.environ.get("MIYA_TIME_TRAVEL"):
+        from tests import timetravel
+
+        timetravel.stop()
 
 
 async def database_available() -> bool:
@@ -54,6 +82,8 @@ async def _truncate(session) -> None:
 @pytest.fixture
 async def session():
     if not await database_available():
+        if os.environ.get("MIYA_REQUIRE_DB") == "1":
+            pytest.fail("MIYA_REQUIRE_DB=1 but no migrated database at DATABASE_URL")
         pytest.skip("no migrated database reachable at DATABASE_URL")
     async with SessionLocal() as s:
         await _truncate(s)

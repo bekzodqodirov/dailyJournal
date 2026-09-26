@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 import sqlalchemy as sa
 
+from miya.bot.formatting import clock, short_date
 from miya.config import settings
 from miya.db import models as m
 from miya.services import backup, health
@@ -28,6 +29,10 @@ from miya.worker import main as worker
 TZ = settings.tz
 NOW = datetime(2026, 9, 15, 21, 40, tzinfo=TZ)
 GB = 1024**3
+# The backup under test is two hours old by the real clock, so it never ages
+# into "stale" however long after writing the suite is run.
+STAMP = (datetime.now(TZ) - timedelta(hours=2)).replace(second=0, microsecond=0)
+STAMP_LABEL = f"{short_date(STAMP.date())} {clock(STAMP)}"
 
 
 class _Bot:
@@ -412,7 +417,7 @@ async def test_a_dead_database_is_reported_from_memory_not_the_ledger(
 
 
 def _backup_file(tmp_path: Path, size: int) -> Path:
-    path = tmp_path / f"miya-20260915-033000{backup.BACKUP_SUFFIX}"
+    path = tmp_path / f"miya-{STAMP:%Y%m%d-%H%M%S}{backup.BACKUP_SUFFIX}"
     path.write_bytes(bytes(range(256)) * (size // 256) + b"x" * (size % 256))
     return path
 
@@ -437,7 +442,7 @@ async def test_a_small_backup_goes_out_as_one_document(session, monkeypatch, tmp
 
     [(sent_path, kwargs)] = bot.documents
     assert sent_path == str(path)
-    assert kwargs["caption"] == "🗄 Zaxira nusxa 15-sen 03:30 · 2 KB · 1/1"
+    assert kwargs["caption"] == f"🗄 Zaxira nusxa {STAMP_LABEL} · 2 KB · 1/1"
     assert kwargs["disable_notification"] is True
     assert bot.sent == []  # silence means it worked
     rows = await _rows(session)
@@ -465,7 +470,7 @@ async def test_a_big_backup_goes_out_in_ordered_pieces_that_are_removed_after(
     assert [p for p, _ in bot.documents] == [f"{path}.part0{n}" for n in (1, 2, 3, 4)]
     captions = [kwargs["caption"] for _, kwargs in bot.documents]
     assert [c.rsplit(" ", 1)[1] for c in captions] == ["1/4", "2/4", "3/4", "4/4"]
-    assert all(c.startswith("🗄 Zaxira nusxa 15-sen 03:30 · ") for c in captions)
+    assert all(c.startswith(f"🗄 Zaxira nusxa {STAMP_LABEL} · ") for c in captions)
     assert sorted(tmp_path.iterdir()) == [path]  # pieces gone, backup kept
     rows = await _rows(session)
     assert rows[health.BACKUP_COMPONENT].detail["sent"] is True
@@ -513,7 +518,7 @@ async def test_a_failed_send_inside_quiet_hours_is_left_to_the_health_job(
     assert rows[health.BACKUP_COMPONENT].detail["sent"] is False
     assert await _ledger(session, "alert:backup_failed") == []
     # The morning health sweep reads the record and says it.
-    info = await health.gather(session)
+    info = await health.gather(session, now=STAMP + timedelta(hours=1))
     assert info.backup.send_failed is True
     assert "backup_failed" in [p.key for p in health.problems(info)]
 

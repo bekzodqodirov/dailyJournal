@@ -34,6 +34,17 @@ from miya.services.queries import PersonSummary, TimelineEntry
 from tests.test_close_and_correct import _command, _Message
 
 TZ = settings.tz
+THIS_YEAR = datetime.now(TZ).year
+
+# The /kim fixture's dates, relative to the real clock: the same shape as the
+# original fixed calendar (a fact, then the records, then three contacts on
+# consecutive days, the profile written the morning of the last one).
+KIM_BASE = (datetime.now(TZ) - timedelta(days=15)).replace(
+    hour=12, minute=0, second=0, microsecond=0
+)
+KIM_RECORDED = (KIM_BASE - timedelta(days=5)).replace(hour=10)
+KIM_FACT_AT = (KIM_BASE - timedelta(days=9)).replace(hour=0)
+KIM_PROFILE_AT = (KIM_BASE + timedelta(days=2)).replace(hour=9)
 
 
 def _now() -> datetime:
@@ -108,11 +119,11 @@ async def _akmal_with_everything(session) -> m.Person:
         phone="+998901234567",
         relationship_="yuk beruvchi mijoz",
         notes="Xitoydan yuk olib keladi.\nOdatda o'z vaqtida to'laydi.",
-        profile_updated_at=datetime(2026, 9, 12, 9, 0, tzinfo=TZ),
+        profile_updated_at=KIM_PROFILE_AT,
     )
     # Dated before the receipt below: a debt or promise recorded today would
     # itself be the last contact, which last_contact_at rightly counts.
-    recorded = datetime(2026, 9, 5, 10, 0, tzinfo=TZ)
+    recorded = KIM_RECORDED
     session.add(
         m.Debt(
             direction=DebtDirection.they_owe_me,
@@ -131,9 +142,9 @@ async def _akmal_with_everything(session) -> m.Person:
         )
     )
     await session.flush()
-    await _fact(session, akmal, "Mashinasi oq Malibu", at=datetime(2026, 9, 1, tzinfo=TZ))
+    await _fact(session, akmal, "Mashinasi oq Malibu", at=KIM_FACT_AT)
     await _fact(session, akmal, "Ukasi Sardor bilan ishlaydi")
-    base = datetime(2026, 9, 10, 12, 0, tzinfo=TZ)
+    base = KIM_BASE
     await _interaction(
         session,
         akmal,
@@ -182,7 +193,7 @@ async def test_kim_shows_everything_held_about_a_person(bound):
     assert "@akmal_gz" in text and "+998901234567" in text
     assert "yuk beruvchi mijoz" in text
     # profile with its date
-    assert "📝 <b>Profil</b> <i>(12-sen)</i>" in text
+    assert f"📝 <b>Profil</b> <i>({f.day_label(KIM_PROFILE_AT)})</i>" in text
     assert "Xitoydan yuk olib keladi." in text
     assert "Profil hali yozilmagan" not in text
     # figures from SQL
@@ -191,13 +202,17 @@ async def test_kim_shows_everything_held_about_a_person(bound):
     # facts, newest first
     assert "🧠" in text
     assert text.index("Ukasi Sardor bilan ishlaydi") < text.index("Mashinasi oq Malibu")
-    assert "1-sen · Mashinasi oq Malibu" in text
+    assert f"{f.day_label(KIM_FACT_AT)} · Mashinasi oq Malibu" in text
     # timeline with source emojis
-    assert "10-sen · 📞 qo'ng'iroq · Yuk ertaga jo'natilishi kelishildi" in text
-    assert "11-sen · 💬 telegram · Konteyner raqamini so'radi" in text
-    assert "12-sen · 🧾 chek · chek 300$" in text
+    day = f.day_label
+    assert f"{day(KIM_BASE)} · 📞 qo'ng'iroq · Yuk ertaga jo'natilishi kelishildi" in text
+    assert (
+        f"{day(KIM_BASE + timedelta(days=1))} · 💬 telegram · Konteyner raqamini so'radi"
+        in text
+    )
+    assert f"{day(KIM_BASE + timedelta(days=2))} · 🧾 chek · chek 300$" in text
     # last contact and totals
-    assert "Oxirgi aloqa: 12-sen" in text
+    assert f"Oxirgi aloqa: {f.day_label(KIM_BASE + timedelta(days=2))}" in text
     assert "jami 3 ta aloqa" in text
     assert "/tarix Akmal — to'liq tarix" in text
     assert len(text) <= f.TELEGRAM_LIMIT + 40
@@ -535,7 +550,7 @@ async def test_eslab_escapes_the_owners_words_on_render_only(bound):
 
 
 def _entry(source, text, *, direction=Direction.in_, when=None) -> TimelineEntry:
-    when = when or datetime(2026, 9, 12, 10, 0, tzinfo=TZ)
+    when = when or datetime(THIS_YEAR, 9, 12, 10, 0, tzinfo=TZ)
     return TimelineEntry(
         interaction=m.Interaction(),
         when=when,
@@ -580,9 +595,9 @@ def test_timeline_line_folds_clips_escapes_and_names_the_speaker():
     old = _entry(
         InteractionSource.assistant_bot,
         "eski",
-        when=datetime(2025, 3, 2, tzinfo=TZ),
+        when=datetime(THIS_YEAR - 1, 3, 2, tzinfo=TZ),
     )
-    assert f.timeline_line(old) == "2-mar 2025 · ✍️ yozuv · eski"
+    assert f.timeline_line(old) == f"2-mar {THIS_YEAR - 1} · ✍️ yozuv · eski"
 
 
 def test_operation_label_and_help_cover_the_new_surface():

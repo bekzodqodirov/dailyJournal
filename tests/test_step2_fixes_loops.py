@@ -43,7 +43,8 @@ ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 
 
 def _at(hour: int, minute: int = 0) -> datetime:
-    return datetime(2026, 9, 15, hour, minute, tzinfo=TZ)
+    """Today, by the real clock, at the given time: the same day ``_ago`` uses."""
+    return _now().replace(hour=hour, minute=minute, second=0, microsecond=0)
 
 
 # --- A1: a debt payment is contact -----------------------------------------------
@@ -227,7 +228,7 @@ async def test_ertaga_earns_exactly_one_more_nudge_when_it_expires(session):
     assert await nudges.collect(session) == []
 
     until = nudges.next_morning(_at(15, 0))
-    assert until == datetime(2026, 9, 16, 9, 0, tzinfo=TZ)
+    assert until == _at(9) + timedelta(days=1)
     nudges.snooze(asked, until=until)
     await session.flush()
 
@@ -259,10 +260,10 @@ def test_the_nudge_rule_is_pure_and_explicit():
 @pytest.mark.parametrize(
     ("now", "expected"),
     [
-        (_at(0, 30), datetime(2026, 9, 15, 9, 0, tzinfo=TZ)),  # before the brief: today
-        (_at(8, 59), datetime(2026, 9, 15, 9, 0, tzinfo=TZ)),
-        (_at(9, 0), datetime(2026, 9, 16, 9, 0, tzinfo=TZ)),  # at it: tomorrow's
-        (_at(15, 0), datetime(2026, 9, 16, 9, 0, tzinfo=TZ)),
+        (_at(0, 30), _at(9)),  # before the brief: today
+        (_at(8, 59), _at(9)),
+        (_at(9, 0), _at(9) + timedelta(days=1)),  # at it: tomorrow's
+        (_at(15, 0), _at(9) + timedelta(days=1)),
     ],
 )
 def test_next_morning_is_the_next_brief_not_always_tomorrows(now, expected):
