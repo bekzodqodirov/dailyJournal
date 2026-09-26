@@ -32,9 +32,10 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
-from miya.db.models import Interaction, Transaction, TransactionEvidence
-from miya.services import sms_money
+from miya.db.models import Interaction
+from miya.services import money_events, sms_money
 from miya.services.people import find_by_phone, resolve_person
 
 log = logging.getLogger(__name__)
@@ -435,9 +436,6 @@ async def _insert_sms(
     if phone is not None:
         person = await find_by_phone(session, phone)
 
-    # Deterministic, token-free: a bank SMS is the bank's record, so it goes
-    # through sms_money.parse and never through extraction or the claim gate.
-    parsed = sms_money.parse(sender, body, received_at=fields["received_at"])
     media: dict = {
         "type": MEDIA_SMS,
         "event_key": key,
@@ -446,28 +444,6 @@ async def _insert_sms(
         "sim_slot": fields["sim_slot"],
         "device_id": device_id,
     }
-    needs_review = False
-    if parsed is not None and parsed.confidence == sms_money.HIGH:
-        media["payment"] = {
-            "amount": str(parsed.amount),
-            "currency": parsed.currency.value,
-            "card_last4": parsed.card_last4,
-            "merchant": parsed.merchant,
-            "balance_after": (
-                str(parsed.balance_after) if parsed.balance_after is not None else None
-            ),
-        }
-    elif parsed is not None:
-        # The verdict and its reason stay on the row for /tekshir; no
-        # "payment" key, because nothing was booked.
-        media["payment_verdict"] = {
-            "verdict": parsed.verdict.value,
-            "reason": parsed.reason,
-        }
-        # A bank text that could not be read with certainty waits for the
-        # owner's eye; a one-time code or an advert is simply stored.
-        needs_review = parsed.verdict is sms_money.Verdict.REVIEW
-
     interaction = Interaction(
         source=InteractionSource.phone_sms,
         direction=Direction.in_,
@@ -475,45 +451,24 @@ async def _insert_sms(
         occurred_at=fields["received_at"],  # the client's own moment, verbatim
         raw_text=body,
         processed=True,
-        needs_review=needs_review,
+        needs_review=False,
         media=media,
     )
     session.add(interaction)
     await session.flush()
 
-    if parsed is not None and parsed.confidence == sms_money.HIGH:
-        # Belt over the event-key index (transactions has no unique
-        # constraint): one transaction per SMS interaction, ever.
-        already = await session.scalar(
-            sa.select(Transaction.id)
-            .where(Transaction.source_interaction_id == interaction.id)
-            .limit(1)
+    # Deterministic, token-free: a bank SMS is the bank's record, so it goes
+    # through sms_money and the one booking service (money_events), never
+    # through extraction or the claim gate.
+    parsed = sms_money.parse(sender, body, received_at=fields["received_at"])
+    if parsed is not None:
+        await money_events.apply_reading(
+            session,
+            interaction,
+            parsed,
+            channel=money_events.channel_for_sms(sender),
+            now=datetime.now(settings.tz),
         )
-        if already is None:
-            channel = "sms:" + sms_money.normalise_sender(sender)
-            txn = Transaction(
-                type=parsed.type,
-                amount=parsed.amount,
-                currency=parsed.currency,
-                category=sms_money.category_of(parsed.merchant, body),
-                description=f"{sender}: {parsed.merchant or body[:80]}",
-                counterparty_person_id=None,  # a bank is not a counterparty
-                occurred_at=fields["received_at"],
-                source_interaction_id=interaction.id,
-                channel=channel,
-                card_last4=parsed.card_last4,
-            )
-            session.add(txn)
-            await session.flush()
-            session.add(
-                TransactionEvidence(
-                    transaction_id=txn.id,
-                    interaction_id=interaction.id,
-                    channel=channel,
-                    card_last4=parsed.card_last4,
-                )
-            )
-            await session.flush()
     return interaction
 
 

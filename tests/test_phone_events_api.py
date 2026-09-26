@@ -229,7 +229,7 @@ async def test_a_money_sms_becomes_one_transaction_and_costs_no_tokens(session, 
     assert row.direction is Direction.in_
     assert row.raw_text == body
     assert row.needs_review is False
-    assert row.media["payment"]["amount"] == "25000.00"
+    assert row.media["money"]["amount"] == "25000.00"
 
     [txn] = list(await session.scalars(sa.select(m.Transaction)))
     assert txn.type is TransactionType.expense
@@ -249,7 +249,10 @@ async def test_a_low_confidence_sms_waits_for_the_owners_eye(session, device):
     assert response.json()["accepted"] == 1
     [row] = await _rows(session)
     assert row.needs_review is True
-    assert row.media["payment_verdict"] == {"verdict": "review", "reason": "no_evidence"}
+    assert (row.media["money"]["verdict"], row.media["money"]["reason"]) == (
+        "review",
+        "no_evidence",
+    )
     assert list(await session.scalars(sa.select(m.Transaction))) == []
     # /tekshir names the source instead of leaking the enum value.
     assert replies.SOURCE_LABEL["phone_sms"] == "sms"
@@ -264,8 +267,11 @@ async def test_a_one_time_code_is_stored_but_never_asks(session, device):
     [row] = await _rows(session)
     assert row.needs_review is False
     assert row.raw_text == "Vash parol: 1234"
-    assert row.media["payment_verdict"] == {"verdict": "ignore", "reason": "otp"}
-    assert "payment" not in row.media
+    assert (row.media["money"]["verdict"], row.media["money"]["reason"]) == (
+        "ignore",
+        "otp",
+    )
+    assert row.media["money"]["transaction_id"] is None
     assert list(await session.scalars(sa.select(m.Transaction))) == []
 
 

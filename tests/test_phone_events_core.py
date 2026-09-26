@@ -381,15 +381,25 @@ async def test_a_payment_sms_becomes_exactly_one_transaction(session):
     assert row.occurred_at == at
     assert row.raw_text == PAYME_BODY
     assert row.needs_review is False
-    assert row.media["payment"] == {
+    [txn] = list(await session.scalars(sa.select(m.Transaction)))
+    assert row.media["money"] == {
+        "v": 1,
+        "verdict": "book",
+        "reason": "ok",
+        "markers": [],
+        "type": "expense",
         "amount": "25000.00",
         "currency": "UZS",
         "card_last4": "1234",
         "merchant": "KORZINKA.UZ",
         "balance_after": "1250000.00",
+        "channel": "sms:payme",
+        "gs_codes": [],
+        "waybills": [],
+        "transaction_id": txn.id,
+        "merged": False,
     }
 
-    [txn] = list(await session.scalars(sa.select(m.Transaction)))
     assert txn.type is TransactionType.expense
     assert txn.amount == Decimal("25000.00")
     assert txn.currency is Currency.UZS
@@ -425,7 +435,8 @@ async def test_a_low_confidence_bank_sms_is_flagged_not_invented(session):
     assert outcome.accepted == 1
     [row] = await _rows(session)
     assert row.needs_review is True  # the owner's /tekshir eye
-    assert "payment" not in row.media
+    assert row.media["money"]["verdict"] == "review"
+    assert row.media["money"]["transaction_id"] is None
     assert await session.scalar(sa.select(sa.func.count(m.Transaction.id))) == 0
     assert await session.scalar(sa.select(sa.func.count(m.UsageLog.id))) == 0
 
@@ -440,7 +451,7 @@ async def test_a_non_payment_sms_is_stored_and_nothing_more(session):
     [row] = await _rows(session)
     assert row.needs_review is False
     assert row.processed is True
-    assert "payment" not in row.media
+    assert "money" not in row.media
     assert await session.scalar(sa.select(sa.func.count(m.Transaction.id))) == 0
 
 

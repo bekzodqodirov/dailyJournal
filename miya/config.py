@@ -180,6 +180,15 @@ class Settings(BaseSettings):
     # Bank adverts ("5% keshbek ...") are ignored by default; true sends
     # them to /tekshir instead.
     payment_adverts_to_review: bool = False
+    # The emergency brake while the parser is tuned: false sends every
+    # completed payment to /tekshir instead of booking it.
+    money_autobook: bool = True
+    # One payment seen through two channels (SMS + app push) within this
+    # many minutes is one transaction.
+    payment_dedupe_window_minutes: int = Field(default=10, ge=1, le=120)
+    # The same text through the same channel within this many seconds is a
+    # re-posted notification, not a second payment.
+    payment_repeat_seconds: int = Field(default=120, ge=0, le=3600)
 
     # --- Backups (spec §10) -------------------------------------------------
     backup_dir: str = "/data/backups"
