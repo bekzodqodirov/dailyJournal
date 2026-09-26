@@ -15,7 +15,7 @@ from typing import Any
 
 import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from miya.config import settings
@@ -203,6 +203,8 @@ class Interaction(Base):
     # When the codes in this row's text were indexed into code_mentions
     # (WP-30, 0017); NULL = not yet.
     codes_indexed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # WP-55: when this row's passages were last (re)written; NULL = pending.
+    search_indexed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     processed: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
@@ -282,6 +284,11 @@ class Interaction(Base):
             "ix_interactions_codes_unindexed",
             "id",
             postgresql_where=sa.text("codes_indexed_at IS NULL"),
+        ),
+        sa.Index(
+            "ix_interactions_unindexed",
+            "id",
+            postgresql_where=sa.text("search_indexed_at IS NULL"),
         ),
         sa.Index(
             "ix_interactions_money_notice_pending",
@@ -764,9 +771,24 @@ class Memory(Base):
         ARRAY(sa.Text), nullable=False, server_default="{}"
     )
     created_at: Mapped[datetime] = created_at_column()
+    # WP-55: the normalised text, for full-text and trigram matching.
+    search_norm: Mapped[str | None] = mapped_column(sa.Text)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        sa.Computed(
+            "to_tsvector('simple'::regconfig, coalesce(search_norm, ''))", persisted=True
+        ),
+    )
 
     __table_args__ = (
         sa.Index("ix_memories_occurred_at", "occurred_at"),
+        sa.Index("ix_memories_tsv", "search_tsv", postgresql_using="gin"),
+        sa.Index(
+            "ix_memories_trgm",
+            "search_norm",
+            postgresql_using="gin",
+            postgresql_ops={"search_norm": "gin_trgm_ops"},
+        ),
         sa.Index("ix_memories_person_occurred", "person_id", sa.text("occurred_at DESC")),
         sa.Index("ix_memories_tags", "tags", postgresql_using="gin"),
         sa.Index(
@@ -904,15 +926,91 @@ __all__ = [
     "Heartbeat",
     "Interaction",
     "Memory",
+    "Passage",
     "Person",
     "Promise",
     "QuestionLog",
+    "RecapDigest",
     "ReminderLog",
     "Task",
     "Transaction",
     "TransactionEvidence",
     "UsageLog",
 ]
+
+
+class Passage(Base):
+    """One searchable stretch of what was said (WP-55, 0021): a message, a
+    transcript or document chunk, a note — with who said it and where."""
+
+    __tablename__ = "passages"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_no: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    source: Mapped[e.InteractionSource] = mapped_column(
+        INTERACTION_SOURCE, nullable=False
+    )
+    tg_chat_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    chat_person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    speaker_person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    from_owner: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
+    media_kind: Mapped[str | None] = mapped_column(sa.Text)
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    body: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    embed_text: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    search_norm: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        sa.Computed("to_tsvector('simple'::regconfig, search_norm)", persisted=True),
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.UniqueConstraint("interaction_id", "chunk_no", name="uq_passages_chunk"),
+        sa.Index("ix_passages_tsv", "search_tsv", postgresql_using="gin"),
+        sa.Index(
+            "ix_passages_trgm",
+            "search_norm",
+            postgresql_using="gin",
+            postgresql_ops={"search_norm": "gin_trgm_ops"},
+        ),
+        sa.Index(
+            "ix_passages_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        sa.Index(
+            "ix_passages_speaker_occurred",
+            "speaker_person_id",
+            sa.text("occurred_at DESC"),
+        ),
+        sa.Index(
+            "ix_passages_chat_person_occurred",
+            "chat_person_id",
+            sa.text("occurred_at DESC"),
+        ),
+        sa.Index("ix_passages_chat_occurred", "tg_chat_id", sa.text("occurred_at DESC")),
+        sa.Index("ix_passages_occurred", sa.text("occurred_at DESC")),
+        sa.Index(
+            "ix_passages_unembedded", "id", postgresql_where=sa.text("embedding IS NULL")
+        ),
+    )
 
 
 # --- the one re-index listener (WP-39) -------------------------------------------
@@ -941,7 +1039,7 @@ def _reindex_changed_text(session, flush_context, instances) -> None:
             continue
         if obj.codes_indexed_at is not None:
             obj.codes_indexed_at = None
-        if getattr(obj, "search_indexed_at", None) is not None:
+        if obj.search_indexed_at is not None:
             obj.search_indexed_at = None
 
 

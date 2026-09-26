@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.models import Memory
 from miya.services.embeddings import Embedder
+from miya.services.text import normalise_for_search
 
 log = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ async def remember(
         occurred_at=occurred_at or datetime.now(settings.tz),
         tags=list(tags),
         source_interaction_id=source_interaction_id,
+        search_norm=normalise_for_search(text),
     )
     session.add(memory)
     return memory

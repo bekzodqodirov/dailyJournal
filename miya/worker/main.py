@@ -82,6 +82,7 @@ from miya.services import (
     health,
     memories,
     money_notices,
+    passages,
     profiles,
     questions,
     recaps,
@@ -222,18 +223,28 @@ async def retention_job() -> None:
         await call_recordings.purge_old_audio(session)
 
 
-async def embed_job() -> None:
-    """Backfill embeddings for memories created since the last tick."""
-    async with session_scope() as session:
-        try:
-            embedded = await memories.embed_pending(session, get_embedder())
-        except EmbeddingError as exc:
-            # Rows stay NULL and are retried next tick; typical cause is the
-            # api container still downloading/loading the model.
-            log.warning("embedding backfill failed, will retry: %s", exc)
+EMBED_JOB_SECONDS = 20
+
+
+async def embed_job(*, budget_seconds: float = EMBED_JOB_SECONDS) -> None:
+    """Backfill embeddings for memories and then passages (WP-55); loops for
+    up to ``budget_seconds`` so a first backfill drains."""
+    started = monotonic()
+    embedder = get_embedder()
+    while True:
+        async with session_scope() as session:
+            try:
+                embedded = await memories.embed_pending(session, embedder)
+                embedded += await passages.embed_pending(session, embedder)
+            except EmbeddingError as exc:
+                # Rows stay NULL and are retried next tick; typical cause is
+                # the api container still downloading/loading the model.
+                log.warning("embedding backfill failed, will retry: %s", exc)
+                return
+        if embedded:
+            log.info("embedded %d new memories and passages", embedded)
+        if not embedded or monotonic() - started > budget_seconds:
             return
-    if embedded:
-        log.info("embedded %d new memories", embedded)
 
 
 async def deliver_report(
@@ -608,8 +619,9 @@ CODE_INDEX_BATCH = 1000
 CODE_INDEX_SECONDS = 20
 
 
-async def code_index_job(*, budget_seconds: float = CODE_INDEX_SECONDS) -> int:
-    """Index GS codes and waybills of every stored text (WP-39).
+async def index_job(*, budget_seconds: float = CODE_INDEX_SECONDS) -> int:
+    """Index what every stored text says: GS codes and waybills (WP-39) and
+    the passages recall searches (WP-55).
 
     One commit per batch; stops on a short batch or when the time budget is
     spent, so the first runs after a deploy backfill history a slice at a time.
@@ -620,8 +632,12 @@ async def code_index_job(*, budget_seconds: float = CODE_INDEX_SECONDS) -> int:
         async with session_scope() as session:
             done = await codes.index_pending(session, limit=CODE_INDEX_BATCH)
             await session.commit()
-        total += done
-        if done < CODE_INDEX_BATCH or monotonic() - started > budget_seconds:
+        async with session_scope() as session:
+            indexed = await passages.index_pending(session)
+            await session.commit()
+        total += done + indexed
+        short = done < CODE_INDEX_BATCH and indexed < settings.passage_index_batch
+        if short or monotonic() - started > budget_seconds:
             return total
 
 
@@ -1333,7 +1349,7 @@ async def run() -> None:
         coalesce=True,
     )
     scheduler.add_job(
-        code_index_job,
+        index_job,
         IntervalTrigger(minutes=2),
         id="code_index",
         max_instances=1,

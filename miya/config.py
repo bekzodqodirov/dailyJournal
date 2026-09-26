@@ -280,6 +280,13 @@ class Settings(BaseSettings):
     recap_model_timeout_seconds: int = Field(default=60, ge=1)
     # WP-54: the morning recap recalls this many of yesterday's subjects.
     recap_morning_top_people: int = Field(default=5, ge=0)
+    # WP-55: passages — what was said, chunked for search. The embed batch
+    # stays within the /v1/embed request cap (256).
+    passage_chunk_chars: int = Field(default=1200, ge=100)
+    passage_chunk_overlap: int = Field(default=200, ge=0)
+    passage_embed_min_chars: int = Field(default=12, ge=1)
+    passage_index_batch: int = Field(default=500, ge=1)
+    passage_embed_batch: int = Field(default=128, ge=1, le=256)
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

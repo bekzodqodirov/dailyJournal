@@ -47,6 +47,7 @@ from miya.db.models import (
     Heartbeat,
     Interaction,
     Memory,
+    Passage,
     ReminderLog,
     UsageLog,
 )
@@ -412,6 +413,29 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
                 )
             )
         ).one()
+        # Passages too (WP-55): the short ones are never embedded.
+        passage_backlog, passage_oldest = (
+            await session.execute(
+                sa.select(sa.func.count(Passage.id), sa.func.min(Passage.created_at))
+                .where(Passage.embedding.is_(None))
+                .where(
+                    sa.func.length(Passage.search_norm)
+                    >= settings.passage_embed_min_chars
+                )
+            )
+        ).one()
+        unindexed = int(
+            await session.scalar(
+                sa.select(sa.func.count(Interaction.id))
+                .where(Interaction.search_indexed_at.is_(None))
+                .where(Interaction.created_at >= now - timedelta(hours=24))
+            )
+            or 0
+        )
+        embed_backlog = int(embed_backlog or 0) + int(passage_backlog or 0) + unindexed
+        embed_oldest_at = min(
+            (t for t in (embed_oldest_at, passage_oldest) if t is not None), default=None
+        )
         claims_pending = int(
             await session.scalar(
                 sa.select(sa.func.count())

@@ -95,6 +95,7 @@ async def _truncate(session) -> None:
         m.Promise,
         m.DebtPayment,
         m.Debt,
+        m.Passage,
         # Interactions reference windows, so they go first.
         m.Interaction,
         m.ConversationWindow,
