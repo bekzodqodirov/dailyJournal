@@ -1352,6 +1352,7 @@ def claim_value_refused(view: claims.ClaimView) -> str:
 MANBA_USAGE = "Qaysi yozuv? Masalan: <code>/manba m1234</code>"
 MANBA_NOT_FOUND = "Bunday yozuv topilmadi — o'chirilgan bo'lishi mumkin."
 QIDIR_USAGE = "Nima qidiray? <code>/qidir bojxona</code>"
+MANBA_EDIT_LINE = "✏️ tahrirlangan {when}; avvalgi matn: «{text}»"
 QIDIR_HIT_CHARS = 140
 QIDIR_FACT_CHARS = 160
 
@@ -1423,6 +1424,15 @@ def manba(source) -> str:
         )
     else:
         body = escape(source.text)
+    edits = [
+        MANBA_EDIT_LINE.format(
+            when=(f"{_day(at)} {clock(at)}" if at is not None else "?"),
+            text=escape(_one_line(old, QIDIR_HIT_CHARS)),
+        )
+        for at, old in getattr(source, "edits", [])
+    ]
+    if edits:
+        body += "\n\n" + "\n".join(edits)
     return clip(f"{header}\n\n{body}")
 
 

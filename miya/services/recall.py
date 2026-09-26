@@ -790,6 +790,21 @@ class Source:
     lines: list[Line] = field(default_factory=list)
     text: str = ""
     source_ref: str | None = None
+    # Earlier versions of an edited message, oldest first (WP-74).
+    edits: list[tuple[datetime | None, str]] = field(default_factory=list)
+
+
+def _edits_of(interaction: Interaction) -> list[tuple[datetime | None, str]]:
+    out = []
+    for entry in (interaction.meta or {}).get("edits") or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            at = datetime.fromisoformat(entry.get("at") or "")
+        except ValueError:
+            at = None
+        out.append((at, str(entry.get("old") or "")))
+    return out
 
 
 async def source_of(session: AsyncSession, ref: str) -> Source | None:
@@ -821,7 +836,10 @@ async def source_of(session: AsyncSession, ref: str) -> Source | None:
     if interaction is None:
         return None
     source = Source(
-        kind="message", ref=f"m{interaction.id}", when=interaction.occurred_at
+        kind="message",
+        ref=f"m{interaction.id}",
+        when=interaction.occurred_at,
+        edits=_edits_of(interaction),
     )
     meta = interaction.meta or {}
     if meta.get("kind") == "window":

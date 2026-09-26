@@ -33,10 +33,18 @@ from telethon.sessions import StringSession
 from telethon.tl.types import Channel, Chat, User
 
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource
-from miya.db.models import ChatMonitor, Interaction, Person
+from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
+from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
 from miya.db.session import engine, session_scope
-from miya.services import approvals, audio, chats, documents, health, owner_address
+from miya.services import (
+    approvals,
+    audio,
+    chats,
+    documents,
+    health,
+    owner_address,
+    windows,
+)
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
@@ -381,6 +389,65 @@ async def already_stored(session, tg_chat_id: int, message) -> bool:
 
 
 TG_MESSAGE_INDEX = "ux_interactions_tg_message"
+# How many earlier versions of an edited message are kept (WP-74).
+MAX_EDITS = 10
+
+
+async def record_edit(client: TelegramClient, message) -> bool:
+    """A message was edited: keep the old words as a revision and store the
+    new ones (WP-74). Reactions and pins also arrive as edits; the text is
+    compared first, so they change nothing. True when something changed."""
+    async with session_scope() as session:
+        monitor = await session.scalar(
+            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == message.chat_id)
+        )
+        row = await session.scalar(
+            sa.select(Interaction).where(
+                Interaction.source == InteractionSource.telegram_userbot,
+                Interaction.tg_chat_id == message.chat_id,
+                Interaction.meta.has_key("tg_message_id"),
+                Interaction.meta["tg_message_id"].astext.cast(sa.BigInteger)
+                == message.id,
+            )
+        )
+        if row is None:
+            unknown = True
+        else:
+            unknown = False
+            if monitor is None or not monitor.monitor_enabled:
+                return False
+            new = (message.message or "").strip() or None
+            if new == row.raw_text:
+                return False
+            edited_at = getattr(message, "edit_date", None) or datetime.now(settings.tz)
+            meta = dict(row.meta or {})
+            meta["edits"] = [
+                *(meta.get("edits") or []),
+                {
+                    "at": edited_at.astimezone(settings.tz).isoformat(),
+                    "old": row.raw_text,
+                },
+            ][-MAX_EDITS:]
+            if isinstance(row.media, dict) and "caption" in row.media:
+                row.media = {**row.media, "caption": new}
+            row.raw_text = new  # the WP-39 listener re-indexes it
+            if isinstance(getattr(message, "id", None), int):
+                monitor.last_seen_message_id = max(
+                    monitor.last_seen_message_id or 0, message.id
+                )
+            if row.window_id is not None:
+                window = await session.get(ConversationWindow, row.window_id)
+                if window is not None and window.status is WindowStatus.pending:
+                    row.meta = meta
+                    await session.flush()
+                    await windows.rerender(session, window)
+                else:
+                    # Already extracted: flagged, never re-extracted.
+                    meta["edited_after_extraction"] = True
+            row.meta = meta
+    if unknown:
+        return await ingest_message(client, message)
+    return True
 
 
 async def ingest_message(client: TelegramClient, message) -> bool:
@@ -910,8 +977,15 @@ async def run() -> None:
                 # message still lands.
                 log.exception("failed to ingest message %s", getattr(event, "id", "?"))
 
+        async def _on_edit(event) -> None:
+            try:
+                await record_edit(client, event.message)
+            except Exception:
+                log.exception("failed to record an edit of %s", getattr(event, "id", "?"))
+
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
+        client.add_event_handler(_on_edit, events.MessageEdited())
         sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
         # Whatever was said while this process was down (WP-21), read once
         # the live handlers are in place so nothing falls between the two.
