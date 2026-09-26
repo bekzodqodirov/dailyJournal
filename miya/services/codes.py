@@ -536,3 +536,62 @@ async def harvest(
                 )
         else:
             _harvested.add(key)
+
+
+# --- code_mentions: exact recall of codes and waybills (WP-39) -------------------
+
+MAX_MENTIONS_PER_INTERACTION = 200
+# Rows whose text repeats other rows (a window's members) or is not the
+# owner's traffic at all: stamped, never indexed.
+_NOT_INDEXED_KINDS = {"window", "question", "client_import"}
+
+
+async def index_interaction(
+    session: AsyncSession, interaction, *, now: datetime | None = None
+) -> int:
+    """(Re)write the code_mentions of one interaction; returns how many."""
+    from miya.db.models import CodeMention
+    from miya.services.ingest import text_for_extraction  # ingest imports us
+
+    now = _now(now)
+    await session.execute(
+        sa.delete(CodeMention).where(CodeMention.interaction_id == interaction.id)
+    )
+    if (interaction.meta or {}).get("kind") in _NOT_INDEXED_KINDS:
+        interaction.codes_indexed_at = now
+        await session.flush()
+        return 0
+    text = text_for_extraction(interaction)
+    found = [("client", c) for c in find_client_codes(text)]
+    found += [("waybill", w) for w in find_waybills(text)]
+    found = found[:MAX_MENTIONS_PER_INTERACTION]
+    for kind, code in found:
+        session.add(
+            CodeMention(
+                interaction_id=interaction.id,
+                kind=kind,
+                code=code,
+                occurred_at=interaction.occurred_at,
+            )
+        )
+    interaction.codes_indexed_at = now
+    await session.flush()
+    return len(found)
+
+
+async def index_pending(session: AsyncSession, *, limit: int = 1000) -> int:
+    """Index up to ``limit`` interactions not indexed yet, oldest id first."""
+    from miya.db.models import Interaction
+
+    rows = list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.codes_indexed_at.is_(None))
+            .order_by(Interaction.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+    )
+    for interaction in rows:
+        await index_interaction(session, interaction)
+    return len(rows)

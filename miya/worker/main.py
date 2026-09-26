@@ -28,6 +28,8 @@ Jobs:
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
                    for a first import (quiet-hours aware; WP-15)
+  * code_index   — every 2 min; GS codes and waybills of every stored text
+                   into code_mentions for exact lookup (WP-39)
   * profile_refresh — every 60 min; rewrites the written profile of up to
                    PROFILE_REFRESH_PER_RUN people whose activity is newer
                    than their profile (sends nothing; build step 4)
@@ -74,6 +76,7 @@ from miya.services import (
     call_recordings,
     chats,
     claims,
+    codes,
     gcal,
     health,
     memories,
@@ -532,6 +535,27 @@ async def _prune_job_heartbeats(session, registered: list[str]) -> int:
         {"registered": registered},
     )
     return result.rowcount or 0
+
+
+CODE_INDEX_BATCH = 1000
+CODE_INDEX_SECONDS = 20
+
+
+async def code_index_job(*, budget_seconds: float = CODE_INDEX_SECONDS) -> int:
+    """Index GS codes and waybills of every stored text (WP-39).
+
+    One commit per batch; stops on a short batch or when the time budget is
+    spent, so the first runs after a deploy backfill history a slice at a time.
+    """
+    started = monotonic()
+    total = 0
+    while True:
+        async with session_scope() as session:
+            done = await codes.index_pending(session, limit=CODE_INDEX_BATCH)
+            await session.commit()
+        total += done
+        if done < CODE_INDEX_BATCH or monotonic() - started > budget_seconds:
+            return total
 
 
 async def profile_refresh_job() -> None:
@@ -1211,6 +1235,13 @@ async def run() -> None:
         IntervalTrigger(minutes=1),
         args=[bot],
         id="money_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        code_index_job,
+        IntervalTrigger(minutes=2),
+        id="code_index",
         max_instances=1,
         coalesce=True,
     )

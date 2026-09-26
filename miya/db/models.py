@@ -883,3 +883,33 @@ __all__ = [
     "TransactionEvidence",
     "UsageLog",
 ]
+
+
+# --- the one re-index listener (WP-39) -------------------------------------------
+
+
+@sa.event.listens_for(sa.orm.Session, "before_flush")
+def _reindex_changed_text(session, flush_context, instances) -> None:
+    """An interaction whose words changed (text, transcript, image
+    description) is indexed again: its code mentions — and, once it exists,
+    its search row — are reset for the worker to rebuild. Bulk updates
+    bypass this; none of them touches text."""
+    for obj in session.dirty:
+        if not isinstance(obj, Interaction):
+            continue
+        state = sa.inspect(obj)
+        changed = any(
+            state.attrs[name].history.has_changes() for name in ("raw_text", "transcript")
+        )
+        if not changed:
+            history = state.attrs.meta.history
+            if history.has_changes():
+                old = (history.deleted[0] if history.deleted else None) or {}
+                new = obj.meta or {}
+                changed = old.get("vision") != new.get("vision")
+        if not changed:
+            continue
+        if obj.codes_indexed_at is not None:
+            obj.codes_indexed_at = None
+        if getattr(obj, "search_indexed_at", None) is not None:
+            obj.search_indexed_at = None

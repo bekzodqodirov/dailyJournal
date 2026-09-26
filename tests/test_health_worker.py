@@ -216,6 +216,7 @@ async def test_the_scheduler_registers_the_monitoring_jobs_and_the_listener(
 
     assert "heartbeat" in registered
     assert "health" in registered
+    assert "code_index" in registered
     [(callback, mask)] = listeners
     assert mask == worker.EVENT_JOB_EXECUTED | worker.EVENT_JOB_ERROR
     # One beat before the catch-up, carrying the job count.

@@ -646,6 +646,16 @@ async def _persist_people(
     return written
 
 
+def _code_tags(tags, text: str) -> list[str]:
+    """The extractor's tags plus every GS code and waybill the text holds,
+    so ix_memories_tags filters on them exactly (WP-39)."""
+    out = list(tags or [])
+    for code in codes.find_client_codes(text) + codes.find_waybills(text):
+        if code not in out:
+            out.append(code)
+    return out
+
+
 def _single_person(applied: Applied, extra: set[int]) -> int | None:
     """The one person this extraction wrote about, or None when it is unclear."""
     ids: set[int] = set(extra)
@@ -813,7 +823,7 @@ async def apply_extraction(
             person_id=fact_person_id,
             occurred_at=occurred,
             source_interaction_id=interaction.id,
-            tags=result.tags or [],
+            tags=_code_tags(result.tags, text),
         )
         applied.facts += 1
 
@@ -828,7 +838,7 @@ async def apply_extraction(
             person_id=fact_person_id,
             occurred_at=occurred,
             source_interaction_id=interaction.id,
-            tags=result.tags or [],
+            tags=_code_tags(result.tags, summary_text),
         )
 
     interaction.processed = True
