@@ -37,6 +37,7 @@ from miya.db.models import (
     Promise,
     Task,
     Transaction,
+    TransactionEvidence,
     UsageLog,
 )
 from miya.services import codes, memories
@@ -227,40 +228,198 @@ async def _top_expenses(
     )
 
 
-async def day_summary(session: AsyncSession, day: date | None = None) -> DaySummary:
-    """Everything that happened on one local day (`/bugun`)."""
-    day = day or datetime.now(settings.tz).date()
-    start, end = day_bounds(day)
-    summary = DaySummary(day=day)
+@dataclass(slots=True)
+class RepaymentLine:
+    payment_id: int
+    debt_id: int
+    person_id: int
+    person_name: str
+    direction: DebtDirection
+    amount: Decimal
+    currency: Currency
+    paid_at: datetime
 
+
+@dataclass(slots=True)
+class CheckableTxn:
+    id: int
+    type: str
+    amount: Decimal
+    currency: Currency
+    occurred_at: datetime
+    description: str | None
+    source: str
+    channel: str | None
+
+
+@dataclass(slots=True)
+class MoneyDay:
+    """Every money figure of a recap window (WP-51) — SQL only, Decimal,
+    per currency, never mixed."""
+
+    income: dict[Currency, Decimal] = field(default_factory=dict)
+    expense: dict[Currency, Decimal] = field(default_factory=dict)
+    by_category: list[tuple[str, Currency, Decimal]] = field(default_factory=list)
+    biggest: list[Transaction] = field(default_factory=list)
+    repayments: list[RepaymentLine] = field(default_factory=list)
+    by_source: dict[str, int] = field(default_factory=dict)
+    checkable: list[CheckableTxn] = field(default_factory=list)
+    checkable_total: int = 0
+    from_phone: int = 0
+    merged: int = 0
+    review_pending: int = 0
+    ignored: int = 0
+    voided: int = 0
+
+
+CHECKABLE_LIMIT = 10
+
+
+async def money_between(
+    session: AsyncSession, start: datetime, end: datetime
+) -> MoneyDay:
+    """The money of [start, end): totals, categories, repayments, and what
+    the phone booked — every sum filtered by ACTIVE_TXN."""
+    money = MoneyDay()
+    in_window = (Transaction.occurred_at >= start, Transaction.occurred_at < end)
     totals = await session.execute(
-        sa.select(
-            Transaction.type,
-            Transaction.currency,
-            sa.func.sum(Transaction.amount),
-        )
-        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        sa.select(Transaction.type, Transaction.currency, sa.func.sum(Transaction.amount))
+        .where(*in_window)
         .where(ACTIVE_TXN)
         .group_by(Transaction.type, Transaction.currency)
     )
     for txn_type, currency, total in totals.all():
-        bucket = summary.income if txn_type.value == "income" else summary.expense
+        bucket = money.income if txn_type.value == "income" else money.expense
         bucket[currency] = total
-
     categories = await session.execute(
         sa.select(
             sa.func.coalesce(Transaction.category, "other"),
             Transaction.currency,
             sa.func.sum(Transaction.amount).label("total"),
         )
-        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(*in_window)
         .where(Transaction.type == "expense")
         .where(ACTIVE_TXN)
         .group_by(Transaction.category, Transaction.currency)
         .order_by(sa.desc("total"))
         .limit(10)
     )
-    summary.by_category = [(c, cur, total) for c, cur, total in categories.all()]
+    money.by_category = [(c, cur, total) for c, cur, total in categories.all()]
+    money.biggest = await _top_expenses(session, start, end)
+
+    rows = await session.execute(
+        sa.select(
+            DebtPayment.id,
+            DebtPayment.amount,
+            DebtPayment.currency,
+            DebtPayment.paid_at,
+            Debt.id,
+            Debt.direction,
+            Person.id,
+            Person.display_name,
+        )
+        .join(Debt, Debt.id == DebtPayment.debt_id)
+        .join(Person, Person.id == Debt.person_id)
+        .where(DebtPayment.paid_at >= start, DebtPayment.paid_at < end)
+        .order_by(DebtPayment.paid_at)
+    )
+    money.repayments = [
+        RepaymentLine(
+            payment_id=pid,
+            debt_id=did,
+            person_id=person_id,
+            person_name=name,
+            direction=direction,
+            amount=amount,
+            currency=currency,
+            paid_at=paid_at,
+        )
+        for pid, amount, currency, paid_at, did, direction, person_id, name in rows.all()
+    ]
+
+    source = sa.func.coalesce(sa.cast(Interaction.source, sa.Text), "manual")
+    by_source = await session.execute(
+        sa.select(source, sa.func.count(Transaction.id))
+        .select_from(Transaction)
+        .outerjoin(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(*in_window)
+        .where(ACTIVE_TXN)
+        .group_by(source)
+    )
+    money.by_source = dict(by_source.all())
+
+    phone = (*in_window, ACTIVE_TXN, Transaction.channel.is_not(None))
+    checkable = await session.execute(
+        sa.select(Transaction, source)
+        .outerjoin(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(*phone)
+        .order_by(Transaction.occurred_at, Transaction.id)
+        .limit(CHECKABLE_LIMIT)
+    )
+    money.checkable = [
+        CheckableTxn(
+            id=t.id,
+            type=t.type.value,
+            amount=t.amount,
+            currency=t.currency,
+            occurred_at=t.occurred_at,
+            description=t.description,
+            source=src,
+            channel=t.channel,
+        )
+        for t, src in checkable.all()
+    ]
+    money.checkable_total = int(
+        await session.scalar(sa.select(sa.func.count(Transaction.id)).where(*phone)) or 0
+    )
+    money.from_phone = int(
+        await session.scalar(
+            sa.select(sa.func.count(Transaction.id)).where(
+                Transaction.created_at >= start,
+                Transaction.created_at < end,
+                Transaction.channel.is_not(None),
+            )
+        )
+        or 0
+    )
+    money.merged = int(
+        await session.scalar(
+            sa.select(sa.func.count(TransactionEvidence.id))
+            .join(Transaction, Transaction.id == TransactionEvidence.transaction_id)
+            .where(
+                TransactionEvidence.created_at >= start,
+                TransactionEvidence.created_at < end,
+                sa.or_(
+                    Transaction.source_interaction_id.is_(None),
+                    TransactionEvidence.interaction_id
+                    != Transaction.source_interaction_id,
+                ),
+            )
+        )
+        or 0
+    )
+    money.review_pending = await money_review_count(session)
+    money.ignored = await ignored_money_count(session, start, end)
+    money.voided = int(
+        await session.scalar(
+            sa.select(sa.func.count(Transaction.id)).where(
+                Transaction.voided_at >= start, Transaction.voided_at < end
+            )
+        )
+        or 0
+    )
+    return money
+
+
+async def day_summary(session: AsyncSession, day: date | None = None) -> DaySummary:
+    """Everything that happened on one local day (`/bugun`)."""
+    day = day or datetime.now(settings.tz).date()
+    start, end = day_bounds(day)
+    summary = DaySummary(day=day)
+
+    money = await money_between(session, start, end)
+    summary.income, summary.expense = money.income, money.expense
+    summary.by_category = money.by_category
 
     people = await session.execute(
         sa.select(Person, sa.func.count(Interaction.id).label("n"))
@@ -295,7 +454,7 @@ async def day_summary(session: AsyncSession, day: date | None = None) -> DaySumm
         .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
         .where(_not_window_row())
     )
-    summary.biggest = await _top_expenses(session, start, end)
+    summary.biggest = money.biggest
     return summary
 
 
@@ -631,7 +790,13 @@ class CompletedToday:
 
 async def completed_on(session: AsyncSession, day: date) -> CompletedToday:
     """What got closed out on one local day (for the daily report)."""
-    start, end = day_bounds(day)
+    return await completed_between(session, *day_bounds(day))
+
+
+async def completed_between(
+    session: AsyncSession, start: datetime, end: datetime
+) -> CompletedToday:
+    """What got closed out in [start, end)."""
     return CompletedToday(
         settled_debts=list(
             await session.scalars(
@@ -935,10 +1100,17 @@ def _addressed_to_owner():
 
 
 async def messages_to_me(
-    session: AsyncSession, day: date | None = None, *, limit: int = 30
+    session: AsyncSession,
+    day: date | None = None,
+    *,
+    limit: int = 30,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> list[Interaction]:
-    """Group messages that mentioned the owner or replied to him, newest last."""
-    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    """Group messages that mentioned the owner or replied to him, newest last.
+    A day, or any [start, end) window (WP-51)."""
+    if start is None or end is None:
+        start, end = day_bounds(day or datetime.now(settings.tz).date())
     return list(
         await session.scalars(
             sa.select(Interaction)
