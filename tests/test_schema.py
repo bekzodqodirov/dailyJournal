@@ -62,6 +62,10 @@ def test_derived_rows_cascade_from_their_interaction():
         fks = list(table.__table__.c["source_interaction_id"].foreign_keys)
         assert fks, table.__name__
         assert fks[0].ondelete == "CASCADE", table.__name__
+    [fk] = m.CodeMention.__table__.c["interaction_id"].foreign_keys
+    assert fk.ondelete == "CASCADE"
+    [fk] = m.ClientCode.__table__.c["person_id"].foreign_keys
+    assert fk.ondelete == "CASCADE"
     # Evidence goes with its transaction and with its interaction.
     for column in ("transaction_id", "interaction_id"):
         [fk] = m.TransactionEvidence.__table__.c[column].foreign_keys
@@ -142,3 +146,16 @@ async def test_person_and_unembedded_lookups_use_their_indexes(session):
     assert "ix_memories_unembedded" in await _plan(
         session, "SELECT id FROM memories WHERE embedding IS NULL ORDER BY id LIMIT 128"
     )
+
+
+async def test_client_code_format_is_canonical_only(session):
+    import pytest
+    from sqlalchemy.exc import IntegrityError
+
+    person = m.Person(display_name="Akmal", aliases=[])
+    session.add(person)
+    await session.flush()
+    session.add(m.ClientCode(code="gs367", person_id=person.id, source="command"))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+    await session.rollback()

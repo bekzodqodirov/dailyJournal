@@ -82,6 +82,8 @@ async def _truncate(session) -> None:
         # Claims reference interactions and people, so they go before both.
         m.QuestionLog,
         m.Claim,
+        m.CodeMention,
+        m.ClientCode,
         m.ReminderLog,
         m.UsageLog,
         m.DailyReport,

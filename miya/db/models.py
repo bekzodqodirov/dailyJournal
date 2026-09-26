@@ -200,6 +200,9 @@ class Interaction(Base):
     media: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     summary: Mapped[str | None] = mapped_column(sa.Text)
     meta: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB)
+    # When the codes in this row's text were indexed into code_mentions
+    # (WP-30, 0017); NULL = not yet.
+    codes_indexed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     processed: Mapped[bool] = mapped_column(
         sa.Boolean, nullable=False, server_default=sa.false()
     )
@@ -274,6 +277,11 @@ class Interaction(Base):
             postgresql_where=sa.text(
                 "source = 'telegram_userbot' AND metadata ? 'tg_message_id'"
             ),
+        ),
+        sa.Index(
+            "ix_interactions_codes_unindexed",
+            "id",
+            postgresql_where=sa.text("codes_indexed_at IS NULL"),
         ),
         sa.Index(
             "ix_interactions_money_notice_pending",
@@ -611,6 +619,91 @@ class Claim(Base):
     )
 
 
+class ClientCode(Base):
+    """A client code (GS367) held by a person (WP-30, 0017).
+
+    At most one active holder per code, enforced by the database; a person
+    may hold several. Moves detach the old row and keep its history;
+    suggestions wait here until the owner answers.
+    """
+
+    __tablename__ = "client_codes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    code: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    person_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="CASCADE"), nullable=False
+    )
+    # active | suggested | rejected | detached
+    status: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="active"
+    )
+    # command | import | contact | tg_name | extraction
+    source: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    source_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    note: Mapped[str | None] = mapped_column(sa.Text)
+    asked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    answered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    person: Mapped[Person] = relationship(lazy="raise")
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "code ~ '^[A-Z]{1,4}[0-9]{1,9}$'", name="ck_client_codes_format"
+        ),
+        sa.CheckConstraint(
+            "status IN ('active','suggested','rejected','detached')",
+            name="ck_client_codes_status",
+        ),
+        sa.Index(
+            "ux_client_codes_active_code",
+            "code",
+            unique=True,
+            postgresql_where=sa.text("status = 'active'"),
+        ),
+        sa.Index("ux_client_codes_code_person", "code", "person_id", unique=True),
+        sa.Index("ix_client_codes_person", "person_id"),
+        sa.Index(
+            "ix_client_codes_suggested",
+            "created_at",
+            postgresql_where=sa.text("status = 'suggested'"),
+        ),
+        sa.Index("ix_client_codes_source_interaction", "source_interaction_id"),
+    )
+
+
+class CodeMention(Base):
+    """A client code or waybill that one interaction's text named (WP-30)."""
+
+    __tablename__ = "code_mentions"
+
+    id: Mapped[int] = mapped_column(sa.BigInteger, primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    # client | waybill
+    kind: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    code: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("kind IN ('client','waybill')", name="ck_code_mentions_kind"),
+        sa.UniqueConstraint(
+            "interaction_id", "kind", "code", name="ux_code_mentions_interaction_code"
+        ),
+        sa.Index("ix_code_mentions_code_occurred", "code", sa.text("occurred_at DESC")),
+    )
+
+
 class QuestionLog(Base):
     """One tap-request slot spent (WP-16): what was put in front of the owner,
     how, and when. Answers to the owner's own commands are never logged."""
@@ -772,6 +865,8 @@ class Heartbeat(Base):
 __all__ = [
     "ChatMonitor",
     "Claim",
+    "ClientCode",
+    "CodeMention",
     "DailyReport",
     "Debt",
     "DebtPayment",
