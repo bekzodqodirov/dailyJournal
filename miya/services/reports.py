@@ -35,6 +35,11 @@ log = logging.getLogger(__name__)
 # Section headings, in order. Bold HTML: the report goes out with
 # parse_mode=HTML, and everything else in it is escaped.
 H_MONEY = "💰 <b>Pul</b>"
+# Money texts (WP-14). replies.py reuses the first for the brief.
+MONEY_REVIEW_LINE = "🔎 {n} ta pul xabari tekshiruv kutmoqda — /tekshir"
+REPORT_IGNORED_LINE = (
+    "🙈 Bugun {n} ta pul xabari e'tiborsiz qoldirildi (kod, reklama) — /tekshir hammasi"
+)
 H_PEOPLE = "👥 <b>Muloqotlar</b>"
 H_NEW = "🧾 <b>Yangi qarz va va'dalar</b>"
 H_DUE = "⏰ <b>Ochiq va muddati o'tganlar</b>"
@@ -80,6 +85,10 @@ class ReportData:
     # the receipt, the brief and /davolar, and the report is not a place to
     # answer from.
     claims_pending: int = 0
+    # Money texts (WP-14): waiting in /tekshir, and ignored today (codes,
+    # adverts) — counts only, so the owner knows both exist.
+    money_review: int = 0
+    money_ignored: int = 0
 
 
 def _stats_json(data: ReportData) -> dict[str, Any]:
@@ -107,6 +116,8 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
         "quiet": len(data.quiet),
         "missed": len(data.missed),
         "claims_pending": data.claims_pending,
+        "money_review": data.money_review,
+        "money_ignored": data.money_ignored,
         "settled_debts": len(data.completed.settled_debts),
         "done_promises": len(data.completed.done_promises),
         "done_tasks": len(data.completed.done_tasks),
@@ -144,6 +155,10 @@ def render_data_block(data: ReportData) -> str:
                 lines.append(f"  • {format_money(txn.amount, txn.currency)} — {what}")
     else:
         lines.append("- bugun pul harakati yozilmadi")
+    if data.money_review:
+        lines.append(MONEY_REVIEW_LINE.format(n=data.money_review))
+    if data.money_ignored:
+        lines.append(REPORT_IGNORED_LINE.format(n=data.money_ignored))
 
     lines.append("\n" + H_PEOPLE)
     lines.append(f"- jami {s.interactions} ta yozuv")
@@ -270,6 +285,10 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         quiet=await loops.quiet_counterparties(session),
         missed=await loops.missed_calls(session),
         claims_pending=await claims.pending_count(session),
+        money_review=await queries.money_review_count(session),
+        money_ignored=await queries.ignored_money_count(
+            session, *queries.day_bounds(day)
+        ),
     )
 
 

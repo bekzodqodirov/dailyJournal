@@ -731,16 +731,105 @@ async def usage_summary(
     return summary
 
 
+# Phone money texts (WP-14): read deterministically, never re-extracted,
+# reviewed in /tekshir's own money block.
+MONEY_SOURCES: tuple[InteractionSource, ...] = (
+    InteractionSource.phone_sms,
+    InteractionSource.phone_notification,
+)
+# Ignored readings that are not worth showing even in /tekshir hammasi.
+IGNORED_HIDDEN_REASONS = ("repeat", "not_payment_app")
+
+
+def _is_money_row():
+    return sa.and_(
+        Interaction.source.in_(MONEY_SOURCES),
+        Interaction.media.has_key("money"),
+    )
+
+
 async def flagged_interactions(
     session: AsyncSession, *, limit: int = 10
 ) -> tuple[list[Interaction], int]:
-    """Interactions whose processing failed (`/tekshir`): newest first, plus count."""
-    stmt = sa.select(Interaction).where(Interaction.needs_review.is_(True))
+    """Interactions whose processing failed (`/tekshir`): newest first, plus
+    count. Money texts have their own block (flagged_money), never both."""
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(sa.not_(_is_money_row()))
+    )
     total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
     rows = list(
         await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
     )
     return rows, total or 0
+
+
+async def flagged_money(
+    session: AsyncSession, *, limit: int = 15
+) -> tuple[list[Interaction], int]:
+    """Money texts waiting for the owner's one tap: newest first, plus count."""
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(_is_money_row())
+    )
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = list(
+        await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
+    )
+    return rows, total or 0
+
+
+def _ignored_money():
+    money = Interaction.media["money"]
+    return sa.and_(
+        _is_money_row(),
+        money["verdict"].astext == "ignore",
+        sa.func.coalesce(money["reason"].astext, "").notin_(IGNORED_HIDDEN_REASONS),
+        sa.not_(money.has_key("resolved")),
+    )
+
+
+async def ignored_money(
+    session: AsyncSession, since: datetime, *, limit: int = 15
+) -> tuple[list[Interaction], int]:
+    """Money texts the reader ignored (codes, adverts) since ``since``: never
+    out of the owner's reach (`/tekshir hammasi`)."""
+    stmt = (
+        sa.select(Interaction)
+        .where(_ignored_money())
+        .where(Interaction.occurred_at >= since)
+    )
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = list(
+        await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
+    )
+    return rows, total or 0
+
+
+async def ignored_money_count(
+    session: AsyncSession, start: datetime, end: datetime
+) -> int:
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(_ignored_money())
+            .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        )
+        or 0
+    )
+
+
+async def money_review_count(session: AsyncSession) -> int:
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(Interaction.needs_review.is_(True))
+            .where(_is_money_row())
+        )
+        or 0
+    )
 
 
 async def retryable_interactions(
@@ -757,6 +846,10 @@ async def retryable_interactions(
     stmt = (
         sa.select(Interaction)
         .where(Interaction.needs_review.is_(True))
+        # Only rows never applied: re-extracting an applied row doubles its
+        # debts (WP-14), and a money text is read by rules, never a model.
+        .where(Interaction.processed.is_(False))
+        .where(Interaction.source.notin_(MONEY_SOURCES))
         .where(
             sa.or_(
                 sa.func.length(sa.func.coalesce(Interaction.raw_text, "")) > 0,

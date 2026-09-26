@@ -34,6 +34,8 @@ class MorningBrief:
     # What a counterparty asserted and the owner has not answered (build step
     # 3): pending claims, oldest first, each with its Ha / Yo'q / Tuzat row.
     claims: list[Claim] = field(default_factory=list)
+    # Money texts waiting in /tekshir (WP-14): one count line, never a push.
+    money_review: int = 0
 
     @property
     def day(self) -> date:
@@ -45,6 +47,7 @@ class MorningBrief:
             or any(self.due.values())
             or (self.loops is not None and not self.loops.is_empty())
             or self.claims
+            or self.money_review
         )
 
 
@@ -57,4 +60,5 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         due=await queries.due_items(session, horizon_days=0),
         loops=await nudges.open_loops(session, now=now),
         claims=await claims.pending(session),
+        money_review=await queries.money_review_count(session),
     )

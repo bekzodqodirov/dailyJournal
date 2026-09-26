@@ -19,11 +19,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
+from miya.db.enums import Currency, TransactionType
 from miya.db.models import Interaction, Transaction, TransactionEvidence
 from miya.services import money_notices, sms_money
 from miya.services.sms_money import ParsedPayment, Verdict
@@ -120,14 +122,17 @@ async def book(
     reading: ParsedPayment,
     *,
     channel: str,
+    check_repeat: bool = True,
 ) -> tuple[Transaction | None, bool]:
     """Attach this payment to the transaction another channel already booked,
-    or book it. Returns (transaction, merged); (None, False) for a repeat."""
+    or book it. Returns (transaction, merged); (None, False) for a repeat.
+    ``check_repeat=False`` when the owner books by hand: the owner's tap is
+    never a re-posted notification."""
     await session.execute(
         sa.text("SELECT pg_advisory_xact_lock(hashtext(:lock))"), {"lock": BOOK_LOCK}
     )
 
-    if await _is_repeat(session, interaction, channel):
+    if check_repeat and await _is_repeat(session, interaction, channel):
         _set_money(interaction, verdict=Verdict.IGNORE.value, reason=REPEAT)
         interaction.needs_review = False
         return None, False
@@ -271,3 +276,71 @@ async def apply_reading(
     return MoneyOutcome(
         verdict=verdict.value, transaction=txn, merged=merged, duplicate=duplicate
     )
+
+
+class NotBookable(Exception):
+    """A review row with no readable amount: there is nothing to book."""
+
+
+async def book_from_review(
+    session: AsyncSession,
+    interaction: Interaction,
+    txn_type: TransactionType,
+    *,
+    by: str,
+    now: datetime | None = None,
+) -> tuple[Transaction, bool]:
+    """The owner's 📉 Chiqim / 📈 Kirim in /tekshir: book what was read, with
+    the owner's direction, through the same dedupe as every other event."""
+    now = now or datetime.now(settings.tz)
+    money = _money(interaction)
+    if not money.get("amount"):
+        raise NotBookable()
+    reading = ParsedPayment(
+        type=txn_type,
+        amount=Decimal(money["amount"]),
+        currency=Currency(money.get("currency") or Currency.UZS.value),
+        card_last4=money.get("card_last4"),
+        merchant=money.get("merchant"),
+        balance_after=None,
+        sender=(interaction.media or {}).get("sender") or "",
+        confidence=sms_money.HIGH,
+        verdict=Verdict.BOOK,
+        reason="owner",
+    )
+    channel = money.get("channel") or _fallback_channel(interaction)
+    txn, merged = await book(
+        session, interaction, reading, channel=channel, check_repeat=False
+    )
+    assert txn is not None  # no repeat check, so book always returns a row
+    _set_money(
+        interaction,
+        verdict=Verdict.BOOK.value,
+        transaction_id=txn.id,
+        merged=merged,
+        resolved={"by": by, "at": now.isoformat(), "action": txn_type.value},
+        owner_label=txn_type.value,
+    )
+    interaction.needs_review = False
+    await session.flush()
+    return txn, merged
+
+
+def resolve_not_money(
+    interaction: Interaction, *, by: str, now: datetime | None = None
+) -> None:
+    """✖️ Pul emas: the text is not a payment; nothing is booked."""
+    now = now or datetime.now(settings.tz)
+    _set_money(
+        interaction,
+        resolved={"by": by, "at": now.isoformat(), "action": "not_money"},
+        owner_label="not_money",
+    )
+    interaction.needs_review = False
+
+
+def _fallback_channel(interaction: Interaction) -> str:
+    media = interaction.media or {}
+    if media.get("sender"):
+        return channel_for_sms(media["sender"])
+    return channel_for_app(media.get("package") or "unknown")

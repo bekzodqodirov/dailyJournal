@@ -32,7 +32,7 @@ from miya.bot import keyboards, replies
 from miya.bot.formatting import clip, escape, parse_ref, ref_of
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource
+from miya.db.enums import ChatType, Direction, InteractionSource, TransactionType
 from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
@@ -44,6 +44,7 @@ from miya.services import (
     documents,
     health,
     memories,
+    money_events,
     nudges,
     planner,
     purge,
@@ -219,11 +220,98 @@ async def cmd_chat_digests(message: Message) -> None:
 
 
 @router.message(Command("tekshir"))
-async def cmd_review(message: Message) -> None:
+async def cmd_review(message: Message, command: CommandObject | None = None) -> None:
+    """`/tekshir`: money texts with one-tap answers, then failed rows;
+    `/tekshir hammasi` also lists what the reader ignored in the last week."""
+    everything = (command.args or "").strip().lower() == "hammasi" if command else False
+    now = datetime.now(settings.tz)
     async with session_scope() as session:
+        money_rows, money_total = await queries.flagged_money(session)
         flagged, total = await queries.flagged_interactions(session)
-        body = replies.review_report(flagged, total)
-    await _safe_answer(message, body)
+        ignored, ignored_total = [], 0
+        if everything:
+            ignored, ignored_total = await queries.ignored_money(
+                session, now - timedelta(days=keyboards.REVIEW_OLD_DAYS)
+            )
+        body = replies.review_report(
+            flagged, total, money_rows, money_total, ignored, ignored_total
+        )
+        keyboard = keyboards.money_review(money_rows, flagged, ignored, now=now)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+def _unresolved_ignored(interaction: Interaction) -> bool:
+    money = (interaction.media or {}).get("money") or {}
+    return money.get("verdict") == "ignore" and "resolved" not in money
+
+
+async def _answer_review(session, action: str, target: str | None) -> str:
+    """One tap in /tekshir (WP-14)."""
+    now = datetime.now(settings.tz)
+    if action == keyboards.REVIEW_OLD:
+        rows, _ = await queries.flagged_money(session, limit=1000)
+        old = [
+            r
+            for r in rows
+            if now - r.occurred_at > timedelta(days=keyboards.REVIEW_OLD_DAYS)
+        ]
+        for row in old:
+            money_events.resolve_not_money(row, by=records.BY_BUTTON, now=now)
+        return replies.REVIEW_NOT_MONEY_BULK.format(n=len(old))
+    if target is None or not target.isdigit():
+        return replies.REVIEW_GONE
+    interaction = await session.get(Interaction, int(target), with_for_update=True)
+    if interaction is None or not (
+        interaction.needs_review or _unresolved_ignored(interaction)
+    ):
+        return replies.REVIEW_GONE
+    if action == keyboards.REVIEW_SEEN:
+        interaction.meta = {
+            **(interaction.meta or {}),
+            "reviewed": {"at": now.isoformat(), "by": records.BY_BUTTON},
+        }
+        interaction.needs_review = False
+        return replies.REVIEW_SEEN
+    if action == keyboards.REVIEW_NOT_MONEY:
+        money_events.resolve_not_money(interaction, by=records.BY_BUTTON, now=now)
+        return replies.REVIEW_NOT_MONEY
+    txn_type = (
+        TransactionType.income
+        if action == keyboards.REVIEW_INCOME
+        else TransactionType.expense
+    )
+    try:
+        txn, merged = await money_events.book_from_review(
+            session, interaction, txn_type, by=records.BY_BUTTON, now=now
+        )
+    except money_events.NotBookable:
+        return replies.REVIEW_GONE
+    if merged:
+        return replies.REVIEW_MERGED.format(id=txn.id)
+    return replies.REVIEW_BOOKED.format(line=replies.txn_short(txn), id=txn.id)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.REVIEW_PREFIX}:"))
+async def on_review_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    target = parts[2] if len(parts) > 2 else None
+    async with session_scope() as session:
+        text = await _answer_review(session, action, target)
+    if callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=keyboards.without(
+                    callback.message.reply_markup, target or action
+                )
+            )
+        except Exception:
+            log.debug("could not trim the review keyboard", exc_info=True)
+        await _safe_answer(callback.message, text)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
 
 
 @router.message(Command("qayta"))

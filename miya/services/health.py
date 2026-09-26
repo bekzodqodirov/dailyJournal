@@ -222,6 +222,9 @@ class Status:
     # Informational only: a phone-less install is healthy, so no Problem
     # and no staleness alert ever comes from this row.
     phone: Component | None = None
+    # Money texts waiting in /tekshir's money block (WP-14): shown, never
+    # counted into the backlog alarm — they are the owner's call, not a fault.
+    money_review: int = 0
 
     @classmethod
     def unreachable(cls, now: datetime) -> Status:
@@ -360,7 +363,7 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
     db_size = None
     userbot_last_message_at = None
     pending = submitted = failed = 0
-    needs_review = claims_pending = 0
+    needs_review = claims_pending = money_review = 0
     cost_today = cost_month = Decimal("0")
     anthropic_last_ok_at = None
     if db_ok:
@@ -379,9 +382,11 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
                 sa.select(sa.func.count())
                 .select_from(Interaction)
                 .where(Interaction.needs_review.is_(True))
+                .where(Interaction.source.notin_(queries.MONEY_SOURCES))
             )
             or 0
         )
+        money_review = await queries.money_review_count(session)
         claims_pending = int(
             await session.scalar(
                 sa.select(sa.func.count())
@@ -427,6 +432,7 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         windows_failed=failed,
         needs_review=needs_review,
         claims_pending=claims_pending,
+        money_review=money_review,
         cost_today_usd=cost_today,
         cost_month_usd=cost_month,
         anthropic_last_ok_at=anthropic_last_ok_at,

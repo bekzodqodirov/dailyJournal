@@ -163,6 +163,13 @@ async def process_interaction(
     A failed extraction sets `needs_review` and leaves the interaction in place —
     the raw input is never lost (spec §14).
     """
+    if interaction.processed:
+        # Its rows are already written; a second extraction would double
+        # every debt (WP-14).
+        log.warning("interaction %s already processed; not re-extracting", interaction.id)
+        return IngestResult(
+            interaction=interaction, applied=None, error="already_processed"
+        )
     text = text_for_extraction(interaction)
     if not text:
         interaction.processed = True

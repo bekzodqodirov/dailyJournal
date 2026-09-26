@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from miya.bot.formatting import (
     PRIORITY_LABEL,
@@ -32,8 +33,8 @@ from miya.bot.formatting import (
     usd,
 )
 from miya.config import settings
-from miya.db.enums import ChatType, DebtDirection, PromiseMadeBy
-from miya.services import claims, health
+from miya.db.enums import ChatType, Currency, DebtDirection, PromiseMadeBy
+from miya.services import claims, health, reports
 from miya.services.brief import MorningBrief
 from miya.services.loops import MissedCall, UnansweredQuestion
 from miya.services.people import Match
@@ -973,7 +974,7 @@ def record_edited(change) -> str:
     return f"✏️ <b>Tuzatildi</b> ({label})\n{line}"
 
 
-def _txn_short(txn) -> str:
+def txn_short(txn) -> str:
     income = txn.type.value == "income"
     return f"{'📈' if income else '📉'} {'Kirim' if income else 'Chiqim'} " + money(
         txn.amount, txn.currency
@@ -985,14 +986,14 @@ def record_voided(change) -> str:
     what = txn.description or txn.category
     tail = f" · {escape(what)}" if what else ""
     return (
-        f"🗑 <code>x{txn.id}</code> o'chirildi: {_txn_short(txn)}{tail}. "
+        f"🗑 <code>x{txn.id}</code> o'chirildi: {txn_short(txn)}{tail}. "
         "Endi hisobotlarga kirmaydi."
     )
 
 
 def record_unvoided(change) -> str:
     txn = change.record
-    return f"↩️ <code>x{txn.id}</code> qaytarildi — yana hisobda: {_txn_short(txn)}."
+    return f"↩️ <code>x{txn.id}</code> qaytarildi — yana hisobda: {txn_short(txn)}."
 
 
 PUL_USAGE = (
@@ -1268,13 +1269,104 @@ SOURCE_LABEL = {
 }
 
 
-def review_report(interactions, total: int) -> str:
-    """`/tekshir`: what failed processing and still needs the owner's eye."""
-    if not interactions:
-        return "✅ Qayta ishlanmagan yozuv yo'q."
+# --- /tekshir: the money block (WP-14) ---------------------------------------
 
+MONEY_REASON_LABEL = {
+    "declined": "rad etilgan ko'rinadi",
+    "reversal": "qaytarish yoki bekor qilish",
+    "pending": "hali o'tmagan (kutilmoqda)",
+    "reminder": "eslatma — kelajakdagi to'lov",
+    "future_date": "sana kelajakda",
+    "advert": "reklamaga o'xshaydi",
+    "advert_with_evidence": "reklamaga o'xshaydi",
+    "conflict": "kirim yoki chiqim — aniq emas",
+    "no_direction": "kirim yoki chiqim — aniq emas",
+    "no_amount": "summa o'qilmadi",
+    "no_evidence": "to'lov o'tgani aniq emas",
+    "otp": "SMS-kod",
+    "otp_conflict": "kod so'zi bor — to'lovmi, tekshiring",
+    "info": "ma'lumot xabari",
+    "autobook_off": "avtomatik yozish o'chirilgan",
+}
+MONEY_NO_AMOUNT = "summa o'qilmadi"
+REVIEW_MONEY_HEADER = "💳 <b>Pul xabarlari — {n} ta tekshiruvda</b>"
+REVIEW_IGNORED_HEADER = "🙈 <b>E'tiborsiz qoldirilganlar — oxirgi 7 kun, {n} ta</b>"
+REVIEW_NOTHING = "✅ Qayta ishlanmagan yozuv yo'q."
+REVIEW_BOOKED = "✅ Yozildi: {line} <code>x{id}</code>"
+REVIEW_MERGED = (
+    "🔗 Bu to'lov allaqachon bor: <code>x{id}</code> — ikkinchi marta yozilmadi."
+)
+REVIEW_NOT_MONEY = "✖️ Pul harakati emas deb belgilandi."
+REVIEW_NOT_MONEY_BULK = "✖️ {n} ta eski xabar «pul emas» deb belgilandi."
+REVIEW_SEEN = "✔️ Ko'rib chiqildi — ro'yxatdan olindi."
+REVIEW_GONE = "Bu yozuv allaqachon ko'rib chiqilgan."
+MONEY_REVIEW_LINE = reports.MONEY_REVIEW_LINE
+PREVIEW_CHARS = 40
+
+
+def money_review_line(interaction, number: int) -> str:
+    """'#1 · 12-sen 14:30 · ✉️ Payme · 250 ming so'm · rad etilgan ko'rinadi'
+    and the text's start on the next line."""
+    media = interaction.media or {}
+    money_info = media.get("money") or {}
+    if interaction.source.value == "phone_notification":
+        who = f"🔔 {escape(media.get('app_label') or 'ilova')}"
+    else:
+        who = f"✉️ {escape(media.get('sender') or 'sms')}"
+    if money_info.get("amount"):
+        amount = money(
+            Decimal(money_info["amount"]),
+            Currency(money_info.get("currency") or Currency.UZS.value),
+        )
+    else:
+        amount = MONEY_NO_AMOUNT
+    reason = MONEY_REASON_LABEL.get(money_info.get("reason") or "", "")
+    text = " ".join((interaction.raw_text or "").split())
+    preview = text[:PREVIEW_CHARS] + ("…" if len(text) > PREVIEW_CHARS else "")
+    when = interaction.occurred_at
+    head = f"#{number} · {day_label(when)} {clock(when)} · {who} · {amount}" + (
+        f" · {reason}" if reason else ""
+    )
+    return f"{head}\n   «{escape(preview)}»"
+
+
+def _money_block(header: str, rows, total: int, *, start: int = 1) -> str:
+    lines = [money_review_line(row, start + i) for i, row in enumerate(rows)]
+    return header.format(n=total) + "\n" + "\n".join(lines)
+
+
+def review_report(
+    interactions,
+    total: int,
+    money_rows=(),
+    money_total: int = 0,
+    ignored_rows=(),
+    ignored_total: int = 0,
+) -> str:
+    """`/tekshir`: the money texts first, each with its one-tap answer, then
+    what failed processing; `/tekshir hammasi` adds what the reader ignored."""
+    blocks = []
+    if money_rows:
+        blocks.append(_money_block(REVIEW_MONEY_HEADER, money_rows, money_total))
+    if interactions:
+        blocks.append(_failed_block(interactions, total, start=len(money_rows) + 1))
+    if ignored_rows:
+        blocks.append(
+            _money_block(
+                REVIEW_IGNORED_HEADER,
+                ignored_rows,
+                ignored_total,
+                start=len(money_rows) + len(interactions) + 1,
+            )
+        )
+    if not blocks:
+        return REVIEW_NOTHING
+    return clip("\n\n".join(blocks))
+
+
+def _failed_block(interactions, total: int, *, start: int) -> str:
     lines = []
-    for it in interactions:
+    for number, it in enumerate(interactions, start):
         label = SOURCE_LABEL.get(it.source.value, it.source.value)
         preview = (it.raw_text or it.transcript or "").strip().replace("\n", " ")
         if len(preview) > 60:
@@ -1283,15 +1375,17 @@ def review_report(interactions, total: int) -> str:
         filename = (it.meta or {}).get("filename") or (it.media or {}).get("filename")
         if not preview and filename:
             detail = f" — {escape(filename)}"
+        # Numbered only where a ✔️ Ko'rdim button refers to the line.
+        tag_ = f"#{number} · " if getattr(it, "processed", False) else ""
         lines.append(
-            f"{short_date(it.occurred_at.date())} {clock(it.occurred_at)} · "
+            f"{tag_}{short_date(it.occurred_at.date())} {clock(it.occurred_at)} · "
             f"{label}{detail}"
         )
 
     header = f"⚠️ <b>{total} ta yozuv qayta ishlanmagan</b>"
     if total > len(interactions):
         header += f" (oxirgi {len(interactions)} tasi)"
-    return clip(header + "\n" + bullet_list(lines, empty="—"))
+    return header + "\n" + bullet_list(lines, empty="—")
 
 
 # --- open loops: the morning brief, the nudge, a new group -------------------
@@ -1361,6 +1455,8 @@ def morning_brief(brief: MorningBrief) -> str:
         if hidden:
             block += f"\n<i>… va yana {hidden} ta — /davolar.</i>"
         parts.append(block)
+    if getattr(brief, "money_review", 0):
+        parts.append(MONEY_REVIEW_LINE.format(n=brief.money_review))
     if loops is not None and loops.stale:
         lines = [stale_line(s) for s in loops.stale]
         parts.append(f"{BRIEF_STALE}\n" + bullet_list(lines, empty="—"))
@@ -1699,7 +1795,12 @@ def status_report(status: health.Status, problems: list[health.Problem]) -> str:
         f"kutayotgan suhbatlar {status.windows_pending} · "
         f"batch'da {status.windows_submitted} · "
         f"ishlanmagan {status.needs_review} (/tekshir) · "
-        f"da'volar {status.claims_pending} (/davolar)",
+        + (
+            f"pul tekshiruvi {status.money_review} · "
+            if getattr(status, "money_review", 0)
+            else ""
+        )
+        + f"da'volar {status.claims_pending} (/davolar)",
         "<b>Xarajat</b>: "
         f"bugun {usd(status.cost_today_usd)} · "
         f"bu oy {usd(status.cost_month_usd)} (/xarajat)",

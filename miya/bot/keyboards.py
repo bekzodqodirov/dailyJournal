@@ -16,6 +16,7 @@ bytes, and a chat list page carries one payload per button.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -544,4 +545,83 @@ def without_claim(
             for b in row
         )
     ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+# --- /tekshir: one tap per money text, a dismiss per seen row (WP-14) ---------
+#
+# rv:e:<id>  📉 Chiqim #n   — book the text as an expense
+# rv:i:<id>  📈 Kirim #n    — book it as income
+# rv:n:<id>  ✖️ Pul emas #n — not a payment; nothing is booked
+# rv:nold    ✖️ …eskilarini — every money review row older than 7 days
+# rv:ok:<id> ✔️ Ko'rdim #n  — a processed row the owner has seen
+
+REVIEW_PREFIX = "rv"
+REVIEW_EXPENSE = "e"
+REVIEW_INCOME = "i"
+REVIEW_NOT_MONEY = "n"
+REVIEW_OLD = "nold"
+REVIEW_SEEN = "ok"
+REVIEW_OLD_DAYS = 7
+
+
+def _money_buttons(row, number: int) -> list[InlineKeyboardButton]:
+    buttons = []
+    if ((row.media or {}).get("money") or {}).get("amount"):
+        buttons += [
+            InlineKeyboardButton(
+                text=f"📉 Chiqim #{number}",
+                callback_data=f"{REVIEW_PREFIX}:{REVIEW_EXPENSE}:{row.id}",
+            ),
+            InlineKeyboardButton(
+                text=f"📈 Kirim #{number}",
+                callback_data=f"{REVIEW_PREFIX}:{REVIEW_INCOME}:{row.id}",
+            ),
+        ]
+    buttons.append(
+        InlineKeyboardButton(
+            text=f"✖️ Pul emas #{number}",
+            callback_data=f"{REVIEW_PREFIX}:{REVIEW_NOT_MONEY}:{row.id}",
+        )
+    )
+    return buttons
+
+
+def money_review(
+    money_rows, other_rows=(), ignored_rows=(), *, now=None
+) -> InlineKeyboardMarkup | None:
+    """The /tekshir keyboard, numbered like replies.review_report's lines."""
+    rows: list[list[InlineKeyboardButton]] = []
+    number = 1
+    for row in money_rows:
+        rows.append(_money_buttons(row, number))
+        number += 1
+    for row in other_rows:
+        if row.processed:
+            # An unprocessed row's exit is /qayta; dismissing a recording
+            # would let retention delete its audio.
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"✔️ Ko'rdim #{number}",
+                        callback_data=f"{REVIEW_PREFIX}:{REVIEW_SEEN}:{row.id}",
+                    )
+                ]
+            )
+        number += 1
+    for row in ignored_rows:
+        rows.append(_money_buttons(row, number))
+        number += 1
+    rows = rows[:MAX_ROWS]
+    if now is not None and any(
+        now - row.occurred_at > timedelta(days=REVIEW_OLD_DAYS) for row in money_rows
+    ):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✖️ 7 kundan eskilarini «pul emas»",
+                    callback_data=f"{REVIEW_PREFIX}:{REVIEW_OLD}",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
