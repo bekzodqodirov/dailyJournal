@@ -833,6 +833,33 @@ def _stats(activity: DayActivity, prose: ProseResult, queue, parts) -> dict:
     }
 
 
+# Problems the system line already names on its own.
+_NAMED_PROBLEMS = {"phone_silent", "backup_unconfigured", "backup_stale"}
+
+
+async def _system_lines(session: AsyncSession, now: datetime) -> list[str]:
+    """MIYA's own blind spots for the evening footer (WP-73). Never breaks
+    the recap: any failure leaves the footer without them."""
+    from miya.bot import recap_text
+    from miya.services import health
+
+    try:
+        status = await health.gather(session, now=now)
+        last = health.last_phone_contact(status)
+        stale = timedelta(hours=settings.recap_phone_stale_hours)
+        silent = now - last if last is not None and now - last > stale else None
+        problems = [p for p in health.problems(status) if p.key not in _NAMED_PROBLEMS]
+        return recap_text.system_lines(
+            phone_silent_for=silent,
+            backup_unconfigured=not status.backup.configured,
+            backup_stale=status.backup.stale,
+            problems=bool(problems),
+        )
+    except Exception:
+        log.warning("the recap's system footer failed", exc_info=True)
+        return []
+
+
 async def build_evening(
     session: AsyncSession, day, *, now: datetime, store: bool
 ) -> RecapResult:
@@ -890,6 +917,7 @@ async def build_evening(
         max_people=settings.recap_max_people,
         max_groups=settings.recap_max_groups,
         auto_resolved=auto,
+        system=await _system_lines(session, now),
     )
     stats = _stats(activity, prose, queue, parts)
     if store:

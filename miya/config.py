@@ -275,6 +275,8 @@ class Settings(BaseSettings):
     money_typed_match_hours: int = Field(default=6, ge=0, le=24)
     # WP-50: a long evening report goes out in at most this many messages.
     recap_max_parts: int = Field(default=4, ge=1, le=8)
+    # The evening recap names a phone silent for longer than this (WP-73).
+    recap_phone_stale_hours: int = Field(default=24, ge=1)
     # WP-52: one capped model call per recap writes a sentence or two per
     # person and group — prose only, never a figure. Blank model = REASON_MODEL.
     recap_prose_enabled: bool = True

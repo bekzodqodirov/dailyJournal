@@ -10,6 +10,7 @@ under a label that says who wrote them.
 from __future__ import annotations
 
 from miya.bot.formatting import (
+    age_label,
     claim_ref,
     clock,
     escape,
@@ -53,6 +54,39 @@ PROSE_DOWN = (
     "Raqamlar va ro'yxatlar to'liq.</i>"
 )
 AUTO_LINE = "🤖 Bugun {n} ta savolni o'zim hal qildim — /savollar hal"
+# MIYA's own blind spots (WP-73), after the queue line, evening only.
+PHONE_SILENT_LINE = (
+    "📱 Telefon ilovasidan {age} beri ma'lumot kelmadi — qo'ng'iroq va SMS'lar "
+    "yozilmayapti bo'lishi mumkin."
+)
+BACKUP_UNCONFIGURED_LINE = (
+    "💾 Zaxira nusxa sozlanmagan — disk buzilsa ma'lumotni tiklab bo'lmaydi "
+    "(BACKUP_AGE_RECIPIENT)."
+)
+BACKUP_STALE_LINE = "💾 Oxirgi zaxira nusxa eskirgan — /holat"
+PROBLEMS_LINE = "🩺 MIYA'da muammo bor — /holat"
+
+
+def system_lines(
+    *,
+    phone_silent_for=None,
+    backup_unconfigured: bool = False,
+    backup_stale: bool = False,
+    problems: bool = False,
+) -> list[str]:
+    """Phone, backup, problems — in that order (WP-73)."""
+    lines = []
+    if phone_silent_for is not None:
+        lines.append(PHONE_SILENT_LINE.format(age=age_label(phone_silent_for)))
+    if backup_unconfigured:
+        lines.append(BACKUP_UNCONFIGURED_LINE)
+    elif backup_stale:
+        lines.append(BACKUP_STALE_LINE)
+    if problems:
+        lines.append(PROBLEMS_LINE)
+    return lines
+
+
 REVIEW_LINE = "⚠️ Tekshirish kerak: {n} ta yozuv — /tekshir"
 
 # Where a booked payment came from, in the owner's words.
@@ -245,6 +279,7 @@ def evening_parts(
     max_people: int = 8,
     max_groups: int = 5,
     auto_resolved: int = 0,
+    system: list[str] | None = None,
 ) -> list[str]:
     """The recap as Telegram messages, sections in order, empty ones left out
     (except 💰 Pul)."""
@@ -261,6 +296,7 @@ def evening_parts(
         footer.append(line)
     if auto_resolved:
         footer.append(AUTO_LINE.format(n=auto_resolved))
+    footer.extend(system or [])
 
     open_items = activity.questions_open or activity.missed_open
     tomorrow_lines = _tomorrow_lines(tomorrow)
