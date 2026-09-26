@@ -151,6 +151,8 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
 | `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
+| `EXTRACT_MODEL_PRICE`, `REASON_MODEL_PRICE` | Blank — "input,output" USD per million tokens for the two model roles; set them when you change a model, then `make reprice SINCE=…` |
+| `SPEND_ALERT_DAILY_USD`, `SPEND_ALERT_MONTHLY_USD` | 5 / 60 — a Telegram warning when MIYA's own API spend passes either (0 = off); the hard cap is the Anthropic Console limit |
 | `QUESTION_BUDGET_PER_DAY`, `QUESTION_BRIEF_SLOTS`, `QUESTION_EVENING_SLOTS` | 10 / 5 / 3 — how many taps a day MIYA may ask for, and how many ride the brief and the evening report (`0` = never push) |
 | `QUESTION_BATCH_MAX`, `QUESTION_PUSH_GAP_MINUTES`, `QUESTION_URGENT_MIN_UZS` | 5 / 120 / 5 mln — questions per pushed message, the gap between pushes, the stake that moves a question up |
 | `QUESTION_GROUP_DIGEST_SIZE`, `QUESTION_GROUP_MAX_SHOWS`, `QUESTION_GROUP_MIN_MESSAGES`, `QUESTION_ASK_CHANNELS` | 3 / 2 / 1 / `false` — the new-groups digest |

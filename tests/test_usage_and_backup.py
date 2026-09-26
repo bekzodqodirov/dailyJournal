@@ -364,3 +364,76 @@ def test_part_number_only_reads_pieces():
     assert backup.part_number(Path("miya-x.dump.age.part07")) == 7
     assert backup.part_number(Path("miya-x.dump.age")) is None
     assert backup.part_number(Path("miya-x.dump.age.partial")) is None
+
+
+# --- WP-25: honest prices ------------------------------------------------------
+
+
+def test_price_for_prefers_the_role_price_and_knows_its_unknowns(monkeypatch):
+    from miya.services import usage
+
+    monkeypatch.setattr(settings, "extract_model_price", "2.00,8.00")
+    assert usage.price_for(settings.extract_model) == (Decimal("2.00"), Decimal("8.00"))
+    monkeypatch.setattr(settings, "extract_model_price", "")
+    assert usage.price_for(settings.extract_model) == usage.MODEL_PRICES.get(
+        settings.extract_model
+    )
+    assert usage.price_for("model-nobody-priced") is None
+
+
+async def test_an_unknown_model_counts_as_unpriced(session):
+    today = datetime.now(settings.tz).date()
+    session.add(
+        m.UsageLog(
+            provider="anthropic",
+            model="model-nobody-priced",
+            operation="extract",
+            input_tokens=100,
+            output_tokens=10,
+            cost_usd=None,
+        )
+    )
+    await session.flush()
+    summary = await queries.usage_summary(session, today, today)
+    assert summary.unpriced_calls == 1
+    assert "1 ta chaqiruvning narxi noma'lum" in replies.usage_report(summary)
+
+
+async def test_reprice_rewrites_a_wrong_cost_and_dry_writes_nothing(session, monkeypatch):
+    from miya.services import usage
+    from miya.tools import reprice_usage
+
+    row = m.UsageLog(
+        provider="anthropic",
+        model="priced-model",
+        operation="extract",
+        input_tokens=1_000_000,
+        output_tokens=100_000,
+        cost_usd=Decimal("9.999999"),
+    )
+    session.add(row)
+    await session.flush()
+    monkeypatch.setitem(usage.MODEL_PRICES, "priced-model", (Decimal("1"), Decimal("5")))
+    today = datetime.now(settings.tz).date()
+
+    n, old, new = await reprice_usage.reprice(session, today, dry=True)
+    assert (n, new) == (1, Decimal("1.500000"))
+    assert row.cost_usd == Decimal("9.999999")
+
+    n, old, new = await reprice_usage.reprice(session, today)
+    assert n == 1 and row.cost_usd == Decimal("1.500000")
+    assert reprice_usage.SUMMARY.format(n=n, old=old, new=new).startswith(
+        "1 ta yozuv qayta hisoblandi"
+    )
+
+
+def test_a_malformed_price_is_refused():
+    import pytest
+    from pydantic import ValidationError
+
+    from miya.config import Settings, parse_price
+
+    assert parse_price("1.00,5.00") == (Decimal("1.00"), Decimal("5.00"))
+    assert parse_price("abc") is None and parse_price("-1,2") is None
+    with pytest.raises(ValidationError):
+        Settings(extract_model_price="cheap")

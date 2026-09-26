@@ -435,6 +435,7 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         ),
         "anthropic_failing": _status(anthropic_failing=True, windows_pending=3),
         "review_backlog": _status(needs_review=health.REVIEW_BACKLOG_THRESHOLD),
+        "spend_high": _status(cost_today_usd=Decimal("5")),
     }
     assert set(cases) == set(health.PROBLEM_KEYS)
     for key, status in cases.items():
@@ -653,4 +654,31 @@ def test_the_unconfigured_backup_has_a_recovery_line():
     assert (
         health.recovery_text("backup_unconfigured")
         == "✅ Zaxira nusxa sozlandi — tiklandi"
+    )
+
+
+# --- WP-25: spend alarms ---------------------------------------------------------
+
+
+def test_spend_high_at_the_daily_threshold_not_below():
+    assert "spend_high" not in [
+        p.key for p in health.problems(_status(cost_today_usd=Decimal("4.99")))
+    ]
+    [problem] = health.problems(_status(cost_today_usd=Decimal("5.00")))
+    assert problem.key == "spend_high" and "kunlik chegara" in problem.text
+
+
+def test_spend_high_monthly_branch_and_zero_disables(monkeypatch):
+    [problem] = health.problems(_status(cost_month_usd=Decimal("60")))
+    assert "oylik chegara" in problem.text
+    monkeypatch.setattr(settings, "spend_alert_monthly_usd", Decimal("0"))
+    monkeypatch.setattr(settings, "spend_alert_daily_usd", Decimal("0"))
+    assert (
+        health.problems(
+            _status(cost_today_usd=Decimal("99"), cost_month_usd=Decimal("999"))
+        )
+        == []
+    )
+    assert (
+        health._RECOVERY["spend_high"] == "✅ API xarajati yana chegara ichida — tiklandi"
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import time
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -62,6 +63,26 @@ def _blank_to_none(v: object) -> object:
 OptionalInt = Annotated[int | None, BeforeValidator(_blank_to_none)]
 
 
+PRICE_ERROR = (
+    "narx «kirish,chiqish» ko'rinishida bo'lsin — million token uchun dollar, "
+    "masalan 1.00,5.00"
+)
+
+
+def parse_price(text: str) -> tuple[Decimal, Decimal] | None:
+    """'1.00,5.00' → (Decimal('1.00'), Decimal('5.00')); None when unreadable."""
+    parts = [p.strip() for p in (text or "").split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        values = tuple(Decimal(p) for p in parts)
+    except InvalidOperation:
+        return None
+    if any(not v.is_finite() or v < 0 for v in values):
+        return None
+    return values  # type: ignore[return-value]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -82,6 +103,14 @@ class Settings(BaseSettings):
     # Person profiles (WP-24): the writer was most of the bill. Blank means
     # EXTRACT_MODEL; a profile waits PROFILE_MIN_AGE_HOURS before a rewrite,
     # and at most PROFILE_DAILY_CAP are written a day (0 turns them off).
+    # USD per million tokens, "input,output", for the two model roles
+    # (WP-25). Blank uses the built-in table; a model the table does not
+    # know is then recorded unpriced and /xarajat says so.
+    extract_model_price: str = ""
+    reason_model_price: str = ""
+    # Spend alarms in USD (0 disables either); the hard cap is the Console's.
+    spend_alert_daily_usd: Decimal = Decimal("5")
+    spend_alert_monthly_usd: Decimal = Decimal("60")
     profile_model: str = ""
     profile_min_age_hours: int = Field(default=24, ge=1)
     profile_daily_cap: int = Field(default=30, ge=0)
@@ -292,6 +321,14 @@ class Settings(BaseSettings):
                 if isinstance(value, str) and value.lstrip().startswith("#"):
                     raise ValueError(COMMENT_VALUE_ERROR.format(key=str(key).upper()))
         return data
+
+    @field_validator("extract_model_price", "reason_model_price")
+    @classmethod
+    def _validate_price(cls, v: str) -> str:
+        v = v.strip()
+        if v and parse_price(v) is None:
+            raise ValueError(PRICE_ERROR)
+        return v
 
     @field_validator("backup_age_recipient")
     @classmethod

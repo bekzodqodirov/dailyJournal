@@ -1270,7 +1270,17 @@ def usage_report(summary) -> str:
     ]
     if summary.cached_share:
         parts.append(f"<i>Keshdan o'qilgan: {summary.cached_share * 100:.0f}%</i>")
+    unpriced = getattr(summary, "unpriced_calls", 0)
+    if unpriced:
+        parts.append(UNPRICED_LINE.format(n=unpriced))
     return clip("\n\n".join(parts))
+
+
+UNPRICED_LINE = (
+    "⚠️ {n} ta chaqiruvning narxi noma'lum — bu model narx jadvalida yo'q "
+    "(.env: EXTRACT_MODEL_PRICE / REASON_MODEL_PRICE). Jami summa haqiqatdan kam "
+    "ko'rinadi."
+)
 
 
 PURGE_USAGE = (

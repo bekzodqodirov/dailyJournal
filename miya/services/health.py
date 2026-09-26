@@ -38,7 +38,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from miya.bot.formatting import age_label, escape
+from miya.bot.formatting import age_label, escape, usd
 from miya.config import settings
 from miya.db.enums import InteractionSource, WindowStatus
 from miya.db.models import (
@@ -74,6 +74,7 @@ PROBLEM_KEYS = (
     "backup_failed",
     "anthropic_failing",
     "review_backlog",
+    "spend_high",
 )
 # Flagged inputs pile up quietly; past this many the pile is itself a fault.
 REVIEW_BACKLOG_THRESHOLD = 20
@@ -621,6 +622,27 @@ def problems(status: Status) -> list[Problem]:
                 "ko'rib chiq.",
             )
         )
+    daily, monthly = settings.spend_alert_daily_usd, settings.spend_alert_monthly_usd
+    if daily > 0 and status.cost_today_usd >= daily:
+        found.append(
+            Problem(
+                "spend_high",
+                "warning",
+                f"⚠️ Bugungi API xarajati {usd(status.cost_today_usd)} — kunlik chegara "
+                f"{usd(daily)}dan oshdi. /xarajat bilan qaysi ish ko'p sarflayotganini "
+                "ko'r; kutilmagan bo'lsa, Anthropic Console'da MIYA kalitini vaqtincha "
+                "o'chir.",
+            )
+        )
+    elif monthly > 0 and status.cost_month_usd >= monthly:
+        found.append(
+            Problem(
+                "spend_high",
+                "warning",
+                f"⚠️ Bu oygi API xarajati {usd(status.cost_month_usd)} — oylik chegara "
+                f"{usd(monthly)}dan oshdi. /xarajat'ni ko'r.",
+            )
+        )
     return found
 
 
@@ -695,6 +717,7 @@ def mark_recovered(
 
 
 _RECOVERY = {
+    "spend_high": "✅ API xarajati yana chegara ichida — tiklandi",
     "worker_silent": "✅ Rejalashtiruvchi (worker) qayta ishlayapti — tiklandi",
     "userbot_silent": "✅ Telegram o'quvchi qayta ulandi — tiklandi",
     "api_silent": "✅ API qayta javob beryapti — tiklandi",

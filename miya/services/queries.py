@@ -669,6 +669,9 @@ class UsageSummary:
     rows: list[UsageRow] = field(default_factory=list)
     total_usd: Decimal = Decimal("0")
     today_usd: Decimal = Decimal("0")
+    # Anthropic calls with no price (a model missing from the table): their
+    # cost is unknown, not zero (WP-25).
+    unpriced_calls: int = 0
 
     @property
     def cached_share(self) -> float:
@@ -718,6 +721,15 @@ async def usage_summary(
             )
         )
     summary.total_usd = sum((r.cost_usd for r in summary.rows), Decimal("0"))
+    summary.unpriced_calls = int(
+        await session.scalar(
+            sa.select(sa.func.count(UsageLog.id))
+            .where(UsageLog.created_at >= start, UsageLog.created_at < end)
+            .where(UsageLog.provider == "anthropic")
+            .where(UsageLog.cost_usd.is_(None))
+        )
+        or 0
+    )
 
     today_start, today_end = day_bounds(datetime.now(settings.tz).date())
     summary.today_usd = Decimal(
