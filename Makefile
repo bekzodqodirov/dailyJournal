@@ -2,7 +2,7 @@
 COMPOSE := docker compose
 .PHONY: help env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill backup backup-key backup-key-show restore
+        backfill backup backup-key backup-key-show restore doctor
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -12,7 +12,11 @@ env: ## Create .env from .env.example if it does not exist
 	@test -f .env || (cp .env.example .env && echo "Created .env — fill it in before 'make up'")
 
 # --- Docker -----------------------------------------------------------------
-up: env ## Build and start everything, then run migrations
+doctor: ## Check .env and the server before make up
+	$(COMPOSE) build api
+	$(COMPOSE) run --rm --no-deps api python -m miya.tools.doctor
+
+up: env $(if $(SKIP_DOCTOR),,doctor) ## Build and start everything, then run migrations (SKIP_DOCTOR=1 to skip the check)
 	$(COMPOSE) up -d --build db api
 	$(MAKE) migrate
 	$(COMPOSE) up -d --build bot worker userbot

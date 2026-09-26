@@ -56,22 +56,37 @@ reasoning model only phrases a query result in Uzbek.
 
 ## Quick start
 
-Requires Docker with Compose v2.
+The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md).
+
+### Server requirements
+
+- **At least 8 GB RAM** plus 2–4 GB swap; 2 vCPU (4 is better); 80 GB SSD;
+  Ubuntu 24.04 LTS; Docker Engine with Compose v2.
+- Outbound HTTPS to the Anthropic API, ElevenLabs, api.telegram.org,
+  huggingface.co (on first start) and GitHub.
+- Why 8 GB: the api holds the bge-m3 search model, about 2.2 GB of weights
+  plus the torch runtime. Below 8 GB it is OOM-killed in a loop.
 
 ```bash
-cp .env.example .env      # then fill it in — see "Configuration" below
-make up                   # builds, starts everything, applies migrations
+cp .env.example .env      # then fill it in — see below
+make backup-key           # prints BACKUP_AGE_RECIPIENT=… for .env
+make doctor               # checks .env and the server; fix every ❌
+make up                   # runs doctor again, builds, starts, applies migrations
 make health               # {"status":"ok", ...}
 make bot                  # tail the assistant bot's logs
 ```
 
-Before `make up`, fill in at least `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`,
-`ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID`, `API_BEARER_TOKEN` (at least 32
-characters: `openssl rand -hex 32`) and `BACKUP_AGE_RECIPIENT` (`make
-backup-key` prints the line). The bot and worker refuse to start without a bot
-token and owner id rather than run unrestricted, and every service refuses a
-blank or short API token. Without a backup key no backup is written, and MIYA
-warns you about it until you set one.
+Before `make up`, fill in: `POSTGRES_PASSWORD` (and the same password inside
+`DATABASE_URL`, before the first start), `ANTHROPIC_API_KEY`,
+`ELEVENLABS_API_KEY`, `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID`,
+`TELETHON_API_ID` and `TELETHON_API_HASH` (unless `USERBOT_ENABLED=false`),
+`OWNER_ALIASES`, `API_BEARER_TOKEN` (at least 32 characters: `openssl rand -hex
+32`), `UPLOAD_TOKENS` for the phone, and `BACKUP_AGE_RECIPIENT` (`make
+backup-key` prints the line). `make doctor` checks all of them, the RAM, the
+swap and the disk; `make up` refuses to start while it reports an error
+(`SKIP_DOCTOR=1` skips it, at your own risk). The bot and worker refuse to
+start without a bot token and owner id rather than run unrestricted, and
+every service refuses a blank or short API token.
 
 `make help` lists every target.
 
@@ -87,6 +102,7 @@ warns you about it until you set one.
 | `make userbot-login` | One-time Telethon login (prints `TELETHON_SESSION`) |
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
+| `make doctor` | Check `.env` and the server before `make up` |
 | `make backup-key` | Create the backup key and print the `.env` line |
 | `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
