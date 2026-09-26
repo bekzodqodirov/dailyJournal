@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 from miya.config import settings
 from miya.db import models as m
-from miya.db.enums import Direction, InteractionSource, WindowStatus
+from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
 from miya.services import windows
 from miya.services.people import resolve_person
 from miya.services.prompts import EXTRACTION_SYSTEM_PROMPT
@@ -55,6 +55,8 @@ async def test_nothing_flushes_while_a_chat_is_still_active(session):
 async def test_thirty_minutes_of_silence_flushes_the_backlog(session):
     now = datetime.now(TZ)
     person = await resolve_person(session, "Akmal")
+    # A private chat: its window is the peer's (a group's is nobody's, WP-47).
+    session.add(m.ChatMonitor(tg_chat_id=CHAT, chat_type=ChatType.private))
     await _message(session, "yuk ketdi", when=now - timedelta(minutes=45), person=person)
     await _message(
         session, "rahmat", when=now - timedelta(minutes=40), out=True, person=person

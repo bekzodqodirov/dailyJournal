@@ -21,6 +21,11 @@ Buffering lives in the database, not in process memory: a userbot restart or a
 worker crash can therefore never lose a message that was waiting for its
 window. A message is "claimed" the moment ``window_id`` is set, so no message
 is ever extracted twice.
+
+A group window has no person (WP-47): what a group said is filed under
+nobody, or under the one person its extraction wrote about. Per-person group
+history comes from the member rows (each carries its speaker) and, later,
+from passages.speaker_person_id.
 """
 
 from __future__ import annotations
@@ -287,7 +292,13 @@ async def flush_ready_windows(
         ) is not None:
             window = ConversationWindow(
                 tg_chat_id=tg_chat_id,
-                person_id=next((i.person_id for i in batch if i.person_id), None),
+                # A private chat's window is the peer's; a group's belongs
+                # to nobody — the first speaker is not the subject (WP-47).
+                person_id=(
+                    next((i.person_id for i in batch if i.person_id), None)
+                    if chat_type is ChatType.private
+                    else None
+                ),
                 started_at=batch[0].occurred_at,
                 ended_at=batch[-1].occurred_at,
                 message_count=len(batch),
