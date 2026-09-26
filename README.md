@@ -307,6 +307,14 @@ outlive the audio.
 
 ---
 
+### Phone: first import and reinstall
+
+The companion app's first SMS harvest reaches back only as far as its
+«Eski SMS'lar» setting (default 30 days, «Yuklamaslik» = from now); a
+reinstall re-sends nothing new, because the server answers `duplicates`; and
+a backfill arrives as one folded Telegram summary. Details in
+`android/README.md` («First SMS import and reinstalling»).
+
 ## Memory, reports and calendar
 
 **Long-term memory.** Extraction's `facts` land in `memories` with a NULL

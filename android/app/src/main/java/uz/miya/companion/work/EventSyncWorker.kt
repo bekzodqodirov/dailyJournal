@@ -59,7 +59,14 @@ class EventSyncWorker(
             // that succeeds.
             hitHarvestCap = false
             val maxCallId = harvestCalls(dao, deviceId, snapshot.lastCallLogId, snapshot.uploadCallLog)
-            val maxSmsId = harvestSms(dao, deviceId, snapshot.lastSmsId, snapshot.smsMode)
+            val maxSmsId = harvestSms(
+                dao,
+                deviceId,
+                snapshot.lastSmsId,
+                snapshot.smsMode,
+                snapshot.smsImportFromMs,
+                snapshot.smsBackfillDays,
+            )
 
             if (!snapshot.serverConfigured || !Graph.tokenStore.hasToken()) {
                 Logx.d("Event sync: server not configured; ${dao.pendingCount()} event(s) waiting")
@@ -171,8 +178,21 @@ class EventSyncWorker(
         deviceId: String,
         afterId: Long,
         mode: String,
+        importFromMs: Long?,
+        backfillDays: Int,
     ): Long {
         if (mode == SmsMode.OFF || !StorageAccess.hasSms(applicationContext)) return afterId
+
+        // The first import reaches back SMS_BACKFILL_DAYS only (WP-65), not
+        // the whole inbox: years of bank SMS must not become rows on day one.
+        val cutoff = if (afterId == 0L) {
+            importFromMs ?: Graph.prefs.freezeSmsImportFrom(
+                SmsSelection.importFrom(System.currentTimeMillis(), backfillDays)
+            )
+        } else {
+            null
+        }
+        val (selection, selectionArgs) = SmsSelection.smsSelection(afterId, cutoff)
 
         var maxSeen = afterId
         val rows = ArrayList<PhoneEventEntity>()
@@ -187,8 +207,8 @@ class EventSyncWorker(
                     Telephony.Sms.DATE,
                     Telephony.Sms.SUBSCRIPTION_ID,
                 ),
-                "${Telephony.Sms._ID} > ?",
-                arrayOf(afterId.toString()),
+                selection,
+                selectionArgs,
                 "${Telephony.Sms._ID} ASC",
             )?.use { c ->
                 val idIdx = c.getColumnIndexOrThrow(Telephony.Sms._ID)

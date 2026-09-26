@@ -24,4 +24,9 @@
     <string name="payment_apps_settings_empty">Hali hech qaysi ilova xabar yubormadi.</string>
     <string name="payme_auto_ticked">Payme avtomatik tanlandi — kerak bo\'lmasa belgini olib tashlang.</string>
     <string name="sms_restricted_hint">SMS ruxsati berilmasa: «Ilova haqida» → ⋮ → «Cheklangan sozlamalarga ruxsat berish». Baribir bo\'lmasa — Payme xabarlari bildirishnoma orqali keladi, SMS rejimini «O\'chiq» qiling.</string>
+    <!-- WP-65: the first SMS import window. -->
+    <string name="sms_backfill_title">Eski SMS\'lar: birinchi ulanishda oxirgi %1$d kunlik to\'lov SMS\'lari yuklanadi</string>
+    <string name="sms_backfill_none">Yuklamaslik</string>
+    <string name="sms_backfill_days">%1$d kun</string>
+    <string name="sms_backfill_year">1 yil</string>
 </resources>

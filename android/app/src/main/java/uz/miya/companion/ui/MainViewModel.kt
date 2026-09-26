@@ -616,6 +616,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setSmsBackfillDays(days: Int) {
+        viewModelScope.launch { Graph.prefs.setSmsBackfillDays(days) }
+    }
+
     fun setSmsMode(value: String) {
         viewModelScope.launch {
             Graph.prefs.setSmsMode(value)

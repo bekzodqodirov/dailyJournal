@@ -67,6 +67,11 @@ data class PrefsSnapshot(
     val listenerConnectedAt: Long? = null,
     val lastPaymentNotificationAt: Long? = null,
     val paymeAutoTicked: Boolean = false,
+    // ---- first SMS import (WP-65) -------------------------------------
+    /** How far back the first harvest reaches; 0 = from now. */
+    val smsBackfillDays: Int = 30,
+    /** The cutoff frozen at the first harvest; null until then. */
+    val smsImportFromMs: Long? = null,
 ) {
     val serverConfigured: Boolean get() = serverUrl.isNotBlank()
 }
@@ -105,6 +110,8 @@ class Prefs(private val context: Context) {
         val LISTENER_CONNECTED_AT = longPreferencesKey("listener_connected_at")
         val LAST_PAYMENT_NOTIFICATION_AT = longPreferencesKey("last_payment_notification_at")
         val PAYME_AUTO_TICKED = booleanPreferencesKey("payme_auto_ticked")
+        val SMS_BACKFILL_DAYS = longPreferencesKey("sms_backfill_days")
+        val SMS_IMPORT_FROM_MS = longPreferencesKey("sms_import_from_ms")
     }
 
     val flow: Flow<PrefsSnapshot> = context.dataStore.data.map { it.toSnapshot() }
@@ -136,6 +143,8 @@ class Prefs(private val context: Context) {
         listenerConnectedAt = this[K.LISTENER_CONNECTED_AT],
         lastPaymentNotificationAt = this[K.LAST_PAYMENT_NOTIFICATION_AT],
         paymeAutoTicked = this[K.PAYME_AUTO_TICKED] ?: false,
+        smsBackfillDays = (this[K.SMS_BACKFILL_DAYS] ?: 30L).toInt(),
+        smsImportFromMs = this[K.SMS_IMPORT_FROM_MS],
     )
 
     private fun seenOrdered(raw: Set<String>?): List<String> =
@@ -249,6 +258,24 @@ class Prefs(private val context: Context) {
 
     suspend fun markPaymentNotification() = update {
         it[K.LAST_PAYMENT_NOTIFICATION_AT] = System.currentTimeMillis()
+    }
+
+    // ---- first SMS import (WP-65) -------------------------------------------
+
+    suspend fun setSmsBackfillDays(days: Int) = update { it[K.SMS_BACKFILL_DAYS] = days.toLong() }
+
+    /**
+     * Freeze the first-import cutoff ONCE. Recomputing "now" on every sweep
+     * would move the cutoff forward forever while no SMS falls inside it.
+     * Returns the frozen value, whoever set it.
+     */
+    suspend fun freezeSmsImportFrom(value: Long): Long {
+        var frozen = value
+        update {
+            val existing = it[K.SMS_IMPORT_FROM_MS]
+            if (existing == null) it[K.SMS_IMPORT_FROM_MS] = value else frozen = existing
+        }
+        return frozen
     }
 
     suspend fun setMediaGeneration(version: String, generation: Long) = update {

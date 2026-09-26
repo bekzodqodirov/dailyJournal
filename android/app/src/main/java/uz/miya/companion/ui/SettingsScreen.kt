@@ -33,6 +33,7 @@ import uz.miya.companion.R
 import uz.miya.companion.data.SmsMode
 import uz.miya.companion.oem.OemHints
 import uz.miya.companion.util.StorageAccess
+import uz.miya.companion.work.SmsSelection
 
 @Composable
 fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
@@ -192,6 +193,31 @@ fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
                 SmsModeChoice("Off", SmsMode.OFF, prefs.smsMode, vm::setSmsMode)
                 SmsModeChoice("Payments", SmsMode.PAYMENTS, prefs.smsMode, vm::setSmsMode)
                 SmsModeChoice("All SMS", SmsMode.ALL, prefs.smsMode, vm::setSmsMode)
+            }
+            Spacer(Modifier.height(12.dp))
+            // WP-65: how far back the FIRST harvest reaches; no effect after it.
+            Text(
+                stringResource(R.string.sms_backfill_title, prefs.smsBackfillDays),
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Spacer(Modifier.height(6.dp))
+            for (chunk in SmsSelection.BACKFILL_CHOICES.chunked(3)) {
+                ButtonRow {
+                    for (days in chunk) {
+                        val label = when (days) {
+                            0 -> stringResource(R.string.sms_backfill_none)
+                            365 -> stringResource(R.string.sms_backfill_year)
+                            else -> stringResource(R.string.sms_backfill_days, days)
+                        }
+                        if (days == prefs.smsBackfillDays) {
+                            Button(onClick = { vm.setSmsBackfillDays(days) }) { Text(label) }
+                        } else {
+                            OutlinedButton(onClick = { vm.setSmsBackfillDays(days) }) {
+                                Text(label)
+                            }
+                        }
+                    }
+                }
             }
         }
 

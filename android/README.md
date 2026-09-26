@@ -354,6 +354,20 @@ than breaks. SMS bodies are never logged, not even redacted
 
 ---
 
+### First SMS import and reinstalling
+
+A fresh install does **not** send the whole inbox. The first harvest reads
+only SMS dated within Settings → Phone events → «Eski SMS'lar» (default 30
+days; «Yuklamaslik» starts from now; up to «1 yil»). The cutoff is frozen at
+that first harvest and never recomputed; changing the choice afterwards has
+no effect, and SMS outside the window are never uploaded later.
+
+Reinstalling is safe: the server dedupes on the event key and on content,
+so re-sent calls, SMS and notifications come back as `duplicates`, not new
+rows. A backfill produces one folded Telegram summary, not a receipt per
+message. To reinstall without re-importing history, choose «Yuklamaslik»
+before the first sync.
+
 ## Building it
 
 **Without Android Studio (recommended):** every push touching `android/`
