@@ -304,6 +304,10 @@ class Settings(BaseSettings):
     recall_recency_halflife_days: int = Field(default=45, ge=1)
     recall_recency_weight: float = Field(default=0.3, ge=0)
     recall_context_lines: int = Field(default=3, ge=0)
+    # WP-75: a question within this many minutes of the last answer carries
+    # up to RAG_FOLLOWUP_PAIRS earlier question/answer pairs as context.
+    rag_followup_minutes: int = Field(default=30, ge=0)
+    rag_followup_pairs: int = Field(default=2, ge=0, le=6)
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

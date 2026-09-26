@@ -1869,12 +1869,69 @@ def _spoken_mode(text: str) -> str:
     return mode
 
 
+def _turn(row: Interaction) -> rag.HistoryTurn:
+    meta = row.meta or {}
+    return rag.HistoryTurn(
+        question=row.raw_text or row.transcript or "",
+        answer=str(meta.get("answer") or ""),
+        refs=[str(r) for r in meta.get("refs") or []],
+    )
+
+
+async def _followup_history(session, message) -> tuple[tuple, bool]:
+    """(history, replied): the answer the owner replied to, or the latest
+    questions within RAG_FOLLOWUP_MINUTES (WP-75)."""
+    answered = sa.and_(
+        Interaction.meta["kind"].astext == "question",
+        Interaction.meta.has_key("answer"),
+    )
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None) if reply is not None else None
+    if isinstance(reply_id, int):
+        row = await session.scalar(
+            sa.select(Interaction)
+            .where(
+                answered,
+                Interaction.meta["answer_message_id"].astext == str(reply_id),
+            )
+            .order_by(Interaction.id.desc())
+            .limit(1)
+        )
+        if row is not None:
+            return (_turn(row),), True
+    minutes = settings.rag_followup_minutes
+    pairs = settings.rag_followup_pairs
+    if minutes <= 0 or pairs <= 0:
+        return (), False
+    at = getattr(message, "date", None)
+    now = at.astimezone(settings.tz) if at is not None else datetime.now(settings.tz)
+    rows = list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(
+                answered,
+                Interaction.occurred_at >= now - timedelta(minutes=minutes),
+                Interaction.occurred_at <= now,
+            )
+            .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
+            .limit(pairs)
+        )
+    )
+    return tuple(_turn(r) for r in reversed(rows)), False
+
+
 async def _answer_into(
-    session, interaction: Interaction, text: str, mode: str, *, header: str | None = None
+    session,
+    interaction: Interaction,
+    text: str,
+    mode: str,
+    *,
+    header: str | None = None,
+    history: tuple = (),
 ) -> str:
     """Answer ``text`` and keep the answer and what it cited on the row."""
     interaction.processed = True
-    result = await rag.answer_full(session, text, mode=mode)
+    result = await rag.answer_full(session, text, mode=mode, history=history)
     reply = clip(f"{header}\n\n{result.text}" if header else result.text)
     interaction.meta = {
         **(interaction.meta or {}),
@@ -1896,11 +1953,15 @@ async def _send_answer(message: Message, reply: str, interaction_id: int) -> Non
                 row.meta = {**(row.meta or {}), "answer_message_id": sent.message_id}
 
 
-async def _answer_question(message: Message, text: str, mode: str) -> None:
+async def _answer_question(
+    message: Message, text: str, mode: str, *, history: tuple | None = None
+) -> None:
     """A question or an opinion: answered, not extracted — but it still lands
     in interactions ("every input lands here"), marked so /tekshir and the
     extractor both leave it alone, with the answer and what it cited."""
     async with session_scope() as session:
+        if history is None:
+            history, _ = await _followup_history(session, message)
         interaction = await create_interaction(
             session,
             source=InteractionSource.assistant_bot,
@@ -1909,7 +1970,7 @@ async def _answer_question(message: Message, text: str, mode: str) -> None:
             occurred_at=message.date.astimezone(settings.tz),
             meta={"kind": "question"},
         )
-        reply = await _answer_into(session, interaction, text, mode)
+        reply = await _answer_into(session, interaction, text, mode, history=history)
         interaction_id = interaction.id
     await _send_answer(message, reply, interaction_id)
 
@@ -2216,9 +2277,14 @@ async def on_text(message: Message) -> None:
             reply = await _code_lookup_reply(session, *lookup)
         await _safe_answer(message, reply)
         return
+    async with session_scope() as session:
+        history, replied = await _followup_history(session, message)
     mode = rag.classify(message.text or "")
+    if replied and mode == "note":
+        # A reply to MIYA's answer asks on, "?" or not (WP-75).
+        mode = "question"
     if mode != "note":
-        await _answer_question(message, message.text, mode)
+        await _answer_question(message, message.text, mode, history=history)
         return
 
     async with session_scope() as session:
@@ -2234,10 +2300,17 @@ async def on_text(message: Message) -> None:
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
-async def _spoken_question(session, interaction: Interaction, text: str) -> str | None:
+async def _spoken_question(
+    session, interaction: Interaction, text: str, message=None
+) -> str | None:
     """A voice or video note that asks something is answered, not logged
     (WP-60); None when it is a note."""
+    history, replied = (
+        await _followup_history(session, message) if message is not None else ((), False)
+    )
     mode = _spoken_mode(text)
+    if mode == "note" and replied:
+        mode = "question"
     if mode == "note":
         return None
     interaction.meta = {
@@ -2247,7 +2320,12 @@ async def _spoken_question(session, interaction: Interaction, text: str) -> str 
         "via": "voice",
     }
     return await _answer_into(
-        session, interaction, text, mode, header=replies.voice_question_header(text)
+        session,
+        interaction,
+        text,
+        mode,
+        header=replies.voice_question_header(text),
+        history=history,
     )
 
 
@@ -2284,7 +2362,7 @@ async def on_voice(message: Message, bot: Bot) -> None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
-            asked = await _spoken_question(session, interaction, text)
+            asked = await _spoken_question(session, interaction, text, message)
             if asked is not None:
                 reply = asked
             else:
@@ -2425,7 +2503,7 @@ async def on_video_note(message: Message, bot: Bot) -> None:
                 reply = replies.TRANSCRIPTION_FAILED_HINT
             else:
                 interaction.media = {**(interaction.media or {}), "processed": True}
-                asked = await _spoken_question(session, interaction, text)
+                asked = await _spoken_question(session, interaction, text, message)
                 if asked is not None:
                     reply = asked
                 else:

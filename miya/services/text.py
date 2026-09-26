@@ -251,7 +251,7 @@ _STOPWORDS_RAW = """
     edi ekan bilan haqida uchun va ham bu shu u men sen siz menga senga kanday
     kachon kayerda kim kimga masala masalasi narsa shunday yana endi bor yok mi chi
     ku iltimos ayt aytib ber topib kidirib eslaysanmi esingdami degan degandi dedi
-    aytgandi gapirgan gapirgandi
+    aytgandi gapirgan gapirgandi keyin undan song keyinchi keyinchalik
     chto kak ty dumaesh pro o ob s i v na po eto byl byla bylo mne on ona
     what do you think about the
     """.split()

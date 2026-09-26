@@ -1017,6 +1017,10 @@ SEMANTIC_DEGRADED = (
     "ℹ️ Ma'no bo'yicha qidiruv hozir ishlamayapti — faqat so'z bo'yicha qidirdim."
 )
 SOURCE_FOOTER = "<i>Asl matn: /manba {ref}</i>"
+FOLLOWUP_NOTE = (
+    "(The turns above are earlier questions and your answers. Use them only "
+    "if this question follows on from them; otherwise ignore them.)"
+)
 # Tools whose results are the ledger; the others carry people's words.
 SQL_TOOLS = {"open_debts", "spending_summary", "list_transactions", "lookup_code"}
 QUOTE_TOOLS = {"search_history", "search_memories", "recent_interactions"}
@@ -1039,6 +1043,18 @@ def classify(text: str) -> str:
 def wants_evidence(text: str) -> bool:
     norm = normalise_for_search(text)
     return any(cue in norm for cue in PREFETCH_CUES)
+
+
+@dataclass(slots=True)
+class HistoryTurn:
+    """An earlier question and MIYA's answer, for a follow-up (WP-75)."""
+
+    question: str
+    answer: str
+    refs: list[str] = field(default_factory=list)
+
+
+HISTORY_ANSWER_CHARS = 1500
 
 
 @dataclass(slots=True)
@@ -1179,15 +1195,26 @@ async def answer_full(
         except Exception:  # embeddings misconfigured — money tools still work
             embedder = None
 
+    history = tuple(history)[-settings.rag_followup_pairs :]
     known_refs: set[str] = set()
-    for item in history:
-        known_refs |= set(getattr(item, "refs", None) or [])
     sql_texts: list[str] = []
     quote_texts: list[str] = []
+    for item in history:
+        known_refs |= set(getattr(item, "refs", None) or [])
+        # The earlier answer's figures already passed the guard.
+        sql_texts.append(item.answer)
     evidence = None
     evidence_block = ""
     if mode == "opinion" or wants_evidence(question):
-        evidence = await recall.search(session, embedder, question, now=now)
+        search_text = question
+        if history:
+            # A follow-up with nothing of its own ("keyin nima bo'ldi?")
+            # borrows the previous question's person and period.
+            people = list(await session.scalars(sa.select(Person)))
+            own = recall.parse_question(question, people, now)
+            if not own.content_terms and own.person is None and own.period is None:
+                search_text = f"{history[-1].question} {question}"
+        evidence = await recall.search(session, embedder, search_text, now=now)
         if not evidence.content_terms and not evidence.person and not evidence.period:
             return RagAnswer(text=NEED_DETAIL, mode=mode)
         if evidence.is_empty():
@@ -1223,7 +1250,15 @@ async def answer_full(
     content += f"---\n{question}"
     if evidence_block:
         content += f"\n\nEVIDENCE (search_history result):\n{evidence_block}"
-    messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
+    messages: list[dict[str, Any]] = []
+    for item in history:
+        messages.append({"role": "user", "content": item.question})
+        messages.append(
+            {"role": "assistant", "content": item.answer[:HISTORY_ANSWER_CHARS]}
+        )
+    if history:
+        content = FOLLOWUP_NOTE + "\n" + content
+    messages.append({"role": "user", "content": content})
     operation = "rag_opinion" if mode == "opinion" else "rag"
 
     final_text = ""
