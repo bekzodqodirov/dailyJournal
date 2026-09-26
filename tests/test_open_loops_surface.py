@@ -263,7 +263,7 @@ async def test_a_sent_brief_is_logged_and_a_missed_one_is_caught_up(session, mon
     one once today's brief time has passed, and never twice."""
     monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
     monkeypatch.setattr(settings, "backup_age_recipient", "")
-    monkeypatch.setattr(worker, "_missed_report_day", _none)
+    monkeypatch.setattr(worker, "_evening_to_resume", _none)
     today = _now().date()
     before = datetime.combine(today, settings.morning_brief_time_parsed, tzinfo=TZ)
 

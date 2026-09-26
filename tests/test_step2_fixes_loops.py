@@ -182,8 +182,9 @@ def test_the_config_check_agrees_with_the_reminder_sweep():
                 quiet_hours="23:30-07:30",
                 morning_brief_time=f"{hour:02d}:{minute:02d}",
             )
-        except ValidationError:
-            refused = True
+        except ValidationError as exc:
+            # Only the quiet-hours rule; REPORT_TIME has its own (WP-49).
+            refused = "QUIET_HOURS" in str(exc) and "MORNING_BRIEF_TIME" in str(exc)
         assert refused is reminders.in_quiet_hours(_at(hour, minute))
 
 

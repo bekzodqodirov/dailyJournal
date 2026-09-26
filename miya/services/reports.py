@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -303,22 +304,55 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
     )
 
 
-async def generate_report(session: AsyncSession, day: date | None = None) -> str:
-    """Compose, store (upsert by date) and return the day's report."""
-    day = day or datetime.now(settings.tz).date()
+EVENING = "evening"
+
+
+async def generate_report(
+    session: AsyncSession,
+    day: date | None = None,
+    *,
+    now: datetime | None = None,
+    store: bool = True,
+) -> str:
+    """Compose and return the day's report; with ``store``, keep it as the
+    evening row for the worker to deliver (WP-49).
+
+    ``/hisobot`` and the API pass ``store=False``: a lunchtime look must not
+    stand in for the evening report. Storing never touches ``delivered_at``
+    or ``parts_sent`` — only the delivery does — and a report already partly
+    sent is returned as stored, so a resume never mixes two versions.
+    """
+    now = now or datetime.now(settings.tz)
+    day = day or now.astimezone(settings.tz).date()
+    if store:
+        existing = await session.scalar(
+            sa.select(DailyReport).where(
+                DailyReport.report_date == day, DailyReport.kind == EVENING
+            )
+        )
+        if existing is not None and existing.parts_sent > 0 and not existing.delivered_at:
+            return existing.content
     data = await gather(session, day)
     content = render_data_block(data)
+    if not store:
+        return content
 
-    # /hisobot can be called repeatedly, and the worker cron can race a manual
-    # /hisobot on the same date — an upsert makes last-writer-wins instead of
-    # a unique-violation that would cost one of them its report.
+    start, _ = queries.day_bounds(day)
+    values = {
+        "content": content,
+        "stats": _stats_json(data),
+        "parts": [f"{report_header(day)}\n\n{content}"],
+        "window_start": start,
+        "window_end": now,
+        "prose_status": "none",
+        "updated_at": now,
+    }
+    # The worker cron can race a catch-up on the same date — an upsert makes
+    # last-writer-wins instead of a unique violation.
     await session.execute(
         insert(DailyReport)
-        .values(report_date=day, content=content, stats=_stats_json(data))
-        .on_conflict_do_update(
-            index_elements=[DailyReport.report_date],
-            set_={"content": content, "stats": _stats_json(data)},
-        )
+        .values(report_date=day, kind=EVENING, **values)
+        .on_conflict_do_update(constraint="uq_daily_reports_date_kind", set_=values)
     )
     await session.flush()
     return content

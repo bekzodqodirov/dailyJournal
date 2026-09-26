@@ -152,7 +152,7 @@ async def test_a_restart_at_night_sends_no_brief(session, monkeypatch):
     real quiet hours and the real report time: nothing at night."""
     assert reminders.in_quiet_hours(_at(23, 45))
     monkeypatch.setattr(settings, "backup_age_recipient", "")
-    monkeypatch.setattr(worker, "_missed_report_day", _none)
+    monkeypatch.setattr(worker, "_evening_to_resume", _none)
 
     class _Clock(datetime):
         @classmethod

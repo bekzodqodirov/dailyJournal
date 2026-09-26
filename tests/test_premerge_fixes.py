@@ -271,49 +271,35 @@ def test_a_shared_audio_file_keeps_its_real_extension():
 async def test_catch_up_recovers_a_report_missed_across_midnight(session, monkeypatch):
     """The headline case: the VPS is down from 18:00 to the next morning.
 
-    Yesterday's 19:00 report never ran, and checking only "today" would never
-    notice — the owner simply loses that day.
+    Yesterday's 19:00 report never went out, and checking only "today" would
+    never notice — the owner simply loses that day. (Temporary until WP-54.)
     """
     from miya.worker import main as worker
 
     morning = datetime.now(TZ).replace(hour=8, minute=0, second=0, microsecond=0)
     yesterday = (morning - timedelta(days=1)).date()
 
-    day = await worker._missed_report_day(morning)
-    assert day == yesterday
+    assert await worker._evening_to_resume(morning) == yesterday
 
 
-async def test_a_lunchtime_hisobot_does_not_mask_the_missed_evening_report(
-    session, monkeypatch
-):
-    """`/hisobot` writes a row for the same date; the row alone proves nothing."""
+async def test_a_delivered_evening_report_is_never_resumed(session, monkeypatch):
+    """Only ``delivered_at`` settles a day (WP-49); a stored row does not."""
     from miya.worker import main as worker
 
     evening = datetime.now(TZ).replace(hour=20, minute=0, second=0, microsecond=0)
-    lunchtime = evening.replace(hour=12)
-
     session.add(
-        m.DailyReport(
-            report_date=evening.date(),
-            content="lunchtime /hisobot",
-            stats={},
-            created_at=lunchtime,
-        )
+        m.DailyReport(report_date=evening.date(), content="x", stats={}, parts=["x"])
     )
     await session.commit()
     try:
-        # The row exists, but it predates REPORT_TIME — the evening report was
-        # still missed.
-        assert await worker._missed_report_day(evening) == evening.date()
-
-        # A row written after REPORT_TIME does settle it.
+        assert await worker._evening_to_resume(evening) == evening.date()
         await session.execute(
             sa.update(m.DailyReport)
             .where(m.DailyReport.report_date == evening.date())
-            .values(created_at=evening)
+            .values(delivered_at=evening, parts_sent=1)
         )
         await session.commit()
-        assert await worker._missed_report_day(evening) is None
+        assert await worker._evening_to_resume(evening) is None
     finally:
         await session.execute(
             sa.delete(m.DailyReport).where(m.DailyReport.report_date == evening.date())
@@ -366,7 +352,7 @@ async def test_catch_up_never_takes_the_worker_down(monkeypatch):
     def _explode_sync(*args, **kwargs):
         raise OSError("/data/backups is not writable")
 
-    monkeypatch.setattr(worker, "_missed_report_day", _explode)
+    monkeypatch.setattr(worker, "_evening_to_resume", _explode)
     monkeypatch.setattr(settings, "backup_age_recipient", "age1test")
     monkeypatch.setattr(worker.backup, "backup_dir", _explode_sync)
 

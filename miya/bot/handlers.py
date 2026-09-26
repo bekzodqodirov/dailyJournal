@@ -403,7 +403,8 @@ async def cmd_report(message: Message) -> None:
     await _typing(message)
     day = datetime.now(settings.tz).date()
     async with session_scope() as session:
-        content = await reports.generate_report(session, day)
+        # A look, not the evening report: stored nowhere (WP-49).
+        content = await reports.generate_report(session, day, store=False)
     await _safe_answer(message, clip(f"{reports.report_header(day)}\n\n{content}"))
 
 

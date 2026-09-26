@@ -62,6 +62,7 @@ from aiogram.types import FSInputFile, Message
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import keyboards, notices, replies
@@ -222,16 +223,58 @@ async def embed_job() -> None:
         log.info("embedded %d new memories", embedded)
 
 
+async def deliver_report(
+    bot: Bot, report_date: date, kind: str = reports.EVENING, *, reply_markup=None
+) -> bool:
+    """Send the parts not yet sent, one by one; each success is committed
+    before the next, so a resume never repeats a part (WP-49). The only
+    writer of ``delivered_at``. True once every part is out."""
+    async with session_scope() as session:
+        row = await session.scalar(
+            sa.select(DailyReport).where(
+                DailyReport.report_date == report_date, DailyReport.kind == kind
+            )
+        )
+        if row is None:
+            return False
+        if row.delivered_at is not None:
+            return True
+        parts, sent = list(row.parts or []), row.parts_sent
+    for index in range(sent, len(parts)):
+        markup = reply_markup if index == len(parts) - 1 else None
+        if not await notify(bot, parts[index], reply_markup=markup):
+            return False
+        async with session_scope() as session:
+            await session.execute(
+                sa.update(DailyReport)
+                .where(DailyReport.report_date == report_date, DailyReport.kind == kind)
+                .values(
+                    parts_sent=DailyReport.parts_sent + 1,
+                    updated_at=sa.func.now(),
+                    delivered_at=(
+                        sa.func.now()
+                        if index == len(parts) - 1
+                        else DailyReport.delivered_at
+                    ),
+                )
+            )
+            await session.commit()
+    return True
+
+
 async def report_job(bot: Bot, *, now: datetime | None = None) -> None:
     """Compose, store and deliver the daily report (cron at REPORT_TIME),
     then the evening's question batch (WP-19)."""
     now = now or datetime.now(settings.tz)
     day = now.astimezone(settings.tz).date()
     async with session_scope() as session:
-        content = await reports.generate_report(session, day)
-    # The report is committed before the send: a Telegram failure costs the
-    # notification, never the report itself (`/hisobot` re-reads it).
-    if await notify(bot, f"{reports.report_header(day)}\n\n{content}"):
+        await reports.generate_report(session, day, now=now)
+        await session.commit()
+    if reminders.in_quiet_hours(now):
+        # Stored, not sent: the catch-up delivers it when quiet hours end.
+        log.info("report for %s stored; quiet hours, not sending", day)
+        return
+    if await deliver_report(bot, day):
         await _slot_questions(
             bot,
             slot=questions.SLOT_EVENING,
@@ -1010,22 +1053,53 @@ def _last_scheduled(at: time, now: datetime) -> datetime:
     return todays if todays <= now else todays - timedelta(days=1)
 
 
-async def _missed_report_day(now: datetime) -> date | None:
-    """The day whose evening report never went out, if there is one.
-
-    A report row alone does not prove the evening report ran: `/hisobot` at
-    lunchtime writes one for the same date. The row must have been *created*
-    after that day's REPORT_TIME to count.
-    """
-    due = _last_scheduled(settings.report_time_parsed, now)
-    day = due.date()
-    async with session_scope() as session:
-        created_at = await session.scalar(
-            sa.select(DailyReport.created_at).where(DailyReport.report_date == day)
-        )
-    if created_at is not None and created_at.astimezone(settings.tz) >= due:
+async def _evening_to_resume(now: datetime) -> date | None:
+    """The day whose evening report is not fully delivered, when it may go
+    out now: never inside quiet hours, and only for today or yesterday."""
+    if reminders.in_quiet_hours(now):
         return None
-    return day
+    day = _last_scheduled(settings.report_time_parsed, now).date()
+    async with session_scope() as session:
+        delivered = await session.scalar(
+            sa.select(DailyReport.delivered_at).where(
+                DailyReport.report_date == day, DailyReport.kind == reports.EVENING
+            )
+        )
+    if delivered is not None:
+        return None
+    today = now.astimezone(settings.tz).date()
+    if today == day:
+        return day
+    if today == day + timedelta(days=1):  # temporary; WP-54 removes it
+        return day
+    return None
+
+
+def _quiet_hours_end(now: datetime) -> datetime:
+    """When the current quiet hours end."""
+    _, end = settings.quiet_hours_parsed
+    moment = datetime.combine(now.date(), end, tzinfo=settings.tz)
+    return moment if moment > now else moment + timedelta(days=1)
+
+
+async def catch_up_evening(bot: Bot) -> None:
+    """Deliver (or finish delivering) a missed evening report."""
+    now = datetime.now(settings.tz)
+    day = await _evening_to_resume(now)
+    if day is None:
+        return
+    log.info("catch-up: the report for %s is not delivered — sending now", day)
+    async with session_scope() as session:
+        await reports.generate_report(session, day, now=now)
+        await session.commit()
+    if await deliver_report(bot, day):
+        await _slot_questions(
+            bot,
+            slot=questions.SLOT_EVENING,
+            via=questions.VIA_EVENING,
+            header=replies.QUESTIONS_EVENING_HEADER,
+            now=now,
+        )
 
 
 async def _backup_is_missing(now: datetime) -> bool:
@@ -1044,7 +1118,7 @@ async def _backup_is_missing(now: datetime) -> bool:
     return newest < due.timestamp()
 
 
-async def catch_up(bot: Bot) -> None:
+async def catch_up(bot: Bot, scheduler=None) -> None:
     """Run anything the scheduler missed while the worker was down.
 
     The jobstore is in memory, so a deploy or a VPS reboot spanning 19:00
@@ -1060,28 +1134,22 @@ async def catch_up(bot: Bot) -> None:
     """
     now = datetime.now(settings.tz)
 
+    # The evening report: resumed now, or — inside quiet hours — once they
+    # end. An outage from 18:00 to the next morning loses *yesterday's*.
     try:
-        day = await _missed_report_day(now)
-    except Exception:
-        log.exception("catch-up could not check for a missed report")
-        day = None
-    if day is not None:
-        # Uses the day, not "today": an outage from 18:00 to the next morning
-        # loses *yesterday's* report, which is exactly the case worth saving.
-        log.info("catch-up: the report for %s was missed — generating now", day)
-        try:
-            async with session_scope() as session:
-                content = await reports.generate_report(session, day)
-            if await notify(bot, f"{reports.report_header(day)}\n\n{content}"):
-                await _slot_questions(
-                    bot,
-                    slot=questions.SLOT_EVENING,
-                    via=questions.VIA_EVENING,
-                    header=replies.QUESTIONS_EVENING_HEADER,
-                    now=datetime.now(settings.tz),
+        if reminders.in_quiet_hours(now):
+            if scheduler is not None:
+                scheduler.add_job(
+                    catch_up_evening,
+                    DateTrigger(run_date=_quiet_hours_end(now)),
+                    args=[bot],
+                    id="catch_up_evening",
+                    replace_existing=True,
                 )
-        except Exception:
-            log.exception("catch-up report failed")
+        else:
+            await catch_up_evening(bot)
+    except Exception:
+        log.exception("catch-up report failed")
 
     try:
         brief_missing = await _brief_is_missing(now)
@@ -1305,7 +1373,7 @@ async def run() -> None:
         log.exception("startup heartbeat failed; the scheduler carries on")
     # Never fatal: the worker's whole job is to keep running.
     try:
-        await catch_up(bot)
+        await catch_up(bot, scheduler)
     except Exception:
         log.exception("startup catch-up failed; the scheduler carries on")
 

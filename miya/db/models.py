@@ -358,6 +358,7 @@ class DebtPayment(Base):
     __table_args__ = (
         sa.CheckConstraint("amount > 0", name="ck_debt_payments_amount_positive"),
         sa.Index("ix_debt_payments_debt", "debt_id"),
+        sa.Index("ix_debt_payments_paid_at", "paid_at"),
     )
 
 
@@ -787,10 +788,39 @@ class DailyReport(Base):
     __tablename__ = "daily_reports"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    report_date: Mapped[date] = mapped_column(sa.Date, unique=True, nullable=False)
+    report_date: Mapped[date] = mapped_column(sa.Date, nullable=False)
     content: Mapped[str] = mapped_column(sa.Text, nullable=False)
     stats: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = created_at_column()
+    # The delivery ledger (WP-49, 0019): one row per day and kind; the
+    # message parts, how many went out, and when all of them had.
+    kind: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="evening"
+    )
+    window_start: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    window_end: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    parts: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    parts_sent: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    prose_status: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="none"
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+
+    __table_args__ = (
+        sa.UniqueConstraint("report_date", "kind", name="uq_daily_reports_date_kind"),
+        sa.CheckConstraint("kind IN ('evening','morning')", name="ck_daily_reports_kind"),
+        sa.CheckConstraint(
+            "prose_status IN ('model','cached','fallback','none')",
+            name="ck_daily_reports_prose_status",
+        ),
+    )
 
 
 class UsageLog(Base):

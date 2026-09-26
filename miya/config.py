@@ -395,6 +395,25 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _report_outside_quiet_hours(self) -> Settings:
+        start, end = self.quiet_hours_parsed
+        if _within(self.report_time_parsed, start, end):
+            raise ValueError(
+                f"REPORT_TIME={self.report_time} falls inside "
+                f"QUIET_HOURS={self.quiet_hours}; pick a time outside the quiet range"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _report_after_brief(self) -> Settings:
+        if self.report_time_parsed <= self.morning_brief_time_parsed:
+            raise ValueError(
+                f"REPORT_TIME={self.report_time} must be later than "
+                f"MORNING_BRIEF_TIME={self.morning_brief_time}"
+            )
+        return self
+
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)

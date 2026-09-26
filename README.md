@@ -444,7 +444,7 @@ Telegram can never report different balances.
 | `GET /v1/transactions` | Income/expense totals over `date_from`…`date_to` |
 | `GET /v1/people/{id}/summary` | One person's balances, promises and contact |
 | `POST /v1/ask` | RAG answer (same SQL-first path as the bot) |
-| `POST /v1/report/today` | Generate and store today's report |
+| `POST /v1/report/today` | Generate today's report (not stored) |
 | `GET /v1/plan/tomorrow` | Tomorrow's plan |
 | `GET /v1/usage` | API spend over a range |
 | `POST /v1/embed` | Embedding service for the bot and worker |
