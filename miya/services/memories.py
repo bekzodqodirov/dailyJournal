@@ -121,6 +121,8 @@ async def search(
     k: int = 8,
     since: datetime | None = None,
     person_id: int | None = None,
+    until: datetime | None = None,
+    person_ids: list[int] | None = None,
 ) -> list[MemoryHit]:
     """Top-k memories by cosine similarity to the query.
 
@@ -143,6 +145,10 @@ async def search(
         stmt = stmt.where(Memory.occurred_at >= since)
     if person_id is not None:
         stmt = stmt.where(Memory.person_id == person_id)
+    if until is not None:
+        stmt = stmt.where(Memory.occurred_at < until)
+    if person_ids:
+        stmt = stmt.where(Memory.person_id.in_(person_ids))
 
     return [
         MemoryHit(memory=row[0], similarity=1.0 - float(row[1]))

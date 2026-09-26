@@ -287,6 +287,14 @@ class Settings(BaseSettings):
     passage_embed_min_chars: int = Field(default=12, ge=1)
     passage_index_batch: int = Field(default=500, ge=1)
     passage_embed_batch: int = Field(default=128, ge=1, le=256)
+    # WP-56: hybrid recall. The similarity floor is a guess until the real
+    # embedding eval (WP-62) tunes it.
+    recall_top_k: int = Field(default=12, ge=1)
+    recall_candidates: int = Field(default=40, ge=1)
+    recall_min_similarity: float = Field(default=0.45, ge=0, le=1)
+    recall_recency_halflife_days: int = Field(default=45, ge=1)
+    recall_recency_weight: float = Field(default=0.3, ge=0)
+    recall_context_lines: int = Field(default=3, ge=0)
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

@@ -244,8 +244,9 @@ def normalise_for_search(text: str) -> str:
 _LETTER_FOLD = str.maketrans({"q": "k", "w": "v"})
 
 
-STOPWORDS: frozenset[str] = frozenset(
-    """
+# Written as people type them; folded like the text they are compared with
+# ("haqida" is matched as "hakida").
+_STOPWORDS_RAW = """
     nima nimaga deb oylaysan oylaysiz oyla fikring fikringiz bolgandi bolgan boldi
     edi ekan bilan haqida uchun va ham bu shu u men sen siz menga senga kanday
     kachon kayerda kim kimga masala masalasi narsa shunday yana endi bor yok mi chi
@@ -254,6 +255,8 @@ STOPWORDS: frozenset[str] = frozenset(
     chto kak ty dumaesh pro o ob s i v na po eto byl byla bylo mne on ona
     what do you think about the
     """.split()
+STOPWORDS: frozenset[str] = frozenset(
+    w.replace("'", "").translate(_LETTER_FOLD) for w in _STOPWORDS_RAW
 )
 
 UZ_SUFFIXES = (
