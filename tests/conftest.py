@@ -42,6 +42,18 @@ def pytest_unconfigure(config) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _backups_in_tmp(monkeypatch, tmp_path_factory):
+    """BACKUP_DIR defaults to /data/backups, which a CI runner cannot create;
+    no test may write there either."""
+    from miya.config import settings
+
+    if settings.backup_dir == "/data/backups":
+        monkeypatch.setattr(
+            settings, "backup_dir", str(tmp_path_factory.mktemp("backups"))
+        )
+
+
+@pytest.fixture(autouse=True)
 def _strong_api_token(monkeypatch):
     """The bot and worker refuse to start with a short API token; tests that
     drive their run() must not trip on the laptop's blank .env."""
