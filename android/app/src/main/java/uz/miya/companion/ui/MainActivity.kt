@@ -172,6 +172,9 @@ fun handleHealthAction(
         HealthAction.OEM -> actions.openIntent(OemHints.appDetailsIntent(context))
         HealthAction.SERVER_SETTINGS -> goToSettings()
         HealthAction.SCAN_NOW -> vm.scanNow()
+        HealthAction.NOTIFICATION_ACCESS ->
+            actions.openIntent(OemHints.notificationListenerIntent(context))
+        HealthAction.PAYMENT_APPS -> goToSettings()
         HealthAction.NONE -> Unit
     }
 }

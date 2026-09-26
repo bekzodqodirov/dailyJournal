@@ -14,6 +14,8 @@ enum class HealthAction {
     OEM,
     SERVER_SETTINGS,
     SCAN_NOW,
+    NOTIFICATION_ACCESS,
+    PAYMENT_APPS,
 }
 
 /**

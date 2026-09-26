@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Environment
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 
 /**
@@ -40,6 +41,11 @@ object StorageAccess {
     fun hasSms(context: Context): Boolean =
         granted(context, Manifest.permission.READ_SMS) &&
             granted(context, Manifest.permission.RECEIVE_SMS)
+
+    /** Notification access (WP-64): a user toggle, not a runtime permission. */
+    fun hasNotificationAccess(context: Context): Boolean =
+        NotificationManagerCompat.getEnabledListenerPackages(context)
+            .contains(context.packageName)
 
     fun granted(context: Context, permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED

@@ -315,6 +315,32 @@ the queue's primary key absorbs the re-read.
 The upload tokens from `UPLOAD_TOKENS` open `/v1/phone/calls` and
 `/v1/phone/sms` exactly as they open `/v1/recordings` — nothing else.
 
+**Payment-app notifications** (WP-64): `READ_SMS` may never be grantable on
+a sideload, so Payme's own pushes are the money feed that works. A
+`NotificationListenerService` (`watch/PaymentNotificationListener.kt`) sees
+every notification's **package name** only, to list it in Settings → «To'lov
+ilovalari»; the text is read only for packages the owner ticks there (no
+package id is hard-coded; an app labelled "Payme" is pre-ticked on first
+sight unless it was unticked before). Summaries, ongoing and progress
+notifications, the SMS app and MIYA itself are skipped. A captured push is
+clipped to the server's limits, keyed exactly like the server's
+`notification_event_key`:
+
+```
+ntf: <device_id>:ntf:<package>:<sha256(id|tag|when in whole-second ms|title|body)[:16]>
+```
+
+queued in Room as kind `notification`, and posted in batches of 50 to
+`/v1/phone/notifications`. There is no high-water mark — the Room row is the
+only copy — and a pending row is never pruned. Notification access is a user
+toggle (onboarding card or Health → «Ruxsat berish»); on Android 13+ a
+sideloaded app may first need App info → ⋮ → «Cheklangan sozlamalarga ruxsat
+berish». Health shows whether access is granted, which apps are chosen, and
+when the last payment notification was seen. The text is never logged.
+
+Manual check: pay 1 000 so'm with Payme, then confirm the Health row shows
+the time, the Queue drains, and the Telegram receipt arrives.
+
 **Google-Dialer phones**: recordings are unreachable there (share-only mode),
 but the call log and SMS work exactly the same — so even that phone gets
 missed-call loops and automatic transactions.
@@ -482,12 +508,15 @@ it is working until each step is verified.
    UPLOAD_TOKENS=phone:<a second long random string>
    ```
 
-   A token from that list opens `/v1/recordings` and `/v1/recordings/probe`
-   and **nothing else** — present it to `/v1/ask`, `/v1/debts` or `/v1/config`
+   A token from that list opens `/v1/recordings`, `/v1/recordings/probe` and
+   the `/v1/phone/*` event routes (calls, SMS, payment notifications) and
+   **nothing else** — present it to `/v1/ask`, `/v1/debts` or `/v1/config`
    and the answer is 401. That is the whole point: a phone is lost, stolen and
    unzipped far more easily than a server, and an APK's stored token is not a
-   secret in the way a server-side one is. With a device token, the worst a
-   thief can do is push audio at you. With the master token he can read every
+   secret in the way a server-side one is. With a device token, a thief can
+   push recordings, call-log events, SMS and payment notifications at you —
+   and the last two become transactions, so revoke a lost phone's token — but
+   cannot read anything back. With the master token they could read every
    transcript, debt and contact you have.
 
    It also makes revocation cheap. Delete that one pair from `UPLOAD_TOKENS`,

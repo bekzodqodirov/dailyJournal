@@ -7,6 +7,9 @@ import androidx.room.PrimaryKey
 object PhoneEventKind {
     const val CALL = "call"
     const val SMS = "sms"
+
+    /** A payment app's push (WP-64); `kind` is TEXT, so no schema change. */
+    const val NOTIFICATION = "notification"
 }
 
 /**

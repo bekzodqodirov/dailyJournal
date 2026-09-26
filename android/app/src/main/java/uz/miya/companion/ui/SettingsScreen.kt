@@ -11,6 +11,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -24,9 +25,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import uz.miya.companion.R
 import uz.miya.companion.data.SmsMode
 import uz.miya.companion.oem.OemHints
 import uz.miya.companion.util.StorageAccess
@@ -189,6 +192,49 @@ fun SettingsScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
                 SmsModeChoice("Off", SmsMode.OFF, prefs.smsMode, vm::setSmsMode)
                 SmsModeChoice("Payments", SmsMode.PAYMENTS, prefs.smsMode, vm::setSmsMode)
                 SmsModeChoice("All SMS", SmsMode.ALL, prefs.smsMode, vm::setSmsMode)
+            }
+        }
+
+        SectionCard(stringResource(R.string.payment_apps_settings_title)) {
+            Text(
+                stringResource(R.string.payment_apps_settings_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            if (prefs.paymeAutoTicked) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    stringResource(R.string.payme_auto_ticked),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            if (prefs.seenPackages.isEmpty()) {
+                Text(
+                    stringResource(R.string.payment_apps_settings_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            // Newest first; no package id is hard-coded anywhere.
+            for (pkg in prefs.seenPackages.asReversed()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = pkg in prefs.paymentAppPackages,
+                        onCheckedChange = { vm.setPaymentAppTicked(pkg, it) },
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(vm.appLabel(pkg), style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            pkg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
         }
 

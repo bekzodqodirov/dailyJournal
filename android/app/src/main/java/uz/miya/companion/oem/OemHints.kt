@@ -162,4 +162,18 @@ object OemHints {
         }
 
     fun appDetailsIntent(context: Context): Intent = appDetails(context)
+
+    /** Straight to MIYA's own notification-access toggle where possible. */
+    fun notificationListenerIntent(context: Context): Intent =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS).putExtra(
+                Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                ComponentName(
+                    context,
+                    uz.miya.companion.watch.PaymentNotificationListener::class.java,
+                ).flattenToString(),
+            )
+        } else {
+            Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        }
 }

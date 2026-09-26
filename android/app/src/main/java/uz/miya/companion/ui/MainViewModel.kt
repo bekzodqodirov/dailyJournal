@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import uz.miya.companion.Graph
+import uz.miya.companion.R
 import uz.miya.companion.data.PrefsSnapshot
 import uz.miya.companion.data.SmsMode
 import uz.miya.companion.data.UploadEntity
@@ -28,6 +29,8 @@ import uz.miya.companion.discover.SafScanner
 import uz.miya.companion.net.UploadApi
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.StorageAccess
+import uz.miya.companion.util.TimeFmt
+import uz.miya.companion.watch.PaymentNotificationListener
 import uz.miya.companion.work.Scheduling
 
 data class UiState(
@@ -200,6 +203,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         val sms = StorageAccess.hasSms(context)
+        // Android 13+ blocks restricted settings for a sideloaded app until
+        // the owner allows them from App info.
+        val restricted = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
         items += HealthItem(
             title = "SMS upload",
             ok = prefs.smsMode == SmsMode.OFF || sms,
@@ -211,12 +217,23 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                         "own server and nowhere else."
                 sms -> "On, ALL incoming SMS. Messages go to your own server and nowhere else."
                 else -> "On in Settings, but READ_SMS/RECEIVE_SMS is not granted, so nothing " +
-                    "is uploaded. Like the call log, these are hard-restricted on a sideload."
+                    "is uploaded. Like the call log, these are hard-restricted on a sideload.\n" +
+                    context.getString(R.string.sms_restricted_hint)
             },
-            action = HealthAction.SMS_PERMISSION,
-            actionLabel = "Grant",
+            action = if (prefs.smsMode != SmsMode.OFF && !sms && restricted) {
+                HealthAction.OEM
+            } else {
+                HealthAction.SMS_PERMISSION
+            },
+            actionLabel = if (prefs.smsMode != SmsMode.OFF && !sms && restricted) {
+                context.getString(R.string.app_info_action)
+            } else {
+                "Grant"
+            },
             critical = false,
         )
+
+        items += paymentAppsHealth(prefs, restricted)
 
         val tree = prefs.treeUri?.let(Uri::parse)
         val treeOk = tree != null && SafScanner.stillGranted(context, tree)
@@ -286,6 +303,68 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         )
 
         return items
+    }
+
+    /** WP-64: whether payment-app pushes can be read, and when one last was. */
+    private fun paymentAppsHealth(prefs: PrefsSnapshot, restricted: Boolean): HealthItem {
+        val title = context.getString(R.string.payment_apps_health_title)
+        val granted = StorageAccess.hasNotificationAccess(context)
+        return when {
+            !granted -> HealthItem(
+                title = title,
+                ok = false,
+                detail = context.getString(R.string.payment_apps_not_granted) +
+                    if (restricted) "\n" + context.getString(R.string.restricted_settings_hint)
+                    else "",
+                action = HealthAction.NOTIFICATION_ACCESS,
+                actionLabel = context.getString(R.string.payment_apps_grant),
+                critical = false,
+            )
+            prefs.paymentAppPackages.isEmpty() -> HealthItem(
+                title = title,
+                ok = false,
+                detail = context.getString(R.string.payment_apps_none_chosen),
+                action = HealthAction.PAYMENT_APPS,
+                actionLabel = context.getString(R.string.payment_apps_choose),
+                critical = false,
+            )
+            prefs.listenerConnectedAt == null -> HealthItem(
+                title = title,
+                ok = false,
+                detail = context.getString(R.string.payment_apps_disconnected),
+                action = HealthAction.NOTIFICATION_ACCESS,
+                actionLabel = context.getString(R.string.payment_apps_grant),
+                critical = false,
+            )
+            else -> HealthItem(
+                title = title,
+                ok = true,
+                detail = context.getString(
+                    R.string.payment_apps_ok,
+                    prefs.paymentAppPackages.sorted().joinToString { appLabel(it) },
+                    TimeFmt.human(prefs.lastPaymentNotificationAt),
+                ),
+                action = HealthAction.PAYMENT_APPS,
+                actionLabel = context.getString(R.string.payment_apps_choose),
+                critical = false,
+            )
+        }
+    }
+
+    /** The app's name when the package resolves, else the package id. */
+    fun appLabel(pkg: String): String = try {
+        val pm = context.packageManager
+        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+    } catch (t: Throwable) {
+        pkg
+    }
+
+    fun setPaymentAppTicked(pkg: String, ticked: Boolean) {
+        viewModelScope.launch {
+            Graph.prefs.setPaymentAppTicked(pkg, ticked)
+            if (ticked) PaymentNotificationListener.captureActiveFor(pkg)
+            refresh()
+        }
     }
 
     // ------------------------------------------------------------- detection

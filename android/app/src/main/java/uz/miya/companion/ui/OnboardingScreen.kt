@@ -24,9 +24,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import uz.miya.companion.R
 import uz.miya.companion.oem.OemHints
 
 /**
@@ -115,6 +117,18 @@ fun OnboardingScreen(state: UiState, vm: MainViewModel, actions: UiActions) {
                 Button(onClick = { actions.requestPermissions(phoneEventPermissionSet()) }) {
                     Text("Grant")
                 }
+            }
+
+            // WP-64: optional, so it carries no step number.
+            SectionCard(stringResource(R.string.payment_apps_onboarding_title)) {
+                Text(
+                    stringResource(R.string.payment_apps_onboarding_body),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = { actions.openIntent(OemHints.notificationListenerIntent(context)) },
+                ) { Text(stringResource(R.string.payment_apps_grant)) }
             }
 
             StepCard(

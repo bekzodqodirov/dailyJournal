@@ -7,6 +7,7 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -56,11 +57,25 @@ data class PrefsSnapshot(
     val uploadCallLog: Boolean,
     /** One of [SmsMode]. */
     val smsMode: String,
+    // ---- payment-app notifications (WP-64) ----------------------------
+    /** Packages whose notification text is read; empty until the owner ticks. */
+    val paymentAppPackages: Set<String> = emptySet(),
+    /** Package NAMES that posted anything, newest last, at most 50. */
+    val seenPackages: List<String> = emptyList(),
+    /** Packages the owner unticked: never auto-ticked again. */
+    val untickedPackages: Set<String> = emptySet(),
+    val listenerConnectedAt: Long? = null,
+    val lastPaymentNotificationAt: Long? = null,
+    val paymeAutoTicked: Boolean = false,
 ) {
     val serverConfigured: Boolean get() = serverUrl.isNotBlank()
 }
 
 class Prefs(private val context: Context) {
+
+    private companion object {
+        const val SEEN_CAP = 50
+    }
 
     private object K {
         val SERVER_URL = stringPreferencesKey("server_url")
@@ -83,6 +98,13 @@ class Prefs(private val context: Context) {
         val LAST_SMS_ID = longPreferencesKey("last_sms_id")
         val UPLOAD_CALL_LOG = booleanPreferencesKey("upload_call_log")
         val SMS_MODE = stringPreferencesKey("sms_mode")
+        val PAYMENT_APP_PACKAGES = stringSetPreferencesKey("payment_app_packages")
+        // DataStore has no ordered list; "<epoch millis>|<package>" keeps order.
+        val SEEN_NOTIFYING_PACKAGES = stringSetPreferencesKey("seen_notifying_packages")
+        val UNTICKED_PACKAGES = stringSetPreferencesKey("unticked_packages")
+        val LISTENER_CONNECTED_AT = longPreferencesKey("listener_connected_at")
+        val LAST_PAYMENT_NOTIFICATION_AT = longPreferencesKey("last_payment_notification_at")
+        val PAYME_AUTO_TICKED = booleanPreferencesKey("payme_auto_ticked")
     }
 
     val flow: Flow<PrefsSnapshot> = context.dataStore.data.map { it.toSnapshot() }
@@ -108,7 +130,24 @@ class Prefs(private val context: Context) {
         lastSmsId = this[K.LAST_SMS_ID] ?: 0L,
         uploadCallLog = this[K.UPLOAD_CALL_LOG] ?: true,
         smsMode = this[K.SMS_MODE] ?: SmsMode.PAYMENTS,
+        paymentAppPackages = this[K.PAYMENT_APP_PACKAGES] ?: emptySet(),
+        seenPackages = seenOrdered(this[K.SEEN_NOTIFYING_PACKAGES]),
+        untickedPackages = this[K.UNTICKED_PACKAGES] ?: emptySet(),
+        listenerConnectedAt = this[K.LISTENER_CONNECTED_AT],
+        lastPaymentNotificationAt = this[K.LAST_PAYMENT_NOTIFICATION_AT],
+        paymeAutoTicked = this[K.PAYME_AUTO_TICKED] ?: false,
     )
+
+    private fun seenOrdered(raw: Set<String>?): List<String> =
+        raw.orEmpty()
+            .mapNotNull { entry ->
+                val cut = entry.indexOf('|')
+                if (cut <= 0) null else entry.substring(0, cut).toLongOrNull()?.let {
+                    it to entry.substring(cut + 1)
+                }
+            }
+            .sortedBy { it.first }
+            .map { it.second }
 
     suspend fun snapshot(): PrefsSnapshot = flow.first()
 
@@ -164,6 +203,52 @@ class Prefs(private val context: Context) {
             SmsMode.OFF, SmsMode.PAYMENTS, SmsMode.ALL -> value
             else -> SmsMode.PAYMENTS
         }
+    }
+
+    // ---- payment-app notifications (WP-64) --------------------------------
+
+    /**
+     * Remember that [pkg] posted a notification — its name only, never its
+     * content — so the chooser can list it. Capped at the newest 50.
+     */
+    suspend fun noteSeenPackage(pkg: String) = update {
+        val now = System.currentTimeMillis()
+        val kept = (it[K.SEEN_NOTIFYING_PACKAGES] ?: emptySet())
+            .filterNot { entry -> entry.substringAfter('|') == pkg }
+            .sortedBy { entry -> entry.substringBefore('|').toLongOrNull() ?: 0L }
+            .takeLast(SEEN_CAP - 1)
+        it[K.SEEN_NOTIFYING_PACKAGES] = (kept + "$now|$pkg").toSet()
+    }
+
+    /** The owner's tick; an untick is remembered so Payme is not re-added. */
+    suspend fun setPaymentAppTicked(pkg: String, ticked: Boolean) = update {
+        val allow = (it[K.PAYMENT_APP_PACKAGES] ?: emptySet()).toMutableSet()
+        val unticked = (it[K.UNTICKED_PACKAGES] ?: emptySet()).toMutableSet()
+        if (ticked) {
+            allow += pkg
+            unticked -= pkg
+        } else {
+            allow -= pkg
+            unticked += pkg
+        }
+        it[K.PAYMENT_APP_PACKAGES] = allow
+        it[K.UNTICKED_PACKAGES] = unticked
+        it[K.PAYME_AUTO_TICKED] = false
+    }
+
+    /** Payme, recognised by its label on first sight (never by package id). */
+    suspend fun autoTickPayment(pkg: String) = update {
+        it[K.PAYMENT_APP_PACKAGES] = (it[K.PAYMENT_APP_PACKAGES] ?: emptySet()) + pkg
+        it[K.PAYME_AUTO_TICKED] = true
+    }
+
+    suspend fun setListenerConnectedAt(value: Long?) = update {
+        if (value == null) it.remove(K.LISTENER_CONNECTED_AT)
+        else it[K.LISTENER_CONNECTED_AT] = value
+    }
+
+    suspend fun markPaymentNotification() = update {
+        it[K.LAST_PAYMENT_NOTIFICATION_AT] = System.currentTimeMillis()
     }
 
     suspend fun setMediaGeneration(version: String, generation: Long) = update {

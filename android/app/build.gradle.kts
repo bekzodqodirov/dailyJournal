@@ -103,4 +103,7 @@ dependencies {
     implementation("com.googlecode.libphonenumber:libphonenumber:8.13.42")
 
     testImplementation("junit:junit:4.13.2")
+    // android.jar's org.json is a stub that throws "not mocked" on the JVM;
+    // the real implementation shadows it on the test classpath.
+    testImplementation("org.json:json:20240303")
 }

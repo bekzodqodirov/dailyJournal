@@ -16,10 +16,10 @@ import uz.miya.companion.ingest.CallLogMatcher
 import uz.miya.companion.ingest.PaymentSenders
 import uz.miya.companion.ingest.PhoneNormalizer
 import uz.miya.companion.net.EventPostOutcome
+import uz.miya.companion.util.Keys
 import uz.miya.companion.util.Logx
 import uz.miya.companion.util.StorageAccess
 import uz.miya.companion.util.TimeFmt
-import java.security.MessageDigest
 import kotlin.coroutines.cancellation.CancellationException
 
 /**
@@ -74,6 +74,16 @@ class EventSyncWorker(
 
             val callsOk = postPending(dao, PhoneEventKind.CALL, snapshot.serverUrl, deviceId)
             val smsOk = postPending(dao, PhoneEventKind.SMS, snapshot.serverUrl, deviceId)
+            // Payment-app pushes (WP-64): no provider to re-read, so no
+            // high-water mark — the Room row IS the only copy, and a PENDING
+            // row is never pruned.
+            val ntfOk = postPending(
+                dao,
+                PhoneEventKind.NOTIFICATION,
+                snapshot.serverUrl,
+                deviceId,
+                NOTIFICATION_MAX_BATCH,
+            )
 
             // The mark moves only when every harvested row below it is
             // settled — PENDING still waiting, or FAILED_PERMANENT parked by
@@ -104,7 +114,7 @@ class EventSyncWorker(
                 Scheduling.enqueueEventSync(applicationContext)
             }
 
-            if (callsOk && smsOk) Result.success() else Result.retry()
+            if (callsOk && smsOk && ntfOk) Result.success() else Result.retry()
         } catch (c: CancellationException) {
             // WorkManager stopping us is not an error; rethrow and reschedule.
             throw c
@@ -203,13 +213,7 @@ class EventSyncWorker(
                         skipped++
                         continue
                     }
-                    // take() counts UTF-16 units; never cut an emoji's
-                    // surrogate pair in half — org.json would emit malformed
-                    // UTF-8 the server may refuse.
-                    var clipped = body.take(MAX_SMS_CHARS)
-                    if (clipped.isNotEmpty() && clipped.last().isHighSurrogate()) {
-                        clipped = clipped.dropLast(1)
-                    }
+                    val clipped = Keys.clipUtf16(body, MAX_SMS_CHARS)
                     val receivedAt = TimeFmt.isoOffsetExact(c.getLong(dateIdx))
                     val payload = JSONObject()
                         .put("sms_id", smsId)
@@ -249,9 +253,10 @@ class EventSyncWorker(
         kind: String,
         baseUrl: String,
         deviceId: String,
+        maxBatch: Int = MAX_BATCH,
     ): Boolean {
         while (true) {
-            val batch = dao.nextBatch(kind, MAX_BATCH)
+            val batch = dao.nextBatch(kind, maxBatch)
             if (batch.isEmpty()) return true
 
             val items = ArrayList<JSONObject>(batch.size)
@@ -270,10 +275,11 @@ class EventSyncWorker(
                 continue
             }
 
-            val outcome = if (kind == PhoneEventKind.CALL) {
-                Graph.api.postCalls(baseUrl, deviceId, items)
-            } else {
-                Graph.api.postSms(baseUrl, deviceId, items)
+            val outcome = when (kind) {
+                PhoneEventKind.CALL -> Graph.api.postCalls(baseUrl, deviceId, items)
+                PhoneEventKind.NOTIFICATION ->
+                    Graph.api.postNotifications(baseUrl, deviceId, items)
+                else -> Graph.api.postSms(baseUrl, deviceId, items)
             }
             when (outcome) {
                 is EventPostOutcome.Delivered -> {
@@ -331,15 +337,7 @@ class EventSyncWorker(
         receivedAtIso: String,
         body: String,
     ): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-            .digest("$sender|$receivedAtIso|$body".toByteArray(Charsets.UTF_8))
-        // First 8 bytes = the server's hexdigest()[:16]. Built by hand so no
-        // locale can ever localise a "digit" of the key.
-        val hex = StringBuilder(16)
-        for (i in 0 until 8) {
-            val b = digest[i].toInt() and 0xff
-            hex.append(HEX_DIGITS[b ushr 4]).append(HEX_DIGITS[b and 0x0f])
-        }
+        val hex = Keys.sha256hex16("$sender|$receivedAtIso|$body")
         return "$deviceId:sms:$smsId:$hex"
     }
 
@@ -354,10 +352,11 @@ class EventSyncWorker(
     }
 
     private companion object {
-        const val HEX_DIGITS = "0123456789abcdef"
-
         /** The server refuses bigger batches; mirrored, never assumed. */
         const val MAX_BATCH = 200
+
+        /** The server's NOTIFICATION_MAX_BATCH. */
+        const val NOTIFICATION_MAX_BATCH = 50
 
         /** The server caps an SMS body at 4096 chars; clip before posting. */
         const val MAX_SMS_CHARS = 4096

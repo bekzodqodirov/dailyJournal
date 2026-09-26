@@ -140,6 +140,14 @@ class UploadApi(
         messages: List<JSONObject>,
     ): EventPostOutcome = postEvents(baseUrl, "/v1/phone/sms", deviceId, "messages", messages)
 
+    /** POST one batch of payment-app notifications (WP-64). See [postCalls]. */
+    suspend fun postNotifications(
+        baseUrl: String,
+        deviceId: String,
+        items: List<JSONObject>,
+    ): EventPostOutcome =
+        postEvents(baseUrl, "/v1/phone/notifications", deviceId, "notifications", items)
+
     private suspend fun postEvents(
         baseUrl: String,
         path: String,
