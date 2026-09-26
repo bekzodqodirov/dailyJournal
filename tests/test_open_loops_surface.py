@@ -315,25 +315,25 @@ async def test_the_report_gains_the_two_sections_with_ages(session):
     data = await reports.gather(session, _now().date())
     block = reports.render_data_block(data)
 
-    unanswered = block[block.index("JAVOBSIZ QOLGANLAR") : block.index("JIM BO'LIB")]
+    unanswered = block[block.index(reports.H_QUESTIONS) : block.index(reports.H_QUIET)]
     assert "Akmal, 6 soat javobsiz: «konteyner qachon keladi?»" in unanswered
-    quiet = block[block.index("JIM BO'LIB QOLGANLAR") : block.index("ERTAGA")]
+    quiet = block[block.index(reports.H_QUIET) : block.index(reports.H_TOMORROW)]
     assert "Sardor: 40 kun jim — $1200 (qarzingiz)" in quiet
     assert [q.interaction_id for q in data.questions] == [seed.asked.id]
     assert reports._stats_json(data)["unanswered"] == 1
     assert reports._stats_json(data)["quiet"] == 1
 
 
-async def test_the_report_sections_say_none_and_the_prompt_lists_them(session):
+async def test_the_report_sections_say_none_in_the_fixed_order(session):
     data = await reports.gather(session, _now().date())
     block = reports.render_data_block(data)
-    assert "JAVOBSIZ QOLGANLAR:\n- yo'q" in block
-    assert "JIM BO'LIB QOLGANLAR:\n- yo'q" in block
+    assert f"{reports.H_QUESTIONS}\n- yo'q" in block
+    assert f"{reports.H_QUIET}\n- yo'q" in block
     assert reports._stats_json(data)["unanswered"] == 0
-    prompt = reports.REPORT_SYSTEM_PROMPT
-    assert "❓ Javobsiz qolganlar" in prompt and "🤫 Jim bo'lib qolganlar" in prompt
-    assert prompt.index("Sizga murojaatlar") < prompt.index("Javobsiz qolganlar")
-    assert prompt.index("Jim bo'lib qolganlar") < prompt.index("📅 Ertaga")
+    shown = [h for h in reports.HEADINGS if h in block]
+    assert shown == sorted(shown, key=block.index)
+    assert block.index(reports.H_TO_ME) < block.index(reports.H_QUESTIONS)
+    assert block.index(reports.H_QUIET) < block.index(reports.H_TOMORROW)
 
 
 # --- 3. nudges ------------------------------------------------------------------

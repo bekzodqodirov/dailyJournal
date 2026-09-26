@@ -558,19 +558,16 @@ async def test_the_report_carries_the_missed_section_with_hostile_names(bound):
     block = reports.render_data_block(data)
 
     assert len(data.missed) == 1
-    assert "📵 JAVOBSIZ QO'NG'IROQLAR:" in block
-    section = block[block.index("JAVOBSIZ QO'NG'IROQLAR") :]
+    assert reports.H_MISSED in block
+    section = block[block.index(reports.H_MISSED) :]
     assert "&lt;b&gt;Yovuz&lt;/b&gt;" in section.split("🤫")[0]
-    assert block.index("JAVOBSIZ QOLGANLAR") < block.index("JAVOBSIZ QO'NG'IROQLAR")
-    assert block.index("JAVOBSIZ QO'NG'IROQLAR") < block.index("JIM BO'LIB")
+    assert block.index(reports.H_QUESTIONS) < block.index(reports.H_MISSED)
+    assert block.index(reports.H_MISSED) < block.index(reports.H_QUIET)
     assert reports._stats_json(data)["missed"] == 1
-    prompt = reports.REPORT_SYSTEM_PROMPT
-    assert prompt.index("Javobsiz qolganlar") < prompt.index("Javobsiz qo'ng'iroqlar")
-    assert prompt.index("Javobsiz qo'ng'iroqlar") < prompt.index("Jim bo'lib")
 
 
 async def test_a_report_without_missed_calls_has_no_empty_section(session):
     data = await reports.gather(session, _now().date())
     block = reports.render_data_block(data)
-    assert "JAVOBSIZ QO'NG'IROQLAR" not in block
+    assert reports.H_MISSED not in block
     assert reports._stats_json(data)["missed"] == 0

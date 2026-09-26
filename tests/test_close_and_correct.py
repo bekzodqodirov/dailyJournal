@@ -948,7 +948,7 @@ async def test_bajarilganlar_lists_the_promise_closed_today_and_not_the_dropped_
 
     data = await reports.gather(session, _today())
     block = reports.render_data_block(data)
-    section = block[block.index("BAJARILGANLAR") : block.index("CHATLARDA")]
+    section = block[block.index(reports.H_DONE) : block.index(reports.H_CHATS)]
     assert "va'da bajarildi: Akmal — invoice yuboradi" in section
     assert "vazifa bajarildi: hujjat topshirish" in section
     assert "kelmaydi" not in section

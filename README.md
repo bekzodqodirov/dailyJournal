@@ -135,7 +135,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `DATABASE_URL` | Must match `POSTGRES_*`; driver is `postgresql+psycopg` |
 | `ANTHROPIC_API_KEY` | Required — extraction, reports and answers all use it |
 | `EXTRACT_MODEL` | `claude-haiku-4-5` — the extraction engine |
-| `REASON_MODEL` | `claude-sonnet-5` — daily report, planner, RAG answers |
+| `REASON_MODEL` | `claude-sonnet-5` — `/reja` planner, RAG answers |
 | `ELEVENLABS_API_KEY` | Scribe transcription (uz/ru) |
 | `TRANSCRIBER` | `elevenlabs`; a local Whisper backend can be swapped in later |
 | `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` | The bot rejects every other user |
@@ -286,12 +286,13 @@ the only source of financial figures; `search_memories` covers contextual
 questions. If the model or a tool fails, the owner gets an honest "try again
 later" instead of a guess.
 
-**Daily report.** At `REPORT_TIME` the worker gathers the day from SQL,
-renders a deterministic data block, and asks Sonnet to phrase it in Uzbek; the
-result is stored in `daily_reports` (upsert per date) and sent to the owner.
-If the Sonnet call fails, the deterministic block itself is stored and sent —
-a report day is never lost. `/hisobot` runs the same path on demand, and
-`/reja` produces the tomorrow plan that also closes the report.
+**Daily report.** At `REPORT_TIME` the worker gathers the day from SQL and
+renders the report deterministically, with Uzbek section headings; no model
+touches it, so no figure can be mis-copied on the owner's evening money
+surface. The result is stored in `daily_reports` (upsert per date) and sent
+to the owner. `/hisobot` runs the same path on demand. Its "📅 Ertaga" section
+is tomorrow's SQL listing; `/reja` is the only model-written plan, and the
+model writing it never sees an amount (debts are named by person and ref).
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
 Google Cloud Console, save it to `secrets/google_oauth.json`, then
@@ -609,8 +610,8 @@ too), so the suite is free and offline.
   back as an error the model can phrase, never a crash.
 * Question routing: `?` or a leading interrogative goes to RAG; question words
   mid-sentence stay log entries.
-* The daily report upserts by date, and an Anthropic outage stores and sends
-  the deterministic data block instead of losing the day.
+* The daily report upserts by date and makes no model call, so an Anthropic
+  outage cannot cost the owner the day's report.
 
 **Google Calendar (Phase 3)**
 * Pulls upsert by `gcal_event_id` — re-pulls change nothing, edits update the

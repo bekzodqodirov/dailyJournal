@@ -212,11 +212,12 @@ async def embed_job() -> None:
 
 async def report_job(bot: Bot) -> None:
     """Compose, store and deliver the daily report (cron at REPORT_TIME)."""
+    day = datetime.now(settings.tz).date()
     async with session_scope() as session:
-        content = await reports.generate_report(session)
+        content = await reports.generate_report(session, day)
     # The report is committed before the send: a Telegram failure costs the
     # notification, never the report itself (`/hisobot` re-reads it).
-    await notify(bot, f"📊 <b>Kunlik hisobot</b>\n\n{content}")
+    await notify(bot, f"{reports.report_header(day)}\n\n{content}")
 
 
 async def gcal_pull_job() -> None:
@@ -946,7 +947,7 @@ async def catch_up(bot: Bot) -> None:
         try:
             async with session_scope() as session:
                 content = await reports.generate_report(session, day)
-            await notify(bot, f"📊 <b>Kunlik hisobot</b> ({day})\n\n{content}")
+            await notify(bot, f"{reports.report_header(day)}\n\n{content}")
         except Exception:
             log.exception("catch-up report failed")
 

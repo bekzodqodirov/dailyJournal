@@ -490,9 +490,8 @@ def _report_data(**kw) -> reports.ReportData:
 def test_the_report_carries_one_line_only_when_claims_wait():
     block = reports.render_data_block(_report_data(claims_pending=3))
     assert "\n❓ Tasdiqlanmagan da'volar: 3 (/davolar)" in block
-    assert block.index("da'volar: 3") < block.index("📅 ERTAGA")
+    assert block.index("da'volar: 3") < block.index(reports.H_TOMORROW)
     assert "da'volar" not in reports.render_data_block(_report_data())
-    assert "Tasdiqlanmagan da'volar" in reports.REPORT_SYSTEM_PROMPT
     assert reports._stats_json(_report_data(claims_pending=3))["claims_pending"] == 3
 
 

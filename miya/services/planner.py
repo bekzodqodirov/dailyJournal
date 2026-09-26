@@ -1,8 +1,10 @@
-"""Tomorrow planner (spec §8): `/reja` and the daily report's last section.
+"""Tomorrow planner (spec §8): `/reja`, and the SQL listing in the daily report.
 
-All inputs are SQL; the reasoning model only arranges them into a realistic time-blocked
-Uzbek schedule around the fixed event times. If the API call fails, the owner
-still gets the deterministic listing — a plan must never silently vanish.
+All inputs are SQL. For `/reja` the reasoning model arranges them into a
+realistic time-blocked Uzbek schedule around the fixed event times; it never
+sees an amount, so it cannot mis-copy one. The daily report's "Ertaga"
+section is the deterministic listing itself (no model). If the API call
+fails, `/reja` still returns the listing — a plan must never silently vanish.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from miya.bot.formatting import escape
+from miya.bot.formatting import escape, money, ref, tags
 from miya.config import settings
 from miya.services import queries
 from miya.services.extraction import API_FAILURES, get_client
@@ -30,8 +32,9 @@ his day in Uzbek (Latin script).
 Rules:
 - Fixed event times are immovable; schedule everything else around them.
 - Overdue items come first in the morning; group errands sensibly.
-- Every date, amount and name must be copied verbatim from the input data —
-  never invent or alter figures.
+- Every date and name must be copied verbatim from the input data — never
+  invent or alter them.
+- Never write any amount or currency; refer to debts by name and ref.
 - Keep it short: a time-blocked list plus at most two sentences of advice.
 - Format for Telegram: plain text, <b>bold</b> for times, no markdown.
 """
@@ -54,15 +57,22 @@ async def plan_inputs(session: AsyncSession, day: date) -> PlanInputs:
     )
 
 
-def render_inputs(inputs: PlanInputs) -> str:
-    """Deterministic text block: prompt input and the no-API fallback.
+def render_inputs(
+    inputs: PlanInputs, *, header: bool = True, amounts: bool = True
+) -> str:
+    """Deterministic listing: the report's "Ertaga", /reja's fallback, and
+    (with ``amounts=False``) the model's input for /reja.
 
     Titles, names and descriptions are escaped for the same reason as in
     reports.py — they are attacker-influenced and end up in an HTML message.
+    Without amounts a debt line names the person, the side, the due date and
+    its refs only: figures reach the owner from SQL, never through a model.
     """
-    lines: list[str] = [f"REJA KUNI: {inputs.day.isoformat()}"]
+    lines: list[str] = [f"REJA KUNI: {inputs.day.isoformat()}"] if header else []
 
-    lines.append("\nBELGILANGAN UCHRASHUVLAR:")
+    if header:
+        lines.append("")
+    lines.append("BELGILANGAN UCHRASHUVLAR:")
     if inputs.events:
         for ev in inputs.events:
             when = ev.start_at.astimezone(settings.tz).strftime("%H:%M")
@@ -95,11 +105,17 @@ def render_inputs(inputs: PlanInputs) -> str:
     if debts:
         for b in debts:
             side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
-            lines.append(
-                f"- {escape(b.person.display_name)}: "
-                f"{b.outstanding} {b.currency.value} "
-                f"({side}, muddat: {b.earliest_due})"
-            )
+            name = escape(b.person.display_name)
+            if amounts:
+                lines.append(
+                    f"- {name}: {money(b.outstanding, b.currency)} "
+                    f"({side}, muddat: {b.earliest_due}){tags('debt', b.ids)}"
+                )
+            else:
+                handles = ", ".join(ref("debt", i) for i in b.ids if i is not None)
+                lines.append(
+                    f"- {name}: qarz ({side}, muddat: {b.earliest_due}) [{handles}]"
+                )
     else:
         lines.append("- yo'q")
 
@@ -109,7 +125,8 @@ def render_inputs(inputs: PlanInputs) -> str:
 async def plan_for(session: AsyncSession, day: date) -> str:
     """A plan for one day. Falls back to the raw listing when the model fails."""
     inputs = await plan_inputs(session, day)
-    data_block = render_inputs(inputs)
+    data_block = render_inputs(inputs, amounts=False)
+    listing = render_inputs(inputs)
 
     try:
         response = await get_client().messages.create(
@@ -126,7 +143,7 @@ async def plan_for(session: AsyncSession, day: date) -> str:
         )
     except API_FAILURES as exc:
         log.warning("planner call failed, falling back to raw listing: %s", exc)
-        return data_block
+        return listing
 
     await record_anthropic_usage(
         session,
@@ -135,7 +152,7 @@ async def plan_for(session: AsyncSession, day: date) -> str:
         usage=response.usage,
     )
     text = "\n".join(b.text for b in response.content if b.type == "text").strip()
-    return text or data_block
+    return text or listing
 
 
 async def plan_tomorrow(session: AsyncSession) -> str:

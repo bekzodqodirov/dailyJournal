@@ -259,7 +259,11 @@ def test_the_report_block_uses_the_shared_renderers_escaped():
         in block
     )
     assert "- Sardor: 40 kun jim — $1200 (qarzingiz)" in block
-    assert "<b>" not in block and "<code>" not in block
+    # Counterparty text is escaped; the only markup is the section headings.
+    assert "Akmal &lt;GZ&gt;" in block and "<GZ>" not in block
+    rendered = [h for h in reports.HEADINGS if h in block]
+    assert block.count("<b>") == len(rendered)
+    assert "<code>" not in block
 
 
 def test_a_long_question_is_cut_the_same_way_in_both_forms():

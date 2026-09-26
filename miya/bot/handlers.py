@@ -288,9 +288,10 @@ async def cmd_search(message: Message, command: CommandObject) -> None:
 @router.message(Command("hisobot"))
 async def cmd_report(message: Message) -> None:
     await _typing(message)
+    day = datetime.now(settings.tz).date()
     async with session_scope() as session:
-        content = await reports.generate_report(session)
-    await _safe_answer(message, clip(f"📊 <b>Kunlik hisobot</b>\n\n{content}"))
+        content = await reports.generate_report(session, day)
+    await _safe_answer(message, clip(f"{reports.report_header(day)}\n\n{content}"))
 
 
 @router.message(Command("ertalab"))

@@ -410,7 +410,7 @@ async def test_the_daily_report_still_arrives_without_an_api_key(session, monkey
     content = await reports.generate_report(session)
     await session.flush()
 
-    assert "HISOBOT KUNI" in content
+    assert reports.H_MONEY in content
     stored = await session.scalar(
         sa.select(m.DailyReport.content).where(
             m.DailyReport.report_date == datetime.now(TZ).date()
