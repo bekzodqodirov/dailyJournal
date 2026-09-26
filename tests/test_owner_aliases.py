@@ -110,3 +110,111 @@ def test_holat_mentions_blank_aliases(monkeypatch):
     assert replies.OWNER_ALIASES_BLANK in replies.status_report(_status(), [])
     monkeypatch.setattr(settings, "owner_aliases", NEW_ALIASES)
     assert replies.OWNER_ALIASES_BLANK not in replies.status_report(_status(), [])
+
+
+# --- WP-36: the extractor knows the owner; nobody is created as the owner -----
+
+from datetime import datetime  # noqa: E402
+
+import sqlalchemy as sa  # noqa: E402
+
+from miya.db import models as m  # noqa: E402
+from miya.db.enums import Direction, InteractionSource  # noqa: E402
+from miya.services import extraction as ex  # noqa: E402
+from miya.services import people  # noqa: E402
+from miya.services.persistence import apply_extraction  # noqa: E402
+
+WP36_ALIASES = "Bekzod, Begika, @owner_test123"
+
+
+@pytest.fixture
+def owner_aliases(monkeypatch):
+    monkeypatch.setattr(settings, "owner_aliases", WP36_ALIASES)
+
+
+def test_the_block_names_the_owner_but_never_the_username(owner_aliases):
+    block = ex.owner_names_block()
+    assert "THE OWNER'S OWN NAMES" in block
+    assert "Bekzod" in block and "Begika" in block
+    assert "@owner_test123" not in block and "owner_test123" not in block
+    assert "'Bekzod akaga 5 mln berdim'" in block
+    text = ex.extraction_system_block()[0]["text"]
+    assert block in text
+    assert ex.extraction_system_block() == ex.extraction_system_block()
+
+
+def test_no_block_without_aliases(monkeypatch):
+    monkeypatch.setattr(settings, "owner_aliases", "")
+    assert ex.owner_names_block() == ""
+    assert "THE OWNER'S OWN NAMES" not in ex.extraction_system_block()[0]["text"]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("Bekzod aka", True),
+        ("БЕКЗОД", True),
+        ("begika", True),
+        ("Bekzod Karimov", False),
+        ("Akmal", False),
+        ("@owner_test123", False),
+    ],
+)
+def test_is_owner_alias(owner_aliases, name, expected):
+    assert people.is_owner_alias(name) is expected
+
+
+def _debt(person: str) -> ex.ExtractedDebt:
+    return ex.ExtractedDebt(
+        direction="they_owe_me",
+        person=person,
+        amount=5_000_000,
+        currency="UZS",
+        reason="yuk",
+        asserted_by="me",
+    )
+
+
+async def _note(session) -> m.Interaction:
+    interaction = m.Interaction(
+        source=InteractionSource.assistant_bot,
+        direction=Direction.in_,
+        occurred_at=datetime.now(settings.tz),
+        raw_text="x",
+    )
+    session.add(interaction)
+    await session.flush()
+    return interaction
+
+
+async def test_a_debt_naming_the_owner_writes_nothing(session, owner_aliases):
+    interaction = await _note(session)
+    applied = await apply_extraction(
+        session, interaction, ex.ExtractionResult(debts=[_debt("Bekzod aka")])
+    )
+    assert applied.owner_named == ["Bekzod aka"]
+    assert interaction.needs_review is True
+    assert list(await session.scalars(sa.select(m.Person))) == []
+    assert list(await session.scalars(sa.select(m.Debt))) == []
+    assert "bu sizning ismingiz" in replies.confirmation(applied)
+
+
+async def test_a_real_client_sharing_the_first_name_still_resolves(
+    session, owner_aliases
+):
+    client = m.Person(display_name="Bekzod Karimov", aliases=["Bekzod"])
+    session.add(client)
+    await session.flush()
+    interaction = await _note(session)
+    applied = await apply_extraction(
+        session, interaction, ex.ExtractionResult(debts=[_debt("Bekzod Karimov")])
+    )
+    [debt] = applied.debts
+    assert debt.person_id == client.id and applied.owner_named == []
+
+
+async def test_a_non_strict_caller_creates_nobody_named_after_the_owner(
+    session, owner_aliases
+):
+    assert await people.resolve_person(session, "Bekzod", telegram_id=4242) is None
+    assert list(await session.scalars(sa.select(m.Person))) == []

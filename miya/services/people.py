@@ -587,9 +587,24 @@ async def resolve_person(
     return person
 
 
+def is_owner_alias(name: str) -> bool:
+    """True when ``name`` is one of the owner's own names (WP-36):
+    'Bekzod aka' and 'БЕКЗОД' are the alias 'Bekzod'; 'Bekzod Karimov' is not."""
+    key = normalise(codes.strip_codes(name or ""))
+    if not key:
+        return False
+    return any(
+        key == normalise(alias)
+        for alias in settings.owner_aliases_parsed
+        if not alias.startswith("@")
+    )
+
+
 async def _owner_guard(session: AsyncSession, name: str) -> None:
-    """Never create a person who is the owner (WP-36 fills this in)."""
-    return None
+    """Never create a person who is the owner (WP-36). Existing people still
+    match before this, so a real client 'Bekzod Karimov' resolves."""
+    if is_owner_alias(name):
+        raise OwnerNamed(name)
 
 
 async def find_by_phone(session: AsyncSession, phone: str) -> Person | None:

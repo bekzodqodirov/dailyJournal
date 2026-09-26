@@ -32,7 +32,7 @@ from miya.db.models import (
     UsageLog,
 )
 from miya.services import queries
-from miya.services.extraction import API_FAILURES, get_client
+from miya.services.extraction import API_FAILURES, get_client, owner_names_block
 from miya.services.people import set_profile
 from miya.services.queries import PersonSummary
 from miya.services.usage import record_anthropic_usage
@@ -265,7 +265,7 @@ async def generate_profile(
             system=[
                 {
                     "type": "text",
-                    "text": PROFILE_SYSTEM_PROMPT,
+                    "text": PROFILE_SYSTEM_PROMPT + owner_names_block(),
                     "cache_control": {"type": "ephemeral"},
                 }
             ],

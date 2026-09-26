@@ -338,13 +338,31 @@ def _schema_instructions() -> str:
     )
 
 
+def owner_names_block() -> str:
+    """The owner's own names, from OWNER_ALIASES (WP-36); '' when unset.
+
+    Usernames (@…) are left out: the extractor reads names, and a public
+    handle has no business in a prompt. Byte-stable for a given .env, so
+    the cached system block stays one cache entry.
+    """
+    names = [a for a in settings.owner_aliases_parsed if not a.startswith("@")]
+    if not names:
+        return ""
+    return (
+        f"\n\nTHE OWNER'S OWN NAMES: {', '.join(names)} (any script or case, with or "
+        f"without 'aka'/'ака', joined or not). Such a name always means the owner "
+        f"(ME). Never emit it as a person, debtor, creditor or counterparty: a THEM "
+        f"line saying '{names[0]} akaga 5 mln berdim' is that speaker paying the owner."
+    )
+
+
 def extraction_system_block(*, with_schema: bool = False) -> list[dict]:
     """The cached system block shared by the real-time and batch paths.
 
     ``with_schema`` appends the JSON Schema for the prompted fallback. Both
     variants stay byte-stable, so each keeps its own cache entry.
     """
-    text = EXTRACTION_SYSTEM_PROMPT
+    text = EXTRACTION_SYSTEM_PROMPT + owner_names_block()
     if with_schema:
         text += _schema_instructions()
     return [
