@@ -170,6 +170,8 @@ class ConversationWindow(Base):
     __table_args__ = (
         sa.Index("ix_conversation_windows_status", "status", "created_at"),
         sa.Index("ix_conversation_windows_batch", "batch_id"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_conversation_windows_person", "person_id"),
     )
 
 
@@ -280,6 +282,8 @@ class Interaction(Base):
                 "(metadata ? 'money_notice') AND NOT (metadata ? 'money_notified')"
             ),
         ),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_interactions_window", "window_id"),
     )
 
 
@@ -321,6 +325,9 @@ class Debt(Base):
         sa.CheckConstraint("amount > 0", name="ck_debts_amount_positive"),
         sa.Index("ix_debts_status_person", "status", "person_id"),
         sa.Index("ix_debts_due_date", "due_date"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_debts_person", "person_id"),
+        sa.Index("ix_debts_source_interaction", "source_interaction_id"),
     )
 
 
@@ -373,6 +380,8 @@ class Promise(Base):
     __table_args__ = (
         sa.Index("ix_promises_status_due", "status", "due_date"),
         sa.Index("ix_promises_person", "person_id"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_promises_source_interaction", "source_interaction_id"),
     )
 
 
@@ -432,6 +441,8 @@ class Transaction(Base):
             "ix_transactions_money_match", "currency", "type", "amount", "occurred_at"
         ),
         sa.Index("ix_transactions_counterparty", "counterparty_person_id"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_transactions_source_interaction", "source_interaction_id"),
     )
 
 
@@ -483,7 +494,11 @@ class Event(Base):
     )
     created_at: Mapped[datetime] = created_at_column()
 
-    __table_args__ = (sa.Index("ix_events_start_at", "start_at"),)
+    __table_args__ = (
+        sa.Index("ix_events_start_at", "start_at"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_events_source_interaction", "source_interaction_id"),
+    )
 
 
 class Task(Base):
@@ -510,7 +525,12 @@ class Task(Base):
         JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
     )
 
-    __table_args__ = (sa.Index("ix_tasks_status_due", "status", "due_date"),)
+    __table_args__ = (
+        sa.Index("ix_tasks_status_due", "status", "due_date"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_tasks_source_interaction", "source_interaction_id"),
+        sa.Index("ix_tasks_related_promise", "related_promise_id"),
+    )
 
 
 class Claim(Base):
@@ -586,6 +606,8 @@ class Claim(Base):
             unique=True,
             postgresql_where=sa.text("evidence_txn_id IS NOT NULL"),
         ),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_claims_person", "person_id"),
     )
 
 
@@ -660,6 +682,11 @@ class Memory(Base):
             postgresql_with={"m": 16, "ef_construction": 64},
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_memories_source_interaction", "source_interaction_id"),
+        sa.Index(
+            "ix_memories_unembedded", "id", postgresql_where=sa.text("embedding IS NULL")
+        ),
     )
 
 
@@ -696,7 +723,11 @@ class UsageLog(Base):
     )
     created_at: Mapped[datetime] = created_at_column()
 
-    __table_args__ = (sa.Index("ix_usage_log_created_at", "created_at"),)
+    __table_args__ = (
+        sa.Index("ix_usage_log_created_at", "created_at"),
+        # Foreign keys that cascade or set null are indexed (WP-23, 0016).
+        sa.Index("ix_usage_log_source_interaction", "source_interaction_id"),
+    )
 
 
 class ReminderLog(Base):
