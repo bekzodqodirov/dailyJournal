@@ -14,11 +14,12 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import sqlalchemy as sa
-from rapidfuzz import fuzz, process
+from rapidfuzz import fuzz
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.models import Person
+from miya.services import codes
 from miya.services.text import fold_apostrophes, to_latin
 
 log = logging.getLogger(__name__)
@@ -67,35 +68,65 @@ def normalise(name: str) -> str:
     return " ".join(tokens) or cleaned.strip()
 
 
-def _candidates(person: Person) -> list[str]:
-    return [normalise(n) for n in [person.display_name, *(person.aliases or [])] if n]
+NameKey = tuple[str, frozenset[str]]
+
+
+def _name_and_codes(name: str) -> NameKey:
+    """A name as (normalised words without codes, its client codes), WP-29."""
+    return normalise(codes.strip_codes(name)), frozenset(codes.find_client_codes(name))
+
+
+def _candidates(person: Person) -> list[NameKey]:
+    keys = [
+        _name_and_codes(n) for n in [person.display_name, *(person.aliases or [])] if n
+    ]
+    return [k for k in keys if k[0] or k[1]]
+
+
+def _score(query: NameKey, candidate: NameKey) -> float:
+    """Codes compare exactly and decide alone; names compare fuzzily.
+
+    GS368 is never a spelling of GS367: two different codes are two different
+    clients whatever the names say.
+    """
+    q_name, q_codes = query
+    c_name, c_codes = candidate
+    if q_codes & c_codes:
+        return 100.0
+    if q_codes and c_codes:
+        return 0.0
+    if q_name and c_name:
+        return float(fuzz.token_set_ratio(q_name, c_name))
+    return 0.0
+
+
+def _is_exact(query: NameKey, candidate: NameKey) -> bool:
+    q_name, q_codes = query
+    c_name, c_codes = candidate
+    return bool(q_codes & c_codes) or (not q_codes and bool(q_name) and q_name == c_name)
 
 
 def best_match(name: str, people: list[Person]) -> tuple[Person | None, float]:
     """Highest-scoring person for `name`, and that score."""
-    target = normalise(name)
-    if not target:
+    target = _name_and_codes(name)
+    if not (target[0] or target[1]):
         return None, 0.0
-
-    index: dict[str, Person] = {}
+    # An exact name (or a held code) wins before any fuzzy scoring:
+    # token_set_ratio gives "Akmal" a perfect score against "Akmal Toshkent"
+    # too, and the tie would send a fact about plain Akmal to whichever row
+    # is older.
     for person in people:
-        for candidate in _candidates(person):
-            index.setdefault(candidate, person)
-    if not index:
+        if any(_is_exact(target, c) for c in _candidates(person)):
+            return person, 100.0
+    best: Person | None = None
+    best_score = 0.0
+    for person in people:
+        score = _person_score(target, person)
+        if best is None or score > best_score:
+            best, best_score = person, score
+    if best is None:
         return None, 0.0
-    if target in index:
-        # An exact name wins before any fuzzy scoring: token_set_ratio gives
-        # "Akmal" a perfect score against "Akmal Toshkent" too, and the tie
-        # would send a fact about plain Akmal to whichever row is older.
-        return index[target], 100.0
-
-    # token_set_ratio so word order and extra words ("Akmal GZ" vs "GZ Akmal")
-    # do not sink an otherwise obvious match.
-    match = process.extractOne(target, index.keys(), scorer=fuzz.token_set_ratio)
-    if match is None:
-        return None, 0.0
-    matched_name, score, _ = match
-    return index[matched_name], float(score)
+    return best, best_score
 
 
 @dataclass(slots=True)
@@ -126,12 +157,9 @@ class Match:
         )
 
 
-def _person_score(target: str, person: Person) -> float:
+def _person_score(target: NameKey, person: Person) -> float:
     """The same scorer as best_match, per person: its best candidate name."""
-    return max(
-        (float(fuzz.token_set_ratio(target, c)) for c in _candidates(person)),
-        default=0.0,
-    )
+    return max((_score(target, c) for c in _candidates(person)), default=0.0)
 
 
 async def find_person(
@@ -141,8 +169,8 @@ async def find_person(
 
     Never creates and never learns an alias: a question is not a contact.
     """
-    target = normalise(name or "")
-    if not target:
+    target = _name_and_codes(name or "")
+    if not (target[0] or target[1]):
         return Match(person=None, score=0.0, runner_up=None, runner_up_score=0.0)
     people = list(await session.scalars(sa.select(Person).order_by(Person.id)))
     # Stable sort: on a tie the earlier row wins, as in best_match.
@@ -151,7 +179,7 @@ async def find_person(
         key=lambda pair: pair[0],
         reverse=True,
     )
-    exact = [p for p in people if target in set(_candidates(p))]
+    exact = [p for p in people if any(_is_exact(target, c) for c in _candidates(p))]
     if len(exact) > 1:
         # Two people literally sharing the name: ask back naming them both,
         # not the longer name that merely contains it.
@@ -255,13 +283,14 @@ async def resolve_person(
 
     if person is not None and score >= MATCH_THRESHOLD:
         names = [person.display_name, *(person.aliases or [])]
-        known = {normalise(n) for n in names}
-        # A spelling in the other script is kept too (WP-28): "Akmal" for
-        # "Акмал" compares equal but is how the owner will type it.
-        new_script = _is_cyrillic(name) not in {_is_cyrillic(n) for n in names if n}
-        if normalise(name) not in known or new_script:
+        known = {normalise(codes.strip_codes(n)) for n in names}
+        # Never an alias with a code in it (WP-29): codes are identities, not
+        # spellings. A spelling in the other script is kept too (WP-28).
+        spelling = codes.strip_codes(name)
+        new_script = _is_cyrillic(spelling) not in {_is_cyrillic(n) for n in names if n}
+        if spelling and (normalise(spelling) not in known or new_script):
             # ORM change tracking does not see in-place list mutation.
-            person.aliases = [*(person.aliases or []), name]
+            person.aliases = [*(person.aliases or []), spelling]
         if telegram_id is not None and person.telegram_id is None:
             person.telegram_id = telegram_id
         if telegram_username and not person.telegram_username:
@@ -275,7 +304,7 @@ async def resolve_person(
 
     log.info("creating person %r (best score %.0f)", name, score)
     person = Person(
-        display_name=name,
+        display_name=codes.strip_codes(name) or name,
         aliases=[],
         telegram_id=telegram_id,
         telegram_username=telegram_username,

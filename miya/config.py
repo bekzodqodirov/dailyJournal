@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     # as an @-mention. Empty by default: the aliases are the owner's own and
     # belong in .env, not in code.
     owner_aliases: str = ""
+    # Client codes (GS367) and waybills (YW26-004715), WP-29: compared
+    # exactly, never fuzzily. Comma-separated prefixes.
+    client_code_prefixes: str = "GS"
+    client_code_max_digits: int = Field(default=6, ge=1, le=9)
+    client_code_strip_leading_zeros: bool = True
+    waybill_prefixes: str = "YW"
     # Catch-up after downtime (WP-21): how often the userbot re-reads allowed
     # chats past the last message it saw, and how much per pass.
     userbot_catchup_minutes: int = Field(default=30, ge=5)

@@ -38,6 +38,7 @@ from decimal import Decimal, InvalidOperation
 
 from miya.config import settings
 from miya.db.enums import Currency, TransactionType
+from miya.services import codes
 from miya.services.records import _CURRENCY_OF
 from miya.services.text import fold_apostrophes
 
@@ -506,7 +507,7 @@ _LAST4 = re.compile(_MASK_CHARS + r" ?(\d{4})(?!\d)")
 _DATE = re.compile(r"\b(\d{1,2})[./-](\d{1,2})[./-](\d{2}|\d{4})\b")
 _TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 # GS client codes and waybill numbers: never an amount, always reported.
-_GS = re.compile(r"(?<![A-Za-z0-9])(?:GS|ГС)\s?-?(\d{1,6})(?!\d)", re.IGNORECASE)
+# GS client codes come from services/codes.py (WP-29): one regex everywhere.
 _WAYBILL = re.compile(r"(?<![A-Za-z0-9])([A-Z]{2}\d{2}-\d{4,8})(?!\d)", re.IGNORECASE)
 
 # A money figure: groups of three behind space/dot/comma/apostrophe
@@ -666,7 +667,7 @@ def _to_decimal(text: str) -> Decimal | None:
 def _mask(clause: str) -> str:
     """Blank out card masks, GS codes, waybills, dates and times so they can
     never become amounts."""
-    for pattern in (_CARD_MASK, _WAYBILL, _GS, _DATE, _TIME):
+    for pattern in (_CARD_MASK, _WAYBILL, codes.client_code_re(), _DATE, _TIME):
         clause = pattern.sub(" ", clause)
     return clause
 
@@ -708,7 +709,7 @@ def _code_shaped(text: str) -> bool:
 
 
 def _gs_codes(text: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(f"GS{int(m.group(1))}" for m in _GS.finditer(text)))
+    return tuple(codes.find_client_codes(text))
 
 
 def _waybills(text: str) -> tuple[str, ...]:
@@ -746,7 +747,7 @@ def _merchant_of(clauses: list[str], body: str) -> str | None:
                 return value
     candidate: str | None = None
     cleaned = _CARD_MASK.sub(" ", body)
-    cleaned = _WAYBILL.sub(" ", _GS.sub(" ", cleaned))
+    cleaned = _WAYBILL.sub(" ", codes.client_code_re().sub(" ", cleaned))
     for match in _CAPS_RUN.finditer(cleaned):
         kept = []
         for token in match.group(0).split():

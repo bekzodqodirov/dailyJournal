@@ -172,7 +172,6 @@ def to_latin(text: str) -> str:
     return "".join(CYR_TO_LAT.get(ch, ch) for ch in text.lower())
 
 
-_GS_JOIN = re.compile(r"\bgs[\s\-_#№]*(\d{1,6})\b")
 _NOT_TOKEN = re.compile(r"[^a-z0-9-]+")
 _LOOSE_HYPHEN = re.compile(r"(?<![a-z0-9])-+|-+(?![a-z0-9])")
 
@@ -189,7 +188,9 @@ def normalise_for_search(text: str) -> str:
         fold_apostrophes(unicodedata.normalize("NFKC", text or "")).casefold()
     )
     text = text.replace("'", "")
-    text = _GS_JOIN.sub(r"gs\1", text)
+    from miya.services import codes  # codes imports nothing from here
+
+    text = codes.join_pattern().sub(r"\1\2", text)
     text = _NOT_TOKEN.sub(" ", text)
     text = _LOOSE_HYPHEN.sub(" ", text)
     # q→k and w→v fold words, never codes: "YW26-004715" stays a waybill.
