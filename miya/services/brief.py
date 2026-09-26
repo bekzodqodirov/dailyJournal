@@ -14,14 +14,14 @@ Rendering is replies.morning_brief; this module only gathers.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.models import Event
-from miya.services import codes, nudges, queries
+from miya.services import approvals, codes, nudges, queries
 from miya.services.loops import OpenLoops
 
 # The reminder_log kind the morning brief is logged under, one row per day.
@@ -44,6 +44,8 @@ class MorningBrief:
     # Code suggestions waiting in /kodlar (WP-33): one count line, never a
     # push, and on its own not a reason to send the brief.
     code_suggestions: int = 0
+    # File questions that expired in the last 24 h (WP-46): a count line.
+    media_expired: int = 0
 
     @property
     def day(self) -> date:
@@ -69,4 +71,5 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         loops=await nudges.open_loops(session, now=now),
         money_review=await queries.money_review_count(session),
         code_suggestions=await codes.pending_suggestion_count(session),
+        media_expired=await approvals.expired_since(session, now - timedelta(hours=24)),
     )

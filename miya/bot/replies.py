@@ -1642,6 +1642,8 @@ def morning_brief(brief: MorningBrief) -> str:
         parts.append(f"{BRIEF_QUIET}\n" + bullet_list(lines, empty="—"))
     if getattr(brief, "money_review", 0):
         parts.append(MONEY_REVIEW_LINE.format(n=brief.money_review))
+    if getattr(brief, "media_expired", 0):
+        parts.append(MEDIA_EXPIRED_LINE.format(n=brief.media_expired))
     if getattr(brief, "code_suggestions", 0):
         # Pulled, never pushed (WP-33): a count, no buttons, not a question.
         parts.append(CODE_SUGGESTIONS_LINE.format(n=brief.code_suggestions))
@@ -2197,6 +2199,7 @@ CODE_STALE = "Bu savol eskirgan — <code>/kod</code> ni qaytadan yozing."
 CODE_MOVE_DECLINED = "O'zgarmadi."
 KODLAR_HEADER = "🏷 <b>Kod takliflari</b> — xabarlardan topildi. To'g'risini tasdiqlang:"
 KODLAR_EMPTY = "🏷 Yangi kod taklifi yo'q."
+MEDIA_EXPIRED_LINE = "📎 {n} ta fayl so'ralmay eskirdi — xabarlari saqlangan."
 CODE_SUGGESTIONS_LINE = "🏷 {n} ta kod taklifi kutyapti — /kodlar"
 
 

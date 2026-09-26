@@ -205,6 +205,12 @@ async def fetch_media(
     return outcome
 
 
+def _media_pushable(message, monitor: ChatMonitor) -> bool:
+    if getattr(message, "out", False) and not settings.media_ask_outgoing:
+        return False
+    return monitor.chat_type is ChatType.private or settings.media_ask_in_groups
+
+
 async def _recheck_to_me(session, interaction: Interaction) -> None:
     """A group voice note is only words once transcribed: look for the
     owner's names again, before the window closes over it (WP-37)."""
@@ -455,6 +461,9 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 media["approval"] = {
                     "state": approvals.PENDING,
                     "reason": plan.ask_reason,
+                    # WP-46: the owner's own files and group files wait in
+                    # /savollar; only what others send privately is pushed.
+                    "pushable": _media_pushable(message, monitor),
                 }
 
         meta = await owner_address.demote_if_namesake(

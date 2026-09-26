@@ -160,11 +160,12 @@ async def test_state_changes_survive_the_orm(session):
 
 
 async def test_an_unanswered_question_expires(session):
+    """A question never shown lives MEDIA_UNASKED_EXPIRY_DAYS (WP-46)."""
     fresh = await _pending(session)
     old = await _pending(
         session,
         occurred_at=datetime.now(settings.tz)
-        - timedelta(hours=settings.media_ask_expiry_hours + 1),
+        - timedelta(days=settings.media_unasked_expiry_days, hours=1),
     )
     await session.flush()
 
