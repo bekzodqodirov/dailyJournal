@@ -533,7 +533,8 @@ it is working until each step is verified.
    ```
 
    A token from that list opens `/v1/recordings`, `/v1/recordings/probe` and
-   the `/v1/phone/*` event routes (calls, SMS, payment notifications) and
+   the phone event routes (`/v1/phone/calls`, `/v1/phone/sms`,
+   `/v1/phone/notifications`, `/v1/phone/heartbeat`) and
    **nothing else** — present it to `/v1/ask`, `/v1/debts` or `/v1/config`
    and the answer is 401. That is the whole point: a phone is lost, stolen and
    unzipped far more easily than a server, and an APK's stored token is not a
@@ -544,7 +545,8 @@ it is working until each step is verified.
    transcript, debt and contact you have.
 
    It also makes revocation cheap. Delete that one pair from `UPLOAD_TOKENS`,
-   restart the API, and the phone is cut off — nothing else needs rotating.
+   run `docker compose up -d --force-recreate api`, and the phone is cut off —
+   nothing else needs rotating.
    Put `API_BEARER_TOKEN` on the phone only if you have a reason to, and know
    that losing the phone then means rotating it everywhere it is used.
 2. **On the phone:** install Tailscale, sign in to the same tailnet, and leave

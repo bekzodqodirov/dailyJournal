@@ -68,7 +68,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, clock, escape, short_date
 from miya.config import settings
-from miya.db.models import DailyReport, Person, ReminderLog
+from miya.db.models import DailyReport, Person, ReminderLog, Transaction
 from miya.db.session import engine, session_scope
 from miya.services import (
     backup,
@@ -81,6 +81,7 @@ from miya.services import (
     gcal,
     health,
     memories,
+    money_events,
     money_notices,
     passages,
     profiles,
@@ -791,9 +792,21 @@ async def money_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
 
         fresh = queue.fresh
         if fresh and len(fresh) < settings.money_receipts_fold_at:
+            told_pairs: set[int] = set()
             for interaction, txn in fresh:
                 notice = (interaction.meta or {}).get(money_notices.MONEY_NOTICE_KEY, {})
-                if notice.get("typed_match"):
+                pair_id = money_events.internal_pair_id(txn) if txn.is_internal else None
+                if pair_id is not None and txn.id in told_pairs:
+                    # Its other side's receipt already named both (WP-69).
+                    money_notices.mark_notified(interaction, now=now)
+                    await session.commit()
+                    continue
+                pair = await session.get(Transaction, pair_id) if pair_id else None
+                if pair is not None:
+                    text = replies.money_internal_receipt(txn, pair)
+                    keyboard = keyboards.record_actions([("transaction", txn.id)])
+                    told_pairs.add(pair.id)
+                elif notice.get("typed_match"):
                     text, keyboard = replies.money_typed_confirmed(txn), None
                 else:
                     text = replies.money_receipt(txn, interaction, txn.counterparty)

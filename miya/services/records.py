@@ -64,6 +64,8 @@ EDITABLE = {
         "due",
         "note",
         "category",
+        # WP-69: a transfer between the owner's own cards, out of the totals.
+        "internal",
     ),
 }
 # The longest description and category a correction may write.
@@ -695,6 +697,11 @@ async def _set_transaction_field(
         old, new = _note(txn, field, txn.description, text, by, now)
         txn.description = text
         return old, new
+    if field == "internal":
+        flag = bool(value)
+        old, new = _note(txn, "is_internal", txn.is_internal, flag, by, now)
+        txn.is_internal = flag
+        return old, new
     # category
     text = str(value).strip().lower()[:CATEGORY_MAX]
     old, new = _note(txn, field, txn.category, text, by, now)
@@ -911,6 +918,9 @@ _PREFIXES = {
     "kategoriya": "category",
 }
 
+# A transfer between the owner's own cards, or an ordinary payment (WP-69).
+_INTERNAL = {"ichki": True, "tashqi": False}
+
 # A money row's direction words (WP-13).
 _TXN_DIRECTION = {"kirim": TransactionType.income, "chiqim": TransactionType.expense}
 
@@ -930,6 +940,8 @@ KEYWORDS = frozenset(
         "teskari",
         "aksincha",
         "teskarisi",
+        "ichki",
+        "tashqi",
         "kirim",
         "chiqim",
         "tomon",
@@ -1034,6 +1046,8 @@ def parse_edit(text: str, *, today: date | None = None) -> Edit | None:
         return Edit("person", code)
 
     lowered = raw.lower()
+    if lowered in _INTERNAL:
+        return Edit("internal", _INTERNAL[lowered])
     if lowered in ("teskari", "aksincha", "teskarisi"):
         return Edit("direction", None)
     if lowered in _TXN_DIRECTION:

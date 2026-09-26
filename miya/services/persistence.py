@@ -156,11 +156,12 @@ async def _apply_fulfilment(
     applied: Applied,
     *,
     now: datetime,
-) -> None:
+) -> list[int]:
+    """Close the one promise this clearly ends. When it ends none clearly,
+    the unmatched line is recorded and up to three candidates come back —
+    this person's open promises from that side, best first (WP-71)."""
     # Distinct tokens: "invoice invoice" is still the one-word topic "invoice".
-    if len(set(normalise(description).split())) < MIN_HINT_TOKENS:
-        applied.unmatched_fulfilments.append((person.display_name, description))
-        return
+    short = len(set(normalise(description).split())) < MIN_HINT_TOKENS
     # Only promises from the same side: "Akmal invoice yubordi" ends what
     # Akmal promised, never what the owner promised Akmal.
     open_promises = list(
@@ -177,9 +178,10 @@ async def _apply_fulfilment(
         key=lambda pair: pair[0],
         reverse=True,
     )
-    if not scored or scored[0][0] < FULFIL_MATCH:
+    candidates = [p.id for _, p in scored[:3]]
+    if short or not scored or scored[0][0] < FULFIL_MATCH:
         applied.unmatched_fulfilments.append((person.display_name, description))
-        return
+        return candidates
     if len(scored) > 1 and scored[0][0] - scored[1][0] < FULFIL_MARGIN:
         log.info(
             "fulfilment %r for %s is ambiguous between promises %s and %s",
@@ -189,12 +191,13 @@ async def _apply_fulfilment(
             scored[1][1].id,
         )
         applied.unmatched_fulfilments.append((person.display_name, description))
-        return
+        return candidates
 
     promise = scored[0][1]
     promise.person = person
     await records.mark_done(session, promise, by=records.BY_EXTRACTION, now=now)
     applied.fulfilled.append((promise, person))
+    return []
 
 
 async def _apply_settlement(
@@ -412,6 +415,31 @@ async def write_debt(
     return debt
 
 
+async def _park_question(
+    session: AsyncSession,
+    interaction: Interaction,
+    kind: str,
+    item,
+    person: Person,
+    claim: Claim | None,
+    extra: dict,
+    applied: Applied,
+    *,
+    now: datetime,
+) -> None:
+    """Keep an unanswerable item as a pending claim the owner is asked
+    about: a new one from an extraction, the same one from an accept."""
+    if claim is not None:
+        claim.payload = {**(claim.payload or {}), **extra}
+        return
+    parked = await claims.create(
+        session, interaction, kind, item, person_id=person.id, now=now
+    )
+    parked.payload = {**parked.payload, **extra}
+    await session.flush()
+    applied.claims.append(parked)
+
+
 async def write_settlement(
     session: AsyncSession,
     interaction: Interaction,
@@ -431,6 +459,7 @@ async def write_settlement(
     if person is None:
         return
     before = len(applied.settlements)
+    ambiguous_before = len(applied.ambiguous_settlements)
     await _apply_settlement(
         session,
         person,
@@ -440,6 +469,19 @@ async def write_settlement(
         applied,
         DebtDirection(item.direction) if item.direction else None,
     )
+    if len(applied.ambiguous_settlements) > ambiguous_before:
+        # "Who paid whom?" is a real question, not receipt text (WP-71).
+        await _park_question(
+            session,
+            interaction,
+            "settlement",
+            item,
+            person,
+            claim,
+            {"origin": "ambiguous", "direction": None},
+            applied,
+            now=now,
+        )
     if claim is not None:
         claim.person_id = person.id
         # The first payment this settlement wrote; an unmatched or ambiguous
@@ -611,7 +653,7 @@ async def write_fulfilment(
             applied.unmatched_fulfilments.append((item.person, item.description))
         return
     before = len(applied.fulfilled)
-    await _apply_fulfilment(
+    candidates = await _apply_fulfilment(
         session,
         person,
         item.description.strip(),
@@ -625,6 +667,19 @@ async def write_fulfilment(
             promise = applied.fulfilled[before][0]
             _claim_note(promise, claim, now)
             _claim_result(claim, "fulfilment", promise.id)
+    if candidates and len(applied.fulfilled) == before:
+        # "Which promise was it?" is a real question, not receipt text (WP-71).
+        await _park_question(
+            session,
+            interaction,
+            "fulfilment",
+            item,
+            person,
+            claim,
+            {"origin": "ambiguous", "candidates": candidates},
+            applied,
+            now=now,
+        )
 
 
 # --- per-person memory (build step 4) ---------------------------------------

@@ -32,7 +32,13 @@ from miya.bot import keyboards, recap_text, replies
 from miya.bot.formatting import clip, escape, parse_ref, ref_of, short_date
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource, TransactionType
+from miya.db.enums import (
+    ChatType,
+    DebtDirection,
+    Direction,
+    InteractionSource,
+    TransactionType,
+)
 from miya.db.models import ChatMonitor, ClientCode, Interaction, Person
 from miya.db.session import session_scope
 from miya.services import (
@@ -1418,9 +1424,54 @@ async def cmd_claims(message: Message) -> None:
     await _safe_answer(message, body, reply_markup=keyboard)
 
 
-async def _answer_claim(session, action: str, claim_id: int) -> _Outcome | None:
+async def _answer_claim(
+    session, action: str, claim_id: int, extra: int | None = None
+) -> _Outcome | None:
     """Ha / Yo'q / Tuzat on one claim. None for an action that is not one."""
     try:
+        if action == keyboards.ACTION_CLAIM_YES:
+            claim = await claims.get(session, claim_id)
+            view = claims.view(claim) if claim is not None else None
+            if (
+                view is not None
+                and view.state == claims.PENDING
+                and (view.origin == "ambiguous")
+            ):
+                # MIYA's own question needs its own answer, not a plain Ha.
+                if view.kind == claims.KIND_SETTLEMENT:
+                    keyboard = keyboards.claim_direction(claim_id)
+                elif view.candidates:
+                    keyboard = keyboards.claim_candidates(claim_id, view.candidates)
+                else:
+                    keyboard = None
+                if keyboard is not None:
+                    return _Outcome(replies.claim_question(view), False, keyboard)
+        if action in (keyboards.ACTION_CLAIM_THEY_PAID, keyboards.ACTION_CLAIM_I_PAID):
+            direction = (
+                DebtDirection.they_owe_me
+                if action == keyboards.ACTION_CLAIM_THEY_PAID
+                else DebtDirection.i_owe_them
+            )
+            accepted = await claims.accept_with_direction(
+                session, claim_id, direction, by=claims.BY_BUTTON
+            )
+            if accepted is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            keyboard = keyboards.applied_actions(
+                replies.confirmation_refs(accepted.applied), []
+            )
+            return _Outcome(replies.claim_accepted(accepted), accepted.written, keyboard)
+        if action == keyboards.ACTION_CLAIM_PROMISE and extra is not None:
+            try:
+                chosen = await claims.choose_promise(
+                    session, claim_id, extra, by=claims.BY_BUTTON
+                )
+            except claims.NotACandidate:
+                return _Outcome(replies.CLAIM_GONE, True)
+            if chosen is None:
+                return _Outcome(replies.CLAIM_GONE, True)
+            _, promise = chosen
+            return _Outcome(replies.claim_promise_kept(promise), True)
         if action == keyboards.ACTION_CLAIM_YES:
             accepted = await claims.accept(session, claim_id, by=claims.BY_BUTTON)
             if accepted is None:
@@ -1470,13 +1521,14 @@ async def on_claim_button(callback: CallbackQuery) -> None:
     says so instead of writing twice.
     """
     parts = (callback.data or "").split(":")
-    if len(parts) != 3 or not parts[2].isdigit():
+    if len(parts) not in (3, 4) or not all(p.isdigit() for p in parts[2:]):
         await callback.answer()
         return
     action, claim_id = parts[1], int(parts[2])
+    extra = int(parts[3]) if len(parts) == 4 else None
 
     async with session_scope() as session:
-        outcome = await _answer_claim(session, action, claim_id)
+        outcome = await _answer_claim(session, action, claim_id, extra)
     if outcome is None:
         await callback.answer()
         return

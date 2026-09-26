@@ -261,6 +261,13 @@ class Settings(BaseSettings):
     money_receipts_fold_at: int = Field(default=4, ge=2)
     # Older events (a first import, a backlog) are only summarised.
     money_receipt_max_age_hours: int = Field(default=12, ge=1)
+    # WP-69: extra last-4 digits of the owner's own cards (comma list), on top
+    # of the cards seen with a balance; a transfer between two of them is
+    # kept out of the income and expense totals.
+    payment_own_cards: str = ""
+    # WP-68: a coded payment from a client who owes asks whether it pays the
+    # debt down (a claim, one of the day's taps). Off by default.
+    money_gs_settle_ask: bool = False
     # true: receipts arrive silently in quiet hours; false: they wait.
     money_receipts_silent_at_night: bool = False
     # WP-42: an owner-typed payment and a bank record of the same amount on
@@ -358,8 +365,11 @@ class Settings(BaseSettings):
     api_port: int = 8000
     # Optional per-device tokens for the Android companion, as space- or
     # comma-separated `name:token` pairs (e.g. "phone:9f3c…"). A token listed
-    # here opens /v1/recordings and /v1/recordings/probe and nothing else, so
-    # an extracted APK cannot read /v1/ask, /v1/debts or /v1/config. Leave it
+    # here reads nothing back — /v1/ask, /v1/debts and /v1/config answer 401 —
+    # but it CAN push recordings, call-log events, SMS and payment
+    # notifications (/v1/recordings*, /v1/phone/*), and payment SMS and
+    # notifications become expense and income rows. Revoke one by deleting its
+    # pair and running `docker compose up -d --force-recreate api`. Leave it
     # empty and the phone uses API_BEARER_TOKEN, which authorises everything.
     upload_tokens: str = ""
 
@@ -480,6 +490,13 @@ class Settings(BaseSettings):
         return tuple(
             p.lower() for p in re.split(r"[,\s]+", self.payment_app_packages) if p
         )
+
+    @property
+    def payment_own_cards_list(self) -> tuple[str, ...]:
+        """PAYMENT_OWN_CARDS as last-4 strings; anything else is dropped."""
+        raw = re.split(r"[,\s]+", self.payment_own_cards)
+        cards = (c.strip().lstrip("*") for c in raw)
+        return tuple(c for c in cards if len(c) == 4 and c.isdigit())
 
     @property
     def owner_aliases_parsed(self) -> tuple[str, ...]:

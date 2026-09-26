@@ -2,7 +2,7 @@
 COMPOSE := docker compose
 .PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill backup backup-key backup-key-show restore doctor
+        backfill backup backup-key backup-key-show restore doctor update
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -21,6 +21,22 @@ up: env $(if $(SKIP_DOCTOR),,doctor) ## Build and start everything, then run mig
 	$(MAKE) migrate
 	$(COMPOSE) up -d --build bot worker userbot
 	@echo "API: http://127.0.0.1:$${API_PORT:-8000}/health"
+
+update: ## Backup, pull, rebuild, prune
+	@echo "Yangilashdan oldin zaxira nusxa olinmoqda…"
+	$(MAKE) backup
+	git pull --ff-only
+	@# One shell line, so SYNC survives. The old bot, worker and userbot stop
+	@# first: a running worker would re-write rows a migration just removed.
+	SYNC=$$($(COMPOSE) --profile syncthing ps -q syncthing 2>/dev/null); \
+	$(COMPOSE) stop bot worker userbot && \
+	$(MAKE) up && \
+	if [ -n "$$SYNC" ]; then \
+		$(COMPOSE) --profile syncthing up -d syncthing && \
+		echo "Syncthing ishlayotgan edi — qo'ng'iroq yozuvlari to'xtamasligi uchun qayta yoqildi (--profile syncthing)."; \
+	fi
+	docker image prune -f
+	@echo "Yangilandi. Botda /holat ni tekshir."
 
 down: ## Stop everything (volumes are kept)
 	$(COMPOSE) down

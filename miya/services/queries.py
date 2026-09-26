@@ -25,6 +25,7 @@ from miya.db.enums import (
     InteractionSource,
     PromiseStatus,
     TaskStatus,
+    TransactionType,
 )
 from miya.db.models import (
     ChatMonitor,
@@ -727,6 +728,58 @@ async def transactions_on(
     )
     if not include_voided:
         stmt = stmt.where(Transaction.voided_at.is_(None))
+    return list(await session.scalars(stmt))
+
+
+async def find_transactions(
+    session: AsyncSession,
+    *,
+    person_id: int | None = None,
+    gs_code: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    type: TransactionType | None = None,
+    currency: Currency | None = None,
+    min_amount: Decimal | None = None,
+    limit: int = 30,
+) -> list[Transaction]:
+    """Active money rows, newest first (WP-70). A person matches as the
+    counterparty; a GS code also matches a payment whose text carried it
+    (on the booking interaction or any evidence), linked or not."""
+    stmt = (
+        sa.select(Transaction)
+        .options(selectinload(Transaction.counterparty))
+        .where(ACTIVE_TXN)
+        .order_by(Transaction.occurred_at.desc(), Transaction.id.desc())
+        .limit(max(1, min(limit, 100)))
+    )
+    who = []
+    if person_id is not None:
+        who.append(Transaction.counterparty_person_id == person_id)
+    if gs_code:
+        coded = Interaction.media.contains({"money": {"gs_codes": [gs_code]}})
+        who.append(
+            sa.exists().where(Interaction.id == Transaction.source_interaction_id, coded)
+        )
+        who.append(
+            sa.exists().where(
+                TransactionEvidence.transaction_id == Transaction.id,
+                Interaction.id == TransactionEvidence.interaction_id,
+                coded,
+            )
+        )
+    if who:
+        stmt = stmt.where(sa.or_(*who))
+    if date_from is not None:
+        stmt = stmt.where(Transaction.occurred_at >= day_bounds(date_from)[0])
+    if date_to is not None:
+        stmt = stmt.where(Transaction.occurred_at < day_bounds(date_to)[1])
+    if type is not None:
+        stmt = stmt.where(Transaction.type == type)
+    if currency is not None:
+        stmt = stmt.where(Transaction.currency == currency)
+    if min_amount is not None:
+        stmt = stmt.where(Transaction.amount >= min_amount)
     return list(await session.scalars(stmt))
 
 

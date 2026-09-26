@@ -971,6 +971,8 @@ TXN_TUZAT_HINT = (
     "<code>/tuzat {ref} kim Akmal</code> — kim bilan · "
     "<code>/tuzat {ref} izoh yuk uchun</code> — izoh · "
     "<code>/tuzat {ref} sana kecha</code> — sana · "
+    "<code>/tuzat {ref} ichki</code> — o'z kartalar orasida · "
+    "<code>/tuzat {ref} tashqi</code> — oddiy to'lov · "
     "<code>/ochir {ref}</code> — noto'g'ri yozilgan bo'lsa"
 )
 TXN_NOT_DOABLE = (
@@ -1008,6 +1010,7 @@ _FIELD_LABEL = {
     "due": "muddat",
     "note": "izoh",
     "category": "turkum",
+    "internal": "o'z kartalar orasida",
 }
 
 FIELD_NOT_EDITABLE = {
@@ -1016,7 +1019,7 @@ FIELD_NOT_EDITABLE = {
     "task": "Vazifada faqat muddatni tuzatish mumkin.",
     "transaction": (
         "Pul harakatida faqat summa, valyuta, tomon (kirim/chiqim), odam, sana, "
-        "izoh va turkumni tuzatish mumkin."
+        "izoh, turkum va ichki/tashqini tuzatish mumkin."
     ),
 }
 
@@ -1122,6 +1125,20 @@ def _receipt_parts(txn, interaction) -> tuple[str, str | None, str | None]:
     return merchant, None, "sms"
 
 
+MONEY_GS_UNLINKED = "🏷 {code} — bu kod hali hech kimga bog'lanmagan"
+
+
+def money_internal_receipt(txn, pair) -> str:
+    """WP-69: a transfer between the owner's own cards, kept out of the totals."""
+    expense, income = (txn, pair) if txn.type.value == "expense" else (pair, txn)
+    first, second = sorted((txn.id, pair.id))
+    return (
+        f"🔁 O'z kartalaringiz orasida: *{expense.card_last4 or '?'} → "
+        f"*{income.card_last4 or '?'}, {money(txn.amount, txn.currency)} — "
+        f"kirim/chiqimga qo'shilmadi. <code>x{first}</code>, <code>x{second}</code>"
+    )
+
+
 def money_receipt(txn, interaction, person=None) -> str:
     """'📉 Chiqim: <b>250 ming so'm</b> · KORZINKA.UZ · karta *1234 · 14:30 · ✉️ x12'"""
     income = txn.type.value == "income"
@@ -1134,8 +1151,17 @@ def money_receipt(txn, interaction, person=None) -> str:
         parts.append(escape(what))
     if txn.card_last4:
         parts.append(f"karta *{txn.card_last4}")
+    gs = [
+        str(c)
+        for c in (((interaction.media or {}).get("money") or {}).get("gs_codes") or [])
+    ]
     if person is not None:
-        parts.append(f"👤 {escape(person.display_name)}")
+        tag = f" ({escape(gs[0])})" if len(gs) == 1 else ""
+        parts.append(f"👤 {escape(person.display_name)}{tag}")
+    elif len(gs) == 1:
+        parts.append(MONEY_GS_UNLINKED.format(code=escape(gs[0])))
+    elif gs:
+        parts.append("🏷 " + ", ".join(escape(c) for c in gs))
     if app:
         parts.append(f"🔔 {escape(app)}")
     parts.append(clock(txn.occurred_at))
@@ -1237,6 +1263,14 @@ CLAIM_ALREADY = "Bu da'voga allaqachon javob berilgan."
 CLAIM_EDITED = "✏️ <b>Tuzatildi</b> — endi javob ber:"
 
 # How many claims the brief lists with buttons; the rest wait in /davolar.
+
+
+def claim_promise_kept(promise) -> str:
+    """ "✅ p7": the promise the owner picked is closed (WP-71)."""
+    return (
+        f"{CLAIM_ACCEPTED_PREFIX} <code>{_ref_handle('promise', promise.id)}</code> "
+        f"{escape(promise.description)} — bajarildi."
+    )
 
 
 def claim_question(view: claims.ClaimView) -> str:

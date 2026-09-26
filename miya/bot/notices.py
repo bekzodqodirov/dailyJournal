@@ -122,5 +122,5 @@ def overflow_summary(items: list[tuple[str, dict[str, int]]]) -> str:
     return clip(
         f"📨 <b>Yana {len(items)} ta suhbatdan yozib olindi</b>\n"
         + bullet_list(lines, empty="—")
-        + "\n<i>Batafsil: /qarz, /vada, /bugun</i>"
+        + "\n<i>Batafsil: /qarz, /vada, /bugun, /savollar</i>"
     )

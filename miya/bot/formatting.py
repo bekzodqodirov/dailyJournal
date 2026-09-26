@@ -578,6 +578,22 @@ def claim_line(view: ClaimView, *, markup: bool = True) -> str:
     repeats = getattr(view, "repeats", 0)
     suffix = f" (+{repeats} takror)" if repeats else ""
     evidence = getattr(view, "evidence", None)
+    if getattr(view, "origin", None) == "ambiguous" and view.kind == "settlement":
+        # WP-71: MIYA's own question — the text did not say who paid whom.
+        name = who if view.person_name else "Kimdir"
+        amount = money(view.amount, view.currency) if view.amount is not None else "?"
+        return f"❓ {handle} {name} bilan {amount} to'lov — kim kimga to'ladi?{suffix}"
+    if getattr(view, "origin", None) == "ambiguous" and view.kind == "fulfilment":
+        text = escape(view.description) if markup else view.description
+        return f"❓ {handle} {who}: «{text}» — qaysi va'da bajarildi?{suffix}"
+    if getattr(view, "origin", None) == "bank_gs" and view.state != "auto":
+        # WP-68: the bank's words, not a person's.
+        code = f" ({escape(view.code) if markup else view.code})" if view.code else ""
+        amount = money(view.amount, view.currency) if view.amount is not None else "?"
+        return (
+            f"❓ {handle} Bank: {who}{code} {amount} yubordi — "
+            f"qarzidan ayirilsinmi?{suffix}"
+        )
     if view.state == "auto" and evidence is not None:
         line = f"✅ {handle} {who} aytdi: {_claim_body(view, markup)} — bank tasdiqladi"
     else:

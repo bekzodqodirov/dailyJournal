@@ -153,6 +153,9 @@ services:
 
   syncthing:
     image: syncthing/syncthing:1
+    # Opt-in: a bare `docker compose up -d` must not open 22000/21027.
+    # Start it with `docker compose --profile syncthing up -d syncthing`.
+    profiles: ["syncthing"]
     restart: unless-stopped
     logging: *default-logging
     hostname: miya-vps

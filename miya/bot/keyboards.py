@@ -463,6 +463,10 @@ ACTION_CLAIM_YES = "y"
 ACTION_CLAIM_NO = "n"
 ACTION_CLAIM_EDIT = "e"
 ACTION_CLAIM_UNDO = "u"
+# WP-71: the answers to MIYA's own questions.
+ACTION_CLAIM_THEY_PAID = "i"  # cl:i:<id> — they repaid me
+ACTION_CLAIM_I_PAID = "o"  # cl:o:<id> — I repaid them
+ACTION_CLAIM_PROMISE = "p"  # cl:p:<claim>:<promise> — this promise was kept
 CLAIM_PREFIX = "cl"
 
 
@@ -494,6 +498,53 @@ def claim_row(claim_id: int, *, number: int | None = None) -> list[InlineKeyboar
             callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_EDIT}:{claim_id}",
         ),
     ]
+
+
+def claim_direction(claim_id: int) -> InlineKeyboardMarkup:
+    """Who paid whom (WP-71)."""
+    handle = claim_ref(claim_id)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"→ U menga to'ladi {handle}",
+                    callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_THEY_PAID}:{claim_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"← Men unga to'ladim {handle}",
+                    callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_I_PAID}:{claim_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"✖️ Yo'q {handle}",
+                    callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_NO}:{claim_id}",
+                )
+            ],
+        ]
+    )
+
+
+def claim_candidates(claim_id: int, promise_ids) -> InlineKeyboardMarkup:
+    """Which promise was kept (WP-71): one button per candidate, and none."""
+    buttons = [
+        InlineKeyboardButton(
+            text=f"✅ {ref('promise', pid)}",
+            callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_PROMISE}:{claim_id}:{pid}",
+        )
+        for pid in list(promise_ids)[:3]
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            buttons,
+            [
+                InlineKeyboardButton(
+                    text=f"✖️ Hech biri {claim_ref(claim_id)}",
+                    callback_data=f"{CLAIM_PREFIX}:{ACTION_CLAIM_NO}:{claim_id}",
+                )
+            ],
+        ]
+    )
 
 
 def claim_actions(claim_ids: list[int]) -> InlineKeyboardMarkup | None:

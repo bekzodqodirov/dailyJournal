@@ -46,6 +46,7 @@ from miya.db.models import (
     DebtPayment,
     Interaction,
     Person,
+    Promise,
     Transaction,
 )
 from miya.services import codes as client_codes
@@ -577,6 +578,11 @@ class ClaimView:
     repeats: int = 0
     # The bank row that proves it (WP-44), when loaded.
     evidence: Any = None
+    # A settlement asked because a coded bank payment came in (WP-68), or a
+    # question MIYA raised itself: who paid whom, which promise (WP-71).
+    origin: str | None = None
+    code: str | None = None
+    candidates: tuple[int, ...] = ()
 
 
 def _money(value: object) -> Decimal | None:
@@ -637,6 +643,11 @@ def view(claim: Claim) -> ClaimView:
         state=claim.state or PENDING,
         txn_type=_txn_type(payload) if kind == KIND_TRANSACTION else None,
         evidence=getattr(claim, "_evidence_txn", None),
+        origin=payload.get("origin") if isinstance(payload.get("origin"), str) else None,
+        code=payload.get("code") if isinstance(payload.get("code"), str) else None,
+        candidates=tuple(
+            int(c) for c in (payload.get("candidates") or []) if str(c).isdigit()
+        ),
     )
 
 
@@ -772,6 +783,67 @@ async def accept(
         await _settle_duplicates(session, claim, state=AUTO, now=now)
     await session.flush()
     return Accepted(claim, applied, written=written)
+
+
+async def accept_with_direction(
+    session: AsyncSession,
+    claim_id: int,
+    direction: DebtDirection,
+    *,
+    by: str,
+    now: datetime | None = None,
+) -> Accepted | None:
+    """ "U menga to'ladi" / "Men unga to'ladim" on a repayment whose side
+    was unclear (WP-71): the side is set, then it is accepted as usual."""
+    now = now or datetime.now(settings.tz)
+    claim = await _locked_pending(session, claim_id)
+    if claim is None:
+        return None
+    old = (claim.payload or {}).get("direction")
+    claim.payload = {**(claim.payload or {}), "direction": direction.value}
+    claim.history = [
+        *(claim.history or []),
+        {
+            "at": now.isoformat(),
+            "field": "direction",
+            "old": old,
+            "new": direction.value,
+            "by": by,
+        },
+    ]
+    await session.flush()
+    return await accept(session, claim_id, by=by, now=now)
+
+
+class NotACandidate(Exception):
+    """The promise offered is not among the claim's candidates."""
+
+
+async def choose_promise(
+    session: AsyncSession,
+    claim_id: int,
+    promise_id: int,
+    *,
+    by: str,
+    now: datetime | None = None,
+) -> tuple[Claim, Promise] | None:
+    """ "✅ p7": the promise the owner says was fulfilled is closed (WP-71)."""
+    now = now or datetime.now(settings.tz)
+    claim = await _locked_pending(session, claim_id)
+    if claim is None:
+        return None
+    if promise_id not in view(claim).candidates:
+        raise NotACandidate(promise_id)
+    promise = await session.get(Promise, promise_id)
+    if promise is None:
+        raise NotACandidate(promise_id)
+    await records.mark_done(session, promise, by=by, now=now)
+    claim.state = ACCEPTED
+    claim.answered_at = now
+    claim.answered_by = by
+    claim.result_kind, claim.result_id = "fulfilment", promise.id
+    await session.flush()
+    return claim, promise
 
 
 async def decline(

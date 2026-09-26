@@ -93,6 +93,7 @@ every service refuses a blank or short API token.
 | Target | What it does |
 |---|---|
 | `make up` | Build and start db, api, bot, worker and userbot, then migrate |
+| `make update` | Back up, `git pull --ff-only`, stop bot/worker/userbot, `make up`, restart Syncthing if it was running, prune old images |
 | `make down` | Stop everything (the database volume is kept) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
@@ -161,6 +162,8 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
 | `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
 | `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
+| `PAYMENT_OWN_CARDS` | empty — extra last-4 digits of your own cards (cards seen with a balance count already); an expense on one and an income of the same amount on another within the dedupe window is a transfer, left out of the totals (`/tuzat x12 tashqi` undoes it) |
+| `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
@@ -273,7 +276,9 @@ end-to-end encrypted sync; no cloud in between.
 
 **One-time pairing:**
 
-1. `make up` starts the `syncthing` container. Open its UI over an SSH tunnel:
+1. Start the `syncthing` container — it sits behind a Compose profile, so
+   `make up` and a bare `docker compose up -d` leave it off:
+   `docker compose --profile syncthing up -d syncthing`. Open its UI over an SSH tunnel:
    `ssh -L 8384:127.0.0.1:8384 vps` → http://127.0.0.1:8384. Set a UI password
    immediately (Actions → Settings → GUI).
 2. Install Syncthing on the phone and add the VPS as a remote device
@@ -625,9 +630,10 @@ prompt and the Batch API for the userbot stream; embeddings run locally.
 
 ## Verification
 
-315 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
-ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
-too), so the suite is free and offline.
+The suite runs against PostgreSQL 16 with pgvector and pg_trgm, in CI on every
+push (see `.github/workflows/`). The Anthropic, ElevenLabs, Google and
+Telegram clients are stubbed throughout (the embedder too), so the suite is
+free and offline.
 
 **Schema and migrations**
 * `upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly, and

@@ -25,9 +25,16 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import Currency, InteractionSource, TransactionType
-from miya.db.models import Interaction, Transaction, TransactionEvidence
-from miya.services import money_notices, sms_money
+from miya.db.enums import (
+    Currency,
+    DebtDirection,
+    DebtStatus,
+    InteractionSource,
+    TransactionType,
+)
+from miya.db.models import Debt, Interaction, Person, Transaction, TransactionEvidence
+from miya.services import codes, money_notices, sms_money
+from miya.services.extraction import ExtractedSettlement
 from miya.services.sms_money import ParsedPayment, Verdict
 
 MONEY_VERSION = 1
@@ -177,11 +184,157 @@ async def _typed_match(session, interaction, reading, *, channel):
     return typed, True
 
 
-async def _link_gs_code(session, txn, reading) -> None:  # WP-68
-    return None
+async def _link_gs_code(
+    session: AsyncSession,
+    txn: Transaction,
+    reading: ParsedPayment,
+    interaction: Interaction,
+) -> None:
+    """A payment carrying exactly one GS code held by a client is theirs
+    (WP-68): the transaction and the interaction name them, so /tarix,
+    /kim and the assistant see it. Several codes, or an unheld one, stay in
+    media.money.gs_codes only — never a fuzzy guess."""
+    gs = list(reading.gs_codes)
+    if len(gs) != 1 or txn.counterparty_person_id is not None:
+        return
+    code = gs[0]
+    person = await codes.holder(session, code)
+    if person is None:
+        return
+    txn.counterparty_person_id = person.id
+    txn.history = [
+        *(txn.history or []),
+        {
+            "at": datetime.now(settings.tz).isoformat(),
+            "field": "person",
+            "old": None,
+            "new": person.id,
+            "by": "gs_code",
+            "code": code,
+        },
+    ]
+    interaction.person_id = person.id
+    _set_money(interaction, gs_person_id=person.id)
+    await session.flush()
+    if settings.money_gs_settle_ask and txn.type is TransactionType.income:
+        await _ask_settlement(session, txn, interaction, person, code)
 
 
-async def _mark_internal_pair(session, txn) -> None:  # WP-69
+async def _ask_settlement(
+    session: AsyncSession,
+    txn: Transaction,
+    interaction: Interaction,
+    person: Person,
+    code: str,
+) -> None:
+    """The client owes, and a coded payment came in: ask whether it pays the
+    debt down. Only ever a question — a DebtPayment is written by "Ha"."""
+    from miya.services import claims  # claims → persistence → money_events
+
+    owes = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(Debt)
+        .where(
+            Debt.person_id == person.id,
+            Debt.direction == DebtDirection.they_owe_me,
+            Debt.currency == txn.currency,
+            Debt.status != DebtStatus.settled,
+        )
+    )
+    if not owes:
+        return
+    item = ExtractedSettlement(
+        person=person.display_name,
+        amount=float(txn.amount),
+        currency=txn.currency.value,
+        note=f"bank: {code} {(interaction.raw_text or '')[:80]}".strip(),
+        direction="they_owe_me",
+        asserted_by="them",
+    )
+    claim = await claims.create(
+        session, interaction, claims.KIND_SETTLEMENT, item, person_id=person.id
+    )
+    claim.payload = {**claim.payload, "origin": "bank_gs", "code": code}
+    claim.evidence_txn_id = txn.id
+    await session.flush()
+
+
+async def own_cards(session: AsyncSession) -> set[str]:
+    """The owner's cards: every last-4 on an active phone transaction whose
+    text reported a balance (only the account holder is told a balance),
+    plus PAYMENT_OWN_CARDS."""
+    rows = await session.scalars(
+        sa.select(sa.distinct(Transaction.card_last4))
+        .join(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(
+            Transaction.card_last4.is_not(None),
+            Transaction.voided_at.is_(None),
+            Transaction.channel.is_not(None),
+            Interaction.media["money"]["balance_after"].astext.is_not(None),
+        )
+    )
+    return {c for c in rows if c} | set(settings.payment_own_cards_list)
+
+
+async def _mark_internal_pair(session: AsyncSession, txn: Transaction) -> None:
+    """Money moved from one of the owner's cards to another is one expense
+    and one income that cancel out: both are marked internal (WP-69), so the
+    totals (queries.ACTIVE_TXN) leave them out. Either side may arrive first."""
+    if txn.card_last4 is None or txn.is_internal or txn.voided_at is not None:
+        return
+    mine = await own_cards(session)
+    if txn.card_last4 not in mine:
+        return
+    other_type = (
+        TransactionType.expense
+        if txn.type is TransactionType.income
+        else TransactionType.income
+    )
+    window = timedelta(minutes=settings.payment_dedupe_window_minutes)
+    pair = await session.scalar(
+        sa.select(Transaction)
+        .where(
+            Transaction.id != txn.id,
+            Transaction.type == other_type,
+            Transaction.amount == txn.amount,
+            Transaction.currency == txn.currency,
+            Transaction.card_last4.in_(mine - {txn.card_last4}),
+            Transaction.is_internal.is_(False),
+            Transaction.voided_at.is_(None),
+            Transaction.occurred_at.between(
+                txn.occurred_at - window, txn.occurred_at + window
+            ),
+        )
+        .order_by(
+            sa.func.abs(sa.extract("epoch", Transaction.occurred_at - txn.occurred_at))
+        )
+        .limit(1)
+        .with_for_update()
+    )
+    if pair is None:
+        return
+    at = datetime.now(settings.tz).isoformat()
+    for row, other in ((txn, pair), (pair, txn)):
+        row.is_internal = True
+        row.history = [
+            *(row.history or []),
+            {
+                "at": at,
+                "field": "is_internal",
+                "old": False,
+                "new": True,
+                "by": "dedupe",
+                "pair": other.id,
+            },
+        ]
+    await session.flush()
+
+
+def internal_pair_id(txn: Transaction) -> int | None:
+    """The other side of an own-card transfer, from the history."""
+    for entry in reversed(txn.history or []):
+        if entry.get("field") == "is_internal" and entry.get("pair"):
+            return int(entry["pair"])
     return None
 
 
@@ -290,6 +443,7 @@ async def book(
             },
         ]
         await session.flush()
+        await _link_gs_code(session, candidate, reading, interaction)
         return candidate, True
 
     raw = interaction.raw_text or ""
@@ -316,7 +470,7 @@ async def book(
         )
     )
     await session.flush()
-    await _link_gs_code(session, txn, reading)
+    await _link_gs_code(session, txn, reading, interaction)
     await _mark_internal_pair(session, txn)
     return txn, False
 

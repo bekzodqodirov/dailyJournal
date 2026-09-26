@@ -24,16 +24,17 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.bot import formatting
 from miya.bot.formatting import WEEKDAYS_UZ
 from miya.config import settings
-from miya.db.enums import DebtDirection, Direction
+from miya.db.enums import DebtDirection, Direction, TransactionType
 from miya.db.models import ChatMonitor, Interaction, Memory, Person
 from miya.services import codes as client_codes
 from miya.services import memories as memories_svc
 from miya.services import queries, recall
 from miya.services.amounts import guard_amounts
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
-from miya.services.extraction import API_FAILURES, get_client
+from miya.services.extraction import API_FAILURES, get_client, to_money
 from miya.services.ingest import text_for_extraction
 from miya.services.people import Match, find_person
 from miya.services.queries import TimelineEntry
@@ -326,6 +327,28 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "list_transactions",
+        "description": (
+            "Individual money rows (not totals), newest first: who paid or was "
+            "paid, when, how much, through what. Use for 'did Akmal / GS367 send "
+            "the money?', 'what did I pay last week over 1 mln?'. The figures "
+            "come from the database; repeat them, never compute new ones."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "person": {
+                    "type": "string",
+                    "description": "A name or a client code such as GS367",
+                },
+                "date_from": {"type": "string", "description": "YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD"},
+                "type": {"type": "string", "enum": ["income", "expense"]},
+                "min_amount": {"type": "string", "description": "e.g. 1000000"},
+            },
+        },
+    },
+    {
         "name": "due_items",
         "description": (
             "Overdue and soon-due debts, promises and tasks within a horizon "
@@ -502,6 +525,59 @@ def _parse_date(value: str) -> date:
     return date.fromisoformat(value.strip()[:10])
 
 
+async def _list_transactions(session: AsyncSession, args: dict) -> str:
+    """WP-70: money rows from SQL, one line each; the model only phrases them."""
+    person_id = None
+    gs_code = None
+    raw = str(args.get("person") or "").strip()
+    if raw:
+        gs_code = client_codes.canonical_client_code(raw)
+        match = await _find_person(session, raw)
+        if match.person is not None and match.ambiguous:
+            return await _ambiguous(session, match)
+        if match.person is not None:
+            person_id = match.person.id
+        elif gs_code is None:
+            return _not_found(raw, match)
+    min_amount = None
+    if args.get("min_amount"):
+        min_amount = to_money(str(args["min_amount"]).replace(" ", ""))
+    rows = await queries.find_transactions(
+        session,
+        person_id=person_id,
+        gs_code=gs_code,
+        date_from=_parse_date(args["date_from"]) if args.get("date_from") else None,
+        date_to=_parse_date(args["date_to"]) if args.get("date_to") else None,
+        type=TransactionType(args["type"]) if args.get("type") else None,
+        min_amount=min_amount,
+    )
+    tz = settings.tz
+    lines = []
+    for txn in rows:
+        sign = "+" if txn.type is TransactionType.income else "−"
+        parts = [
+            f"x{txn.id}",
+            txn.occurred_at.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+            f"{sign}{formatting.money(txn.amount, txn.currency)}",
+        ]
+        if txn.counterparty is not None:
+            parts.append(txn.counterparty.display_name)
+        if txn.description:
+            parts.append(txn.description[:80])
+        if txn.card_last4:
+            parts.append(f"karta *{txn.card_last4}")
+        lines.append(" · ".join(parts))
+    return _dumps(
+        {
+            "person": raw or None,
+            "client_code": gs_code,
+            "count": len(lines),
+            "transactions": lines,
+            "note": "Rows from the ledger; x-refs cite them. Empty means none found.",
+        }
+    )
+
+
 async def _run_tool(
     session: AsyncSession,
     embedder: Embedder | None,
@@ -649,6 +725,8 @@ async def _run_tool(
             }
         )
 
+    if name == "list_transactions":
+        return await _list_transactions(session, args)
     if name == "spending_summary":
         summary = await queries.spending_summary(
             session, _parse_date(args["date_from"]), _parse_date(args["date_to"])
