@@ -96,6 +96,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — bugun nima bo'ldi (hozirgacha)
 /kecha — kecha nima bo'ldi (qisqa xulosa)
+/fikr &lt;matn&gt; — yozuvlarga qarab fikrimni aytaman
+/savol &lt;matn&gt; — yozib qo'ymasdan, savol sifatida javob beraman
+/manba &lt;m123&gt; — javobdagi manbaning asl matni
 /ertalab — kechagi xulosa va bugungi ishlar, ochiq qolganlar
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
@@ -134,6 +137,8 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("qidir", "Xotiradan qidirish"),
     ("hisobot", "Bugun nima bo'ldi"),
     ("kecha", "Kecha nima bo'ldi"),
+    ("fikr", "Yozuvlarga qarab fikr"),
+    ("savol", "Savol sifatida javob"),
     ("ertalab", "Ertalabki xulosa"),
     ("reja", "Ertangi reja"),
     ("chats", "Qaysi chatlar o'qilishi"),
@@ -1329,6 +1334,7 @@ SEARCH_UNAVAILABLE = (
 
 OPERATION_LABEL = {
     "recap": "kunlik xulosa (AI)",
+    "rag_opinion": "fikr so'rovlari",
     "extract": "xabarlardan ajratish",
     "extract_window": "telegram suhbatlari (batch)",
     "extract_window_instant": "telegram suhbatlari (tezkor)",
@@ -2441,3 +2447,10 @@ def auto_resolved_report(resolved, people: dict | None = None) -> str:
 
 def claim_reopened(view) -> str:
     return f"↩️ <b>{claim_ref(view.id)} yana ochiq</b> — javob ber:\n{claim_line(view)}"
+
+
+# --- questions and opinions (WP-58) ---------------------------------------------
+
+SAVOL_USAGE = "Savolni yozing: <code>/savol Akmal qachon keladi</code>"
+FIKR_USAGE = "Nima haqida? <code>/fikr Akmal bilan konteyner masalasi</code>"
+NOTE_SAVE_GONE = "Bu savol topilmadi yoki allaqachon yozib qo'yilgan."

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -31,11 +31,13 @@ from miya.db.models import ChatMonitor, Interaction, Memory, Person
 from miya.services import codes as client_codes
 from miya.services import memories as memories_svc
 from miya.services import queries, recall
+from miya.services.amounts import guard_amounts
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
 from miya.services.extraction import API_FAILURES, get_client
 from miya.services.ingest import text_for_extraction
 from miya.services.people import Match, find_person
 from miya.services.queries import TimelineEntry
+from miya.services.text import normalise_for_search
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -163,6 +165,24 @@ deganman?":
   score is low and a runner_up is named, DO NOT answer about either person:
   ask back in ONE line naming the candidates, e.g. "Kimni nazarda tutding:
   Akmal GZ yoki Akmal Toshkent?".
+
+Recall and opinion questions (MODE: opinion, or an EVIDENCE block is
+present): base every statement about what happened ONLY on EVIDENCE, further
+search_history or person_summary calls, or SQL tools. If nothing relevant is
+there, say so in one line ("Bu haqda yozuvlarda hech narsa topilmadi.") and
+stop. Never reconstruct events from general knowledge. Answer in Uzbek
+Latin, Telegram HTML, at most 15 lines, in this order: <b>Yozuvlarda:</b>
+2-6 bullets, oldest first. Each bullet has the date (12-sentabr), where,
+who, and a short verbatim quote in «…», and ends with the ref in square
+brackets exactly as given, e.g. [m4521]. Never cite a ref that is not in a
+tool result. Then <b>Mening fikrim:</b> 2-5 lines of YOUR assessment,
+marked as such ("menimcha", "ehtimol"), reasoning only from the cited
+bullets and SQL results. Say when evidence is thin or contradictory.
+Optionally <b>Ochiq qolganlar (bazadan):</b> only from open_debts or
+person_summary fields. Optionally one line "<b>Taklif:</b> …". An amount
+inside a quote is what that person SAID: keep it inside «…» attributed to
+them. Balances, totals and who-owes-whom come only from SQL tools. Never
+add up quoted amounts. If the person is ambiguous, ask back in one line.
 
 Clients — the owner identifies clients by a GS code (GS367) or by name. A code
 is exact: pass it as the name to person_summary, person_timeline or open_debts,
@@ -861,6 +881,191 @@ async def _search_history(
     )
 
 
+# --- routing and opinion mode (WP-58) -----------------------------------------------
+
+OPINION_CUES = tuple(
+    re.compile(p)
+    for p in (
+        r"\bnima deb o?ylaysan",
+        r"\bnima deysan\b",
+        r"\bfikring(iz)?\b",
+        r"\bkanday o?ylaysan",
+        r"\bmaslahat",
+        r"\bnima kilsam\b",
+        r"\bnima kilay\b",
+        r"\bchto (ty )?dumaesh",
+        r"\bkak (ty )?dumaesh",
+        r"\btvoe mnenie",
+        r"\bsovet",
+        r"\bwhat do you think",
+    )
+)
+ROUTE_CUES = (
+    "esingdami",
+    "eslaysanmi",
+    "eslab ber",
+    "topib ber",
+    "kidirib ber",
+    "aytib ber",
+    "pomnish",
+    "napomni",
+)
+PREFETCH_CUES = (
+    "bolgandi",
+    "bolgan edi",
+    "degandi",
+    "aytgandi",
+    "gaplashgan",
+    "nima boldi",
+    "nima gap",
+    "masala",
+    "hakida",
+    "esingdami",
+    "eslaysanmi",
+)
+
+NOT_FOUND = "🔎 Bu haqda yozuvlarda hech narsa topilmadi."
+NOT_FOUND_PERSON = "🔎 {name} bilan «{words}» haqida yozuvlarda hech narsa topilmadi."
+NOT_FOUND_LAST_CONTACT = "Oxirgi aloqa: {date}."
+NOT_FOUND_HINT = (
+    "Boshqa so'z, ism yoki sana bilan so'rab ko'ring — masalan: "
+    "<code>/fikr Akmal konteyner sentabr</code>"
+)
+NEED_DETAIL = (
+    "Qaysi voqeani nazarda tutyapsiz? Ism, mavzu yoki sana ayting — masalan: "
+    "«Akmal, konteyner, sentabr»."
+)
+SEMANTIC_DEGRADED = (
+    "ℹ️ Ma'no bo'yicha qidiruv hozir ishlamayapti — faqat so'z bo'yicha qidirdim."
+)
+SOURCE_FOOTER = "<i>Asl matn: /manba {ref}</i>"
+# Tools whose results are the ledger; the others carry people's words.
+SQL_TOOLS = {"open_debts", "spending_summary", "list_transactions", "lookup_code"}
+QUOTE_TOOLS = {"search_history", "search_memories", "recent_interactions"}
+REF_RE = re.compile(r"\b([mf]\d+(?:#\d+)?)\b")
+CITED_RE = re.compile(r"\[([mf]\d+(?:#\d+)?)\]")
+
+
+def classify(text: str) -> str:
+    """'opinion', 'question' or 'note'. The cues are matched on the folded
+    text; looks_like_question always on the raw one (it needs its '?' and
+    the q-spelled first words)."""
+    norm = normalise_for_search(text)
+    if any(cue.search(norm) for cue in OPINION_CUES):
+        return "opinion"
+    if looks_like_question(text) or any(cue in norm for cue in ROUTE_CUES):
+        return "question"
+    return "note"
+
+
+def wants_evidence(text: str) -> bool:
+    norm = normalise_for_search(text)
+    return any(cue in norm for cue in PREFETCH_CUES)
+
+
+@dataclass(slots=True)
+class RagAnswer:
+    text: str
+    refs: list[str] = field(default_factory=list)
+    mode: str = "question"
+    model_called: bool = False
+    evidence_refs: list[str] = field(default_factory=list)
+
+
+def render_citations(text: str, known_refs: set[str]) -> tuple[str, list[str]]:
+    """[m123] → <code>m123</code> for refs a tool really returned; any other
+    bracketed ref is dropped. Returns the text and the refs kept, in order."""
+    kept: list[str] = []
+    dropped = 0
+
+    def one(match: re.Match[str]) -> str:
+        nonlocal dropped
+        ref = match.group(1)
+        if ref in known_refs:
+            if ref not in kept:
+                kept.append(ref)
+            return f"<code>{ref}</code>"
+        dropped += 1
+        return ""
+
+    out = CITED_RE.sub(one, text)
+    if dropped:
+        log.warning("dropped %d citation(s) no tool returned", dropped)
+    return out, kept
+
+
+def _evidence_json(result) -> dict:
+    tz = settings.tz
+    return {
+        "note": UNTRUSTED_NOTE,
+        "degraded": result.degraded,
+        "episodes": [
+            {
+                "ref": e.ref,
+                "when": e.when.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+                "where": e.where,
+                "lines": [
+                    {
+                        "ref": line.ref,
+                        "when": line.when.astimezone(tz).strftime("%H:%M"),
+                        "who": line.who,
+                        "text": line.text,
+                        "hit": line.hit,
+                    }
+                    for line in e.lines
+                ],
+            }
+            for e in result.episodes
+        ],
+        "facts": [
+            {
+                "ref": f.ref,
+                "when": f.when.astimezone(tz).strftime("%Y-%m-%d"),
+                "about": f.about,
+                "text": f.text,
+            }
+            for f in result.facts
+        ],
+    }
+
+
+def _fallback_block(result) -> str:
+    from miya.bot.formatting import escape, short_date
+
+    lines = []
+    for episode in result.episodes:
+        for line in episode.lines:
+            if line.hit and len(lines) < 3:
+                lines.append(
+                    f"• {short_date(line.when.astimezone(settings.tz).date())} · "
+                    f"{escape(episode.where)} · {escape(line.who)}: "
+                    f"«{escape(line.text[:160])}» <code>{line.ref}</code>"
+                )
+    return "<b>Yozuvlarda:</b>\n" + "\n".join(lines)
+
+
+def _refs_in(output: str) -> set[str]:
+    try:
+        data = json.loads(output)
+    except (TypeError, ValueError):
+        return set()
+    found: set[str] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            ref = node.get("ref")
+            if isinstance(ref, str) and REF_RE.fullmatch(ref):
+                found.add(ref)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(data)
+    return found
+
+
 async def answer(
     session: AsyncSession,
     question: str,
@@ -869,12 +1074,62 @@ async def answer(
     now: datetime | None = None,
 ) -> str:
     """One RAG turn: question in, Uzbek answer out. Never raises."""
+    return (await answer_full(session, question, embedder=embedder, now=now)).text
+
+
+async def answer_full(
+    session: AsyncSession,
+    question: str,
+    *,
+    embedder: Embedder | None = None,
+    now: datetime | None = None,
+    mode: str | None = None,
+    history: tuple = (),
+) -> RagAnswer:
+    """One RAG turn, with what it cited. Never raises.
+
+    An opinion — or a question that recalls something — is answered from
+    evidence fetched first; when there is none, it says so without a model
+    call. Every answer's figures pass the amount guard."""
     now = now or datetime.now(settings.tz)
+    mode = mode or classify(question)
+    if mode == "note":
+        mode = "question"
     if embedder is None:
         try:
             embedder = get_embedder()
         except Exception:  # embeddings misconfigured — money tools still work
             embedder = None
+
+    known_refs: set[str] = set()
+    for item in history:
+        known_refs |= set(getattr(item, "refs", None) or [])
+    sql_texts: list[str] = []
+    quote_texts: list[str] = []
+    evidence = None
+    evidence_block = ""
+    if mode == "opinion" or wants_evidence(question):
+        evidence = await recall.search(session, embedder, question, now=now)
+        if not evidence.content_terms and not evidence.person and not evidence.period:
+            return RagAnswer(text=NEED_DETAIL, mode=mode)
+        if evidence.is_empty():
+            if evidence.person is not None:
+                text = NOT_FOUND_PERSON.format(
+                    name=evidence.person.display_name,
+                    words=" ".join(evidence.content_terms) or "…",
+                )
+                last = await queries.last_contact_at(session, evidence.person.id)
+                if last is not None:
+                    text += "\n" + NOT_FOUND_LAST_CONTACT.format(
+                        date=last.astimezone(settings.tz).date().isoformat()
+                    )
+            else:
+                text = NOT_FOUND
+            return RagAnswer(text=f"{text}\n{NOT_FOUND_HINT}", mode=mode)
+        payload = _evidence_json(evidence)
+        evidence_block = _dumps(payload)
+        known_refs |= _refs_in(evidence_block)
+        quote_texts.append(evidence_block)
 
     client = get_client()
     system = [
@@ -884,14 +1139,17 @@ async def answer(
             "cache_control": {"type": "ephemeral"},
         }
     ]
-    messages: list[dict[str, Any]] = [
-        {
-            "role": "user",
-            "content": f"{date_hints(now)}\n---\n{question}",
-        }
-    ]
+    content = f"{date_hints(now)}\n"
+    if evidence is not None:
+        content += f"MODE: {mode}\n"
+    content += f"---\n{question}"
+    if evidence_block:
+        content += f"\n\nEVIDENCE (search_history result):\n{evidence_block}"
+    messages: list[dict[str, Any]] = [{"role": "user", "content": content}]
+    operation = "rag_opinion" if mode == "opinion" else "rag"
 
     final_text = ""
+    called = False
     for _round in range(MAX_TOOL_ROUNDS):
         try:
             response = await client.messages.create(
@@ -903,12 +1161,13 @@ async def answer(
             )
         except API_FAILURES as exc:
             log.warning("rag call failed: %s", exc)
-            return final_text or FALLBACK_ANSWER
+            break
+        called = True
 
         await record_anthropic_usage(
             session,
             model=settings.reason_model,
-            operation="rag",
+            operation=operation,
             usage=response.usage,
         )
 
@@ -931,6 +1190,14 @@ async def answer(
                 # A tool bug must not kill the answer — report it to the model.
                 log.exception("tool %s failed", block.name)
                 output = _dumps({"error": f"tool failed: {type(exc).__name__}"})
+            known_refs |= _refs_in(output)
+            if block.name in SQL_TOOLS:
+                sql_texts.append(output)
+            elif block.name == "person_summary":
+                sql_texts.append(output)  # balances and open debts are SQL
+                quote_texts.append(output)
+            elif block.name in QUOTE_TOOLS:
+                quote_texts.append(output)
             results.append(
                 {
                     "type": "tool_result",
@@ -942,4 +1209,21 @@ async def answer(
     else:
         log.warning("rag hit MAX_TOOL_ROUNDS without a final answer")
 
-    return final_text or FALLBACK_ANSWER
+    if not final_text:
+        return RagAnswer(text=FALLBACK_ANSWER, mode=mode, model_called=called)
+    text, refs = render_citations(final_text, known_refs)
+    if mode == "opinion" and not refs and evidence is not None:
+        text = f"{text}\n\n{_fallback_block(evidence)}"
+        refs = [line.ref for e in evidence.episodes for line in e.lines if line.hit][:3]
+    text = guard_amounts(text, sql_texts=sql_texts, quote_texts=quote_texts)
+    if evidence is not None and evidence.degraded:
+        text = f"{SEMANTIC_DEGRADED}\n\n{text}"
+    if refs:
+        text += "\n\n" + SOURCE_FOOTER.format(ref=refs[0])
+    return RagAnswer(
+        text=text,
+        refs=refs,
+        mode=mode,
+        model_called=called,
+        evidence_refs=sorted(_refs_in(evidence_block)) if evidence_block else [],
+    )

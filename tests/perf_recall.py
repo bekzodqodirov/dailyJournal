@@ -30,19 +30,23 @@ def _vector() -> str:
 
 
 async def test_the_retrievers_use_their_indexes(session):
-    await session.execute(
-        sa.text(
-            "INSERT INTO interactions (source, direction, occurred_at, raw_text,"
-            " processed, needs_review, search_indexed_at)"
-            " VALUES ('assistant_bot', 'in', now(), 'x', true, false, now())"
-        )
-    )
-    interaction_id = await session.scalar(sa.text("SELECT max(id) FROM interactions"))
+    # Build the vector index once after seeding, not row by row; the DDL is
+    # rolled back with the test's transaction.
+    await session.execute(sa.text("DROP INDEX ix_passages_embedding_hnsw"))
     words = ["konteyner", "bojxona", "narx", "yuk", "invoys", "tolov", "mashina"]
     started = time.monotonic()
-    for batch in range(ROWS // 1000):
+    for _batch in range(ROWS // 1000):
+        # One interaction per thousand chunks: chunk_no is a smallint.
+        interaction_id = await session.scalar(
+            sa.text(
+                "INSERT INTO interactions (source, direction, occurred_at, raw_text,"
+                " processed, needs_review, search_indexed_at)"
+                " VALUES ('assistant_bot', 'in', now(), 'x', true, false, now())"
+                " RETURNING id"
+            )
+        )
         values = ",".join(
-            f"({interaction_id}, {batch * 1000 + i}, 'assistant_bot', now(), 'b', 'e',"
+            f"({interaction_id}, {i}, 'assistant_bot', now(), 'b', 'e',"
             f" '{random.choice(words)} {random.choice(words)}', '{_vector()}')"
             for i in range(1000)
         )
@@ -52,6 +56,12 @@ async def test_the_retrievers_use_their_indexes(session):
                 f" body, embed_text, search_norm, embedding) VALUES {values}"
             )
         )
+    await session.execute(
+        sa.text(
+            "CREATE INDEX ix_passages_embedding_hnsw ON passages USING hnsw"
+            " (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)"
+        )
+    )
     await session.execute(sa.text("ANALYZE passages"))
     print(f"seeded {ROWS} passages in {time.monotonic() - started:.1f}s")
 

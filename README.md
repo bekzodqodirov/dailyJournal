@@ -553,7 +553,7 @@ else leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
-| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names) | Extraction, the recap's prose, planner, RAG answers |
+| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names); when the owner asks a question, verbatim quotes of the stored messages found for it | Extraction, the recap's prose, planner, RAG answers |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |

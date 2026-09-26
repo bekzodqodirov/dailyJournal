@@ -91,21 +91,22 @@ def _media_path(suffix: str) -> Path:
     return settings.media_dir / f"{stamp}-{uuid.uuid4().hex[:8]}{suffix}"
 
 
-async def _safe_answer(message: Message, text: str | None, *, reply_markup=None) -> None:
-    """Reply after the data is durable; a failed send only costs the receipt."""
+async def _safe_answer(message: Message, text: str | None, *, reply_markup=None):
+    """Reply after the data is durable; a failed send only costs the receipt.
+    Returns the sent message, or None when nothing went out."""
     if not text:
-        return
+        return None
     try:
-        await message.answer(text, reply_markup=reply_markup)
-        return
+        return await message.answer(text, reply_markup=reply_markup)
     except Exception:
         log.exception("could not send reply to owner (data is committed)")
     # Model-composed replies can contain broken HTML; a plain-text retry beats
     # the owner never seeing the answer at all.
     try:
-        await message.answer(text, parse_mode=None, reply_markup=reply_markup)
+        return await message.answer(text, parse_mode=None, reply_markup=reply_markup)
     except Exception:
         log.exception("plain-text retry failed too")
+    return None
 
 
 def _receipt(result) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -1775,6 +1776,91 @@ async def _code_to_person(session, code: str, name: str, holder: Person | None):
     return replies.code_attached(code, person.display_name, held), None
 
 
+async def _answer_question(message: Message, text: str, mode: str) -> None:
+    """A question or an opinion: answered, not extracted — but it still lands
+    in interactions ("every input lands here"), marked so /tekshir and the
+    extractor both leave it alone, with the answer and what it cited."""
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            text=text,
+            occurred_at=message.date.astimezone(settings.tz),
+            meta={"kind": "question"},
+        )
+        interaction.processed = True
+        result = await rag.answer_full(session, text, mode=mode)
+        reply = clip(result.text)
+        interaction.meta = {
+            **(interaction.meta or {}),
+            "mode": result.mode,
+            "answer": reply[:4000],
+            "refs": result.refs,
+        }
+        interaction_id = interaction.id
+    sent = await _safe_answer(
+        message, reply, reply_markup=keyboards.save_as_note(interaction_id)
+    )
+    if sent is not None and getattr(sent, "message_id", None) is not None:
+        async with session_scope() as session:
+            row = await session.get(Interaction, interaction_id)
+            if row is not None:
+                row.meta = {**(row.meta or {}), "answer_message_id": sent.message_id}
+
+
+@router.message(Command("savol"))
+async def cmd_ask(message: Message, command: CommandObject) -> None:
+    """`/savol …` — answered as a question, never written down as a note."""
+    text = (command.args or "").strip()
+    if not text:
+        await _safe_answer(message, replies.SAVOL_USAGE)
+        return
+    await _answer_question(message, text, "question")
+
+
+@router.message(Command("fikr"))
+async def cmd_opinion(message: Message, command: CommandObject) -> None:
+    """`/fikr …` — what the records say about it, then MIYA's own view."""
+    text = (command.args or "").strip()
+    if not text:
+        await _safe_answer(message, replies.FIKR_USAGE)
+        return
+    await _answer_question(message, text, "opinion")
+
+
+@router.callback_query(F.data.startswith("vq:n:"))
+async def on_save_as_note(callback: CallbackQuery) -> None:
+    """📝 Eslatma sifatida yozib qo'y: the owner meant it as a note after all."""
+    raw = (callback.data or "").split(":")[-1]
+    body = replies.NOTE_SAVE_GONE
+    keyboard = None
+    if raw.isdigit():
+        async with session_scope() as session:
+            question = await session.get(Interaction, int(raw))
+            if question is not None and (question.meta or {}).get("kind") == "question":
+                note = await create_interaction(
+                    session,
+                    source=InteractionSource.assistant_bot,
+                    direction=Direction.in_,
+                    text=question.raw_text,
+                    occurred_at=question.occurred_at,
+                )
+                question.meta = {**question.meta, "saved_as_note": note.id}
+                result = await process_interaction(session, note)
+                body, keyboard = _receipt(result)
+    if callback.message is not None:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            log.debug("could not drop the save-as-note button", exc_info=True)
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
 @router.message(Command("yuk"))
 async def cmd_waybill(message: Message, command: CommandObject) -> None:
     """`/yuk YW26-004715` — every message, call and note that mentions it."""
@@ -2017,22 +2103,9 @@ async def on_text(message: Message) -> None:
             reply = await _code_lookup_reply(session, *lookup)
         await _safe_answer(message, reply)
         return
-    if rag.looks_like_question(message.text):
-        # Questions are answered, not extracted — but they still land in
-        # interactions ("every input lands here"), marked so `/tekshir` and
-        # the extractor both leave them alone.
-        async with session_scope() as session:
-            interaction = await create_interaction(
-                session,
-                source=InteractionSource.assistant_bot,
-                direction=Direction.in_,
-                text=message.text,
-                occurred_at=message.date.astimezone(settings.tz),
-                meta={"kind": "question"},
-            )
-            interaction.processed = True
-            reply = clip(await rag.answer(session, message.text))
-        await _safe_answer(message, reply)
+    mode = rag.classify(message.text or "")
+    if mode != "note":
+        await _answer_question(message, message.text, mode)
         return
 
     async with session_scope() as session:

@@ -861,3 +861,17 @@ def auto_resolved_keyboard(claim_ids, monitor_ids) -> InlineKeyboardMarkup | Non
         for i in monitor_ids
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def save_as_note(interaction_id: int) -> InlineKeyboardMarkup:
+    """Under an answer: the owner meant it as a note after all (WP-58)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📝 Eslatma sifatida yozib qo'y",
+                    callback_data=f"vq:n:{interaction_id}",
+                )
+            ]
+        ]
+    )
