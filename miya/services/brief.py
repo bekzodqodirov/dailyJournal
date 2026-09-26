@@ -21,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.models import Event
-from miya.services import nudges, queries
+from miya.services import codes, nudges, queries
 from miya.services.loops import OpenLoops
 
 # The reminder_log kind the morning brief is logged under, one row per day.
@@ -41,6 +41,9 @@ class MorningBrief:
     queue: Any = None
     # Money texts waiting in /tekshir (WP-14): one count line, never a push.
     money_review: int = 0
+    # Code suggestions waiting in /kodlar (WP-33): one count line, never a
+    # push, and on its own not a reason to send the brief.
+    code_suggestions: int = 0
 
     @property
     def day(self) -> date:
@@ -65,4 +68,5 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         due=await queries.due_items(session, horizon_days=0),
         loops=await nudges.open_loops(session, now=now),
         money_review=await queries.money_review_count(session),
+        code_suggestions=await codes.pending_suggestion_count(session),
     )

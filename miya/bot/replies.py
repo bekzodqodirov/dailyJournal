@@ -84,7 +84,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /qarz — ochiq qarzlar
 /vada — ochiq va'dalar
 /bugun — bugungi holat
-/kim &lt;ism&gt; — odam haqida hamma narsa: profil, qarz, va'da, tarix
+/kim &lt;ism yoki GS kod&gt; — odam haqida hamma narsa: profil, qarz, va'da, tarix
+/kod &lt;ism&gt; &lt;GS kod&gt; — mijoz kodini biriktirish
+/kodlar — xabarlardan topilgan kod takliflari
 /tarix &lt;ism&gt; [N] — odam bilan to'liq aloqa tarixi (oxirgi N ta)
 /eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
 /qidir &lt;so'z&gt; — xotiradan qidirish
@@ -141,6 +143,8 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("kim", "Odam haqida hamma narsa"),
     ("tarix", "Odam bilan aloqa tarixi"),
     ("eslab", "Odam haqida eslab qolish"),
+    ("kod", "Mijoz kodini biriktirish"),
+    ("kodlar", "Kod takliflari"),
     ("pul", "bugungi to'lovlar ro'yxati"),
     ("ochir", "noto'g'ri pul yozuvini o'chirish"),
 )
@@ -300,6 +304,7 @@ _AMBIGUOUS_HINT = {
     "tarix": "/tarix {name}",
     "eslab": "/eslab {name}: …",
     "unut": "/unut {name}",
+    "kod": "/kod {name} …",
 }
 
 
@@ -1587,6 +1592,9 @@ def morning_brief(brief: MorningBrief) -> str:
         parts.append(f"{BRIEF_QUIET}\n" + bullet_list(lines, empty="—"))
     if getattr(brief, "money_review", 0):
         parts.append(MONEY_REVIEW_LINE.format(n=brief.money_review))
+    if getattr(brief, "code_suggestions", 0):
+        # Pulled, never pushed (WP-33): a count, no buttons, not a question.
+        parts.append(CODE_SUGGESTIONS_LINE.format(n=brief.code_suggestions))
     line = queue_line(getattr(brief, "queue", None))
     if line:
         parts.append(line)
@@ -2123,3 +2131,81 @@ def savollar(
     if pages > 1:
         lines.append(SAVOLLAR_PAGE.format(page=page, pages=pages))
     return clip("\n".join(lines))
+
+
+# --- client codes by hand (WP-33) ---------------------------------------------
+
+KOD_USAGE = (
+    "🏷 <b>Mijoz kodlari</b>\n"
+    "<code>/kod Akmal GS367</code> — kodni odamga biriktirish\n"
+    "<code>/kod GS367</code> — bu kod kimniki\n"
+    "<code>/kod GS367 o'chir</code> — kodni olib tashlash\n"
+    "<code>/kod yangi Akmal GS367</code> — yangi odam qo'shib, kod berish\n"
+    "<code>/kodlar</code> — xabarlardan topilgan takliflar"
+)
+CODE_STALE = "Bu savol eskirgan — <code>/kod</code> ni qaytadan yozing."
+CODE_MOVE_DECLINED = "O'zgarmadi."
+KODLAR_HEADER = "🏷 <b>Kod takliflari</b> — xabarlardan topildi. To'g'risini tasdiqlang:"
+KODLAR_EMPTY = "🏷 Yangi kod taklifi yo'q."
+CODE_SUGGESTIONS_LINE = "🏷 {n} ta kod taklifi kutyapti — /kodlar"
+
+
+def code_attached(code: str, name: str, all_codes: list[str]) -> str:
+    text = f"🏷 <b>{escape(code)}</b> → <b>{escape(name)}</b> biriktirildi."
+    if len(all_codes) > 1:
+        text += f"\nBarcha kodlari: {escape(', '.join(all_codes))}"
+    return text
+
+
+def code_already(code: str, name: str) -> str:
+    return f"🏷 <b>{escape(code)}</b> allaqachon shu odamda: <b>{escape(name)}</b>."
+
+
+def code_taken(code: str, holder: str, target: str) -> str:
+    return (
+        f"⚠️ <b>{escape(code)}</b> hozir boshqa odamda: <b>{escape(holder)}</b>.\n"
+        f"<b>{escape(target)}</b> nomiga o'tkazaymi?"
+    )
+
+
+def code_moved(code: str, target: str, holder: str) -> str:
+    return (
+        f"🏷 <b>{escape(code)}</b> endi <b>{escape(target)}</b> nomida "
+        f"(avval: <b>{escape(holder)}</b>). Eski bog'lanish tarixda saqlandi."
+    )
+
+
+def code_person_not_found(name: str, code: str) -> str:
+    return (
+        f"❓ «<b>{escape(name)}</b>» topilmadi. Yangi odam qilib qo'shish: "
+        f"<code>/kod yangi {escape(name)} {escape(code)}</code>"
+    )
+
+
+def code_detached(code: str, name: str) -> str:
+    return f"🗑 <b>{escape(code)}</b> olib tashlandi (avval: <b>{escape(name)}</b>)."
+
+
+def code_bad(text: str) -> str:
+    return (
+        f"❓ Bu mijoz kodiga o'xshamaydi: «{escape(text)}». "
+        f"Masalan: <code>GS367</code>"
+    )
+
+
+def code_suggestion_line(code: str, name: str, day: str, excerpt: str) -> str:
+    return (
+        f"• <b>{escape(code)}</b> → <b>{escape(name)}</b> "
+        f"<i>({escape(day)}: «{escape(excerpt)}»)</i>"
+    )
+
+
+def code_suggestion_accepted(code: str, name: str) -> str:
+    return f"✅ <b>{escape(code)}</b> → <b>{escape(name)}</b>."
+
+
+def code_suggestion_rejected(code: str, name: str) -> str:
+    return (
+        f"✖️ Rad etildi: <b>{escape(code)}</b> → <b>{escape(name)}</b>. "
+        f"Qayta so'ramayman."
+    )

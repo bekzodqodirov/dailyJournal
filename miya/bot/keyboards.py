@@ -775,3 +775,38 @@ def group_ids_in(markup: InlineKeyboardMarkup | None) -> list[int]:
             if parts[:2] == ["ng", "y"] and parts[2].lstrip("-").isdigit():
                 ids.append(int(parts[2]))
     return ids
+
+
+# --- client codes (WP-33) ------------------------------------------------------
+
+
+def code_move(row_id: int, person_id: int) -> InlineKeyboardMarkup:
+    """ "✅ Ha, o'tkaz" / "Yo'q" under "GS367 hozir boshqa odamda"."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Ha, o'tkaz", callback_data=f"kod:mv:{row_id}:{person_id}"
+                ),
+                InlineKeyboardButton(text="Yo'q", callback_data="kod:no"),
+            ]
+        ]
+    )
+
+
+def code_suggestions(rows) -> InlineKeyboardMarkup | None:
+    """One row per suggestion: [✅ GS367 → Akmal] [✖️]."""
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"✅ {row.code} → {row.person.display_name[:20]}",
+                    callback_data=f"kod:sy:{row.id}",
+                ),
+                InlineKeyboardButton(text="✖️", callback_data=f"kod:sn:{row.id}"),
+            ]
+            for row in rows
+        ]
+    )
