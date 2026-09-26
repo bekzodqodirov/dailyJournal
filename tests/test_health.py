@@ -438,6 +438,16 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         "spend_high": _status(cost_today_usd=Decimal("5")),
         "api_restarting": _status(api_starts_last_hour=3),
         "search_down": _status(embed_backlog=1, embed_oldest_at=NOW - timedelta(hours=2)),
+        "phone_silent": _status(phone_seen=_phone("phone_seen", hours=5)),
+        "phone_stream_off": _status(
+            phone_app=_phone(
+                "phone_app",
+                hours=0,
+                wanted={"sms": True},
+                granted={"sms": False},
+                ever_granted={"sms": True},
+            )
+        ),
     }
     assert set(cases) == set(health.PROBLEM_KEYS)
     for key, status in cases.items():
@@ -717,3 +727,95 @@ async def test_api_starts_are_counted_within_the_hour(session):
     status = await health.gather(session, now=now)
     assert status.api_starts_last_hour == 3
     assert "api_restarting" in [p.key for p in health.problems(status)]
+
+
+# --- phone liveness (WP-66) -------------------------------------------------
+
+
+def _phone(name: str, *, hours: float, now=NOW, **detail) -> health.Component:
+    seen = now - timedelta(hours=hours)
+    return health.Component(
+        name, seen, timedelta(hours=hours), dict(detail), stale=False, disabled=False
+    )
+
+
+def _at(day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(2026, 9, day, hour, minute, tzinfo=TZ)
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    monkeypatch.setattr(settings, "quiet_hours", "23:30-07:30")
+    monkeypatch.setattr(settings, "phone_silent_hours", 4)
+
+
+def test_awake_between_skips_quiet_hours(quiet):
+    assert health.awake_between(_at(1, 23), _at(2, 7, 40)) == timedelta(minutes=40)
+    assert health.awake_between(_at(1, 7), _at(1, 12)) == timedelta(hours=4, minutes=30)
+    assert health.awake_between(_at(1, 10), _at(1, 14, 30)) == timedelta(
+        hours=4, minutes=30
+    )
+    # Two nights: only the day parts count.
+    assert health.awake_between(_at(1, 12), _at(3, 12)) == timedelta(hours=32)
+    assert health.awake_between(_at(1, 12), _at(1, 11)) == timedelta(0)
+
+
+def test_phone_silent_after_four_awake_hours(quiet):
+    now = _at(15, 16, 0)
+    raised = _status(now=now, phone=_phone("phone", hours=4 + 1 / 60, now=now))
+    calm = _status(now=now, phone=_phone("phone", hours=4 - 1 / 60, now=now))
+    assert "phone_silent" in _keys(raised)
+    assert "phone_silent" not in _keys(calm)
+
+
+def test_the_night_does_not_count_as_silence(quiet):
+    now = _at(16, 7, 45)
+    status = _status(now=now, phone_seen=_phone("phone_seen", hours=8.75, now=now))
+    assert "phone_silent" not in _keys(status)
+
+
+def test_phone_silent_is_off_at_zero_and_without_a_phone(quiet, monkeypatch):
+    assert "phone_silent" not in _keys(_status())
+    monkeypatch.setattr(settings, "phone_silent_hours", 0)
+    assert "phone_silent" not in _keys(_status(phone=_phone("phone", hours=30)))
+
+
+def test_a_revoked_stream_is_named(quiet):
+    status = _status(
+        phone_app=_phone(
+            "phone_app",
+            hours=0,
+            wanted={"sms": True, "call_log": True},
+            granted={"sms": False, "call_log": True},
+            ever_granted={"sms": True, "call_log": True},
+        )
+    )
+    [problem] = [p for p in health.problems(status) if p.key == "phone_stream_off"]
+    assert "SMS" in problem.text
+
+
+def test_a_never_granted_stream_is_shown_not_alerted(quiet):
+    from miya.bot import replies
+
+    status = _status(
+        phone_app=_phone(
+            "phone_app",
+            hours=0,
+            wanted={"sms": True},
+            granted={"sms": False},
+            ever_granted={},
+        )
+    )
+    assert "phone_stream_off" not in _keys(status)
+    line = replies._phone_line(status)
+    assert line.startswith("📱 Telefon — oxirgi aloqa: hozirgina")
+    assert line.endswith(" · ruxsat berilmagan: SMS")
+
+
+def test_the_holat_line_shows_silence(quiet):
+    from miya.bot import replies
+
+    status = _status(
+        phone=_phone("phone", hours=6), phone_seen=_phone("phone_seen", hours=5)
+    )
+    assert replies._phone_line(status).startswith("⚠️ Telefon — 5 soatdan beri jim · ")

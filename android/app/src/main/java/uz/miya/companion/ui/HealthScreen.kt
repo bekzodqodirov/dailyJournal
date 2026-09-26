@@ -17,7 +17,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
+import uz.miya.companion.R
 import uz.miya.companion.oem.OemHints
 import uz.miya.companion.util.StorageAccess
 import uz.miya.companion.util.TimeFmt
@@ -59,6 +61,14 @@ fun HealthScreen(
             KeyValue("Queue depth", state.queueDepth.toString())
             KeyValue("Failed", state.failedRows.size.toString())
             KeyValue("Last scan", TimeFmt.ago(prefs?.lastScanAt))
+            // WP-66: the server hears from the phone at least hourly.
+            Text(
+                stringResource(
+                    R.string.last_heartbeat,
+                    TimeFmt.human(prefs?.lastHeartbeatAt),
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+            )
             KeyValue(
                 "Call-end trigger",
                 if (state.callTriggerActive) "active" else "inactive (needs phone state)",

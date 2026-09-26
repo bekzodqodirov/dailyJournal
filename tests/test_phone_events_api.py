@@ -590,3 +590,52 @@ async def test_the_recap_lists_missed_calls_with_hostile_names_escaped(bound):
 async def test_a_recap_without_missed_calls_has_no_open_section(session):
     text = await recap_helpers.recap_of(session, _now().date(), now=_now())
     assert recap_text.RECAP_OPEN not in text
+
+
+# --- liveness (WP-66) ----------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_seen(monkeypatch):
+    monkeypatch.setattr(main, "_phone_seen_at", {})
+
+
+async def test_the_heartbeat_endpoint_records_the_app_state(session, device, fresh_seen):
+    from miya.services import health
+
+    body = {
+        "device_id": DEVICE,
+        "app_version": "1.0.7",
+        "version_code": 7,
+        "wanted": {"sms": True, "calendar": True},
+        "granted": {"sms": False},
+        "ever_granted": {"sms": True},
+        "queue": {"events_pending": 2, "other": 9},
+    }
+    response = device.post("/v1/phone/heartbeat", json=body)
+
+    assert response.status_code == 200 and response.json()["ok"] is True
+    beats = await health.beats(session)
+    detail = beats["phone_app"].detail
+    assert detail["wanted"] == {"sms": True}  # unknown streams dropped
+    assert detail["queue"] == {"events_pending": 2}
+    assert "phone_seen" in beats
+
+
+async def test_the_heartbeat_needs_a_token(session, monkeypatch):
+    monkeypatch.setattr(settings, "api_bearer_token", TOKEN)
+    with TestClient(app) as anonymous:
+        assert (
+            anonymous.post("/v1/phone/heartbeat", json={"device_id": DEVICE}).status_code
+            == 401
+        )
+
+
+async def test_an_empty_batch_is_contact_but_not_a_new_event(session, device, fresh_seen):
+    from miya.services import health
+
+    device.post("/v1/phone/calls", json=_calls_payload())
+    beats = await health.beats(session)
+    assert "phone_seen" in beats and "phone" not in beats
+    assert beats["phone_seen"].detail == {"path": "/v1/phone/calls", "device_id": DEVICE}
+    assert device.get("/v1/debts").status_code == 401

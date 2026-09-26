@@ -354,6 +354,16 @@ than breaks. SMS bodies are never logged, not even redacted
 
 ---
 
+### Liveness heartbeat
+
+Once an hour, even with nothing to send, EventSyncWorker posts
+`/v1/phone/heartbeat`: what the owner wants (call log, SMS, recordings,
+payment notifications), what is granted now, what was ever granted on this
+install, the queue depths and the app version. The server alerts when the
+phone has been silent for `PHONE_SILENT_HOURS` awake hours, and when a
+permission that was granted is revoked — never for one that was never
+granted. Health shows «Serverga oxirgi xabar».
+
 ### First SMS import and reinstalling
 
 A fresh install does **not** send the whole inbox. The first harvest reads

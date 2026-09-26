@@ -79,7 +79,17 @@ PROBLEM_KEYS = (
     "spend_high",
     "api_restarting",
     "search_down",
+    "phone_silent",
+    "phone_stream_off",
 )
+# The phone app's streams (WP-66), as the heartbeat names them.
+KNOWN_STREAMS = ("call_log", "sms", "recordings", "notifications")
+STREAM_LABEL = {
+    "call_log": "qo'ng'iroqlar ro'yxati",
+    "sms": "SMS",
+    "recordings": "qo'ng'iroq yozuvlari papkasi",
+    "notifications": "bildirishnomalar (Payme)",
+}
 # reminder_log kind the api writes once per start (WP-26).
 API_START_KIND = "api_start"
 # Flagged inputs pile up quietly; past this many the pile is itself a fault.
@@ -229,6 +239,10 @@ class Status:
     # Informational only: a phone-less install is healthy, so no Problem
     # and no staleness alert ever comes from this row.
     phone: Component | None = None
+    # WP-66: any contact from the phone (even an empty batch), and the app's
+    # hourly heartbeat with what it wants and what it is allowed.
+    phone_seen: Component | None = None
+    phone_app: Component | None = None
     # Money texts waiting in /tekshir's money block (WP-14): shown, never
     # counted into the backlog alarm — they are the owner's call, not a fault.
     money_review: int = 0
@@ -464,6 +478,16 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         phone=(
             component_of("phone", rows["phone"], now=now) if "phone" in rows else None
         ),
+        phone_seen=(
+            component_of("phone_seen", rows["phone_seen"], now=now)
+            if "phone_seen" in rows
+            else None
+        ),
+        phone_app=(
+            component_of("phone_app", rows["phone_app"], now=now)
+            if "phone_app" in rows
+            else None
+        ),
         jobs={
             key[len(JOB_PREFIX) :]: component_of(key[len(JOB_PREFIX) :], row, now=now)
             for key, row in rows.items()
@@ -527,6 +551,70 @@ def search_stale(status: Status) -> bool:
         and status.now - status.embed_oldest_at
         > timedelta(minutes=settings.embed_stale_minutes)
     )
+
+
+def awake_between(start: datetime, end: datetime) -> timedelta:
+    """The time in [start, end) outside QUIET_HOURS, walking day by day in
+    the owner's zone."""
+    tz = settings.tz
+    start, end = start.astimezone(tz), end.astimezone(tz)
+    if end <= start:
+        return timedelta(0)
+    quiet_start, quiet_end = settings.quiet_hours_parsed
+    total = timedelta(0)
+    day = start.date() - timedelta(days=1)
+    while True:
+        base = datetime.combine(day, quiet_start, tzinfo=tz)
+        q_end_day = day if quiet_start < quiet_end else day + timedelta(days=1)
+        q_start = base
+        q_end = datetime.combine(q_end_day, quiet_end, tzinfo=tz)
+        # The awake span after this quiet stretch, up to the next one.
+        next_q_start = datetime.combine(day + timedelta(days=1), quiet_start, tzinfo=tz)
+        awake_from, awake_to = q_end, next_q_start
+        lo, hi = max(awake_from, start), min(awake_to, end)
+        if hi > lo:
+            total += hi - lo
+        if q_start > end:
+            break
+        day += timedelta(days=1)
+    return total
+
+
+def last_phone_contact(status: Status) -> datetime | None:
+    seen = [
+        c.last_seen_at
+        for c in (status.phone, status.phone_seen, status.phone_app)
+        if c is not None and c.last_seen_at is not None
+    ]
+    return max(seen) if seen else None
+
+
+def phone_streams(status: Status) -> tuple[list[str], list[str]]:
+    """(revoked, never granted): streams the app wants but cannot use. Only
+    a granted → revoked change is a fault; a never-granted one (READ_SMS may
+    be impossible on a sideload) is shown, never alerted."""
+    if status.phone_app is None:
+        return [], []
+    detail = status.phone_app.detail or {}
+    wanted = detail.get("wanted") or {}
+    granted = detail.get("granted") or {}
+    ever = detail.get("ever_granted") or {}
+    revoked, never = [], []
+    for key in KNOWN_STREAMS:
+        if not wanted.get(key) or granted.get(key):
+            continue
+        (revoked if ever.get(key) else never).append(key)
+    return revoked, never
+
+
+def phone_silent_for(status: Status) -> timedelta | None:
+    """Awake silence past PHONE_SILENT_HOURS, else None."""
+    hours = settings.phone_silent_hours
+    last = last_phone_contact(status)
+    if hours <= 0 or last is None:
+        return None
+    awake = awake_between(last, status.now)
+    return awake if awake > timedelta(hours=hours) else None
 
 
 def problems(status: Status) -> list[Problem]:
@@ -707,6 +795,29 @@ def problems(status: Status) -> list[Problem]:
                 "etsa serverda: <code>docker compose logs --tail=50 api</code>.",
             )
         )
+    silent = phone_silent_for(status)
+    if silent is not None:
+        found.append(
+            Problem(
+                "phone_silent",
+                "warning",
+                f"⚠️ Telefon ilovasi {age_label(silent)}dan beri jim (kunduzgi soatlar "
+                "hisobida) — qo'ng'iroqlar, SMS va Payme xabarlari MIYA'ga kelmayapti. "
+                "Telefonda MIYA Companion'ni och: «Holat» ekranida qizil qator bo'lsa, "
+                "o'shani tuzat (batareya cheklovi, avtostart, internet yoki Tailscale).",
+            )
+        )
+    revoked, _never = phone_streams(status)
+    if revoked:
+        names = ", ".join(STREAM_LABEL[key] for key in revoked)
+        found.append(
+            Problem(
+                "phone_stream_off",
+                "warning",
+                f"⚠️ Telefonda ruxsat o'chib qolgan: {escape(names)}. MIYA Companion → "
+                "«Holat» ekranida qizil qatorni bosib, ruxsatni qayta yoq.",
+            )
+        )
     daily, monthly = settings.spend_alert_daily_usd, settings.spend_alert_monthly_usd
     if daily > 0 and status.cost_today_usd >= daily:
         found.append(
@@ -804,6 +915,8 @@ def mark_recovered(
 _RECOVERY = {
     "api_restarting": "✅ API yana barqaror ishlayapti — tiklandi",
     "search_down": "✅ Qidiruv yana ishlayapti — tiklandi",
+    "phone_silent": "✅ Telefon ilovasi yana aloqada — tiklandi",
+    "phone_stream_off": "✅ Telefondagi ruxsatlar yana joyida — tiklandi",
     "spend_high": "✅ API xarajati yana chegara ichida — tiklandi",
     "worker_silent": "✅ Rejalashtiruvchi (worker) qayta ishlayapti — tiklandi",
     "userbot_silent": "✅ Telegram o'quvchi qayta ulandi — tiklandi",

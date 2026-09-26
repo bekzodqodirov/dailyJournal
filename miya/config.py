@@ -349,6 +349,9 @@ class Settings(BaseSettings):
     # The same problem is repeated no more often than this while it persists;
     # a recovery notice goes out once when it clears.
     alert_repeat_hours: int = Field(default=6, ge=1)
+    # The phone app is "silent" after this many AWAKE hours (quiet hours not
+    # counted) without contacting the server (WP-66); 0 switches it off.
+    phone_silent_hours: int = Field(default=4, ge=0)
 
     # --- Internal API -------------------------------------------------------
     api_bearer_token: str = ""

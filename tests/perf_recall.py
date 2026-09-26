@@ -72,17 +72,21 @@ async def test_the_retrievers_use_their_indexes(session):
     await session.execute(sa.text("ANALYZE passages"))
     print(f"seeded {ROWS} passages in {time.monotonic() - started:.1f}s")
 
-    lexical = (
-        await session.execute(
-            sa.text(
-                # The shape recall runs: every match ranked, then the top.
-                "EXPLAIN SELECT id FROM passages WHERE search_tsv @@"
-                " to_tsquery('simple', 'konteyner:*') ORDER BY"
-                " ts_rank_cd(search_tsv, to_tsquery('simple', 'konteyner:*'), 32)"
-                " DESC LIMIT 40"
-            )
-        )
-    ).all()
+    # The shape recall runs: every match ranked, then the top. A prefix
+    # tsquery gets the planner's default 2% estimate whatever the data, so
+    # whether it prefers the index is a statistics question; what must hold
+    # is that the index serves this query at all.
+    lexical_sql = sa.text(
+        "EXPLAIN SELECT id FROM passages WHERE search_tsv @@"
+        " to_tsquery('simple', 'konteyner:*') ORDER BY"
+        " ts_rank_cd(search_tsv, to_tsquery('simple', 'konteyner:*'), 32)"
+        " DESC LIMIT 40"
+    )
+    natural = (await session.execute(lexical_sql)).all()
+    print("lexical plan:", " ".join(r[0] for r in natural))
+    await session.execute(sa.text("SET LOCAL enable_seqscan = off"))
+    lexical = (await session.execute(lexical_sql)).all()
+    await session.execute(sa.text("SET LOCAL enable_seqscan = on"))
     assert "ix_passages_tsv" in " ".join(r[0] for r in lexical)
 
     await session.execute(sa.text("SET LOCAL hnsw.ef_search = 100"))

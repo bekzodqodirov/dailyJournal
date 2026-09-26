@@ -148,6 +148,29 @@ class UploadApi(
     ): EventPostOutcome =
         postEvents(baseUrl, "/v1/phone/notifications", deviceId, "notifications", items)
 
+    /**
+     * The hourly liveness post (WP-66). The classifier of [postEvents]
+     * applies; a 200 is Delivered with zero counts.
+     */
+    suspend fun postHeartbeat(baseUrl: String, payload: JSONObject): EventPostOutcome =
+        withContext(Dispatchers.IO) {
+            try {
+                val request = Request.Builder()
+                    .url(join(baseUrl, "/v1/phone/heartbeat"))
+                    .post(payload.toString().toRequestBody(jsonType))
+                    .build()
+                client.newCall(request).execute().use { r -> classifyEvents(r) }
+            } catch (cleartext: UnknownServiceException) {
+                EventPostOutcome.Permanent(cleartextMessage(baseUrl, cleartext))
+            } catch (bad: IllegalArgumentException) {
+                EventPostOutcome.Permanent("Bad server URL \"$baseUrl\"")
+            } catch (io: IOException) {
+                EventPostOutcome.Retry(io.message ?: io.javaClass.simpleName)
+            } catch (t: Throwable) {
+                EventPostOutcome.Permanent(t.message ?: t.javaClass.simpleName)
+            }
+        }
+
     private suspend fun postEvents(
         baseUrl: String,
         path: String,

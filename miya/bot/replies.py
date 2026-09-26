@@ -2093,22 +2093,33 @@ def _search_line(status: health.Status) -> str:
 
 
 def _phone_line(status: health.Status) -> str | None:
-    """The companion app's last accepted batch — informational, never a fault.
+    """The phone app: last contact, last new event, and any stream it wants
+    but cannot use (WP-66).
 
-    None (no line at all) when no phone has ever uploaded: a phone-less
+    None (no line at all) when no phone has ever been in touch: a phone-less
     install is healthy and should not read as missing something.
     """
-    phone = getattr(status, "phone", None)
-    if phone is None:
+    last = health.last_phone_contact(status)
+    if last is None:
         return None
-    detail = phone.detail or {}
-    parts = []
-    if detail.get("calls"):
-        parts.append(f"{detail['calls']} qo'ng'iroq")
-    if detail.get("sms"):
-        parts.append(f"{detail['sms']} sms")
-    tail = f" ({', '.join(parts)})" if parts else ""
-    return f"📱 Telefon — oxirgi yuklash: {_ago(phone.age)}{tail}"
+    phone = getattr(status, "phone", None)
+    event = _ago(phone.age) if phone is not None else STATUS_NEVER
+    silent = health.phone_silent_for(status)
+    if silent is not None:
+        return (
+            f"⚠️ Telefon — {age_label(silent)}dan beri jim · "
+            f"oxirgi yangi voqea: {event}"
+        )
+    revoked, never = health.phone_streams(status)
+    tail = ""
+    if revoked:
+        tail += " · o'chgan: " + ", ".join(health.STREAM_LABEL[k] for k in revoked)
+    if never:
+        tail += " · ruxsat berilmagan: " + ", ".join(
+            health.STREAM_LABEL[k] for k in never
+        )
+    contact = _ago(max(status.now - last, timedelta(0)))
+    return f"📱 Telefon — oxirgi aloqa: {contact} · oxirgi yangi voqea: {event}{tail}"
 
 
 OWNER_ALIASES_BLANK = (

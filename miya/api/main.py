@@ -17,7 +17,7 @@ from typing import Annotated, Any
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya import __version__
@@ -712,6 +712,7 @@ async def upload_recording(request: Request, session: SessionDep) -> JSONRespons
     if audio_path.exists() or await call_recordings.already_ingested(
         session, parsed.sha256, call_id=parsed.call_id, occurred_at=started_at
     ):
+        await _phone_seen(session, "/v1/recordings", parsed.device_id)
         return JSONResponse(
             {
                 "status": "duplicate",
@@ -796,6 +797,7 @@ async def upload_recording(request: Request, session: SessionDep) -> JSONRespons
         parsed.device_id,
         written,
     )
+    await _phone_seen(session, "/v1/recordings", parsed.device_id)
     return JSONResponse(
         {
             "status": "accepted",
@@ -851,6 +853,7 @@ async def probe_recordings(
         )
         known_call.update(r for r in rows if r)
 
+    await _phone_seen(session, "/v1/recordings/probe", None)
     return {
         "known_sha256": sorted(known_sha),
         "known_call_id": sorted(known_call),
@@ -987,6 +990,63 @@ async def _phone_beat(
         log.warning("could not record the phone heartbeat", exc_info=True)
 
 
+# Any contact at all, even an empty or duplicate-only batch (WP-66): the
+# `phone` beat above moves only on accepted events, so a quiet phone that
+# is alive would otherwise look dead. At most one write a minute.
+PHONE_SEEN_EVERY = timedelta(seconds=60)
+_phone_seen_at: dict[str, datetime] = {}
+
+
+async def _phone_seen(session: AsyncSession, path: str, device_id: str | None) -> None:
+    now = datetime.now(settings.tz)
+    last = _phone_seen_at.get("phone_seen")
+    if last is not None and now - last < PHONE_SEEN_EVERY:
+        return
+    try:
+        await health.beat(
+            session, "phone_seen", detail={"path": path, "device_id": device_id}, now=now
+        )
+        await session.commit()
+        _phone_seen_at["phone_seen"] = now
+    except Exception:
+        log.warning("could not record phone contact", exc_info=True)
+
+
+class PhoneHeartbeatIn(BaseModel):
+    """The app's hourly "I am alive, and this is what I may do" (WP-66)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str = Field(min_length=1, max_length=128)
+    app_version: str | None = Field(default=None, max_length=32)
+    version_code: int | None = None
+    wanted: dict[str, bool] = Field(default_factory=dict)
+    granted: dict[str, bool] = Field(default_factory=dict)
+    ever_granted: dict[str, bool] = Field(default_factory=dict)
+    queue: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("wanted", "granted", "ever_granted")
+    @classmethod
+    def _known_streams(cls, v: dict[str, bool]) -> dict[str, bool]:
+        return {k: bool(x) for k, x in v.items() if k in health.KNOWN_STREAMS}
+
+    @field_validator("queue")
+    @classmethod
+    def _known_queues(cls, v: dict[str, int]) -> dict[str, int]:
+        keys = ("recordings_pending", "events_pending", "events_failed")
+        return {k: int(x) for k, x in v.items() if k in keys}
+
+
+@api.post("/phone/heartbeat", tags=["phone"])
+async def phone_heartbeat(body: PhoneHeartbeatIn, session: SessionDep) -> dict[str, Any]:
+    """Liveness and permission state from the phone. Reads nothing back."""
+    now = datetime.now(settings.tz)
+    await health.beat(session, "phone_app", detail=body.model_dump(), now=now)
+    await session.commit()
+    await _phone_seen(session, "/v1/phone/heartbeat", body.device_id)
+    return {"ok": True, "server_time": now.isoformat()}
+
+
 @api.post("/phone/calls", tags=["phone"])
 async def upload_call_events(
     body: CallEventsRequest, session: SessionDep
@@ -1001,6 +1061,7 @@ async def upload_call_events(
     await session.commit()
     if outcome.accepted:
         await _phone_beat(session, body.device_id, "calls", outcome.accepted)
+    await _phone_seen(session, "/v1/phone/calls", body.device_id)
     return _outcome_json(outcome)
 
 
@@ -1014,6 +1075,7 @@ async def upload_sms(body: SmsRequest, session: SessionDep) -> dict[str, Any]:
     await session.commit()
     if outcome.accepted:
         await _phone_beat(session, body.device_id, "sms", outcome.accepted)
+    await _phone_seen(session, "/v1/phone/sms", body.device_id)
     return _outcome_json(outcome)
 
 
@@ -1029,6 +1091,7 @@ async def upload_notifications(
     await session.commit()
     if outcome.accepted:
         await _phone_beat(session, body.device_id, "notifications", outcome.accepted)
+    await _phone_seen(session, "/v1/phone/notifications", body.device_id)
     return _outcome_json(outcome)
 
 

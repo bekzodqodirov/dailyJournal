@@ -72,6 +72,11 @@ data class PrefsSnapshot(
     val smsBackfillDays: Int = 30,
     /** The cutoff frozen at the first harvest; null until then. */
     val smsImportFromMs: Long? = null,
+    // ---- liveness (WP-66) ---------------------------------------------
+    /** When the server last acknowledged a heartbeat. */
+    val lastHeartbeatAt: Long? = null,
+    /** Streams ever seen granted on this install (a reinstall resets it). */
+    val everGrantedStreams: Set<String> = emptySet(),
 ) {
     val serverConfigured: Boolean get() = serverUrl.isNotBlank()
 }
@@ -112,6 +117,8 @@ class Prefs(private val context: Context) {
         val PAYME_AUTO_TICKED = booleanPreferencesKey("payme_auto_ticked")
         val SMS_BACKFILL_DAYS = longPreferencesKey("sms_backfill_days")
         val SMS_IMPORT_FROM_MS = longPreferencesKey("sms_import_from_ms")
+        val LAST_HEARTBEAT_AT = longPreferencesKey("last_heartbeat_at")
+        val EVER_GRANTED_STREAMS = stringSetPreferencesKey("ever_granted_streams")
     }
 
     val flow: Flow<PrefsSnapshot> = context.dataStore.data.map { it.toSnapshot() }
@@ -145,6 +152,8 @@ class Prefs(private val context: Context) {
         paymeAutoTicked = this[K.PAYME_AUTO_TICKED] ?: false,
         smsBackfillDays = (this[K.SMS_BACKFILL_DAYS] ?: 30L).toInt(),
         smsImportFromMs = this[K.SMS_IMPORT_FROM_MS],
+        lastHeartbeatAt = this[K.LAST_HEARTBEAT_AT],
+        everGrantedStreams = this[K.EVER_GRANTED_STREAMS] ?: emptySet(),
     )
 
     private fun seenOrdered(raw: Set<String>?): List<String> =
@@ -276,6 +285,15 @@ class Prefs(private val context: Context) {
             if (existing == null) it[K.SMS_IMPORT_FROM_MS] = value else frozen = existing
         }
         return frozen
+    }
+
+    // ---- liveness (WP-66) ----------------------------------------------------
+
+    suspend fun setLastHeartbeatAt(value: Long) = update { it[K.LAST_HEARTBEAT_AT] = value }
+
+    /** Only ever grows: a granted → revoked change is what the server alerts on. */
+    suspend fun addEverGranted(streams: Set<String>) = update {
+        it[K.EVER_GRANTED_STREAMS] = (it[K.EVER_GRANTED_STREAMS] ?: emptySet()) + streams
     }
 
     suspend fun setMediaGeneration(version: String, generation: Long) = update {

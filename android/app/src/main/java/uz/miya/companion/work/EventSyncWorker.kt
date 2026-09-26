@@ -1,17 +1,22 @@
 package uz.miya.companion.work
 
 import android.content.Context
+import android.net.Uri
 import android.provider.Telephony
 import android.telephony.SubscriptionManager
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import org.json.JSONObject
+import kotlinx.coroutines.flow.first
+import uz.miya.companion.BuildConfig
 import uz.miya.companion.Graph
 import uz.miya.companion.data.PhoneEventDao
 import uz.miya.companion.data.PhoneEventEntity
 import uz.miya.companion.data.PhoneEventKind
+import uz.miya.companion.data.PrefsSnapshot
 import uz.miya.companion.data.SmsMode
 import uz.miya.companion.data.UploadState
+import uz.miya.companion.discover.SafScanner
 import uz.miya.companion.ingest.CallLogMatcher
 import uz.miya.companion.ingest.PaymentSenders
 import uz.miya.companion.ingest.PhoneNormalizer
@@ -109,6 +114,11 @@ class EventSyncWorker(
             }
 
             dao.pruneDoneBefore(System.currentTimeMillis() - KEEP_DONE_MILLIS)
+
+            // Liveness (WP-66): once an hour, even with nothing pending, so a
+            // quiet but healthy phone never reads as dead on the server, and
+            // a revoked permission is reported.
+            maybeHeartbeat(snapshot, dao, deviceId)
 
             // A first install or a long offline stretch leaves thousands of
             // provider rows behind the mark; one run reads at most MAX_BATCH
@@ -340,6 +350,64 @@ class EventSyncWorker(
                     return false
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------- liveness
+
+    private suspend fun maybeHeartbeat(
+        snapshot: PrefsSnapshot,
+        dao: PhoneEventDao,
+        deviceId: String,
+    ) {
+        val now = System.currentTimeMillis()
+        if (!Heartbeat.due(snapshot.lastHeartbeatAt, now)) return
+        try {
+            val ctx = applicationContext
+            val tree = snapshot.treeUri?.let(Uri::parse)
+            val recordingsOk = (tree != null && SafScanner.stillGranted(ctx, tree)) ||
+                (snapshot.folderRelativePath != null &&
+                    (StorageAccess.hasMediaAudio(ctx) || StorageAccess.allFiles()))
+            val granted = mapOf(
+                "call_log" to StorageAccess.hasCallLog(ctx),
+                "sms" to StorageAccess.hasSms(ctx),
+                "recordings" to recordingsOk,
+                "notifications" to StorageAccess.hasNotificationAccess(ctx),
+            )
+            val wanted = mapOf(
+                "call_log" to snapshot.uploadCallLog,
+                "sms" to (snapshot.smsMode != SmsMode.OFF),
+                "recordings" to (snapshot.treeUri != null || snapshot.folderRelativePath != null),
+                "notifications" to snapshot.paymentAppPackages.isNotEmpty(),
+            )
+            val nowGranted = granted.filterValues { it }.keys
+            Graph.prefs.addEverGranted(nowGranted)
+            val queue = mapOf(
+                "recordings_pending" to Graph.database.uploads().observeQueueDepth().first(),
+                "events_pending" to dao.pendingCount(),
+                "events_failed" to dao.failedCount(),
+            )
+            val map = Heartbeat.heartbeatMap(
+                deviceId = deviceId,
+                wanted = wanted,
+                granted = granted,
+                everGranted = snapshot.everGrantedStreams + nowGranted,
+                queue = queue,
+                versionName = BuildConfig.VERSION_NAME,
+                versionCode = BuildConfig.VERSION_CODE,
+            )
+            val payload = JSONObject()
+            for ((key, value) in map) {
+                payload.put(key, if (value is Map<*, *>) JSONObject(value) else value)
+            }
+            when (val outcome = Graph.api.postHeartbeat(snapshot.serverUrl, payload)) {
+                is EventPostOutcome.Delivered -> Graph.prefs.setLastHeartbeatAt(now)
+                else -> Logx.w("Heartbeat not delivered: $outcome")
+            }
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            Logx.w("Heartbeat failed: ${t.javaClass.simpleName}")
         }
     }
 

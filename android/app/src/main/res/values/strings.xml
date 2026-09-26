@@ -29,4 +29,6 @@
     <string name="sms_backfill_none">Yuklamaslik</string>
     <string name="sms_backfill_days">%1$d kun</string>
     <string name="sms_backfill_year">1 yil</string>
+    <!-- WP-66 -->
+    <string name="last_heartbeat">Serverga oxirgi xabar: %1$s</string>
 </resources>
