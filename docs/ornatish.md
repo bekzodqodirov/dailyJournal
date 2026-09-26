@@ -38,4 +38,5 @@
    - Birinchi 10 kun har kechqurun /bugun'dagi xarajat jamini o'zing hisoblagan bilan solishtir.
    - Haftasiga 2 marta /xarajat'ni Anthropic Console'dagi summa bilan solishtir.
    - Bir marta: make restore FILE=/data/backups/<oxirgi fayl> DRY=1 → ichidagi jadvallar ro'yxati chiqsin.
+10b) Tashqi kuzatuvchi: healthchecks.io'da «MIYA» tekshiruvini yarat (davr 5 daqiqa, kutish 15 daqiqa), Telegram integratsiyasini ulab, ping manzilini .env'dagi DEADMAN_PING_URL= ga yoz, keyin docker compose up -d --force-recreate worker.
 11) Telefon ilovasi: faqat Telegramga kelgan yangi imzoli APK'ni, serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda, WP-63 qo'shadi).

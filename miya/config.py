@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     embed_stale_minutes: int = Field(default=60, ge=5)
     # This many API starts within an hour is a restart loop (usually RAM).
     api_restart_alert_count: int = Field(default=3, ge=2)
+    # An external dead-man's switch (WP-27): the worker GETs this URL every
+    # DEADMAN_PING_MINUTES after its heartbeat; the service alerts when the
+    # pings stop. Blank = off.
+    deadman_ping_url: str = ""
+    deadman_ping_minutes: int = Field(default=5, ge=1)
 
     # --- Telegram -----------------------------------------------------------
     assistant_bot_token: str = ""

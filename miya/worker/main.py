@@ -49,7 +49,9 @@ import signal
 import sys
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from time import monotonic
 
+import httpx
 import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -869,6 +871,37 @@ async def heartbeat_job(scheduler: AsyncIOScheduler | None = None) -> None:
     jobs = len(scheduler.get_jobs()) if scheduler is not None else 0
     async with session_scope() as session:
         await health.beat(session, "worker", detail={"jobs": jobs})
+    # Only after the beat is durable: a dead database stops the ping too.
+    await _deadman_ping()
+
+
+# When the last external ping went out (per process).
+_last_deadman_ping: float | None = None
+
+
+async def _deadman_ping(*, transport=None) -> bool:
+    """GET DEADMAN_PING_URL at most every DEADMAN_PING_MINUTES (WP-27).
+
+    Every other alert runs on this server; this one is how a dead VPS gets
+    noticed. Never raises."""
+    global _last_deadman_ping
+    url = settings.deadman_ping_url.strip()
+    if not url:
+        return False
+    now = monotonic()
+    if (
+        _last_deadman_ping is not None
+        and now - _last_deadman_ping < settings.deadman_ping_minutes * 60
+    ):
+        return False
+    _last_deadman_ping = now
+    try:
+        async with httpx.AsyncClient(timeout=10, transport=transport) as client:
+            await client.get(url)
+        return True
+    except Exception:
+        log.warning("dead-man ping failed", exc_info=True)
+        return False
 
 
 # When the database is down the alert ledger is down with it; this memo is

@@ -522,7 +522,8 @@ command ends, success or not.
 
 ### Documented egress
 
-Four external services receive data. Nothing else leaves the VPS.
+Four external services receive data, plus one optional bare ping. Nothing
+else leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
@@ -530,6 +531,8 @@ Four external services receive data. Nothing else leaves the VPS.
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
+
+| **`DEADMAN_PING_URL`** (optional) | A bare GET every `DEADMAN_PING_MINUTES`, no data | An outside watcher notices a dead server |
 
 Embeddings run locally on the VPS CPU (`BAAI/bge-m3`) — no egress.
 

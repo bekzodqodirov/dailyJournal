@@ -684,3 +684,54 @@ async def test_a_backup_key_set_later_is_announced_as_recovered(session):
     await session.flush()
     due, recovered = await health.alerts_due(session, [], now=NOW + timedelta(minutes=5))
     assert due == [] and recovered == ["backup_unconfigured"]
+
+
+# --- WP-27: the external dead-man's switch ------------------------------------
+
+
+def _ping_transport(seen: list, *, fail: bool = False):
+    import httpx
+
+    def handler(request):
+        if fail:
+            raise httpx.ConnectError("down", request=request)
+        seen.append(str(request.url))
+        return httpx.Response(200)
+
+    return httpx.MockTransport(handler)
+
+
+async def test_the_deadman_ping_once_per_interval(monkeypatch):
+    monkeypatch.setattr(settings, "deadman_ping_url", "https://hc.example/ping/abc")
+    monkeypatch.setattr(worker, "_last_deadman_ping", None)
+    seen: list = []
+    assert await worker._deadman_ping(transport=_ping_transport(seen)) is True
+    assert await worker._deadman_ping(transport=_ping_transport(seen)) is False
+    assert seen == ["https://hc.example/ping/abc"]
+
+
+async def test_no_url_no_ping_and_errors_never_raise(monkeypatch):
+    monkeypatch.setattr(worker, "_last_deadman_ping", None)
+    monkeypatch.setattr(settings, "deadman_ping_url", "")
+    seen: list = []
+    assert await worker._deadman_ping(transport=_ping_transport(seen)) is False
+    monkeypatch.setattr(settings, "deadman_ping_url", "https://hc.example/ping/abc")
+    assert await worker._deadman_ping(transport=_ping_transport(seen, fail=True)) is False
+    assert seen == []
+
+
+async def test_a_failed_db_beat_sends_no_ping(monkeypatch):
+    pinged: list = []
+
+    async def _ping(**kwargs):
+        pinged.append(True)
+        return True
+
+    async def _broken(*args, **kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(worker, "_deadman_ping", _ping)
+    monkeypatch.setattr(worker.health, "beat", _broken)
+    with pytest.raises(RuntimeError):
+        await worker.heartbeat_job(None)
+    assert pinged == []
