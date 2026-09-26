@@ -158,7 +158,9 @@ async def collect(
     items: list[Pending] = []
 
     # (a) Claims.
-    for claim in await claims.askable(session, now=now, for_push=for_push):
+    askable = await claims.askable(session, now=now, for_push=for_push)
+    await claims.load_evidence(session, askable)
+    for claim in askable:
         items.append(pending_of_claim(claim, now))
 
     # (b) Missed calls.
@@ -434,4 +436,5 @@ async def auto_resolve(session: AsyncSession, *, now: datetime) -> dict[str, int
         "groups_decided": await chats.apply_default_rules(session, now=now),
         "claims_linked": await claims.collapse_duplicates(session, now=now),
         "claims_superseded": len(await claims.resolve_superseded(session, now=now)),
+        "claims_bank": len(await claims.match_bank_evidence(session, now=now)),
     }

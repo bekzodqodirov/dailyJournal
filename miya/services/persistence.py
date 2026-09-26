@@ -780,6 +780,7 @@ async def _gate(
     claim = await claims.create(
         session, interaction, kind, item, person_id=person_id, now=now
     )
+    await claims.match_bank_evidence(session, now=now, claim=claim)
     applied.claims.append(claim)
     return True
 

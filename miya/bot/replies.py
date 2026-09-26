@@ -514,7 +514,7 @@ def confirmation_refs(applied: Applied) -> list[tuple[str, int]]:
 
 def confirmation_claim_ids(applied: Applied) -> list[int]:
     """The claims a confirmation asks about, in the order the lines show."""
-    return [c.id for c in applied.claims if c.id is not None]
+    return [c.id for c in applied.claims if c.id is not None and c.state == "pending"]
 
 
 def debts_report(balances: list[DebtBalance]) -> str:

@@ -498,7 +498,28 @@ def claim_line(view: ClaimView, *, markup: bool = True) -> str:
     question = "va'dasi bajarilganmi?" if view.kind == "fulfilment" else "to'g'rimi?"
     repeats = getattr(view, "repeats", 0)
     suffix = f" (+{repeats} takror)" if repeats else ""
-    return f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}{suffix}"
+    evidence = getattr(view, "evidence", None)
+    if view.state == "auto" and evidence is not None:
+        line = f"✅ {handle} {who} aytdi: {_claim_body(view, markup)} — bank tasdiqladi"
+    else:
+        line = (
+            f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}{suffix}"
+        )
+    if evidence is not None:
+        line += "\n" + claim_evidence_line(evidence, markup=markup)
+    return line
+
+
+def claim_evidence_line(txn, *, markup: bool = True) -> str:
+    """The bank row under a claim (WP-44); the figures are the SQL row's."""
+    sign = "+" if txn.type.value == "income" else "−"
+    when = txn.occurred_at.astimezone(settings.tz)
+    handle = ref("transaction", txn.id)
+    handle = f"<code>{handle}</code>" if markup else handle
+    return (
+        f"    💳 Bank: {sign}{money(txn.amount, txn.currency)} · "
+        f"{short_date(when.date())} {clock(when)} {handle}"
+    )
 
 
 # --- one person's history: one line per contact ----------------------------

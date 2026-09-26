@@ -72,6 +72,7 @@ DECLINED = "declined"
 AUTO = "auto"
 BY_AUTO_DUPLICATE = "auto:duplicate"
 BY_AUTO_OWN = "auto:own"
+BY_AUTO_BANK = "auto:bank"
 MONEY_KINDS = ("debt", "settlement", "transaction")
 
 # Who answered — the claim's ``answered_by`` and the "by" of the history entry
@@ -574,6 +575,8 @@ class ClaimView:
     txn_type: str | None = None
     # How many later claims repeat this one (WP-43).
     repeats: int = 0
+    # The bank row that proves it (WP-44), when loaded.
+    evidence: Any = None
 
 
 def _money(value: object) -> Decimal | None:
@@ -633,6 +636,7 @@ def view(claim: Claim) -> ClaimView:
         ),
         state=claim.state or PENDING,
         txn_type=_txn_type(payload) if kind == KIND_TRANSACTION else None,
+        evidence=getattr(claim, "_evidence_txn", None),
     )
 
 
@@ -720,9 +724,30 @@ async def accept(
             session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     elif claim.kind == KIND_TRANSACTION:
-        row = await persistence.write_transaction(
-            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
-        )
+        bank = None
+        if claim.evidence_txn_id:
+            bank = await session.get(Transaction, claim.evidence_txn_id)
+        else:
+            found = await bank_candidates(session, claim)
+            bank = found[0] if len(found) == 1 else None
+        if bank is not None:
+            # The bank already booked it (WP-44): link, never a second row.
+            if bank.counterparty_person_id is None and hint is not None:
+                bank.counterparty_person_id = hint.id
+            applied.transactions.append(bank)
+            claim.result_kind, claim.result_id = "transaction", bank.id
+            claim.evidence_txn_id = bank.id
+            row = bank
+        else:
+            row = await persistence.write_transaction(
+                session,
+                interaction,
+                item,
+                applied,
+                now=now,
+                claim=claim,
+                person_hint=hint,
+            )
     elif claim.kind == KIND_PROMISE:
         row = await persistence.write_promise(
             session, interaction, item, applied, now=now, claim=claim, person_hint=hint
@@ -766,6 +791,7 @@ async def decline(
     claim.state = DECLINED
     claim.answered_at = now
     claim.answered_by = by
+    claim.evidence_txn_id = None  # the bank row is free for another claim
     await _settle_duplicates(session, claim, state=DECLINED, now=now)
     await session.flush()
     return claim
@@ -899,3 +925,138 @@ async def edit(
 
     await session.flush()
     return claim
+
+
+# --- claims the bank already proves (WP-44) ------------------------------------
+
+BANK_KINDS = (KIND_TRANSACTION, KIND_SETTLEMENT)
+
+
+def _want(claim: Claim) -> TransactionType:
+    """Income when the claim says money came to the owner."""
+    payload = claim.payload or {}
+    if claim.kind == KIND_TRANSACTION:
+        incoming = payload.get("type") == "income"
+    else:
+        incoming = payload.get("direction") == DebtDirection.they_owe_me.value
+    return TransactionType.income if incoming else TransactionType.expense
+
+
+def _bank_key(claim: Claim):
+    payload = claim.payload or {}
+    amount = _money(payload.get("amount"))
+    if amount is None:
+        return None
+    return _want(claim), amount, payload.get("currency") or "UZS"
+
+
+async def _anchor(session: AsyncSession, claim: Claim) -> datetime | None:
+    return await session.scalar(
+        sa.select(Interaction.occurred_at).where(Interaction.id == claim.interaction_id)
+    )
+
+
+async def bank_candidates(session: AsyncSession, claim: Claim) -> list[Transaction]:
+    """Bank-evidenced rows (SMS or app, incl. typed rows an SMS matched)
+    that could be the money this claim speaks of."""
+    key = _bank_key(claim)
+    anchor = await _anchor(session, claim)
+    if key is None or anchor is None:
+        return []
+    want, amount, currency = key
+    window = timedelta(hours=settings.claim_bank_match_hours)
+    return list(
+        await session.scalars(
+            sa.select(Transaction)
+            .where(
+                Transaction.channel.is_not(None),
+                Transaction.voided_at.is_(None),
+                Transaction.type == want,
+                Transaction.currency == Currency(currency),
+                Transaction.amount == amount,
+                Transaction.occurred_at.between(anchor - window, anchor + window),
+                ~sa.exists().where(Claim.evidence_txn_id == Transaction.id),
+            )
+            .order_by(Transaction.id)
+        )
+    )
+
+
+async def _open_bank_claims(session: AsyncSession) -> list[tuple[Claim, datetime]]:
+    rows = await session.execute(
+        sa.select(Claim, Interaction.occurred_at)
+        .join(Interaction, Interaction.id == Claim.interaction_id)
+        .where(
+            Claim.state == PENDING,
+            Claim.kind.in_(BANK_KINDS),
+            Claim.evidence_txn_id.is_(None),
+            Claim.duplicate_of.is_(None),
+        )
+        .order_by(Claim.id)
+    )
+    return [(c, anchor) for c, anchor in rows.all() if _is_automatic(c)]
+
+
+async def match_bank_evidence(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    claim: Claim | None = None,
+    txn: Transaction | None = None,
+) -> list[Claim]:
+    """Link each claim to the one bank row that proves it — only when the
+    pairing is unique both ways — and close what may close by itself."""
+    if settings.claim_bank_match_hours <= 0:
+        return []
+    open_claims = await _open_bank_claims(session)
+    window = timedelta(hours=settings.claim_bank_match_hours)
+    targets = [c for c, _ in open_claims if claim is None or c.id == claim.id]
+    matched: list[Claim] = []
+    for target in targets:
+        found = await bank_candidates(session, target)
+        if len(found) != 1:
+            continue
+        bank = found[0]
+        if txn is not None and bank.id != txn.id:
+            continue
+        key = _bank_key(target)
+        rivals = [
+            c
+            for c, anchor in open_claims
+            if c.id != target.id
+            and _bank_key(c) == key
+            and bank.occurred_at - window <= anchor <= bank.occurred_at + window
+        ]
+        if rivals:
+            continue
+        target.evidence_txn_id = bank.id
+        target._evidence_txn = bank
+        if target.kind == KIND_TRANSACTION and settings.claim_bank_autoclose_transactions:
+            target.state = AUTO
+            target.answered_by = BY_AUTO_BANK
+            target.answered_at = now
+            target.result_kind, target.result_id = "transaction", bank.id
+        elif (
+            target.kind == KIND_SETTLEMENT and settings.claim_bank_autoaccept_settlements
+        ):
+            await session.flush()
+            await accept(session, target.id, by=BY_AUTO_BANK, now=now)
+        matched.append(target)
+    await session.flush()
+    return matched
+
+
+async def load_evidence(session: AsyncSession, rows) -> None:
+    """Put each claim's evidence row on it, one query, for rendering."""
+    ids = {c.evidence_txn_id for c in rows if c.evidence_txn_id}
+    if not ids:
+        return
+    found = {
+        t.id: t
+        for t in await session.scalars(
+            sa.select(Transaction).where(Transaction.id.in_(ids))
+        )
+    }
+    for c in rows:
+        if c.evidence_txn_id in found:
+            c._evidence_txn = found[c.evidence_txn_id]

@@ -1341,6 +1341,7 @@ async def cmd_claims(message: Message) -> None:
         pending = await claims.pending(session)
         shown = pending[: keyboards.MAX_ROWS]
         repeats = await claims.duplicate_counts(session, [c.id for c in shown])
+        await claims.load_evidence(session, shown)
         views = [claims.view(c) for c in shown]
         for view in views:
             view.repeats = repeats.get(view.id, 0)

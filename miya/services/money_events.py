@@ -186,8 +186,10 @@ async def _mark_internal_pair(session, txn) -> None:  # WP-69
 
 
 async def _match_bank_evidence(session, *, now: datetime, txn: Transaction) -> None:
-    """claims.match_bank_evidence (WP-44); a no-op until then."""
-    return None
+    """A fresh bank row may prove a pending claim (WP-44)."""
+    from miya.services import claims  # claims → persistence → money_events
+
+    await claims.match_bank_evidence(session, now=now, txn=txn)
 
 
 # --- booking ------------------------------------------------------------------------
