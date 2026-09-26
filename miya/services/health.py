@@ -46,6 +46,7 @@ from miya.db.models import (
     ConversationWindow,
     Heartbeat,
     Interaction,
+    Memory,
     ReminderLog,
     UsageLog,
 )
@@ -75,7 +76,11 @@ PROBLEM_KEYS = (
     "anthropic_failing",
     "review_backlog",
     "spend_high",
+    "api_restarting",
+    "search_down",
 )
+# reminder_log kind the api writes once per start (WP-26).
+API_START_KIND = "api_start"
 # Flagged inputs pile up quietly; past this many the pile is itself a fault.
 REVIEW_BACKLOG_THRESHOLD = 20
 # No successful Anthropic call for this long while windows wait = failing.
@@ -226,6 +231,10 @@ class Status:
     # Money texts waiting in /tekshir's money block (WP-14): shown, never
     # counted into the backlog alarm — they are the owner's call, not a fault.
     money_review: int = 0
+    # WP-26: api starts in the last hour, and memories waiting for a vector.
+    api_starts_last_hour: int = 0
+    embed_backlog: int = 0
+    embed_oldest_at: datetime | None = None
 
     @classmethod
     def unreachable(cls, now: datetime) -> Status:
@@ -388,6 +397,21 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
             or 0
         )
         money_review = await queries.money_review_count(session)
+        api_starts = int(
+            await session.scalar(
+                sa.select(sa.func.count(ReminderLog.id))
+                .where(ReminderLog.kind == API_START_KIND)
+                .where(ReminderLog.sent_at >= now - timedelta(hours=1))
+            )
+            or 0
+        )
+        embed_backlog, embed_oldest_at = (
+            await session.execute(
+                sa.select(sa.func.count(Memory.id), sa.func.min(Memory.created_at)).where(
+                    Memory.embedding.is_(None)
+                )
+            )
+        ).one()
         claims_pending = int(
             await session.scalar(
                 sa.select(sa.func.count())
@@ -434,6 +458,9 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         needs_review=needs_review,
         claims_pending=claims_pending,
         money_review=money_review,
+        api_starts_last_hour=api_starts,
+        embed_backlog=int(embed_backlog or 0),
+        embed_oldest_at=embed_oldest_at,
         cost_today_usd=cost_today,
         cost_month_usd=cost_month,
         anthropic_last_ok_at=anthropic_last_ok_at,
@@ -468,6 +495,14 @@ def _since(component: Component) -> str:
     if component.age is None:
         return "hali bir marta ham xabar bermagan"
     return f"{age_label(component.age)}dan beri jim"
+
+
+def search_stale(status: Status) -> bool:
+    return (
+        status.embed_oldest_at is not None
+        and status.now - status.embed_oldest_at
+        > timedelta(minutes=settings.embed_stale_minutes)
+    )
 
 
 def problems(status: Status) -> list[Problem]:
@@ -622,6 +657,32 @@ def problems(status: Status) -> list[Problem]:
                 "ko'rib chiq.",
             )
         )
+    if status.api_starts_last_hour >= settings.api_restart_alert_count:
+        found.append(
+            Problem(
+                "api_restarting",
+                "warning",
+                f"⚠️ API so'nggi bir soatda {status.api_starts_last_hour} marta qayta "
+                "ishga tushdi — odatda serverda xotira (RAM) yetmayotganini "
+                "bildiradi: qidiruv (/qidir) va telefon yuklashlari uzilib qoladi. "
+                "Serverda: "
+                "<code>free -h</code> va <code>docker compose logs --tail=50 api</code>. "
+                "MIYA uchun kamida 8 GB RAM kerak.",
+            )
+        )
+    if search_stale(status):
+        found.append(
+            Problem(
+                "search_down",
+                "warning",
+                f"⚠️ Qidiruv ishlamayapti: {status.embed_backlog} ta yangi yozuv "
+                f"{age_label(status.now - status.embed_oldest_at)}dan beri "
+                "indekslanmagan — /qidir va «nima deb o'ylaysan» savollari yangi "
+                "ma'lumotni topmaydi. "
+                "Birinchi ishga tushishda model (~2 GB) yuklanadi — 30 daqiqa kut; davom "
+                "etsa serverda: <code>docker compose logs --tail=50 api</code>.",
+            )
+        )
     daily, monthly = settings.spend_alert_daily_usd, settings.spend_alert_monthly_usd
     if daily > 0 and status.cost_today_usd >= daily:
         found.append(
@@ -717,6 +778,8 @@ def mark_recovered(
 
 
 _RECOVERY = {
+    "api_restarting": "✅ API yana barqaror ishlayapti — tiklandi",
+    "search_down": "✅ Qidiruv yana ishlayapti — tiklandi",
     "spend_high": "✅ API xarajati yana chegara ichida — tiklandi",
     "worker_silent": "✅ Rejalashtiruvchi (worker) qayta ishlayapti — tiklandi",
     "userbot_silent": "✅ Telegram o'quvchi qayta ulandi — tiklandi",

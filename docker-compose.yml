@@ -11,6 +11,8 @@ services:
   db:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
+    # Under memory pressure the kernel picks something else than the database.
+    oom_score_adj: -500
     logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-miya}
@@ -61,6 +63,9 @@ services:
   api:
     build: .
     restart: unless-stopped
+    # The embedding model is the one large process; bounded so the kernel
+    # kills it, not PostgreSQL, when the server runs out of RAM (WP-26).
+    mem_limit: ${API_MEM_LIMIT:-4g}
     logging: *default-logging
     env_file: .env
     depends_on:

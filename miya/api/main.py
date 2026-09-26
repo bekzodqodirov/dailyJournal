@@ -32,7 +32,14 @@ from miya.db.enums import (
     InteractionSource,
     PromiseStatus,
 )
-from miya.db.models import Debt, DebtPayment, Interaction, Person, Transaction
+from miya.db.models import (
+    Debt,
+    DebtPayment,
+    Interaction,
+    Person,
+    ReminderLog,
+    Transaction,
+)
 from miya.db.session import SessionLocal, engine, get_session
 from miya.services import (
     call_recordings,
@@ -45,6 +52,7 @@ from miya.services import (
     reports,
 )
 from miya.services.embeddings import EmbeddingError, get_local_embedder
+from miya.services.health import API_START_KIND
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -77,6 +85,17 @@ def assert_startup_config() -> None:
             log.warning("UPLOAD_TOKENS: %s's token equals API_BEARER_TOKEN", name)
 
 
+async def _record_start() -> None:
+    """One row per start (WP-26): a crash loop answers /health between
+    crashes, so only counting starts shows it. Never stops the API."""
+    try:
+        async with SessionLocal() as session:
+            session.add(ReminderLog(kind=API_START_KIND, ref=__version__))
+            await session.commit()
+    except Exception:
+        log.warning("could not record the api start", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logging.basicConfig(
@@ -84,6 +103,7 @@ async def lifespan(app: FastAPI):
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
     log.info("MIYA API starting (tz=%s, version=%s)", settings.timezone, __version__)
+    await _record_start()
     yield
     await engine.dispose()
     log.info("MIYA API stopped")

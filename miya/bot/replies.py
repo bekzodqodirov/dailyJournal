@@ -1852,6 +1852,18 @@ def _anthropic_line(status: health.Status) -> str:
     return f"✅ Anthropic — oxirgi muvaffaqiyat: {last}"
 
 
+def _search_line(status: health.Status) -> str:
+    backlog = getattr(status, "embed_backlog", 0)
+    oldest = getattr(status, "embed_oldest_at", None)
+    if not backlog or oldest is None:
+        return "✅ Qidiruv — tayyor"
+    mark = "⚠️" if health.search_stale(status) else "⏳"
+    return (
+        f"{mark} Qidiruv — {backlog} ta yozuv kutmoqda "
+        f"({age_label(status.now - oldest)}dan beri)"
+    )
+
+
 def _phone_line(status: health.Status) -> str | None:
     """The companion app's last accepted batch — informational, never a fault.
 
@@ -1896,6 +1908,7 @@ def status_report(
         _disk_line(status),
         _backup_line(status),
         _anthropic_line(status),
+        _search_line(status),
         *([line] if (line := _phone_line(status)) else []),
         "<b>Navbatda</b>: "
         f"kutayotgan suhbatlar {status.windows_pending} · "

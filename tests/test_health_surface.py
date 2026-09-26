@@ -128,6 +128,7 @@ def test_a_healthy_status_renders_the_contract_shape():
         "✅ Disk — 34 GB bo'sh",
         "✅ Zaxira nusxa — bugun 03:30 · 12 MB · Telegramga yuborildi",
         "✅ Anthropic — oxirgi muvaffaqiyat: 12 daqiqa oldin",
+        "✅ Qidiruv — tayyor",
         "<b>Navbatda</b>: kutayotgan suhbatlar 0 · batch'da 0 · "
         "ishlanmagan 0 (/tekshir) · da'volar 0 (/davolar)",
         "<b>Xarajat</b>: bugun $0.10 · bu oy $3.50 (/xarajat)",

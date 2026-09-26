@@ -121,3 +121,35 @@ def test_api_main_module_exits_before_uvicorn(monkeypatch):
         runpy.run_module("miya.api", run_name="__main__")
     assert "API_BEARER_TOKEN" in str(caught.value)
     assert calls == []
+
+
+# --- WP-26: every start is recorded, and a dead database never stops it ----------
+
+
+async def test_entering_the_app_records_one_start(session):
+    import sqlalchemy as sa
+
+    from miya.db import models as m
+    from miya.services import health
+
+    with TestClient(app):
+        pass
+    kinds = list(
+        await session.scalars(
+            sa.select(m.ReminderLog.kind).where(
+                m.ReminderLog.kind == health.API_START_KIND
+            )
+        )
+    )
+    assert kinds == [health.API_START_KIND]
+
+
+def test_the_lifespan_survives_an_unreachable_database(monkeypatch):
+    from miya.api import main as api_main
+
+    def _broken():
+        raise OSError("db down")
+
+    monkeypatch.setattr(api_main, "SessionLocal", _broken)
+    with TestClient(app) as client:
+        assert client is not None

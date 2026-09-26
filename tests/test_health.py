@@ -436,6 +436,8 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         "anthropic_failing": _status(anthropic_failing=True, windows_pending=3),
         "review_backlog": _status(needs_review=health.REVIEW_BACKLOG_THRESHOLD),
         "spend_high": _status(cost_today_usd=Decimal("5")),
+        "api_restarting": _status(api_starts_last_hour=3),
+        "search_down": _status(embed_backlog=1, embed_oldest_at=NOW - timedelta(hours=2)),
     }
     assert set(cases) == set(health.PROBLEM_KEYS)
     for key, status in cases.items():
@@ -682,3 +684,36 @@ def test_spend_high_monthly_branch_and_zero_disables(monkeypatch):
     assert (
         health._RECOVERY["spend_high"] == "✅ API xarajati yana chegara ichida — tiklandi"
     )
+
+
+# --- WP-26: restart loop and dead search -----------------------------------------
+
+
+def test_the_search_threshold():
+    fresh = _status(embed_backlog=1, embed_oldest_at=NOW - timedelta(minutes=10))
+    assert health.problems(fresh) == []
+    stale = _status(embed_backlog=1, embed_oldest_at=NOW - timedelta(hours=2))
+    assert [p.key for p in health.problems(stale)] == ["search_down"]
+    assert health.problems(_status(api_starts_last_hour=2)) == []
+
+
+async def test_api_starts_are_counted_within_the_hour(session):
+    now = datetime.now(settings.tz)
+    for minutes in (5, 20, 40):
+        session.add(
+            m.ReminderLog(
+                kind=health.API_START_KIND,
+                ref="v",
+                sent_at=now - timedelta(minutes=minutes),
+            )
+        )
+    for hours in (2, 3, 4):
+        session.add(
+            m.ReminderLog(
+                kind=health.API_START_KIND, ref="v", sent_at=now - timedelta(hours=hours)
+            )
+        )
+    await session.flush()
+    status = await health.gather(session, now=now)
+    assert status.api_starts_last_hour == 3
+    assert "api_restarting" in [p.key for p in health.problems(status)]

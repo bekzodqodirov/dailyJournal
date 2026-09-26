@@ -58,12 +58,16 @@ class LocalEmbedder(Embedder):
 
                     log.info("loading embedding model %s ...", self._model_name)
                     self._model = SentenceTransformer(self._model_name, device="cpu")
+                    # A very long text would otherwise take gigabytes (WP-26).
+                    self._model.max_seq_length = settings.embed_max_seq_length
                     log.info("embedding model %s ready", self._model_name)
         return self._model
 
     def _encode(self, texts: list[str]) -> list[list[float]]:
         model = self._get_model()
-        vectors = model.encode(texts, normalize_embeddings=True)
+        vectors = model.encode(
+            texts, normalize_embeddings=True, batch_size=settings.embed_batch_size
+        )
         return [v.tolist() for v in vectors]
 
     async def embed(self, texts: list[str]) -> list[list[float]]:

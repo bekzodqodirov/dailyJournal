@@ -112,6 +112,13 @@ On first start the api container downloads the bge-m3 embedding model (~2 GB,
 cached in a volume). Until it finishes, `/qidir` and semantic search politely
 report that search is not ready yet; everything else works immediately.
 
+Two `/holat` alerts watch the server itself: **API restarting** (three or
+more api starts within an hour — almost always too little RAM; the api is
+capped at `API_MEM_LIMIT`, 4 GB by default, so the kernel kills it rather than
+PostgreSQL) and **search down** (a memory waiting more than
+`EMBED_STALE_MINUTES` for its vector — the first start downloads the ~2 GB
+model, so give it half an hour).
+
 ### Local development without Docker
 
 ```bash

@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     # process over HTTP so only one process holds the ~2 GB model in RAM.
     # Empty (api container) means load the model locally.
     embed_service_url: str = ""
+    # Bound the embedder's memory (WP-26): tokens per text, texts per batch.
+    embed_max_seq_length: int = Field(default=512, ge=16)
+    embed_batch_size: int = Field(default=16, ge=1)
+    # Search is "down" when a memory waits this long for its vector.
+    embed_stale_minutes: int = Field(default=60, ge=5)
+    # This many API starts within an hour is a restart loop (usually RAM).
+    api_restart_alert_count: int = Field(default=3, ge=2)
 
     # --- Telegram -----------------------------------------------------------
     assistant_bot_token: str = ""
