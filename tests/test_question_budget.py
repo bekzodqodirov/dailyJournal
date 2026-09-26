@@ -281,7 +281,11 @@ async def test_collect_sees_every_kind_and_record_shown_marks_each(session):
         tg_chat_id=4242, chat_type=ChatType.private, title="Sardor", monitor_enabled=True
     )
     group = m.ChatMonitor(
-        tg_chat_id=-4243, chat_type=ChatType.group, title="Yuk", monitor_enabled=False
+        tg_chat_id=-4243,
+        chat_type=ChatType.group,
+        title="Yuk",
+        monitor_enabled=False,
+        seen_count=3,
     )
     question = m.Interaction(
         source=InteractionSource.telegram_userbot,

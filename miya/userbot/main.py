@@ -354,6 +354,16 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             ),
         )
         if not monitor.monitor_enabled:
+            if monitor.chat_type is not ChatType.private and monitor.decided_by is None:
+                # Activity only — counters and timestamps rank the group in
+                # the owner's next digest (WP-20); nothing it says is kept.
+                await chats.note_activity(
+                    session,
+                    monitor,
+                    out=bool(getattr(message, "out", False)),
+                    addressed=addressed_to_owner(message, monitor.chat_type),
+                    now=datetime.now(settings.tz),
+                )
             return False
 
         plan = plan_for(

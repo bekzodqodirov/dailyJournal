@@ -742,12 +742,36 @@ def is_numbered(markup: InlineKeyboardMarkup | None) -> bool:
 
 
 def group_digest(monitors) -> InlineKeyboardMarkup | None:
-    """One numbered ✅ Ha / ✖️ Yo'q row per listed group (the ng: payloads)."""
-    rows = [
-        [
-            InlineKeyboardButton(text=f"{n} ✅ Ha", callback_data=f"ng:y:{m.id}"),
-            InlineKeyboardButton(text=f"{n} ✖️ Yo'q", callback_data=f"ng:n:{m.id}"),
-        ]
-        for n, m in enumerate(monitors, 1)
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    """One ✅ {marks}{title} / ✖️ row per listed group, and a last
+    "✖️ Qolganlari kerak emas" that declines whatever is still listed."""
+    rows = []
+    for m in monitors:
+        marks = ("📣 " if m.addressed_at else "") + ("✍️ " if m.owner_active_at else "")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"✅ {marks}{_short(m.title, m.tg_chat_id)}",
+                    callback_data=f"ng:y:{m.id}",
+                ),
+                InlineKeyboardButton(text="✖️", callback_data=f"ng:n:{m.id}"),
+            ]
+        )
+    if not rows:
+        return None
+    rows.append(
+        [InlineKeyboardButton(text="✖️ Qolganlari kerak emas", callback_data="ng:r")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def group_ids_in(markup: InlineKeyboardMarkup | None) -> list[int]:
+    """The monitors a digest still lists, read off its ✅ buttons."""
+    if markup is None:
+        return []
+    ids = []
+    for row in markup.inline_keyboard:
+        for button in row:
+            parts = (button.callback_data or "").split(":")
+            if parts[:2] == ["ng", "y"] and parts[2].lstrip("-").isdigit():
+                ids.append(int(parts[2]))
+    return ids

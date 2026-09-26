@@ -194,13 +194,15 @@ async def collect(
             _pending(KIND_NUDGE, f"q{q.interaction_id}", q.stake_rank, q.asked_at, q)
         )
 
-    # (e) New groups: one digest, each listed group its own tap.
-    monitors = await chats.awaiting_join_question(
-        session,
-        now=now,
-        limit=settings.question_group_digest_size,
-        for_push=for_push,
-    )
+    # (e) New groups: one digest a day at most, each listed group its own tap.
+    monitors = []
+    if not (for_push and await _digest_sent_today(session, now)):
+        monitors = await chats.awaiting_join_question(
+            session,
+            now=now,
+            limit=settings.question_group_digest_size,
+            for_push=for_push,
+        )
     if monitors:
         since = min((m.last_seen_at or m.updated_at) for m in monitors)
         day = now.astimezone(settings.tz).date().isoformat()
@@ -246,6 +248,16 @@ async def collect(
             item.offers = counts.get(item.ref, (0, None))[0]
 
     return sorted(items, key=rank_key)
+
+
+async def _digest_sent_today(session: AsyncSession, now: datetime) -> bool:
+    found = await session.scalar(
+        sa.select(QuestionLog.id)
+        .where(QuestionLog.kind == KIND_GROUPS)
+        .where(QuestionLog.sent_at >= reminders.day_start(now))
+        .limit(1)
+    )
+    return found is not None
 
 
 async def offers_of(

@@ -40,8 +40,8 @@ class _Chat(_Message):
     chat = SimpleNamespace(id=1)
 
 
-async def _money_text(session, body, *, ago=timedelta(minutes=5), app=False):
-    at = datetime.now(TZ) - ago
+async def _money_text(session, body, *, ago=timedelta(minutes=5), app=False, at=None):
+    at = at or datetime.now(TZ) - ago
     if app:
         source, media = InteractionSource.phone_notification, {"app_label": "Payme"}
         channel = money_events.channel_for_app("uz.dida.payme")
@@ -233,8 +233,9 @@ async def test_the_report_counts_ignored_texts(session):
     data = await reports.gather(session, today)
     assert "e'tiborsiz" not in reports.render_data_block(data)
 
-    await _money_text(session, "Vash kod: 1234. Nikomu ne soobshchayte")
-    await _money_text(session, "Vash kod: 5678. Nikomu ne soobshchayte")
+    noon = datetime.now(TZ).replace(hour=12, minute=0, second=0, microsecond=0)
+    await _money_text(session, "Vash kod: 1234. Nikomu ne soobshchayte", at=noon)
+    await _money_text(session, "Vash kod: 5678. Nikomu ne soobshchayte", at=noon)
     data = await reports.gather(session, today)
     assert reports.REPORT_IGNORED_LINE.format(n=2) in reports.render_data_block(data)
 

@@ -70,6 +70,7 @@ from miya.services import (
     batch,
     brief,
     call_recordings,
+    chats,
     claims,
     gcal,
     health,
@@ -418,7 +419,10 @@ async def send_questions(
     for item in items:
         if item.kind != questions.KIND_GROUPS:
             continue
-        body = replies.group_digest(item.subject)
+        waiting = await chats.awaiting_join_question(session, now=now, limit=1000)
+        body = replies.group_digest(
+            item.subject, more=max(0, len(waiting) - len(item.subject))
+        )
         ok, msg = await deliver(
             bot, body, reply_markup=keyboards.group_digest(item.subject)
         )

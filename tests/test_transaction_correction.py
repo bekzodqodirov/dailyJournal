@@ -47,7 +47,10 @@ async def _txn(session, amount="250000", **over) -> m.Transaction:
         "currency": Currency.UZS,
         "category": "oziq-ovqat",
         "description": "KORZINKA.UZ",
-        "occurred_at": datetime.now(TZ).replace(microsecond=0) - timedelta(minutes=30),
+        # Midday today, so /pul and "sana kecha" never straddle midnight.
+        "occurred_at": datetime.now(TZ).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        ),
     }
     fields.update(over)
     txn = m.Transaction(**fields)

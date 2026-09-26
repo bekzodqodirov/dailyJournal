@@ -337,6 +337,10 @@ re-typing them. It is passive by construction:
 * It downloads no history. Only messages that arrive after it starts are read;
   the dialog list is used for chat titles only.
 * `USERBOT_ENABLED=false` turns the whole thing off in one flag.
+* In a group that is switched off and not yet decided, it keeps only a
+  message counter and two timestamps (when the owner last wrote there, when
+  someone addressed him) — never the text, the sender or any media — so the
+  daily "Yangi guruhlar" digest can offer the active groups first.
 * The Telethon session string is a **full credential** for the account. Keep it
   in `.env`, and revoke it from Telegram → Settings → Devices if it leaks.
 

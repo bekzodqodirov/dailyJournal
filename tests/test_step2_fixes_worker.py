@@ -249,7 +249,9 @@ async def test_a_tap_for_a_chat_nobody_asked_about_changes_nothing(session):
     assert service.monitor_enabled is False and service.backfill_requested_at is None
     assert unasked.monitor_enabled is False and unasked.asked_at is None
     assert await chats.pending_backfills(session) == []
-    # The question for the group is still owed.
+    # The question for the group is still owed, once it shows traffic.
+    unasked.seen_count = 1
+    await session.flush()
     assert [w.id for w in await chats.awaiting_join_question(session)] == [unasked.id]
 
 

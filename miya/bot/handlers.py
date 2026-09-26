@@ -729,6 +729,27 @@ async def on_new_group_button(callback: CallbackQuery) -> None:
     user session — reads it on its next sweep, exactly as with approved media.
     """
     parts = (callback.data or "").split(":")
+    markup = callback.message.reply_markup if callback.message is not None else None
+    if parts[1:2] == ["r"]:
+        # "✖️ Qolganlari kerak emas": every group the digest still lists.
+        ids = keyboards.group_ids_in(markup)
+        async with session_scope() as session:
+            declined = [
+                m for m in [await chats.decline_join(session, i) for i in ids] if m
+            ]
+        if callback.message is not None:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                log.debug("could not clear the digest keyboard", exc_info=True)
+            await _safe_answer(
+                callback.message, replies.GROUP_REST_DONE.format(n=len(declined))
+            )
+        try:
+            await callback.answer()
+        except Exception:
+            log.debug("could not acknowledge the callback", exc_info=True)
+        return
     if len(parts) != 3 or not parts[2].lstrip("-").isdigit():
         await callback.answer()
         return
@@ -752,7 +773,21 @@ async def on_new_group_button(callback: CallbackQuery) -> None:
                 else replies.NEW_GROUP_GONE
             )
 
-    await _finish_row(callback, _trimmed(callback, "ng", monitor_id), body)
+    trimmed = _trimmed(callback, "ng", monitor_id)
+    if trimmed is not None and not keyboards.group_ids_in(trimmed):
+        trimmed = None  # only the rest row was left
+        if callback.message is not None:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                log.debug("could not clear the digest keyboard", exc_info=True)
+            await _safe_answer(callback.message, body)
+            try:
+                await callback.answer()
+            except Exception:
+                log.debug("could not acknowledge the callback", exc_info=True)
+            return
+    await _finish_row(callback, trimmed, body)
 
 
 @router.callback_query(F.data.startswith("unut:"))

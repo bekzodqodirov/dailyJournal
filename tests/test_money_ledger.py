@@ -30,7 +30,10 @@ def _txn(amount: str, *, category="transport", **over) -> m.Transaction:
         "amount": Decimal(amount),
         "currency": Currency.UZS,
         "category": category,
-        "occurred_at": datetime.now(TZ) - timedelta(minutes=5),
+        # Midday today: "five minutes ago" is yesterday just after midnight.
+        "occurred_at": datetime.now(TZ).replace(
+            hour=12, minute=0, second=0, microsecond=0
+        ),
     }
     fields.update(over)
     return m.Transaction(**fields)

@@ -1643,17 +1643,30 @@ def new_group_question(
     return f"{label} {name} — o'qiymi?"
 
 
-GROUP_DIGEST_HEADER = "👥 <b>Yangi guruhlar — o'qiymi?</b>"
+GROUP_DIGEST_HEADER = "👥 <b>Yangi guruhlar</b> — {n} ta. Qaysilarini o'qiyin?"
+GROUP_DIGEST_HINT = (
+    "<i>✅ bosilgani darhol yoqiladi, oxirgi {days} kuni ham o'qiladi. "
+    "Bosilmaganlari o'chiq qoladi — keyin /chats dan yoqsa bo'ladi.</i>"
+)
+GROUP_DIGEST_LEGEND = "<i>📣 — senga murojaat qilishgan · ✍️ — o'zing yozgansan</i>"
+GROUP_DIGEST_MORE = "<i>Yana {k} tasi keyingi safar.</i>"
+GROUP_REST_DONE = "👌 {n} ta guruh o'chiq qoldi. Kerak bo'lsa /chats dan yoqasan."
 
 
-def group_digest(monitors) -> str:
-    """Several undecided groups in one message, one ✅/✖️ row each (WP-18;
-    WP-20 gives it its final shape)."""
+def group_digest(monitors, *, more: int = 0, days: int | None = None) -> str:
+    """One message for several undecided groups (WP-20); the rows are the
+    buttons, so the text only frames them."""
+    from miya.services.chats import BACKFILL_DAYS
+
     lines = [
-        f"{n}. {new_group_question(m.title, m.tg_chat_id, chat_type=m.chat_type)}"
-        for n, m in enumerate(monitors, 1)
+        GROUP_DIGEST_HEADER.format(n=len(monitors)),
+        GROUP_DIGEST_HINT.format(days=days or BACKFILL_DAYS),
     ]
-    return GROUP_DIGEST_HEADER + "\n" + "\n".join(lines)
+    if any(m.addressed_at or m.owner_active_at for m in monitors):
+        lines.append(GROUP_DIGEST_LEGEND)
+    if more > 0:
+        lines.append(GROUP_DIGEST_MORE.format(k=more))
+    return "\n".join(lines)
 
 
 def new_group_accepted(title: str | None, tg_chat_id: int, days: int) -> str:

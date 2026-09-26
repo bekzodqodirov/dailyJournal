@@ -187,6 +187,7 @@ async def toggle(
         # "o'qiymi?", whether or not the question ever went out: a group he
         # deliberately turned off must not be asked about afterwards.
         monitor.asked_at = monitor.asked_at or _now(now)
+        monitor.decided_by = "owner"
     await session.flush()
     log.info(
         "chat %s (%s): %s -> %s",
@@ -219,22 +220,51 @@ async def awaiting_join_question(
     limit: int = 8,
     for_push: bool = True,
 ) -> list[ChatMonitor]:
-    """Groups and channels switched off that the owner was never asked about.
+    """Groups (and channels, when QUESTION_ASK_CHANNELS) switched off that
+    nobody has decided about yet, most worth asking first (WP-20).
 
-    Oldest first, a few per sweep: the first dialog sync after deployment can
-    register every group he is in, and those are asked a handful at a time
-    rather than as one burst of fifty messages.
+    A fresh install sees every group the owner is in; asking about each was
+    a hundred messages on day one. Now a group is offered only once it shows
+    traffic (QUESTION_GROUP_MIN_MESSAGES), at most QUESTION_GROUP_MAX_SHOWS
+    digests and once a day; groups that addressed him or where he wrote come
+    first, then the busiest.
     """
-    return list(
-        await session.scalars(
-            sa.select(ChatMonitor)
-            .where(ChatMonitor.chat_type.in_([ChatType.group, ChatType.channel]))
-            .where(ChatMonitor.monitor_enabled.is_(False))
-            .where(ChatMonitor.asked_at.is_(None))
-            .order_by(ChatMonitor.id)
-            .limit(limit)
-        )
+    from miya.services import reminders  # reminders imports nothing from here
+
+    now = _now(now)
+    types = [ChatType.group]
+    if settings.question_ask_channels:
+        types.append(ChatType.channel)
+    stmt = (
+        sa.select(ChatMonitor)
+        .where(ChatMonitor.chat_type.in_(types))
+        .where(ChatMonitor.monitor_enabled.is_(False))
+        .where(ChatMonitor.decided_by.is_(None))
     )
+    if for_push:
+        stmt = stmt.where(
+            ChatMonitor.digest_shows < settings.question_group_max_shows
+        ).where(
+            sa.or_(
+                ChatMonitor.offered_at.is_(None),
+                ChatMonitor.offered_at < reminders.day_start(now),
+            )
+        )
+    if settings.question_group_min_messages > 0:
+        stmt = stmt.where(
+            sa.or_(
+                ChatMonitor.seen_count >= settings.question_group_min_messages,
+                ChatMonitor.owner_active_at.is_not(None),
+                ChatMonitor.addressed_at.is_not(None),
+            )
+        )
+    stmt = stmt.order_by(
+        ChatMonitor.addressed_at.is_(None),
+        ChatMonitor.owner_active_at.is_(None),
+        ChatMonitor.seen_count.desc(),
+        ChatMonitor.id,
+    ).limit(limit)
+    return list(await session.scalars(stmt))
 
 
 def mark_asked(monitor: ChatMonitor, *, now: datetime | None = None) -> None:
@@ -250,9 +280,64 @@ def mark_offered(monitor: ChatMonitor, *, now: datetime) -> None:
 
 
 async def apply_default_rules(session: AsyncSession, *, now: datetime) -> int:
-    """Decide the groups no digest needs to ask about (the rules land in
-    WP-20); returns how many were decided."""
-    return 0
+    """Decide the chats no digest needs to ask about; returns how many.
+
+    Channels are broadcasts, not conversations: left off by rule unless
+    QUESTION_ASK_CHANNELS. A group offered QUESTION_GROUP_MAX_SHOWS times
+    and never answered was the owner's answer: left off, still in /chats.
+    """
+    from miya.services import reminders
+
+    decided = 0
+    if not settings.question_ask_channels:
+        result = await session.execute(
+            sa.update(ChatMonitor)
+            .where(ChatMonitor.chat_type == ChatType.channel)
+            .where(ChatMonitor.decided_by.is_(None))
+            .where(ChatMonitor.monitor_enabled.is_(False))
+            .values(
+                decided_by="rule:channel",
+                asked_at=sa.func.coalesce(ChatMonitor.asked_at, now),
+            )
+        )
+        decided += result.rowcount or 0
+    result = await session.execute(
+        sa.update(ChatMonitor)
+        .where(ChatMonitor.decided_by.is_(None))
+        .where(ChatMonitor.digest_shows >= settings.question_group_max_shows)
+        .where(ChatMonitor.offered_at < reminders.day_start(now))
+        .values(decided_by="rule:ignored")
+    )
+    decided += result.rowcount or 0
+    return decided
+
+
+async def note_activity(
+    session: AsyncSession,
+    monitor: ChatMonitor,
+    *,
+    out: bool,
+    addressed: bool,
+    now: datetime,
+) -> None:
+    """Count a message in a switched-off, undecided group. Counters and
+    timestamps only: nothing the message says is stored."""
+    if monitor.chat_type is ChatType.private or monitor.decided_by is not None:
+        return
+    await session.execute(
+        sa.update(ChatMonitor)
+        .where(ChatMonitor.id == monitor.id)
+        .values(
+            seen_count=ChatMonitor.seen_count + 1,
+            last_seen_at=now,
+            owner_active_at=sa.case(
+                (sa.literal(out), now), else_=ChatMonitor.owner_active_at
+            ),
+            addressed_at=sa.case(
+                (sa.literal(addressed), now), else_=ChatMonitor.addressed_at
+            ),
+        )
+    )
 
 
 async def _answerable(session: AsyncSession, monitor_id: int) -> ChatMonitor | None:
@@ -280,6 +365,7 @@ async def accept_join(
         return None
     now = _now(now)
     monitor.monitor_enabled = True
+    monitor.decided_by = "owner"
     if monitor.backfill_done_at is None:
         monitor.backfill_requested_at = now
         monitor.backfill_attempts = 0
@@ -300,6 +386,7 @@ async def decline_join(
     monitor = await _answerable(session, monitor_id)
     if monitor is None:
         return None
+    monitor.decided_by = "owner"
     log.info("chat %s (%s) left off by the owner", monitor.tg_chat_id, monitor.title)
     return monitor
 

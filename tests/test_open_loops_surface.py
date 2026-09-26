@@ -630,7 +630,10 @@ async def _asked_group(session, chat_id, title):
     return monitor
 
 
-async def test_only_switched_off_groups_and_channels_are_asked_and_only_once(session):
+async def test_only_switched_off_groups_and_channels_are_asked_and_only_once(
+    session, monkeypatch
+):
+    monkeypatch.setattr(settings, "question_ask_channels", True)
     await chats.sync_dialogs(
         session,
         [
@@ -641,12 +644,14 @@ async def test_only_switched_off_groups_and_channels_are_asked_and_only_once(ses
     )
     on = await chats.ensure_monitor(session, _dialog(-444, ChatType.group, "Yoqilgan"))
     on.monitor_enabled = True
+    for monitor in await session.scalars(sa.select(m.ChatMonitor)):
+        monitor.seen_count = 1  # a group is offered once it shows traffic (WP-20)
     await session.flush()
 
     waiting = await chats.awaiting_join_question(session)
     assert [w.tg_chat_id for w in waiting] == [-222, -333]
 
-    chats.mark_asked(waiting[0])
+    chats.mark_offered(waiting[0], now=datetime.now(TZ))
     await session.flush()
     assert [w.tg_chat_id for w in await chats.awaiting_join_question(session)] == [-333]
     assert len(await chats.awaiting_join_question(session, limit=0)) == 0
