@@ -102,6 +102,13 @@ def _with(name: str, component: health.Component) -> dict[str, health.Component]
     return {**_healthy(), name: component}
 
 
+@pytest.fixture(autouse=True)
+def _aliases_set(monkeypatch):
+    """The layout contracts below are for a configured server; the extra
+    'OWNER_ALIASES bo'sh' line is covered in test_owner_aliases.py."""
+    monkeypatch.setattr(settings, "owner_aliases", "Bekzod")
+
+
 def _lines(status: health.Status, problems=None) -> list[str]:
     return replies.status_report(status, problems or []).split("\n")
 

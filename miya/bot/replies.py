@@ -1538,6 +1538,12 @@ def _phone_line(status: health.Status) -> str | None:
     return f"📱 Telefon — oxirgi yuklash: {_ago(phone.age)}{tail}"
 
 
+OWNER_ALIASES_BLANK = (
+    "ℹ️ OWNER_ALIASES bo'sh — guruhlarda ismingizni yozib murojaat qilinganlar "
+    "«sizga» deb belgilanmaydi (faqat @-eslatma va javoblar). .env ga qo'shing."
+)
+
+
 def status_report(status: health.Status, problems: list[health.Problem]) -> str:
     """`/holat`: every part of MIYA on one line each, then what to do."""
     now = status.now.astimezone(settings.tz)
@@ -1560,6 +1566,10 @@ def status_report(status: health.Status, problems: list[health.Problem]) -> str:
         f"bugun {usd(status.cost_today_usd)} · "
         f"bu oy {usd(status.cost_month_usd)} (/xarajat)",
     ]
+    if not settings.owner_aliases_parsed:
+        # Information, not a problem: it never alerts, it only explains why
+        # plain-text "Bekzod aka, …" in groups is not marked as his.
+        lines.append(OWNER_ALIASES_BLANK)
     if problems:
         lines.append("")
         lines += [problem.text for problem in problems]
