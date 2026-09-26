@@ -911,22 +911,28 @@ async def test_the_worker_attaches_buttons_to_pings_and_sends_the_question(
 
     await worker.reminder_job(bot)
 
-    ping, question = bot.sent
+    [ping] = bot.sent
     assert "Eslatma" in ping[0] and f"<code>d{debt.id}</code>" in ping[0]
     assert _payloads(ping[1]) == [
         [f"rec:d:d{debt.id}", f"rec:e:d{debt.id}", f"rec:f:d{debt.id}"],
         [f"rec:d:t{task.id}", f"rec:e:t{task.id}"],
     ]
-    assert "Hali ochiqmi?" in question[0] and "javob yozaman" in question[0]
-    assert _payloads(question[1]) == [
-        [f"rec:o:p{stale.id}", f"rec:d:p{stale.id}", f"rec:c:p{stale.id}"]
-    ]
-    # Both went into the log: the next sweep has nothing to say.
-    kinds = set(await session.scalars(sa.select(m.ReminderLog.kind)))
-    assert kinds == {"debt", "task", "ask:promise"}
     bot.sent.clear()
     await worker.reminder_job(bot)
     assert bot.sent == []
+
+    # "Hali ochiqmi?" is a tap-request now: the question job asks it (WP-18).
+    afternoon = _now().replace(hour=14, minute=0, second=0, microsecond=0)
+    session.add(m.ReminderLog(kind="brief", ref=afternoon.date().isoformat()))
+    await session.commit()
+    await worker.question_job(bot, now=afternoon)
+    [question] = bot.sent
+    assert "hali ochiqmi?" in question[0] and "javob yozaman" in question[0]
+    assert _payloads(question[1]) == [
+        [f"rec:o:p{stale.id}", f"rec:d:p{stale.id}", f"rec:c:p{stale.id}"]
+    ]
+    kinds = set(await session.scalars(sa.select(m.ReminderLog.kind)))
+    assert kinds == {"debt", "task", "brief", "ask:promise"}
 
 
 # --- the evening report finally lists what was kept ---------------------------

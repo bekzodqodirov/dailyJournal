@@ -1668,6 +1668,19 @@ def new_group_question(
     return f"{label} {name} — o'qiymi?"
 
 
+GROUP_DIGEST_HEADER = "👥 <b>Yangi guruhlar — o'qiymi?</b>"
+
+
+def group_digest(monitors) -> str:
+    """Several undecided groups in one message, one ✅/✖️ row each (WP-18;
+    WP-20 gives it its final shape)."""
+    lines = [
+        f"{n}. {new_group_question(m.title, m.tg_chat_id, chat_type=m.chat_type)}"
+        for n, m in enumerate(monitors, 1)
+    ]
+    return GROUP_DIGEST_HEADER + "\n" + "\n".join(lines)
+
+
 def new_group_accepted(title: str | None, tg_chat_id: int, days: int) -> str:
     name = escape(title or f"chat {tg_chat_id}")
     return f"✅ <b>{name}</b> — endi o'qiyman. Oxirgi {days} kunini ham o'qib chiqaman."
@@ -1882,3 +1895,98 @@ def status_report(status: health.Status, problems: list[health.Problem]) -> str:
         lines.append("")
         lines += [problem.text for problem in problems]
     return clip("\n".join(lines))
+
+
+# --- the question batch (WP-18) --------------------------------------------------
+#
+# One sender (worker.question_job) puts up to QUESTION_BATCH_MAX questions in
+# one numbered message; each line's buttons carry the same number.
+
+QUESTIONS_HEADER = "❓ <b>Savollar</b> · bugun {used}/{budget}"
+QUESTIONS_FOOTER = (
+    "<i>Javob bermasang ham hech narsa yo'qolmaydi — hammasi /savollar da turadi.</i>"
+)
+CLAIMS_QUEUED = "<i>Tasdiqlash navbatda — /savollar</i>"
+MONEY_ITEM_LINE = "💳 {clock} · {amount} · {label} — kirimmi, chiqimmi yoki pul emasmi?"
+
+
+def _media_item_line(interaction, people: dict | None) -> str:
+    media = dict(interaction.media or {})
+    person = (people or {}).get(interaction.person_id)
+    who = escape(person.display_name) if person is not None else "Nomaʼlum"
+    kind = MEDIA_ASK_LABELS.get(
+        approvals_reason(interaction), str(media.get("type") or "fayl")
+    )
+    detail = " · ".join(
+        p for p in (escape(media.get("filename") or ""), _size(media.get("size"))) if p
+    )
+    return (
+        f"📎 {who} {escape(kind)} yubordi"
+        + (f" · {detail}" if detail else "")
+        + (" — o'qiymi?")
+    )
+
+
+def approvals_reason(interaction) -> str:
+    approval = (interaction.media or {}).get("approval") or {}
+    return str(approval.get("reason") or "")
+
+
+def _money_item_line(interaction) -> str:
+    info = (interaction.media or {}).get("money") or {}
+    amount = (
+        money(
+            Decimal(info["amount"]),
+            Currency(info.get("currency") or Currency.UZS.value),
+        )
+        if info.get("amount")
+        else MONEY_NO_AMOUNT
+    )
+    return MONEY_ITEM_LINE.format(
+        clock=clock(interaction.occurred_at),
+        amount=amount,
+        label=MONEY_REASON_LABEL.get(info.get("reason") or "", ""),
+    )
+
+
+def question_item_line(item, people: dict | None = None) -> str:
+    """One queued question (questions.Pending) as one line, number excluded."""
+    subject = item.subject
+    if item.kind == "claim":
+        return claim_line(claims.view(subject))
+    if item.kind == "missed":
+        return missed_line(subject)
+    if item.kind == "nudge":
+        return "❓ " + question_line(subject)
+    if item.kind == "media":
+        return _media_item_line(subject, people)
+    if item.kind == "money":
+        return _money_item_line(subject)
+    # still_open
+    body = (
+        _balance_line(subject.balance)
+        if subject.balance is not None
+        else record_line(subject.kind, subject.record, subject.person)
+    )
+    return f"📌 {body} — hali ochiqmi?"
+
+
+def question_batch(
+    items, *, header: str, used: int, budget: int, people: dict | None = None
+) -> tuple[str, int]:
+    """(body, how many lines fit). ``used`` counts this batch whole; when not
+    everything fits, the header counts only what is shown."""
+    lines = [question_item_line(item, people) for item in items]
+    kept: list[str] = []
+    for line in lines:
+        numbered = [f"{n}. {text}" for n, text in enumerate([*kept, line], 1)]
+        trial = "x" * 60 + "\n" + "\n".join(numbered) + "\n" + QUESTIONS_FOOTER
+        if len(trial) > TELEGRAM_LIMIT - 60:
+            break
+        kept.append(line)
+    used -= len(lines) - len(kept)
+    title = header.format(used=used, budget=budget)
+    body = "\n".join(
+        [title, *(f"{n}. {text}" for n, text in enumerate(kept, 1)), QUESTIONS_FOOTER]
+    )
+    return body, len(kept)

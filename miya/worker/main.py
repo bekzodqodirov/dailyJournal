@@ -20,16 +20,11 @@ Jobs:
                    pieces (build step 5)
   * morning_brief — cron at MORNING_BRIEF_TIME; today's meetings, what is due,
                    and every open loop, deterministic, never skipped
-  * nudges       — every 30 min; one short message per question nobody
-                   answered, with ✅ Javob berdim / ⏰ Ertaga (quiet-hours aware)
-  * missed_call_nudge — every 30 min; one "📵 … qo'ng'iroq qildi — javobsiz"
-                   per missed-call loop the companion app uploaded, with
-                   ✅ Bog'landim / ⏰ Ertaga (quiet-hours aware; build step 6)
-  * new_chat_ask — every 2 min; "Yangi guruh: … — o'qiymi?" once per new
-                   group or channel (quiet-hours aware)
-  * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
-                   claim no receipt has shown after CLAIM_ASK_AFTER_MINUTES, a few
-                   per sweep (quiet-hours aware; build step 3)
+  * questions    — every 5 min; the one sender of tap-requests: counterparty
+                   claims, money texts, missed calls, "Hali ochiqmi?",
+                   unanswered questions, new groups and big files, ranked
+                   money first and held to QUESTION_BUDGET_PER_DAY
+                   (quiet-hours aware; WP-18)
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
                    for a first import (quiet-hours aware; WP-15)
@@ -59,7 +54,7 @@ import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, Message
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -71,19 +66,17 @@ from miya.config import settings
 from miya.db.models import Claim, DailyReport, Person, ReminderLog
 from miya.db.session import engine, session_scope
 from miya.services import (
-    approvals,
     backup,
     batch,
     brief,
     call_recordings,
-    chats,
     claims,
     gcal,
     health,
     memories,
     money_notices,
-    nudges,
     profiles,
+    questions,
     reminders,
     reports,
     windows,
@@ -93,44 +86,60 @@ from miya.services.embeddings import EmbeddingError, get_embedder
 log = logging.getLogger(__name__)
 
 
-async def notify(bot: Bot, text: str, *, reply_markup=None, silent: bool = False) -> bool:
+async def deliver(
+    bot: Bot, text: str, *, reply_markup=None, silent: bool = False
+) -> tuple[bool, Message | None]:
     """Send to the owner; retry as plain text if Telegram rejects the HTML.
 
     Report and reminder bodies carry names and descriptions that a
     counterparty controls, and the report itself is composed by a model. A
     single stray tag must not silently cost the owner his evening summary.
     ``reply_markup`` (the reminder buttons) rides along on both attempts.
+    Returns (delivered, the sent message) — the message id goes into
+    question_log.
     """
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             settings.owner_telegram_id,
             clip(text),
             reply_markup=reply_markup,
             disable_notification=silent,
         )
-        return True
+        return True, sent
     except Exception:
         log.warning("HTML send failed, retrying as plain text", exc_info=True)
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             settings.owner_telegram_id,
             clip(text),
             parse_mode=None,
             reply_markup=reply_markup,
             disable_notification=silent,
         )
-        return True
+        return True, sent
     except Exception:
         log.exception("could not reach the owner at all")
-        return False
+        return False, None
+
+
+async def notify_message(
+    bot: Bot, text: str, *, reply_markup=None, silent: bool = False
+) -> Message | None:
+    ok, sent = await deliver(bot, text, reply_markup=reply_markup, silent=silent)
+    return sent if ok else None
+
+
+async def notify(bot: Bot, text: str, *, reply_markup=None, silent: bool = False) -> bool:
+    ok, _ = await deliver(bot, text, reply_markup=reply_markup, silent=silent)
+    return ok
 
 
 async def reminder_job(bot: Bot) -> None:
     """Ping the owner about anything due. Silent during quiet hours.
 
-    Two messages at most: the pings, with a ✅ / ✏️ / 🔄 row per line so an
-    item can be closed or corrected from the reminder itself, and the
-    "Hali ochiqmi?" question for items the pings are done with.
+    One message: the pings, with a ✅ / ✏️ / 🔄 row per line so an item can
+    be closed or corrected from the reminder itself. "Hali ochiqmi?" is a
+    tap-request and goes through the question queue (question_job).
     """
     if reminders.in_quiet_hours():
         log.debug("inside quiet hours — skipping reminder sweep")
@@ -159,23 +168,12 @@ async def reminder_job(bot: Bot) -> None:
             await reminders.mark_sent(session, bundle, rendered=rendered)
             await session.commit()
 
-        if bundle.questions:
-            # Same rule as the pings: only what fit in the message is logged
-            # as asked; the tail qualifies again next sweep.
-            body, shown = replies.still_open_question_with_count(bundle.questions)
-            shown = min(shown, keyboards.MAX_ROWS)
-            keyboard = keyboards.question_keyboard(bundle.questions[:shown])
-            if not await notify(bot, body, reply_markup=keyboard):
-                return
-            await reminders.mark_asked(session, bundle, rendered=shown)
-
     log.info(
-        "sent reminder: %d debts, %d promises, %d tasks, %d events, %d questions",
+        "sent reminder: %d debts, %d promises, %d tasks, %d events",
         len(bundle.debts),
         len(bundle.promises),
         len(bundle.tasks),
         len(bundle.events),
-        len(bundle.questions),
     )
 
 
@@ -304,7 +302,7 @@ async def brief_job(bot: Bot) -> bool:
         async with session_scope() as session:
             session.add(ReminderLog(kind=BRIEF_KIND, ref=data.day.isoformat()))
             # A claim shown with its Ha / Yo'q row on the brief was asked;
-            # claim_ask_job must not repeat it as its own message.
+            # the question job must not repeat it as its own message.
             if claim_ids:
                 now = datetime.now(settings.tz)
                 for claim in await session.scalars(
@@ -346,153 +344,136 @@ async def _brief_is_missing(now: datetime) -> bool:
     return found is None
 
 
-async def nudge_job(bot: Bot) -> None:
-    """Nudge the owner about questions nobody answered (every 30 minutes).
+async def send_questions(
+    bot: Bot,
+    session,
+    items: list[questions.Pending],
+    *,
+    via: str,
+    header: str,
+    now: datetime,
+) -> int:
+    """Send planned questions and record what the owner really saw (WP-18).
 
-    One short message per question, ✅ Javob berdim / ⏰ Ertaga under each,
-    at most nudges.MAX_PER_SWEEP per sweep with one line for the rest —
-    those come next sweep, nothing is dropped. Quiet-hours aware the way
-    every other ping is: the sweep skips, the question keeps.
+    The groups digest goes as its own message; everything else as one
+    numbered batch. Nothing is recorded for a message that did not go out:
+    the items qualify again on the next tick. Returns the tap-requests
+    recorded.
     """
-    if reminders.in_quiet_hours():
-        return
-
-    async with session_scope() as session:
-        due = await nudges.collect(session)
-        if not due:
-            return
-        head, tail = due[: nudges.MAX_PER_SWEEP], due[nudges.MAX_PER_SWEEP :]
-        sent: list = []
-        for question in head:
-            if not await notify(
-                bot,
-                replies.nudge(question),
-                reply_markup=keyboards.nudge_actions(question.interaction_id),
-            ):
-                break
-            sent.append(question)
-        # Logged only for what went out, and committed at once: a crash
-        # mid-sweep repeats at most one nudge and loses none.
-        nudges.mark_nudged(session, sent)
-        await session.commit()
-        if tail and len(sent) == len(head):
-            await notify(bot, replies.nudge_overflow(len(tail)))
-
-    log.info("sent %d nudge(s), %d more waiting", len(sent), len(tail))
-
-
-async def missed_call_nudge_job(bot: Bot) -> None:
-    """Nudge the owner about calls nobody returned (every 30 minutes).
-
-    The companion app uploads the call log; loops.missed_calls turns the
-    rings nobody dealt with into loops, and nudges.collect_missed applies
-    the questions' own discipline: one nudge per number ever, plus one more
-    after "⏰ Ertaga" expires — from then on only the brief and the report
-    carry it. At most nudges.MAX_PER_SWEEP per sweep, the tail simply
-    qualifies again next sweep; nothing is dropped. Quiet-hours aware: a
-    missed call at 02:00 keeps until morning. Marked nudged only for what
-    notify() actually delivered, committed at once, so a crash mid-sweep
-    repeats at most one nudge and loses none.
-    """
-    if reminders.in_quiet_hours():
-        return
-
-    async with session_scope() as session:
-        due = await nudges.collect_missed(session)
-        if not due:
-            return
-        sent: list = []
-        for missed in due[: nudges.MAX_PER_SWEEP]:
-            if not await notify(
-                bot,
-                replies.missed_nudge(missed),
-                reply_markup=keyboards.missed_actions(missed.interaction_id),
-            ):
-                break
-            sent.append(missed)
-        nudges.mark_missed_nudged(session, sent)
-        await session.commit()
-
-    log.info(
-        "sent %d missed-call nudge(s), %d more waiting", len(sent), len(due) - len(sent)
-    )
-
-
-async def new_chat_ask_job(bot: Bot) -> None:
-    """ "Yangi guruh: … — o'qiymi?" for every group or channel that started
-    switched off, once each (the owner's decision: new groups on with one
-    tap). Quiet-hours aware; a few per sweep so a first sync of fifty groups
-    is not fifty messages at once.
-    """
-    if reminders.in_quiet_hours():
-        return
-
-    # Marked asked only after Telegram accepted the message, and committed
-    # per group: a failed send used to mark the group asked forever, so it
-    # was never offered again. A crash between send and commit repeats at
-    # most one question, which is the accepted cost.
-    async with session_scope() as session:
-        for monitor in await chats.awaiting_join_question(session):
-            body = replies.new_group_question(
-                monitor.title, monitor.tg_chat_id, chat_type=monitor.chat_type
-            )
-            try:
-                await bot.send_message(
-                    settings.owner_telegram_id,
-                    clip(body),
-                    reply_markup=keyboards.new_group_question(monitor.id),
-                )
-            except Exception:
-                log.exception("could not ask about chat monitor %s", monitor.id)
-                break
-            chats.mark_asked(monitor)
-            await session.commit()
-
-
-# A claim rides on its window's receipt when there is one; these are for the
-# rest. Ten minutes leaves the receipt path time to run first (the window job
-# ticks every five), and five per sweep keeps a backlog from becoming a wall
-# of questions — the owner tolerates twenty-odd confirmations a day.
-CLAIM_MAX_PER_SWEEP = 5
-
-
-async def claim_ask_job(bot: Bot) -> None:
-    """Ask about counterparty claims no receipt has shown (build step 3).
-
-    The receipt normally carries the question; a claim from the batch path
-    with its receipt folded into the overflow summary, from a bot or a call
-    interaction, or one whose receipt keyboard was clipped, has nobody to
-    ask it. Once such a claim is CLAIM_ASK_AFTER_MINUTES old it is asked here, one
-    message each with its own ✅ / ✖️ / ✏️ row, at most CLAIM_MAX_PER_SWEEP
-    per sweep. Quiet-hours aware like every other ping: the claim keeps.
-
-    Marked asked only *after* Telegram accepted the message, and committed
-    per claim: a failed send leaves it unasked, so the next sweep asks it
-    again. A crash between the send and the commit repeats at most one
-    question. The sweep stops at the first undelivered message; the rest
-    wait for the next one. A claim is never lost either way — it stays
-    pending, in /davolar and in the morning brief, until the owner answers it.
-    """
-    if reminders.in_quiet_hours():
-        return
-
-    asked = 0
-    async with session_scope() as session:
-        waiting = await claims.unasked(
-            session,
-            older_than=timedelta(minutes=settings.claim_ask_after_minutes),
-            limit=CLAIM_MAX_PER_SWEEP,
+    spent = await questions.spent_today(session, now=now)
+    sent = 0
+    rest = [p for p in items if p.kind != questions.KIND_GROUPS]
+    for item in items:
+        if item.kind != questions.KIND_GROUPS:
+            continue
+        body = replies.group_digest(item.subject)
+        ok, msg = await deliver(
+            bot, body, reply_markup=keyboards.group_digest(item.subject)
         )
-        for claim in waiting:
-            body = replies.claim_question(claims.view(claim))
-            keyboard = keyboards.claim_actions([claim.id])
-            if not await notify(bot, body, reply_markup=keyboard):
-                break
-            claims.mark_asked(claim)
-            await session.commit()
-            asked += 1
-    if asked:
-        log.info("asked about %d claim(s), %d more waiting", asked, len(waiting) - asked)
+        if not ok:
+            return sent
+        await questions.record_shown(
+            session,
+            [item],
+            via=via,
+            now=now,
+            tg_message_id=getattr(msg, "message_id", None),
+        )
+        await session.commit()
+        sent += len(item.subject)
+    if not rest:
+        return sent
+    people = await _people_of(session, rest)
+    body, shown = replies.question_batch(
+        rest,
+        header=header,
+        used=spent + sent + len(rest),
+        budget=settings.question_budget_per_day,
+        people=people,
+    )
+    if shown == 0:
+        return sent
+    ok, msg = await deliver(
+        bot, body, reply_markup=keyboards.question_batch(rest[:shown])
+    )
+    if not ok:
+        return sent
+    await questions.record_shown(
+        session,
+        rest[:shown],
+        via=via,
+        now=now,
+        tg_message_id=getattr(msg, "message_id", None),
+    )
+    await session.commit()
+    return sent + shown
+
+
+async def _people_of(session, items) -> dict[int, Person]:
+    ids = {
+        p.subject.person_id
+        for p in items
+        if p.kind == questions.KIND_MEDIA and p.subject.person_id is not None
+    }
+    if not ids:
+        return {}
+    rows = await session.scalars(sa.select(Person).where(Person.id.in_(ids)))
+    return {person.id: person for person in rows}
+
+
+async def question_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The one sender of tap-requests (WP-18; owner answer 3: 5-10 a day).
+
+    Every five minutes: settle what needs no tap, collect everything that
+    wants one, and let questions.plan decide what fits today's budget, the
+    evening reserve and the gap between pushes. Urgent money comes first;
+    the rest waits for the brief, the evening report and /savollar, where
+    nothing is ever lost.
+    """
+    now = now or datetime.now(settings.tz)
+    if reminders.in_quiet_hours(now):
+        return
+    async with session_scope() as session:
+        resolved = await questions.auto_resolve(session, now=now)
+        await session.commit()
+        if any(resolved.values()):
+            log.info("questions resolved without asking: %s", resolved)
+        pending = await questions.collect(session, now=now, for_push=True)
+        if not pending:
+            return
+        picked = questions.plan(
+            pending,
+            spent=await questions.spent_today(session, now=now),
+            slot=questions.SLOT_DAY,
+            now=now,
+            last_push=await questions.last_push_at(session, now=now),
+            brief_sent=await questions.brief_sent_today(session, now=now),
+        )
+        if not picked:
+            return
+        shown = await send_questions(
+            bot,
+            session,
+            picked,
+            via=questions.VIA_PUSH,
+            header=replies.QUESTIONS_HEADER,
+            now=now,
+        )
+    log.info("asked %d question(s), %d waiting", shown, len(pending) - len(picked))
+
+
+async def _prune_job_heartbeats(session, registered: list[str]) -> int:
+    """Drop heartbeat rows of jobs this worker no longer runs, so /holat
+    never names a retired job (WP-16 deletes them once; an old worker may
+    have re-written them during the migration)."""
+    result = await session.execute(
+        sa.text(
+            "DELETE FROM heartbeats WHERE component LIKE 'job:%' "
+            "AND component <> ALL(:registered)"
+        ),
+        {"registered": registered},
+    )
+    return result.rowcount or 0
 
 
 # Profiles per sweep: one reasoning-model call each, so a first run over a
@@ -513,51 +494,6 @@ async def profile_refresh_job() -> None:
         written = await profiles.refresh_stale(session, limit=PROFILE_REFRESH_PER_RUN)
     if written:
         log.info("refreshed %d person profile(s)", written)
-
-
-async def media_ask_job(bot: Bot) -> None:
-    """Ask the owner about attachments too big to fetch on spec (spec §6).
-
-    Quiet-hours aware: a 300 MB video at 02:00 is not worth a notification,
-    and the question keeps until morning — the file is not going anywhere.
-    """
-    async with session_scope() as session:
-        expired = await approvals.expire_stale(session)
-    if expired:
-        log.info("expired %d unanswered media question(s)", expired)
-
-    if reminders.in_quiet_hours():
-        return
-
-    # Marked asked only after Telegram accepted the message: a question
-    # marked before a failed send used to expire unseen after 48 hours.
-    async with session_scope() as session:
-        for interaction in await approvals.awaiting_question(session):
-            person = (
-                await session.get(Person, interaction.person_id)
-                if interaction.person_id
-                else None
-            )
-            body = replies.media_question(
-                who=person.display_name if person else None,
-                media=dict(interaction.media or {}),
-                reason=approvals.reason_of(interaction),
-            )
-            try:
-                await bot.send_message(
-                    settings.owner_telegram_id,
-                    clip(body),
-                    reply_markup=keyboards.media_approval(interaction.id),
-                )
-            except Exception:
-                log.exception("could not ask about attachment %s", interaction.id)
-                break
-            approvals.set_state(
-                interaction,
-                approvals.ASKED,
-                shown_at=datetime.now(settings.tz).isoformat(),
-            )
-            await session.commit()
 
 
 async def batch_submit_job() -> None:
@@ -602,10 +538,10 @@ async def chat_notice_job(bot: Bot) -> None:
     A detailed receipt also carries the questions its window raised: a ✅ /
     ✖️ / ✏️ row per counterparty claim (build step 3), so "Akmal aytdi: sen
     unga qarzsan — to'g'rimi?" is answered from the receipt itself. A claim
-    counts as asked only once the receipt really went out, and only if its
-    row fit under the message; the summary path asks nothing, and whatever
-    it (or a clipped keyboard) leaves unasked reaches him through
-    claim_ask_job.
+    counts as asked only once the receipt really went out, and only as many
+    rows as today's question budget allows (WP-18); the summary path asks
+    nothing, and whatever is left unasked reaches him through question_job,
+    the brief and /savollar.
     """
     async with _notice_lock:
         if reminders.in_quiet_hours():
@@ -620,25 +556,45 @@ async def chat_notice_job(bot: Bot) -> None:
             rest = queue[notices.MAX_DETAILED :]
 
             for item in detailed:
-                # Only claims nobody has asked yet ride on the receipt: one
-                # claim_ask_job may have beaten it after quiet hours, and the
-                # owner already holds that row.
+                # Only claims nobody has asked yet ride on the receipt: the
+                # question queue may have beaten it after quiet hours, and
+                # the owner already holds that row.
                 waiting = [
                     claim
                     for claim in await claims.pending_for(session, item.interaction.id)
-                    if claim.asked_at is None
+                    if claim.asked_at is None and claim.duplicate_of is None
                 ]
-                shown = waiting[: keyboards.MAX_ROWS]
-                keyboard = keyboards.claim_actions([claim.id for claim in shown])
-                if not await notify(bot, item.text, reply_markup=keyboard):
+                # The receipt is not an interruption of its own, but each
+                # claim row on it is a tap-request: the day's budget decides
+                # how many ride along (WP-18); the rest wait in the queue.
+                allowed = questions.plan(
+                    [questions.pending_of_claim(c, now) for c in waiting],
+                    spent=await questions.spent_today(session, now=now),
+                    slot=questions.SLOT_DAY,
+                    now=now,
+                    last_push=None,
+                    brief_sent=True,
+                    interrupting=False,
+                )[: keyboards.MAX_ROWS]
+                keyboard = keyboards.claim_actions([p.subject.id for p in allowed])
+                text = item.text
+                if len(allowed) < len(waiting):
+                    text += "\n" + replies.CLAIMS_QUEUED
+                ok, msg = await deliver(bot, text, reply_markup=keyboard)
+                if not ok:
                     # Unreachable: everything left stays queued for the next poll.
                     return
                 # Marked only after a successful send, and committed at once, so
                 # a crash mid-sweep repeats at most one receipt and loses none.
-                # The claims whose buttons he now sees are marked with it.
+                # The claims whose buttons he now sees are logged with it.
                 batch.mark_notified(item.interaction, now=now)
-                for claim in shown:
-                    claims.mark_asked(claim, now=now)
+                await questions.record_shown(
+                    session,
+                    allowed,
+                    via=questions.VIA_RECEIPT,
+                    now=now,
+                    tg_message_id=getattr(msg, "message_id", None),
+                )
                 await session.commit()
 
             if rest:
@@ -1124,14 +1080,6 @@ async def run() -> None:
         coalesce=True,
     )
     scheduler.add_job(
-        media_ask_job,
-        IntervalTrigger(minutes=2),
-        id="media_ask",
-        args=[bot],
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
         batch_submit_job,
         IntervalTrigger(hours=settings.batch_flush_hours),
         id="batch_submit",
@@ -1159,34 +1107,10 @@ async def run() -> None:
         misfire_grace_time=3600,
     )
     scheduler.add_job(
-        nudge_job,
-        IntervalTrigger(minutes=30),
+        question_job,
+        IntervalTrigger(minutes=5),
         args=[bot],
-        id="nudges",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        missed_call_nudge_job,
-        IntervalTrigger(minutes=30),
-        args=[bot],
-        id="missed_call_nudge",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        new_chat_ask_job,
-        IntervalTrigger(minutes=2),
-        args=[bot],
-        id="new_chat_ask",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.add_job(
-        claim_ask_job,
-        IntervalTrigger(minutes=2),
-        args=[bot],
-        id="claim_ask",
+        id="questions",
         max_instances=1,
         coalesce=True,
     )
@@ -1239,6 +1163,13 @@ async def run() -> None:
     )
     scheduler.start()
     log.info("worker started (tz=%s); jobs: %s", settings.timezone, scheduler.get_jobs())
+    try:
+        async with session_scope() as session:
+            await _prune_job_heartbeats(
+                session, [f"{health.JOB_PREFIX}{job.id}" for job in scheduler.get_jobs()]
+            )
+    except Exception:
+        log.warning("could not prune stale job heartbeats", exc_info=True)
     # The first beat goes out before the catch-up, which can take minutes
     # (a report, a backup): the bot's watchdog must not read that as silence.
     try:

@@ -422,75 +422,6 @@ async def test_ertaga_snoozes_the_nudge_until_the_next_brief(session):
     assert len(await nudges.collect(session, now=until + timedelta(minutes=1))) == 1
 
 
-async def test_the_nudge_job_sends_one_per_question_capped_with_a_summary(
-    session, monkeypatch
-):
-    await _monitor(session)
-    people = [await _person(session, f"Odam {i}") for i in range(7)]
-    for i, person in enumerate(people):
-        await _monitor(session, 2000 + i)
-        await _msg(
-            session,
-            f"savol {i} qachon?",
-            at=_ago(hours=10 - i),
-            chat_id=2000 + i,
-            person=person,
-        )
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _Bot()
-
-    await worker.nudge_job(bot)
-
-    assert len(bot.sent) == nudges.MAX_PER_SWEEP + 1
-    first, markup = bot.sent[0]
-    assert replies.NUDGE_HEADER in first
-    assert "<b>Odam 0</b> · 10 soat oldin" in first and "«savol 0 qachon?»" in first
-    assert [p[:7] for p in _buttons(markup)] == ["rec:qa:", "rec:qs:"]
-    assert "yana 2 ta javobsiz savol" in bot.sent[-1][0]
-    # Only the five that went out are logged; the two come next sweep.
-    logged = await session.scalar(
-        sa.select(sa.func.count())
-        .select_from(m.ReminderLog)
-        .where(m.ReminderLog.kind == nudges.NUDGE_KIND)
-    )
-    assert logged == nudges.MAX_PER_SWEEP
-    bot.sent.clear()
-    await worker.nudge_job(bot)
-    assert len(bot.sent) == 2
-
-
-async def test_quiet_hours_hold_the_nudge_and_never_drop_it(session, monkeypatch):
-    akmal = await _person(session)
-    await _monitor(session)
-    await _msg(session, "narxi qancha?", at=_ago(hours=6), person=akmal)
-    await session.commit()
-    quiet = True
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: quiet)
-    bot = _Bot()
-
-    await worker.nudge_job(bot)
-    assert bot.sent == []
-
-    quiet = False
-    await worker.nudge_job(bot)
-    assert len(bot.sent) == 1
-
-
-async def test_an_unreachable_owner_logs_nothing(session, monkeypatch):
-    akmal = await _person(session)
-    await _monitor(session)
-    await _msg(session, "narxi qancha?", at=_ago(hours=6), person=akmal)
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-
-    await worker.nudge_job(_Bot(reachable=False))
-
-    assert (
-        await session.scalar(sa.select(sa.func.count()).select_from(m.ReminderLog)) == 0
-    )
-
-
 async def test_the_two_nudge_buttons_through_the_handler(bound):  # noqa: F811
     akmal = await _person(bound)
     await _monitor(bound)
@@ -763,55 +694,6 @@ async def test_a_backfill_stops_after_three_failures_or_when_switched_off(sessio
     other.monitor_enabled = False  # /chats, between the tap and the sweep
     await session.flush()
     assert await chats.pending_backfills(session) == []
-
-
-async def test_the_worker_asks_once_with_two_buttons(session, monkeypatch):
-    await chats.sync_dialogs(session, [_dialog(-222, ChatType.group, "GZ <logistika>")])
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _Bot()
-
-    await worker.new_chat_ask_job(bot)
-    await worker.new_chat_ask_job(bot)
-
-    [(text, markup)] = bot.sent
-    assert "Yangi guruh" in text and "GZ &lt;logistika&gt;" in text and "o'qiymi?" in text
-    monitor = await chats.get_monitor(session, -222)
-    await session.refresh(monitor)
-    assert _buttons(markup) == [f"ng:y:{monitor.id}", f"ng:n:{monitor.id}"]
-    assert monitor.asked_at is not None and monitor.monitor_enabled is False
-
-
-async def test_a_failed_group_question_is_offered_again(session, monkeypatch):
-    """Marked asked only after Telegram accepted it: a failed send used to
-    mark the group asked forever, so it was never offered again."""
-    await chats.sync_dialogs(session, [_dialog(-222, ChatType.group, "GZ")])
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    down = _Bot(reachable=False)
-
-    await worker.new_chat_ask_job(down)
-
-    monitor = await chats.get_monitor(session, -222)
-    await session.refresh(monitor)
-    assert monitor.asked_at is None
-    assert [w.tg_chat_id for w in await chats.awaiting_join_question(session)] == [-222]
-
-    up = _Bot()
-    await worker.new_chat_ask_job(up)
-    assert len(up.sent) == 1
-    await session.refresh(monitor)
-    assert monitor.asked_at is not None
-
-
-async def test_the_worker_does_not_ask_at_night(session, monkeypatch):
-    await chats.sync_dialogs(session, [_dialog(-222, ChatType.group, "GZ")])
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: True)
-    bot = _Bot()
-    await worker.new_chat_ask_job(bot)
-    assert bot.sent == []
-    assert len(await chats.awaiting_join_question(session)) == 1
 
 
 async def test_the_two_group_buttons_through_the_handler(bound):  # noqa: F811

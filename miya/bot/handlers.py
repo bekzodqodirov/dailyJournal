@@ -301,8 +301,10 @@ async def on_review_button(callback: CallbackQuery) -> None:
     if callback.message is not None:
         try:
             await callback.message.edit_reply_markup(
-                reply_markup=keyboards.without(
-                    callback.message.reply_markup, target or action
+                reply_markup=keyboards.without_prefixed(
+                    callback.message.reply_markup,
+                    keyboards.REVIEW_PREFIX,
+                    target if action != keyboards.REVIEW_OLD else action,
                 )
             )
         except Exception:
@@ -601,7 +603,9 @@ async def on_media_button(callback: CallbackQuery) -> None:
             None,
             approvals.EXPIRED,
         ):
-            await _edit_callback(callback, replies.MEDIA_GONE)
+            await _finish_row(
+                callback, _trimmed(callback, "md", raw_id), replies.MEDIA_GONE
+            )
             return
         approvals.set_state(
             interaction,
@@ -610,7 +614,7 @@ async def on_media_button(callback: CallbackQuery) -> None:
         )
         body = replies.MEDIA_APPROVED if answer == "y" else replies.MEDIA_DECLINED
 
-    await _edit_callback(callback, body)
+    await _finish_row(callback, _trimmed(callback, "md", raw_id), body)
 
 
 @router.callback_query(F.data.startswith("ng:"))
@@ -645,7 +649,7 @@ async def on_new_group_button(callback: CallbackQuery) -> None:
                 else replies.NEW_GROUP_GONE
             )
 
-    await _edit_callback(callback, body)
+    await _finish_row(callback, _trimmed(callback, "ng", monitor_id), body)
 
 
 @router.callback_query(F.data.startswith("unut:"))
@@ -677,6 +681,32 @@ async def on_purge_button(callback: CallbackQuery) -> None:
             body = replies.purge_done(plan, result)
 
     await _edit_callback(callback, body)
+
+
+async def _finish_row(callback: CallbackQuery, trimmed, text: str) -> None:
+    """Answer one tap. Inside a numbered batch (or when other rows are left)
+    only this row goes and the outcome is its own message; a message about
+    one thing is edited in place, as before."""
+    markup = callback.message.reply_markup if callback.message is not None else None
+    if callback.message is not None and (
+        keyboards.is_numbered(markup) or trimmed is not None
+    ):
+        try:
+            await callback.message.edit_reply_markup(reply_markup=trimmed)
+        except Exception:
+            log.debug("could not trim the question keyboard", exc_info=True)
+        await _safe_answer(callback.message, text)
+        try:
+            await callback.answer()
+        except Exception:
+            log.debug("could not acknowledge the callback", exc_info=True)
+        return
+    await _edit_callback(callback, text)
+
+
+def _trimmed(callback: CallbackQuery, prefix: str, ident):
+    markup = callback.message.reply_markup if callback.message is not None else None
+    return keyboards.without_prefixed(markup, prefix, ident)
 
 
 async def _edit_callback(callback: CallbackQuery, text: str) -> None:
@@ -1079,7 +1109,8 @@ async def on_record_button(callback: CallbackQuery) -> None:
         # A nudged question, not a record: "q<interaction id>".
         async with session_scope() as session:
             text = await _answer_nudge(session, action, handle)
-        await _edit_callback(callback, text)
+        markup = callback.message.reply_markup if callback.message is not None else None
+        await _finish_row(callback, keyboards.without(markup, handle), text)
         return
     if action in keyboards.MISSED_ANSWERS:
         # A missed-call loop, not a record: "m<interaction id>". Unlike a

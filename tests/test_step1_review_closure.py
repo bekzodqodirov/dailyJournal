@@ -40,7 +40,6 @@ from miya.services import extraction as ex
 from miya.services import queries, records, reminders
 from miya.services.people import resolve_person
 from miya.services.persistence import apply_extraction
-from miya.worker import main as worker
 from tests.test_adversarial_fixes import _fulfilment
 from tests.test_close_and_correct import (
     _Callback,
@@ -570,43 +569,6 @@ async def test_mark_asked_logs_only_the_rendered_questions(session):
     await session.flush()
     refs = sorted(await session.scalars(sa.select(m.ReminderLog.ref)))
     assert refs == ["0", "1"]
-
-
-async def test_the_worker_asks_the_clipped_tail_next_sweep(session, monkeypatch):
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-
-    class _Bot:
-        def __init__(self) -> None:
-            self.sent: list[tuple[str, object]] = []
-
-        async def send_message(self, chat_id, text, **kwargs):
-            self.sent.append((text, kwargs.get("reply_markup")))
-
-    for i in range(reminders.MAX_QUESTIONS):
-        session.add(
-            m.Task(
-                description=f"vazifa {i} " + "x" * 300,
-                created_at=_now() - timedelta(days=8),
-            )
-        )
-    await session.commit()
-    bot = _Bot()
-
-    await worker.reminder_job(bot)
-
-    [(text, markup)] = bot.sent
-    shown = len(markup.inline_keyboard)
-    assert 0 < shown < reminders.MAX_QUESTIONS
-    assert f"va yana {reminders.MAX_QUESTIONS - shown} ta" in text
-    asked = await session.scalar(sa.select(sa.func.count()).select_from(m.ReminderLog))
-    assert asked == shown  # the tail was not marked
-
-    bot.sent.clear()
-    await worker.reminder_job(bot)
-    [(text, markup)] = bot.sent
-    assert len(markup.inline_keyboard) == reminders.MAX_QUESTIONS - shown
-    asked = await session.scalar(sa.select(sa.func.count()).select_from(m.ReminderLog))
-    assert asked == reminders.MAX_QUESTIONS
 
 
 # --- 13: dedupe by calendar day ------------------------------------------------

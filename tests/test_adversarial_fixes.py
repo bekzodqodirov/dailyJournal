@@ -481,10 +481,14 @@ async def test_the_worker_sends_the_balance_keyboard(session, monkeypatch):
     await session.commit()
     bot = _Bot()
 
-    await worker.reminder_job(bot)
+    # "Hali ochiqmi?" is a tap-request: the question job asks it (WP-18).
+    afternoon = _now().replace(hour=14, minute=0, second=0, microsecond=0)
+    session.add(m.ReminderLog(kind="brief", ref=afternoon.date().isoformat()))
+    await session.commit()
+    await worker.question_job(bot, now=afternoon)
 
     [(text, markup)] = bot.sent
-    assert "Hali ochiqmi?" in text
+    assert "hali ochiqmi?" in text
     assert _payloads(markup) == [[f"rec:o:d{first.id}", f"rec:b:d{first.id}"]]
 
 

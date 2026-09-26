@@ -199,7 +199,12 @@ def record_row(
 
 
 def question_row(
-    kind: str, record_id: int, *, labelled: bool, label: str | None = None
+    kind: str,
+    record_id: int,
+    *,
+    labelled: bool,
+    label: str | None = None,
+    number: int | None = None,
 ) -> list[InlineKeyboardButton]:
     """Ha / Bajarildi (/ Yop) — the "Hali ochiqmi?" answer row.
 
@@ -212,18 +217,18 @@ def question_row(
     handle = ref(kind, record_id)
     suffix = f" {label or handle}" if labelled else ""
     done = ACTION_SETTLE_BALANCE if kind == "debt" else ACTION_DONE
+    if number is not None:
+        texts = (f"{number} Ha, ochiq", f"{number} ✅ Bajarildi", f"{number} ✖️ Yop")
+    else:
+        texts = (f"Ha{suffix}", f"✅ Bajarildi{suffix}", f"✖️ Yop{suffix}")
     row = [
-        InlineKeyboardButton(
-            text=f"Ha{suffix}", callback_data=f"rec:{ACTION_OPEN}:{handle}"
-        ),
-        InlineKeyboardButton(
-            text=f"✅ Bajarildi{suffix}", callback_data=f"rec:{done}:{handle}"
-        ),
+        InlineKeyboardButton(text=texts[0], callback_data=f"rec:{ACTION_OPEN}:{handle}"),
+        InlineKeyboardButton(text=texts[1], callback_data=f"rec:{done}:{handle}"),
     ]
     if kind != "debt":
         row.append(
             InlineKeyboardButton(
-                text=f"✖️ Yop{suffix}", callback_data=f"rec:{ACTION_CLOSE}:{handle}"
+                text=texts[2], callback_data=f"rec:{ACTION_CLOSE}:{handle}"
             )
         )
     return row
@@ -378,10 +383,21 @@ def parse_missed_ref(handle: str) -> int | None:
 
 
 def missed_row(
-    interaction_id: int, *, labelled: bool = True
+    interaction_id: int, *, labelled: bool = True, number: int | None = None
 ) -> list[InlineKeyboardButton]:
     """✅ Bog'landim / ⏰ Ertalab eslat for one missed-call loop."""
     handle = missed_ref(interaction_id)
+    if number is not None:
+        return [
+            InlineKeyboardButton(
+                text=f"{number} ✅ Bog'landim",
+                callback_data=f"rec:{ACTION_MISSED_ANSWERED}:{handle}",
+            ),
+            InlineKeyboardButton(
+                text=f"{number} ⏰ Ertalab",
+                callback_data=f"rec:{ACTION_MISSED_SNOOZE}:{handle}",
+            ),
+        ]
     suffix = f" {handle}" if labelled else ""
     return [
         InlineKeyboardButton(
@@ -462,7 +478,19 @@ ACTION_CLAIM_EDIT = "e"
 CLAIM_PREFIX = "cl"
 
 
-def claim_row(claim_id: int) -> list[InlineKeyboardButton]:
+def claim_row(claim_id: int, *, number: int | None = None) -> list[InlineKeyboardButton]:
+    if number is not None:
+        return [
+            InlineKeyboardButton(
+                text=f"{number} {label}",
+                callback_data=f"{CLAIM_PREFIX}:{action}:{claim_id}",
+            )
+            for label, action in (
+                ("✅ Ha", ACTION_CLAIM_YES),
+                ("✖️ Yo'q", ACTION_CLAIM_NO),
+                ("✏️ Tuzat", ACTION_CLAIM_EDIT),
+            )
+        ]
     handle = claim_ref(claim_id)
     return [
         InlineKeyboardButton(
@@ -624,4 +652,115 @@ def money_review(
                 )
             ]
         )
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+# --- one message, several questions (WP-18) ------------------------------------
+#
+# The question job sends up to QUESTION_BATCH_MAX questions as one numbered
+# message. The payloads are the single-question ones, unchanged; only the
+# button text gains the line number, and every handler removes its own row
+# only (without_prefixed), so answering #2 leaves #1 and #3 in place.
+
+
+def nudge_row(interaction_id: int, *, number: int) -> list[InlineKeyboardButton]:
+    handle = question_ref(interaction_id)
+    return [
+        InlineKeyboardButton(
+            text=f"{number} ✅ Javob berdim",
+            callback_data=f"rec:{ACTION_QUESTION_ANSWERED}:{handle}",
+        ),
+        InlineKeyboardButton(
+            text=f"{number} ⏰ Ertalab",
+            callback_data=f"rec:{ACTION_QUESTION_SNOOZE}:{handle}",
+        ),
+    ]
+
+
+def media_row(interaction_id: int, *, number: int) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(
+            text=f"{number} ✅ O'qi", callback_data=f"md:y:{interaction_id}"
+        ),
+        InlineKeyboardButton(
+            text=f"{number} ✖️ Kerak emas", callback_data=f"md:n:{interaction_id}"
+        ),
+    ]
+
+
+def money_row(interaction_id: int, *, number: int) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(
+            text=f"{number} 📉 Chiqim",
+            callback_data=f"{REVIEW_PREFIX}:{REVIEW_EXPENSE}:{interaction_id}",
+        ),
+        InlineKeyboardButton(
+            text=f"{number} 📈 Kirim",
+            callback_data=f"{REVIEW_PREFIX}:{REVIEW_INCOME}:{interaction_id}",
+        ),
+        InlineKeyboardButton(
+            text=f"{number} ✖️ Pul emas",
+            callback_data=f"{REVIEW_PREFIX}:{REVIEW_NOT_MONEY}:{interaction_id}",
+        ),
+    ]
+
+
+def question_item_row(item, number: int) -> list[InlineKeyboardButton]:
+    """The answer row of one queued question (questions.Pending)."""
+    subject = item.subject
+    if item.kind == "claim":
+        return claim_row(subject.id, number=number)
+    if item.kind == "missed":
+        return missed_row(subject.interaction_id, number=number)
+    if item.kind == "nudge":
+        return nudge_row(subject.interaction_id, number=number)
+    if item.kind == "media":
+        return media_row(subject.id, number=number)
+    if item.kind == "money":
+        return money_row(subject.id, number=number)
+    # still_open: a debt question is keyed by the first row of its balance.
+    kind, record_id = subject.refs[0]
+    return question_row(kind, record_id, labelled=False, number=number)
+
+
+def question_batch(items) -> InlineKeyboardMarkup | None:
+    rows = [question_item_row(item, n) for n, item in enumerate(items, 1)]
+    rows = rows[:MAX_ROWS]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def without_prefixed(
+    markup: InlineKeyboardMarkup | None, prefix: str, ident
+) -> InlineKeyboardMarkup | None:
+    """The keyboard minus the rows of one (prefix, id): md:y:55 never takes
+    cl:y:55 with it."""
+    if markup is None:
+        return None
+    ident = str(ident)
+
+    def hit(button) -> bool:
+        parts = (button.callback_data or "").split(":")
+        return parts[0] == prefix and parts[-1] == ident
+
+    rows = [row for row in markup.inline_keyboard if not any(hit(b) for b in row)]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def is_numbered(markup: InlineKeyboardMarkup | None) -> bool:
+    if markup is None:
+        return False
+    return any(
+        (b.text or "")[:1].isdigit() for row in markup.inline_keyboard for b in row
+    )
+
+
+def group_digest(monitors) -> InlineKeyboardMarkup | None:
+    """One numbered ✅ Ha / ✖️ Yo'q row per listed group (the ng: payloads)."""
+    rows = [
+        [
+            InlineKeyboardButton(text=f"{n} ✅ Ha", callback_data=f"ng:y:{m.id}"),
+            InlineKeyboardButton(text=f"{n} ✖️ Yo'q", callback_data=f"ng:n:{m.id}"),
+        ]
+        for n, m in enumerate(monitors, 1)
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None

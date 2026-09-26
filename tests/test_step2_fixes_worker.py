@@ -425,22 +425,3 @@ async def test_javob_berdim_in_a_group_covers_only_what_was_aimed_at_him(
 
 
 # --- B8. a channel is announced as a channel -----------------------------------
-
-
-async def test_the_question_names_the_chat_type(session, monkeypatch):
-    await chats.sync_dialogs(session, [_dialog(CHANNEL, ChatType.channel, "Bojxona")])
-    await session.commit()
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    seen: list[tuple] = []
-
-    def _question(title, tg_chat_id, **kwargs):
-        seen.append((title, tg_chat_id, kwargs.get("chat_type")))
-        return "savol"
-
-    monkeypatch.setattr(worker.replies, "new_group_question", _question)
-    bot = _Bot()
-
-    await worker.new_chat_ask_job(bot)
-
-    assert seen == [("Bojxona", CHANNEL, ChatType.channel)]
-    assert bot.sent == ["savol"]

@@ -9,7 +9,6 @@ per sweep, never inside quiet hours, never twice. The brief lists them too.
 
 from __future__ import annotations
 
-import inspect
 from datetime import datetime, timedelta
 
 import sqlalchemy as sa
@@ -127,8 +126,8 @@ async def test_a_counterparty_debt_rides_on_the_receipt_as_a_question(
     ]
     assert await _asked_at(session, claim.id) is not None
     assert await batch.pending_notices(session) == []
-    # Asked with the receipt, so the sweep has nothing left to ask.
-    await worker.claim_ask_job(bot)
+    # Asked with the receipt, so the question queue has nothing left to ask.
+    await worker.question_job(bot, now=datetime.now(TZ))
     assert len(bot.sent) == 1
 
 
@@ -156,9 +155,12 @@ async def test_a_receipt_without_claims_carries_no_keyboard(session, monkeypatch
     assert bot.markups == [None]
 
 
-async def test_only_the_claims_whose_buttons_fit_count_as_asked(session, monkeypatch):
-    """A keyboard is capped at MAX_ROWS; the tail is not asked by a receipt
-    it never appeared under — the sweep picks it up."""
+async def test_only_the_claims_the_budget_allows_ride_on_the_receipt(
+    session, monkeypatch
+):
+    """Each claim row is a tap-request (WP-18): the receipt carries what
+    today's budget allows, says the rest are queued, and the question job
+    asks the rest later — nothing is marked asked that was not shown."""
     now = datetime.now(TZ)
     interaction = _parked(0, "GZ logistika", now=now)
     session.add(interaction)
@@ -183,110 +185,18 @@ async def test_only_the_claims_whose_buttons_fit_count_as_asked(session, monkeyp
     await worker.chat_notice_job(bot)
 
     [markup] = bot.markups
-    assert len(markup.inline_keyboard) == keyboards.MAX_ROWS
-    shown, clipped = ids[: keyboards.MAX_ROWS], ids[keyboards.MAX_ROWS :]
-    assert all([await _asked_at(session, i) for i in shown])
-    assert not any([await _asked_at(session, i) for i in clipped])
+    batch_max = settings.question_batch_max
+    assert len(markup.inline_keyboard) == batch_max
+    assert replies.CLAIMS_QUEUED in bot.sent[0]
+    asked = [await _asked_at(session, i) for i in ids]
+    assert sum(1 for a in asked if a is not None) == batch_max
 
-    await worker.claim_ask_job(bot)
-    assert [_buttons(k)[0] for k in bot.markups[1:]] == [f"cl:y:{i}" for i in clipped]
+    await worker.question_job(bot, now=datetime.now(TZ))
+    asked = [await _asked_at(session, i) for i in ids]
+    assert sum(1 for a in asked if a is not None) == 2 * batch_max
 
 
 # --- the sweep asks the rest -------------------------------------------------
-
-
-def test_the_sweep_waits_claim_ask_after_minutes():
-    assert settings.claim_ask_after_minutes == 10
-    assert worker.CLAIM_MAX_PER_SWEEP == 5
-    source = inspect.getsource(worker.run)
-    assert 'id="claim_ask"' in source
-    registration = source[source.index("claim_ask_job,") : source.index('id="claim_ask"')]
-    assert "IntervalTrigger(minutes=2)" in registration
-
-
-async def test_quiet_hours_hold_the_question(session, monkeypatch):
-    [claim_id] = await _old_claims(session, 1)
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: True)
-    bot = _KeyboardBot()
-
-    await worker.claim_ask_job(bot)
-
-    assert bot.sent == []
-    assert await _asked_at(session, claim_id) is None
-
-
-async def test_an_old_unasked_claim_is_asked_once_with_buttons(session, monkeypatch):
-    [claim_id] = await _old_claims(session, 1)
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _KeyboardBot()
-
-    await worker.claim_ask_job(bot)
-
-    [text] = bot.sent
-    claim = await session.get(m.Claim, claim_id)
-    assert text == replies.claim_question(claims.view(claim))
-    assert "Akmal" in text and "to'g'rimi" in text
-    [markup] = bot.markups
-    assert _buttons(markup) == [
-        f"cl:y:{claim_id}",
-        f"cl:n:{claim_id}",
-        f"cl:e:{claim_id}",
-    ]
-    assert await _asked_at(session, claim_id) is not None
-
-    await worker.claim_ask_job(bot)
-    assert len(bot.sent) == 1
-
-
-async def test_a_fresh_claim_waits_for_its_receipt(session, monkeypatch):
-    [claim_id] = await _old_claims(session, 1, age=timedelta(minutes=2))
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _KeyboardBot()
-
-    await worker.claim_ask_job(bot)
-
-    assert bot.sent == []
-    assert await _asked_at(session, claim_id) is None
-
-
-async def test_a_backlog_is_asked_a_few_per_sweep_oldest_first(session, monkeypatch):
-    ids = await _old_claims(session, worker.CLAIM_MAX_PER_SWEEP + 2)
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _KeyboardBot()
-
-    await worker.claim_ask_job(bot)
-    assert len(bot.sent) == worker.CLAIM_MAX_PER_SWEEP
-    asked = [_buttons(k)[0] for k in bot.markups]
-    assert asked == [f"cl:y:{i}" for i in ids[: worker.CLAIM_MAX_PER_SWEEP]]
-
-    await worker.claim_ask_job(bot)
-    assert len(bot.sent) == len(ids)
-    asked = [_buttons(k)[0] for k in bot.markups]
-    assert asked == [f"cl:y:{i}" for i in ids]
-
-    await worker.claim_ask_job(bot)
-    assert len(bot.sent) == len(ids)
-
-
-async def test_an_undelivered_question_stops_the_sweep(session, monkeypatch):
-    """Marked only after Telegram accepted it: an undelivered question stays
-    unasked, so the next sweep asks it again — and it stays pending for
-    /davolar and the brief meanwhile. The sweep stops at the first failure."""
-    first, *rest = await _old_claims(session, 3)
-    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
-    bot = _KeyboardBot(reachable=False)
-
-    await worker.claim_ask_job(bot)
-
-    assert bot.sent == []
-    assert await _asked_at(session, first) is None
-    assert not any([await _asked_at(session, i) for i in rest])
-    assert [c.id for c in await claims.pending(session)] == [first, *rest]
-
-    bot.reachable = True
-    await worker.claim_ask_job(bot)
-    assert [_buttons(k)[0] for k in bot.markups] == [f"cl:y:{i}" for i in (first, *rest)]
-    assert all([await _asked_at(session, i) for i in (first, *rest)])
 
 
 # --- the brief and the receipt's source line ---------------------------------
@@ -316,7 +226,7 @@ async def test_a_claim_shown_on_the_brief_is_not_asked_again(session, monkeypatc
     for claim_id in ids:
         assert await _asked_at(session, claim_id) is not None
 
-    await worker.claim_ask_job(bot)
+    await worker.question_job(bot, now=datetime.now(TZ))
     assert len(bot.sent) == 1
 
 
