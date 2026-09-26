@@ -218,3 +218,47 @@ async def test_a_non_strict_caller_creates_nobody_named_after_the_owner(
 ):
     assert await people.resolve_person(session, "Bekzod", telegram_id=4242) is None
     assert list(await session.scalars(sa.select(m.Person))) == []
+
+
+# --- WP-37: suffixes, joined and hyphenated forms, channels, runtime @ --------
+
+
+@pytest.mark.parametrize(
+    ("text", "flagged"),
+    [
+        ("Bekzodga ayting", True),
+        ("bekzodakaga yozdim", True),
+        ("Бекзодга", True),
+        ("Bekzod-aka, qarang", True),
+        ("Бекзодака", True),
+        ("GSR Logisticsga", True),
+        ("Begaga ayt", True),
+        ("@owner_test123 qarang", True),
+        ("Begalar keldi", False),
+        ("Bekzodjon aytdi", False),
+        ("Begim keldi", False),
+        ("Bekzodbek keldi", False),
+        ("email@owner_test123x", False),
+        ("GS367 keldi", False),
+    ],
+)
+def test_suffixed_and_joined_forms(monkeypatch, text, flagged):
+    monkeypatch.setattr(settings, "owner_aliases", NEW_ALIASES)
+    assert userbot.addressed_to_owner(_group_message(text), ChatType.group) is flagged
+
+
+def test_channels_and_the_owners_own_messages_are_never_addressed(monkeypatch):
+    monkeypatch.setattr(settings, "owner_aliases", NEW_ALIASES)
+    assert not userbot.addressed_to_owner(_group_message("Bekzod aka"), ChatType.channel)
+    own = SimpleNamespace(message="Bekzod aka", out=True, mentioned=False)
+    assert not userbot.addressed_to_owner(own, ChatType.group)
+    mention = SimpleNamespace(message="salom", out=False, mentioned=True)
+    assert userbot.addressed_to_owner(mention, ChatType.group)
+
+
+def test_the_runtime_username_counts_without_env(monkeypatch):
+    monkeypatch.setattr(settings, "owner_aliases", "")
+    monkeypatch.setattr(userbot, "_RUNTIME_ALIASES", ("@owner_test123",))
+    assert userbot.addressed_to_owner(
+        _group_message("@owner_test123 salom"), ChatType.group
+    )

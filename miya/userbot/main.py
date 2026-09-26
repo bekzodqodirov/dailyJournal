@@ -205,6 +205,29 @@ async def fetch_media(
     return outcome
 
 
+async def _recheck_to_me(session, interaction: Interaction) -> None:
+    """A group voice note is only words once transcribed: look for the
+    owner's names again, before the window closes over it (WP-37)."""
+    meta = interaction.meta or {}
+    if (
+        meta.get("to_me")
+        or interaction.window_id is not None
+        or interaction.direction is not Direction.in_
+        or interaction.tg_chat_id is None
+        or not interaction.transcript
+    ):
+        return
+    chat_type = await session.scalar(
+        sa.select(ChatMonitor.chat_type).where(
+            ChatMonitor.tg_chat_id == interaction.tg_chat_id
+        )
+    )
+    if chat_type is not ChatType.group:
+        return
+    if mentions_owner(interaction.transcript):
+        interaction.meta = {**meta, "to_me": True, "to_me_via": "transcript"}
+
+
 async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
     """Write what `fetch_media` produced. Short, and inside one transaction."""
     media = dict(interaction.media or {})
@@ -232,6 +255,7 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
                 **(interaction.meta or {}),
                 "asr_language": outcome.transcript.language,
             }
+        await _recheck_to_me(session, interaction)
 
     if outcome.vision is not None:
         if outcome.vision.usage is not None:
@@ -481,13 +505,24 @@ def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
     also searched for the owner's aliases (OWNER_ALIASES), whole word, either
     script, any case.
     """
-    if chat_type is ChatType.private or getattr(message, "out", False):
+    if chat_type in (ChatType.private, ChatType.channel):
+        # A channel post is a broadcast: it can never be aimed at the owner.
+        return False
+    if getattr(message, "out", False):
         return False
     if getattr(message, "mentioned", False):
         return True
-    pattern = alias_pattern(settings.owner_aliases_parsed)
-    text = getattr(message, "message", None) or ""
-    return bool(pattern and pattern.search(fold_apostrophes(text)))
+    return mentions_owner(getattr(message, "message", None) or "")
+
+
+# The owner's own @username, learned from get_me() at start (WP-37): it need
+# not be written into .env to count.
+_RUNTIME_ALIASES: tuple[str, ...] = ()
+
+
+def mentions_owner(text: str) -> bool:
+    pattern = alias_pattern(settings.owner_aliases_parsed + _RUNTIME_ALIASES)
+    return bool(pattern and pattern.search(fold_apostrophes(text or "")))
 
 
 def _message_meta(message: object, monitor: ChatMonitor) -> dict:
@@ -825,6 +860,9 @@ async def run() -> None:
             )
 
         me = await client.get_me()
+        global _RUNTIME_ALIASES
+        if getattr(me, "username", None):
+            _RUNTIME_ALIASES = ("@" + me.username,)
         log.info("userbot connected as %s (read-only)", display_name_of(me))
         await beat_userbot(enabled=True, connected=True, user_id=me.id)
         await sync_from_client(client)

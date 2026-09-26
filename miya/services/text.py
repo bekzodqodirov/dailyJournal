@@ -100,26 +100,67 @@ def transliterate(latin: str) -> str:
     return "".join(out)
 
 
+# Case endings an alias may carry and still be the owner: "Bekzodga",
+# "Bekzod akaning", "Бекзодга". Deliberately not lar / jon / m — "Begalar",
+# "Bekzodjon" and "Begim" are other people or other words.
+ALIAS_SUFFIXES = (
+    "ga",
+    "ka",
+    "qa",
+    "ni",
+    "ning",
+    "niki",
+    "da",
+    "dan",
+    "га",
+    "ка",
+    "қа",
+    "ни",
+    "нинг",
+    "ники",
+    "да",
+    "дан",
+)
+
+
 @functools.lru_cache(maxsize=8)
 def alias_pattern(aliases: tuple[str, ...]) -> re.Pattern[str] | None:
     """One regex that matches any alias as a whole word, in either script.
 
-    Whole word means no letter or digit on either side — so "Bega" does not
-    fire on "Begalar" but does on "Bega," and "(Bega)". Inner whitespace in a
-    multi-word alias matches any run of whitespace. Cached per alias tuple,
-    so the userbot compiles it once and a test that changes the setting
-    gets a fresh one.
+    Names match joined, spaced or hyphenated ("Bekzod aka", "bekzodaka",
+    "Bekzod-aka", "Бекзодака") and with an Uzbek case ending ("Bekzodga");
+    never inside a longer word — "Begalar" and "Bekzodjon" stay out. An
+    ``@username`` matches only as itself, never inside an e-mail address.
+    Cached per alias tuple, so a test that changes the setting gets a
+    fresh one.
     """
-    spellings: list[str] = []
+    names: list[str] = []
+    handles: list[str] = []
     for alias in aliases:
-        latin = fold_apostrophes(alias.strip())
-        for spelling in (latin, transliterate(latin)):
-            if spelling and spelling.lower() not in (s.lower() for s in spellings):
-                spellings.append(spelling)
-    if not spellings:
+        alias = fold_apostrophes(alias.strip())
+        if not alias:
+            continue
+        if alias.startswith("@"):
+            if alias.lower() not in (h.lower() for h in handles):
+                handles.append(alias)
+            continue
+        for spelling in (alias, transliterate(alias)):
+            if spelling and spelling.lower() not in (n.lower() for n in names):
+                names.append(spelling)
+    alternatives: list[str] = []
+    if names:
+        words = "|".join(
+            r"[\s\-]*".join(re.escape(part) for part in re.split(r"[\s\-]+", n))
+            for n in names
+        )
+        suffixes = "|".join(sorted(ALIAS_SUFFIXES, key=len, reverse=True))
+        alternatives.append(rf"(?<![\w'@])(?:{words})(?:{suffixes})?(?![\w'])")
+    if handles:
+        words = "|".join(re.escape(h) for h in handles)
+        alternatives.append(rf"(?<![\w'@])(?:{words})(?![\w])")
+    if not alternatives:
         return None
-    words = (r"\s+".join(re.escape(part) for part in s.split()) for s in spellings)
-    return re.compile(r"(?<![\w'])(?:" + "|".join(words) + r")(?![\w'])", re.IGNORECASE)
+    return re.compile("|".join(alternatives), re.IGNORECASE)
 
 
 # --- Cyrillic → Latin (Uzbek and Russian), for comparing and searching -------
