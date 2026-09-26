@@ -237,7 +237,7 @@ POSSESSIVE_NOT_QUESTION: frozenset[str] = frozenset(
 )
 
 
-def _ends_in_question_particle(folded: str) -> bool:
+def ends_in_question_particle(folded: str) -> bool:
     """The "-mi" rule, on apostrophe-folded text with its case intact."""
     if len(folded.split()) > QUESTION_PARTICLE_MAX_WORDS:
         return False
@@ -262,7 +262,7 @@ def looks_like_question(text: str | None) -> bool:
         return True
     if _QUESTION_WORD.search(folded):
         return True
-    return _ends_in_question_particle(folded)
+    return ends_in_question_particle(folded)
 
 
 # --- ordering ------------------------------------------------------------------

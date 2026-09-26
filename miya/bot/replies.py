@@ -135,6 +135,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("tekshir", "Qayta ishlanmagan yozuvlar"),
     ("qayta", "Ularni qaytadan ajratish"),
     ("qidir", "Xotiradan qidirish"),
+    ("manba", "Javobdagi manbaning asl matni"),
     ("hisobot", "Bugun nima bo'ldi"),
     ("kecha", "Kecha nima bo'ldi"),
     ("fikr", "Yozuvlarga qarab fikr"),
@@ -1314,16 +1315,81 @@ def claim_value_refused(view: claims.ClaimView) -> str:
     return f"Bu qiymat to'g'ri kelmadi.\n{claim_tuzat_hint(view)}"
 
 
-def search_results(hits, query: str) -> str:
-    """`/qidir`: raw semantic hits — no LLM, just what memory holds."""
-    if not hits:
-        return f"🔍 <b>{escape(query)}</b> bo'yicha xotirada hech narsa topilmadi."
+MANBA_USAGE = "Qaysi yozuv? Masalan: <code>/manba m1234</code>"
+MANBA_NOT_FOUND = "Bunday yozuv topilmadi — o'chirilgan bo'lishi mumkin."
+QIDIR_USAGE = "Nima qidiray? <code>/qidir bojxona</code>"
+QIDIR_HIT_CHARS = 140
+QIDIR_FACT_CHARS = 160
 
-    lines = [
-        f"{short_date(h.memory.occurred_at.date())} · {escape(h.memory.content)}"
-        for h in hits
-    ]
-    return clip(f"🔍 <b>{escape(query)}</b>\n" + bullet_list(lines, empty="—"))
+
+def qidir_header(query: str, count: int) -> str:
+    return f"🔍 <b>{escape(query)}</b> — {count} ta topildi"
+
+
+def qidir_empty(query: str) -> str:
+    return f"🔎 <b>{escape(query)}</b> bo'yicha yozuvlarda hech narsa topilmadi."
+
+
+def _day(value: datetime) -> str:
+    return short_date(value.astimezone(settings.tz).date())
+
+
+def _one_line(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def qidir_results(result, query: str) -> str:
+    """`/qidir`: the recall hits (WP-59) — where, who, the words, the ref;
+    no model involved."""
+    lines = []
+    for episode in result.episodes:
+        for line in episode.lines:
+            if not line.hit:
+                continue
+            lines.append(
+                f"• {_day(line.when)} · {escape(episode.where)} · "
+                f"{escape(line.who)}: «{escape(_one_line(line.text, QIDIR_HIT_CHARS))}» "
+                f"<code>{escape(line.ref)}</code>"
+            )
+    for fact in result.facts:
+        lines.append(
+            f"• {_day(fact.when)} · 💡 "
+            f"{escape(_one_line(fact.text, QIDIR_FACT_CHARS))} "
+            f"<code>{escape(fact.ref)}</code>"
+        )
+    if not lines:
+        return qidir_empty(query)
+    return clip("\n".join([qidir_header(query, len(lines)), *lines]))
+
+
+def manba(source) -> str:
+    """`/manba`: the original words behind a citation, escaped and clipped."""
+    when = source.when
+    if source.kind == "fact":
+        header = f"💡 <b>Xotira</b> · {_day(when)}"
+        if source.about:
+            header += f" · {escape(source.about)}"
+        parts = [header, escape(source.text)]
+        if source.source_ref:
+            parts.append(f"Manba: /manba {source.source_ref}")
+        return clip("\n\n".join(parts))
+    header = (
+        f"📄 <b>Asl yozuv</b> · {_day(when)} {clock(when)}"
+        f" · {escape(source.where or '')}"
+    )
+    if source.lines:
+        body = "\n".join(
+            (
+                f"<b>{clock(line.when)} {escape(line.who)}: {escape(line.text)}</b>"
+                if line.hit
+                else f"{clock(line.when)} {escape(line.who)}: {escape(line.text)}"
+            )
+            for line in source.lines
+        )
+    else:
+        body = escape(source.text)
+    return clip(f"{header}\n\n{body}")
 
 
 SEARCH_UNAVAILABLE = (
@@ -1408,6 +1474,16 @@ _COUNT_LABEL = {
     "events": "uchrashuv",
     "tasks": "vazifa",
     "memories": "xotira",
+    "claims": "da'vo",
+    "group_lines": "guruhlardagi xabari",
+    "person_card": "odam kartasi (ism, telefon, taxalluslar)",
+}
+_KEPT_LABEL = {
+    "transactions_kept": "pul harakati: {n} ta — summa qoladi, ism olib tashlanadi",
+    "mentions_kept": "boshqa yozuvlarda tilga olingan: {n} ta",
+    "payments_in_range": (
+        "shu kunlardagi qarz to'lovlari: {n} ta — qarz qoldig'i buzilmasligi uchun"
+    ),
 }
 
 
@@ -1420,17 +1496,33 @@ def purge_preview(plan) -> str:
     ]
     if plan.files:
         lines.append(f"media fayl: {len(plan.files)} ta")
+    kept = [
+        _KEPT_LABEL[key].format(n=count)
+        for key, count in (getattr(plan, "kept", None) or {}).items()
+        if count and key in _KEPT_LABEL
+    ]
+    kept_block = (
+        "\n\n<b>Qoladi (o'chirilmaydi):</b>\n" + bullet_list(kept, empty="—")
+        if kept
+        else ""
+    )
 
     return clip(
         f"⚠️ <b>O'chirishni tasdiqlang</b>\n"
         f"{_PURGE_KIND.get(plan.kind, plan.kind)}: <b>{escape(plan.label)}</b>\n\n"
         + bullet_list(lines, empty="—")
+        + kept_block
         + "\n\n<i>Bu amalni ortga qaytarib bo'lmaydi.</i>"
     )
 
 
 def purge_done(plan, result) -> str:
     tail = f", {result.files_deleted} ta fayl" if result.files_deleted else ""
+    if plan.kind == "person":
+        return (
+            f"🗑 <b>{escape(plan.label)}</b> o'chirildi: {result.interactions} ta yozuv, "
+            f"{result.memories} ta xotira, {result.claims} ta da'vo{tail}."
+        )
     return (
         f"🗑 <b>{escape(plan.label)}</b> o'chirildi: "
         f"{result.interactions} ta yozuv{tail}."
@@ -2453,4 +2545,15 @@ def claim_reopened(view) -> str:
 
 SAVOL_USAGE = "Savolni yozing: <code>/savol Akmal qachon keladi</code>"
 FIKR_USAGE = "Nima haqida? <code>/fikr Akmal bilan konteyner masalasi</code>"
-NOTE_SAVE_GONE = "Bu savol topilmadi yoki allaqachon yozib qo'yilgan."
+SAVED_AS_NOTE = "📝 Eslatma sifatida yozib qo'ydim:"
+ALREADY_SAVED = "Bu allaqachon yozib qo'yilgan."
+QUESTION_GONE = "Bu xabar topilmadi — o'chirilgan bo'lishi mumkin."
+VOICE_QUESTION_CHARS = 300
+
+
+def voice_question_header(text: str) -> str:
+    """What was heard, so a misheard question is visible (WP-60)."""
+    heard = " ".join(text.split())
+    if len(heard) > VOICE_QUESTION_CHARS:
+        heard = heard[: VOICE_QUESTION_CHARS - 1] + "…"
+    return f"🎙 <i>Savolingiz:</i> «{escape(heard)}»"

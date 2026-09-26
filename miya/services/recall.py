@@ -21,7 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
-from miya.db.models import ChatMonitor, Interaction, Memory, Passage, Person
+from miya.db.models import (
+    ChatMonitor,
+    ConversationWindow,
+    Interaction,
+    Memory,
+    Passage,
+    Person,
+)
 from miya.services import people as people_mod
 from miya.services import queries
 from miya.services.embeddings import Embedder, EmbeddingError
@@ -626,8 +633,10 @@ def _text(interaction: Interaction) -> str:
     return (interaction.raw_text or interaction.transcript or "").strip()
 
 
-async def _chat_lines(session, chat: int, first: datetime, last: datetime):
-    n = settings.recall_context_lines
+async def _chat_lines(
+    session, chat: int, first: datetime, last: datetime, *, n: int | None = None
+):
+    n = settings.recall_context_lines if n is None else n
     member = sa.and_(
         Interaction.tg_chat_id == chat,
         Interaction.source == InteractionSource.telegram_userbot,
@@ -685,6 +694,10 @@ async def _episodes(session: AsyncSession, hits: list[Passage]) -> list[Episode]
             groups[-1].append(passage)
         else:
             groups.append([passage])
+    # Grouped in time, returned by rank: the episode holding the best hit
+    # comes first, and the cut keeps the best, not the oldest.
+    rank = {id(p): i for i, p in enumerate(hits)}
+    groups.sort(key=lambda group: min(rank[id(p)] for p in group))
     groups = groups[:MAX_EPISODES]
 
     context_rows: dict[int, list[Interaction]] = {}
@@ -757,3 +770,110 @@ async def _episodes(session: AsyncSession, hits: list[Passage]) -> list[Episode]
             )
         )
     return episodes
+
+
+# --- one source, whole (WP-59) ----------------------------------------------------------
+
+REF_RE = re.compile(r"^([mf])(\d+)(?:#(\d+))?$", re.IGNORECASE)
+SOURCE_TEXT_CHARS = 3500
+
+
+@dataclass(slots=True)
+class Source:
+    """What `/manba` shows: a message with the lines around it, or a fact."""
+
+    kind: str  # "message" | "fact"
+    ref: str
+    when: datetime
+    where: str | None = None
+    about: str | None = None
+    lines: list[Line] = field(default_factory=list)
+    text: str = ""
+    source_ref: str | None = None
+
+
+async def source_of(session: AsyncSession, ref: str) -> Source | None:
+    """The row behind a citation ref (``m12``, ``m12#3``, ``f7``), or None
+    when it is malformed or gone."""
+    match = REF_RE.match(ref.strip())
+    if match is None:
+        return None
+    kind, number, chunk_no = match.group(1).lower(), int(match.group(2)), match.group(3)
+    if kind == "f":
+        memory = await session.get(Memory, number)
+        if memory is None:
+            return None
+        person = await session.get(Person, memory.person_id) if memory.person_id else None
+        return Source(
+            kind="fact",
+            ref=f"f{memory.id}",
+            when=memory.occurred_at,
+            about=person.display_name if person else None,
+            text=memory.content[:SOURCE_TEXT_CHARS],
+            source_ref=(
+                f"m{memory.source_interaction_id}"
+                if memory.source_interaction_id
+                else None
+            ),
+        )
+
+    interaction = await session.get(Interaction, number)
+    if interaction is None:
+        return None
+    source = Source(
+        kind="message", ref=f"m{interaction.id}", when=interaction.occurred_at
+    )
+    meta = interaction.meta or {}
+    if meta.get("kind") == "window":
+        window = (
+            await session.get(ConversationWindow, meta.get("window_id") or 0)
+            if meta.get("window_id")
+            else None
+        )
+        source.text = ((window.text if window else None) or _text(interaction))[
+            :SOURCE_TEXT_CHARS
+        ]
+        rows = [interaction]
+    elif (
+        interaction.source is InteractionSource.telegram_userbot
+        and interaction.tg_chat_id
+    ):
+        rows = await _chat_lines(
+            session,
+            interaction.tg_chat_id,
+            interaction.occurred_at,
+            interaction.occurred_at,
+            n=settings.recall_context_lines * 2,
+        )
+        if interaction not in rows:
+            rows.append(interaction)
+    else:
+        rows = [interaction]
+        body = None
+        if chunk_no is not None:
+            body = await session.scalar(
+                sa.select(Passage.body).where(
+                    Passage.interaction_id == interaction.id,
+                    Passage.chunk_no == int(chunk_no),
+                )
+            )
+            if body is not None:
+                source.ref += f"#{int(chunk_no)}"
+        source.text = (body or _text(interaction))[:SOURCE_TEXT_CHARS]
+    monitors, names = await _labels(session, rows)
+    source.where = where_label(interaction, monitors, names)
+    if len(rows) > 1 or (rows and not source.text):
+        source.lines = [
+            Line(
+                ref=f"m{row.id}",
+                when=row.occurred_at,
+                who=_who(row, names),
+                text=_text(row)[
+                    : HIT_CHARS if row.id == interaction.id else CONTEXT_CHARS
+                ],
+                hit=row.id == interaction.id,
+            )
+            for row in rows
+            if _text(row)
+        ]
+    return source

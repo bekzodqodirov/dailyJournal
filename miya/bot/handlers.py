@@ -44,6 +44,7 @@ from miya.services import (
     client_import,
     documents,
     health,
+    loops,
     memories,
     money_events,
     nudges,
@@ -53,12 +54,13 @@ from miya.services import (
     queries,
     questions,
     rag,
+    recall,
     recaps,
     records,
     reminders,
 )
 from miya.services import codes as client_codes
-from miya.services.embeddings import EmbeddingError, get_embedder
+from miya.services.embeddings import get_embedder
 from miya.services.extraction import ExtractedTransaction
 from miya.services.ingest import (
     create_interaction,
@@ -68,7 +70,7 @@ from miya.services.ingest import (
     transcribe_into,
 )
 from miya.services.people import find_person
-from miya.services.text import fold_apostrophes
+from miya.services.text import fold_apostrophes, normalise_for_search
 
 log = logging.getLogger(__name__)
 
@@ -373,11 +375,11 @@ async def cmd_retry(message: Message) -> None:
 async def cmd_search(message: Message, command: CommandObject) -> None:
     query = (command.args or "").strip()
     if not query:
-        await _safe_answer(message, "Nima qidiray? <code>/qidir bojxona</code>")
+        await _safe_answer(message, replies.QIDIR_USAGE)
         return
 
     await _typing(message)
-    exact = ""
+    now = datetime.now(settings.tz)
     async with session_scope() as session:
         # Codes and waybills are matched exactly, never by embedding (WP-40);
         # the block survives the embedder being down.
@@ -388,15 +390,38 @@ async def cmd_search(message: Message, command: CommandObject) -> None:
                 session, code, limit=replies.QIDIR_EXACT_MAX
             )
         lines.sort(key=lambda line: line.when, reverse=True)
-        if lines:
-            exact = replies.exact_hits_block(lines)
+        exact = replies.exact_hits_block(lines) if lines else ""
+        # Hybrid recall (WP-59): the words stand even when meaning search
+        # is down.
         try:
-            hits = await memories.search(session, get_embedder(), query, k=8)
-            body = replies.search_results(hits, query)
-        except EmbeddingError:
-            log.warning("semantic search unavailable", exc_info=True)
-            body = "" if exact else replies.SEARCH_UNAVAILABLE
+            embedder = get_embedder()
+        except Exception:
+            log.warning("embedder unavailable for /qidir", exc_info=True)
+            embedder = None
+        result = await recall.search(session, embedder, query, now=now, k=10)
+        degraded = embedder is None or result.degraded is not None
+        if result.is_empty() and exact:
+            body = ""
+        else:
+            body = replies.qidir_results(result, query)
+            if degraded:
+                body = f"{body}\n\n{rag.SEMANTIC_DEGRADED}"
     await _safe_answer(message, clip("\n\n".join(p for p in (exact, body) if p)))
+
+
+@router.message(Command("manba"))
+async def cmd_source(message: Message, command: CommandObject) -> None:
+    """`/manba m12` — the original words behind a citation (WP-59)."""
+    ref = (command.args or "").strip()
+    if not ref:
+        await _safe_answer(message, replies.MANBA_USAGE)
+        return
+    async with session_scope() as session:
+        source = await recall.source_of(session, ref)
+    if source is None:
+        await _safe_answer(message, replies.MANBA_NOT_FOUND)
+        return
+    await _safe_answer(message, replies.manba(source))
 
 
 @router.message(Command("hisobot"))
@@ -1776,6 +1801,49 @@ async def _code_to_person(session, code: str, name: str, holder: Person | None):
     return replies.code_attached(code, person.display_name, held), None
 
 
+_SPOKEN_ASK = re.compile(r"(?<![a-z0-9])(?:nima|kim)(?![a-z0-9])")
+
+
+def _spoken_mode(text: str) -> str:
+    """A transcript has no '?': the "-mi" particle marks the question too,
+    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi")."""
+    mode = rag.classify(text)
+    if mode != "note":
+        return mode
+    if loops.ends_in_question_particle(fold_apostrophes(text)):
+        return "question"
+    if _SPOKEN_ASK.search(normalise_for_search(text)) and rag.wants_evidence(text):
+        return "question"
+    return mode
+
+
+async def _answer_into(
+    session, interaction: Interaction, text: str, mode: str, *, header: str | None = None
+) -> str:
+    """Answer ``text`` and keep the answer and what it cited on the row."""
+    interaction.processed = True
+    result = await rag.answer_full(session, text, mode=mode)
+    reply = clip(f"{header}\n\n{result.text}" if header else result.text)
+    interaction.meta = {
+        **(interaction.meta or {}),
+        "mode": result.mode,
+        "answer": reply[:4000],
+        "refs": result.refs,
+    }
+    return reply
+
+
+async def _send_answer(message: Message, reply: str, interaction_id: int) -> None:
+    sent = await _safe_answer(
+        message, reply, reply_markup=keyboards.save_as_note(interaction_id)
+    )
+    if sent is not None and getattr(sent, "message_id", None) is not None:
+        async with session_scope() as session:
+            row = await session.get(Interaction, interaction_id)
+            if row is not None:
+                row.meta = {**(row.meta or {}), "answer_message_id": sent.message_id}
+
+
 async def _answer_question(message: Message, text: str, mode: str) -> None:
     """A question or an opinion: answered, not extracted — but it still lands
     in interactions ("every input lands here"), marked so /tekshir and the
@@ -1789,24 +1857,9 @@ async def _answer_question(message: Message, text: str, mode: str) -> None:
             occurred_at=message.date.astimezone(settings.tz),
             meta={"kind": "question"},
         )
-        interaction.processed = True
-        result = await rag.answer_full(session, text, mode=mode)
-        reply = clip(result.text)
-        interaction.meta = {
-            **(interaction.meta or {}),
-            "mode": result.mode,
-            "answer": reply[:4000],
-            "refs": result.refs,
-        }
+        reply = await _answer_into(session, interaction, text, mode)
         interaction_id = interaction.id
-    sent = await _safe_answer(
-        message, reply, reply_markup=keyboards.save_as_note(interaction_id)
-    )
-    if sent is not None and getattr(sent, "message_id", None) is not None:
-        async with session_scope() as session:
-            row = await session.get(Interaction, interaction_id)
-            if row is not None:
-                row.meta = {**(row.meta or {}), "answer_message_id": sent.message_id}
+    await _send_answer(message, reply, interaction_id)
 
 
 @router.message(Command("savol"))
@@ -1831,24 +1884,32 @@ async def cmd_opinion(message: Message, command: CommandObject) -> None:
 
 @router.callback_query(F.data.startswith("vq:n:"))
 async def on_save_as_note(callback: CallbackQuery) -> None:
-    """📝 Eslatma sifatida yozib qo'y: the owner meant it as a note after all."""
+    """📝 Eslatma sifatida yozib qo'y: the owner meant it as a note after all.
+    The question row itself becomes the note, once (WP-60)."""
     raw = (callback.data or "").split(":")[-1]
-    body = replies.NOTE_SAVE_GONE
+    body = replies.QUESTION_GONE
     keyboard = None
     if raw.isdigit():
         async with session_scope() as session:
-            question = await session.get(Interaction, int(raw))
-            if question is not None and (question.meta or {}).get("kind") == "question":
-                note = await create_interaction(
-                    session,
-                    source=InteractionSource.assistant_bot,
-                    direction=Direction.in_,
-                    text=question.raw_text,
-                    occurred_at=question.occurred_at,
-                )
-                question.meta = {**question.meta, "saved_as_note": note.id}
-                result = await process_interaction(session, note)
-                body, keyboard = _receipt(result)
+            row = await session.get(Interaction, int(raw))
+            meta = (row.meta or {}) if row is not None else {}
+            if row is None or meta.get("kind") not in ("question", "note_from_question"):
+                body = replies.QUESTION_GONE
+            elif meta.get("converted_at"):
+                body = replies.ALREADY_SAVED
+            else:
+                row.meta = {
+                    **meta,
+                    "kind": "note_from_question",
+                    "converted_at": datetime.now(settings.tz).isoformat(),
+                }
+                row.processed = False
+                # A question was never indexed; the note must be.
+                row.search_indexed_at = None
+                row.codes_indexed_at = None
+                result = await process_interaction(session, row)
+                receipt, keyboard = _receipt(result)
+                body = f"{replies.SAVED_AS_NOTE}\n{receipt}"
     if callback.message is not None:
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
@@ -2121,6 +2182,23 @@ async def on_text(message: Message) -> None:
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
+async def _spoken_question(session, interaction: Interaction, text: str) -> str | None:
+    """A voice or video note that asks something is answered, not logged
+    (WP-60); None when it is a note."""
+    mode = _spoken_mode(text)
+    if mode == "note":
+        return None
+    interaction.meta = {
+        **(interaction.meta or {}),
+        "kind": "question",
+        "mode": mode,
+        "via": "voice",
+    }
+    return await _answer_into(
+        session, interaction, text, mode, header=replies.voice_question_header(text)
+    )
+
+
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message, bot: Bot) -> None:
     await _typing(message)
@@ -2149,12 +2227,21 @@ async def on_voice(message: Message, bot: Bot) -> None:
         )
         text = await transcribe_into(session, interaction, path)
         keyboard = None
+        asked = None
         if text is None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
-            result = await process_interaction(session, interaction)
-            reply, keyboard = _receipt(result)
+            asked = await _spoken_question(session, interaction, text)
+            if asked is not None:
+                reply = asked
+            else:
+                result = await process_interaction(session, interaction)
+                reply, keyboard = _receipt(result)
+        interaction_id = interaction.id
+    if asked is not None:
+        await _send_answer(message, reply, interaction_id)
+        return
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
@@ -2254,6 +2341,7 @@ async def on_video_note(message: Message, bot: Bot) -> None:
 
     audio_path = path.with_suffix(".mp3")
     keyboard = None
+    asked = None
     async with session_scope() as session:
         # The row is created *before* ffmpeg runs. A failed audio extraction
         # must still leave a needs_review interaction the owner can find in
@@ -2285,9 +2373,17 @@ async def on_video_note(message: Message, bot: Bot) -> None:
                 reply = replies.TRANSCRIPTION_FAILED_HINT
             else:
                 interaction.media = {**(interaction.media or {}), "processed": True}
-                result = await process_interaction(session, interaction)
-                reply, keyboard = _receipt(result)
+                asked = await _spoken_question(session, interaction, text)
+                if asked is not None:
+                    reply = asked
+                else:
+                    result = await process_interaction(session, interaction)
+                    reply, keyboard = _receipt(result)
+        interaction_id = interaction.id
     # Replied only after the commit, like every other handler here.
+    if asked is not None:
+        await _send_answer(message, reply, interaction_id)
+        return
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 

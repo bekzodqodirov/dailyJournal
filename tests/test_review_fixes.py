@@ -679,7 +679,7 @@ async def test_forgetting_a_person_takes_their_conversation_windows(session):
     assert window.status is WindowStatus.pending
 
     plan = await purge.plan_person(session, person)
-    assert window.id in plan.window_ids
+    assert window.id in plan.rerender_window_ids
 
     await purge.execute(session, plan)
     await session.flush()

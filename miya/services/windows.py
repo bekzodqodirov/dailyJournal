@@ -253,6 +253,43 @@ async def _person_names(
     return dict(rows.all())
 
 
+async def rerender(session: AsyncSession, window: ConversationWindow) -> bool:
+    """Re-render a window from the members it still has (after a purge; an
+    edit, WP-74). With none left the window and its synthetic row go and
+    False comes back."""
+    members = list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(
+                Interaction.window_id == window.id,
+                sa.func.coalesce(Interaction.meta["kind"].astext, "") != "window",
+            )
+            .order_by(Interaction.occurred_at, Interaction.id)
+        )
+    )
+    synthetic = list(
+        await session.scalars(
+            sa.select(Interaction).where(
+                Interaction.window_id == window.id,
+                Interaction.meta["kind"].astext == "window",
+            )
+        )
+    )
+    if not members:
+        for row in synthetic:
+            await session.delete(row)
+        await session.delete(window)
+        await session.flush()
+        return False
+    window.text = render_window(members, await _person_names(session, members))
+    window.message_count = len(members)
+    window.char_count = sum(_content_length(i) for i in members)
+    for row in synthetic:
+        row.raw_text = window.text
+    await session.flush()
+    return True
+
+
 async def _chat_types(session: AsyncSession, chat_ids: list[int]) -> dict[int, ChatType]:
     if not chat_ids:
         return {}

@@ -33,7 +33,14 @@ async def test_the_retrievers_use_their_indexes(session):
     # Build the vector index once after seeding, not row by row; the DDL is
     # rolled back with the test's transaction.
     await session.execute(sa.text("DROP INDEX ix_passages_embedding_hnsw"))
+    # A searched word is rare in real chats; with every row holding one of a
+    # handful of words the planner rightly prefers a sequential scan.
     words = ["konteyner", "bojxona", "narx", "yuk", "invoys", "tolov", "mashina"]
+
+    def norm() -> str:
+        filler = " ".join(f"s{random.randrange(50_000)}" for _ in range(6))
+        return f"{filler} {random.choice(words)}" if random.random() < 0.002 else filler
+
     started = time.monotonic()
     for _batch in range(ROWS // 1000):
         # One interaction per thousand chunks: chunk_no is a smallint.
@@ -47,7 +54,7 @@ async def test_the_retrievers_use_their_indexes(session):
         )
         values = ",".join(
             f"({interaction_id}, {i}, 'assistant_bot', now(), 'b', 'e',"
-            f" '{random.choice(words)} {random.choice(words)}', '{_vector()}')"
+            f" '{norm()}', '{_vector()}')"
             for i in range(1000)
         )
         await session.execute(
@@ -68,8 +75,11 @@ async def test_the_retrievers_use_their_indexes(session):
     lexical = (
         await session.execute(
             sa.text(
+                # The shape recall runs: every match ranked, then the top.
                 "EXPLAIN SELECT id FROM passages WHERE search_tsv @@"
-                " to_tsquery('simple', 'konteyner:*') LIMIT 40"
+                " to_tsquery('simple', 'konteyner:*') ORDER BY"
+                " ts_rank_cd(search_tsv, to_tsquery('simple', 'konteyner:*'), 32)"
+                " DESC LIMIT 40"
             )
         )
     ).all()
