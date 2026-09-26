@@ -837,12 +837,15 @@ async def recent_interactions(
     person_id: int | None = None,
     days: int = 7,
     limit: int = 20,
+    now: datetime | None = None,
 ) -> list[Interaction]:
-    """Recent interaction summaries, newest first (RAG context)."""
-    since = datetime.now(settings.tz) - timedelta(days=days)
+    """Recent interaction summaries, newest first (RAG context). Questions
+    the owner asked the bot are not interactions with anyone (WP-57)."""
+    since = (now or datetime.now(settings.tz)) - timedelta(days=days)
     stmt = (
         sa.select(Interaction)
         .where(Interaction.occurred_at >= since)
+        .where(sa.func.coalesce(Interaction.meta["kind"].astext, "") != "question")
         .order_by(Interaction.occurred_at.desc())
         .limit(limit)
     )

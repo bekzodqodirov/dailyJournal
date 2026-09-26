@@ -297,6 +297,11 @@ SOURCE_FILTERS = {
     "call": Passage.source == InteractionSource.phone_call,
     "document": Passage.media_kind == "document",
     "sms": Passage.source == InteractionSource.phone_sms,
+    "telegram": Passage.source == InteractionSource.telegram_userbot,
+    "note": Passage.source.in_(
+        (InteractionSource.assistant_bot, InteractionSource.manual)
+    ),
+    "app": Passage.source == InteractionSource.phone_notification,
 }
 
 

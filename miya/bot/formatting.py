@@ -707,3 +707,14 @@ def minutes_label(seconds: int) -> str:
     if seconds < 60:
         return "1 daqiqadan kam"
     return f"{round(seconds / 60)} daqiqa"
+
+
+WEEKDAYS_UZ = [
+    "dushanba",
+    "seshanba",
+    "chorshanba",
+    "payshanba",
+    "juma",
+    "shanba",
+    "yakshanba",
+]

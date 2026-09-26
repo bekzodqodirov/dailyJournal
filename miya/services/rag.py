@@ -24,14 +24,16 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.bot.formatting import WEEKDAYS_UZ
 from miya.config import settings
 from miya.db.enums import DebtDirection, Direction
-from miya.db.models import Interaction, Memory, Person
+from miya.db.models import ChatMonitor, Interaction, Memory, Person
 from miya.services import codes as client_codes
 from miya.services import memories as memories_svc
-from miya.services import queries
+from miya.services import queries, recall
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
 from miya.services.extraction import API_FAILURES, get_client
+from miya.services.ingest import text_for_extraction
 from miya.services.people import Match, find_person
 from miya.services.queries import TimelineEntry
 from miya.services.usage import record_anthropic_usage
@@ -126,8 +128,9 @@ Data access rules — these are absolute:
   data is missing ("ma'lumot topilmadi"). NEVER estimate or invent figures.
 - For questions about debts, balances, spending, promises, schedules or
   people: call the matching tool first, then phrase its result.
-- For contextual "what did X say / what happened with Y" questions: use
-  search_memories and recent_interactions, and cite dates from the results.
+- For contextual "what did X say / what happened with Y" questions: call
+  search_history first (then person_summary if you need balances or the
+  profile), and cite the refs from the results.
 - Amounts in tool results are exact decimal strings with a currency. Render
   them in the owner's usual style: "5 mln UZS" for 5000000.00 UZS,
   "1 200 USD" for 1200.00 USD. Never change the digits, only the formatting.
@@ -169,6 +172,45 @@ alone. Figures still come only from the SQL tools.
 """
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "search_history",
+        "description": (
+            "Find what actually happened: searches every stored message, "
+            "voice-message and call transcript, document and note verbatim, plus "
+            "remembered facts, by meaning AND by exact words (names, GS codes like "
+            "GS367, waybills like YW26-004715), in Uzbek Latin or Cyrillic and "
+            "Russian. Returns episodes with refs, dates, where, and who said each "
+            'line. Use FIRST for "X bilan nima bo\'lgandi", "esingdami", "nima deb '
+            "o'ylaysan\", and before giving any opinion."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "person": {"type": "string"},
+                "date_from": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+                "chat": {"type": "string", "description": "chat title, fuzzy"},
+                "sources": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "telegram",
+                            "call",
+                            "voice",
+                            "document",
+                            "note",
+                            "sms",
+                            "app",
+                        ],
+                    },
+                },
+                "k": {"type": "integer", "minimum": 1, "maximum": 20},
+            },
+            "required": ["query"],
+        },
+    },
     {
         "name": "lookup_code",
         "description": (
@@ -294,6 +336,8 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
+                "person": {"type": "string"},
+                "date_to": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
                 "k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
@@ -344,9 +388,11 @@ def _jsonable(value: Any) -> Any:
         }
     if isinstance(value, Interaction):
         return {
+            "ref": f"m{value.id}",
             "occurred_at": _jsonable(value.occurred_at),
             "source": _jsonable(value.source),
-            "summary": value.summary or (value.raw_text or "")[:200],
+            # A voice note or a call is its transcript (WP-57).
+            "summary": value.summary or text_for_extraction(value)[:300],
         }
     if is_dataclass(value) and not isinstance(value, type):
         return {k: _jsonable(v) for k, v in asdict(value).items()}
@@ -437,9 +483,18 @@ def _parse_date(value: str) -> date:
 
 
 async def _run_tool(
-    session: AsyncSession, embedder: Embedder | None, name: str, args: dict
+    session: AsyncSession,
+    embedder: Embedder | None,
+    name: str,
+    args: dict,
+    *,
+    now: datetime | None = None,
 ) -> str:
-    """Execute one tool call. Errors come back as JSON so the model can adapt."""
+    """Execute one tool call. Errors come back as JSON so the model can adapt.
+    Relative windows count from ``now`` — the question's moment (WP-57)."""
+    now = now or datetime.now(settings.tz)
+    if name == "search_history":
+        return await _search_history(session, embedder, args, now=now)
     if name == "open_debts":
         person = None
         if args.get("person"):
@@ -524,11 +579,7 @@ async def _run_tool(
         direction = Direction(args["direction"]) if args.get("direction") else None
         limit = max(1, min(int(args.get("limit") or 30), 100))
         days = int(args.get("days") or 0)
-        since = (
-            datetime.now(settings.tz) - timedelta(days=max(1, min(days, 365)))
-            if days
-            else None
-        )
+        since = now - timedelta(days=max(1, min(days, 365))) if days else None
         entries = await queries.timeline(
             session, match.person.id, limit=limit, since=since, direction=direction
         )
@@ -662,9 +713,25 @@ async def _run_tool(
     if name == "search_memories":
         if embedder is None:
             return _dumps({"error": "semantic search is not available right now"})
+        person_id = None
+        if args.get("person"):
+            match = await _find_person(session, args["person"])
+            if match.person is None:
+                return _not_found(args["person"], match)
+            if match.ambiguous:
+                return await _ambiguous(session, match)
+            person_id = match.person.id
+        until = None
+        if args.get("date_to"):
+            until = queries.day_bounds(_parse_date(args["date_to"]))[1]
         try:
             hits = await memories_svc.search(
-                session, embedder, args.get("query", ""), k=int(args.get("k", 8))
+                session,
+                embedder,
+                args.get("query", ""),
+                k=int(args.get("k", 8)),
+                person_id=person_id,
+                until=until,
             )
         except EmbeddingError as exc:
             log.warning("search_memories failed: %s", exc)
@@ -675,6 +742,7 @@ async def _run_tool(
                 "note": UNTRUSTED_NOTE,
                 "results": [
                     {
+                        "ref": f"f{h.memory.id}",
                         **_jsonable(h.memory),
                         "person": names.get(h.memory.person_id),
                         "similarity": round(h.similarity, 3),
@@ -698,10 +766,99 @@ async def _run_tool(
             person_id=person.id if person else None,
             days=int(args.get("days") or 7),
             limit=int(args.get("limit") or 20),
+            now=now,
         )
         return _dumps({"note": UNTRUSTED_NOTE, "results": _jsonable(rows)})
 
     return _dumps({"error": f"unknown tool: {name}"})
+
+
+def date_hints(now: datetime) -> str:
+    """The calendar words resolved for this question, so the model never
+    does date arithmetic (WP-57)."""
+    today = now.astimezone(settings.tz).date()
+    monday = today - timedelta(days=today.weekday())
+    last_monday = monday - timedelta(days=7)
+    first = today.replace(day=1)
+    last_month_end = first - timedelta(days=1)
+    return (
+        f"CURRENT_DATE: {today.isoformat()} ({WEEKDAYS_UZ[today.weekday()]}), "
+        f"{settings.timezone}\n"
+        f"bugun={today}; kecha={today - timedelta(days=1)}; "
+        f"o'tgan kuni={today - timedelta(days=2)}\n"
+        f"bu hafta={monday}..{today}; "
+        f"o'tgan hafta={last_monday}..{last_monday + timedelta(days=6)}\n"
+        f"bu oy={first}..{today}; "
+        f"o'tgan oy={last_month_end.replace(day=1)}..{last_month_end}"
+    )
+
+
+async def _search_history(
+    session: AsyncSession, embedder: Embedder | None, args: dict, *, now: datetime
+) -> str:
+    person = None
+    match = None
+    if args.get("person"):
+        match = await _find_person(session, args["person"])
+        if match.person is None:
+            return _not_found(args["person"], match)
+        if match.ambiguous:
+            return await _ambiguous(session, match)
+        person = match.person
+    chat = None
+    if args.get("chat"):
+        chat = await session.scalar(
+            sa.select(ChatMonitor.tg_chat_id)
+            .where(ChatMonitor.title.ilike(f"%{args['chat']}%"))
+            .limit(1)
+        )
+    result = await recall.search(
+        session,
+        embedder,
+        str(args.get("query") or ""),
+        now=now,
+        person=person,
+        date_from=_parse_date(args["date_from"]) if args.get("date_from") else None,
+        date_to=_parse_date(args["date_to"]) if args.get("date_to") else None,
+        chat=chat,
+        sources=list(args["sources"]) if args.get("sources") else None,
+        k=max(1, min(int(args.get("k") or settings.recall_top_k), 20)),
+    )
+    tz = settings.tz
+    return _dumps(
+        {
+            "note": UNTRUSTED_NOTE,
+            "person_match": _match_info(match) if match is not None else None,
+            "degraded": result.degraded,
+            "episodes": [
+                {
+                    "ref": e.ref,
+                    "when": e.when.astimezone(tz).strftime("%Y-%m-%d %H:%M"),
+                    "where": e.where,
+                    "lines": [
+                        {
+                            "ref": line.ref,
+                            "when": line.when.astimezone(tz).strftime("%H:%M"),
+                            "who": line.who,
+                            "text": line.text,
+                            "hit": line.hit,
+                        }
+                        for line in e.lines
+                    ],
+                }
+                for e in result.episodes
+            ],
+            "facts": [
+                {
+                    "ref": f.ref,
+                    "when": f.when.astimezone(tz).strftime("%Y-%m-%d"),
+                    "about": f.about,
+                    "text": f.text,
+                }
+                for f in result.facts
+            ],
+        }
+    )
 
 
 async def answer(
@@ -730,11 +887,7 @@ async def answer(
     messages: list[dict[str, Any]] = [
         {
             "role": "user",
-            "content": (
-                f"CURRENT_DATE: {now.date().isoformat()} "
-                f"({now.strftime('%A')}, {settings.timezone})\n"
-                f"---\n{question}"
-            ),
+            "content": f"{date_hints(now)}\n---\n{question}",
         }
     ]
 
@@ -772,7 +925,7 @@ async def answer(
         for block in tool_uses:
             try:
                 output = await _run_tool(
-                    session, embedder, block.name, dict(block.input or {})
+                    session, embedder, block.name, dict(block.input or {}), now=now
                 )
             except Exception as exc:
                 # A tool bug must not kill the answer — report it to the model.
