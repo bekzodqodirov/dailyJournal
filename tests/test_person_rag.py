@@ -531,7 +531,7 @@ async def test_profile_refresh_job_calls_refresh_stale_with_the_limit(
     await worker.profile_refresh_job()
 
     assert len(seen) == 1
-    assert seen[0]["limit"] == worker.PROFILE_REFRESH_PER_RUN == 10
+    assert seen[0]["limit"] == settings.profile_refresh_per_run == 5
     assert seen[0]["session"] is not None
 
 
@@ -578,13 +578,13 @@ async def test_profile_refresh_job_writes_a_profile_end_to_end(session, monkeypa
     assert operation == profiles.PROFILE_OPERATION
 
 
-def test_profile_refresh_is_registered_every_thirty_minutes():
+def test_profile_refresh_is_registered_every_hour():
     source = inspect.getsource(worker.run)
     assert 'id="profile_refresh"' in source
     registration = source[
         source.index("profile_refresh_job,") : source.index('id="profile_refresh"')
     ]
-    assert "IntervalTrigger(minutes=30)" in registration
+    assert "IntervalTrigger(minutes=60)" in registration
     tail = source[source.index('id="profile_refresh"') :][:120]
     assert "max_instances=1" in tail and "coalesce=True" in tail
     assert "profile_refresh" in worker.__doc__
