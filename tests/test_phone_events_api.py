@@ -436,7 +436,7 @@ def _brief_ns(*, missed=(), questions=(), stale=(), claims_=()):
     return ns
 
 
-def test_the_brief_slots_missed_between_questions_and_claims():
+def test_the_brief_slots_missed_between_questions_and_stale():
     body = replies.morning_brief(
         _brief_ns(
             missed=[_missed(attempts=3)],
@@ -448,7 +448,6 @@ def test_the_brief_slots_missed_between_questions_and_claims():
     positions = [
         body.index(replies.BRIEF_QUESTIONS),
         body.index(replies.BRIEF_MISSED),
-        body.index(replies.BRIEF_CLAIMS),
         body.index(replies.BRIEF_STALE),
     ]
     assert positions == sorted(positions)
@@ -458,31 +457,31 @@ def test_the_brief_slots_missed_between_questions_and_claims():
 def test_a_brief_without_missed_reads_as_before():
     data = _brief_ns(questions=[_question()])
     assert replies.BRIEF_MISSED not in replies.morning_brief(data)
-    assert replies.morning_brief_missed_ids(data) == []
 
     # A brief whose loops predate build step 6 simply has no section.
     legacy = _brief_ns(questions=[_question()])
     legacy.loops = SimpleNamespace(questions=[_question()], stale=[], quiet=[])
     assert replies.BRIEF_MISSED not in replies.morning_brief(legacy)
-    assert replies.morning_brief_missed_ids(legacy) == []
 
 
 def _payloads(markup) -> list[list[str]]:
     return [[b.callback_data for b in row] for row in markup.inline_keyboard]
 
 
-def test_the_brief_keyboard_rows_their_order_and_their_ids():
-    data = _brief_ns(missed=[_missed(12), _missed(15)])
-    assert replies.morning_brief_missed_ids(data) == [12, 15]
-
-    markup = keyboards.brief_actions([], [], claim_ids=[3], missed_ids=[12, 15])
+def test_the_batch_rows_their_order_and_their_ids():
+    items = [
+        SimpleNamespace(kind="claim", subject=SimpleNamespace(id=3)),
+        SimpleNamespace(kind="missed", subject=SimpleNamespace(interaction_id=12)),
+        SimpleNamespace(kind="missed", subject=SimpleNamespace(interaction_id=15)),
+    ]
+    markup = keyboards.question_batch(items)
     assert _payloads(markup) == [
         ["cl:y:3", "cl:n:3", "cl:e:3"],
         ["rec:ma:m12", "rec:ms:m12"],
         ["rec:ma:m15", "rec:ms:m15"],
     ]
     labels = [b.text for b in markup.inline_keyboard[1]]
-    assert labels == ["✅ Bog'landim m12", "⏰ Ertalab eslat m12"]
+    assert labels == ["2 ✅ Bog'landim", "2 ⏰ Ertalab"]
 
 
 def test_missed_payloads_fit_and_never_read_as_records():
@@ -529,10 +528,11 @@ async def test_the_brief_and_the_ma_button_close_the_loop(bound):
 
     message = _Message()
     await handlers.cmd_brief(message)
-    [(body, markup)] = message.sent
+    [(body, _)] = message.sent
     assert replies.BRIEF_MISSED in body
     assert "&lt;b&gt;Yovuz&lt;/b&gt;" in body and "(2 marta)" in body
-    assert [f"rec:ma:m{oldest.id}", f"rec:ms:m{oldest.id}"] in _payloads(markup)
+    # /ertalab tells; the buttons come with the question batch (WP-19).
+    markup = keyboards.missed_actions(oldest.id)
 
     tapped = _Message(reply_markup=markup)
     await handlers.on_record_button(_Callback(f"rec:ma:m{oldest.id}", tapped))

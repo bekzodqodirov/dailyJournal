@@ -190,6 +190,7 @@ it recorded:
 | `/xarajat` | What MIYA's own API calls cost this month |
 | `/unut` | Delete a person, a chat or a date range — asks first |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
+| `/savollar` | Every question waiting for the owner's tap (claims, money texts, missed calls, groups, files), ranked money first and paged; answering here spends none of the day's 5–10 asked questions |
 | `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong |
 | `/yordam` | The command list |
 

@@ -23,6 +23,7 @@ from miya.db import models as m
 from miya.db.enums import Currency, DebtDirection, PromiseMadeBy, PromiseStatus
 from miya.services import brief, claims, reports
 from miya.services import extraction as ex
+from miya.services import questions as questions_mod
 from miya.services.persistence import Applied, apply_extraction
 from tests.test_close_and_correct import _Callback, _command, _Message
 from tests.test_pipeline import _interaction
@@ -242,9 +243,7 @@ def test_every_claim_payload_fits_telegrams_64_bytes_for_a_ten_digit_id():
     markups = [
         keyboards.claim_actions([TEN_DIGITS]),
         keyboards.applied_actions([("debt", TEN_DIGITS)], [TEN_DIGITS]),
-        keyboards.brief_actions(
-            [("debt", TEN_DIGITS)], [("promise", TEN_DIGITS)], claim_ids=[TEN_DIGITS]
-        ),
+        keyboards.brief_actions([("debt", TEN_DIGITS)]),
     ]
     payloads = [
         b.callback_data for mk in markups for row in mk.inline_keyboard for b in row
@@ -279,16 +278,6 @@ def test_the_keyboard_ceiling_holds_and_only_what_fits_counts_as_shown():
     assert keyboards.claim_ids_in(markup) == ids[: keyboards.MAX_ROWS - 2]
     assert keyboards.claim_ids_in(None) == []
     assert keyboards.claim_ids_in(keyboards.record_actions([("debt", 12)])) == []
-
-
-def test_the_brief_keyboard_appends_claim_rows():
-    markup = keyboards.brief_actions([("debt", 12)], [("promise", 7)], claim_ids=[3])
-    assert _payloads(markup)[-1] == ["cl:y:3", "cl:n:3", "cl:e:3"]
-    assert len(markup.inline_keyboard) == 3
-    assert _payloads(keyboards.brief_actions([], [], claim_ids=[3])) == [
-        ["cl:y:3", "cl:n:3", "cl:e:3"]
-    ]
-    assert keyboards.brief_actions([], []) is None
 
 
 def test_an_answered_claim_leaves_the_keyboard_and_the_rest_stay():
@@ -403,7 +392,7 @@ def test_the_answer_strings_and_the_help():
 # --- the brief ---------------------------------------------------------------
 
 
-def _brief(claim_rows, *, questions=True, stale=True):
+def _brief(queue=None, *, questions=True, stale=True):
     loops = SimpleNamespace(
         questions=[_question()] if questions else [],
         stale=[_stale()] if stale else [],
@@ -415,49 +404,26 @@ def _brief(claim_rows, *, questions=True, stale=True):
         events=[],
         due={},
         loops=loops,
-        claims=claim_rows,
+        queue=queue,
         is_empty=lambda: False,
     )
 
 
-def test_the_brief_section_sits_between_questions_and_stale_and_names_its_ids():
-    body = replies.morning_brief(_brief([_claim(12), _claim(13, claims.KIND_PROMISE)]))
-    assert replies.BRIEF_CLAIMS in body
-    positions = [
-        body.index(replies.BRIEF_QUESTIONS),
-        body.index(replies.BRIEF_CLAIMS),
-        body.index(replies.BRIEF_STALE),
-    ]
-    assert positions == sorted(positions)
-    assert "• ❓ <code>c12</code>" in body and "• ❓ <code>c13</code>" in body
-    assert replies.morning_brief_claim_ids(_brief([_claim(12), _claim(13)])) == [12, 13]
+def test_the_brief_counts_the_queue_in_one_last_line():
+    """WP-19: the brief tells; the numbered batch after it asks."""
+    body = replies.morning_brief(_brief(questions_mod.QueueSummary(waiting=3, money=2)))
+    assert body.endswith("❓ Yana 3 ta savol navbatda (2 tasi pul bo'yicha) — /savollar")
+    assert "Yana" not in replies.morning_brief(_brief())
+    legacy = _brief()
+    del legacy.queue
+    assert "Yana" not in replies.morning_brief(legacy)
 
 
-def test_the_brief_caps_its_claims_and_only_the_shown_ones_get_buttons():
-    rows = [_claim(i) for i in range(1, replies.BRIEF_MAX_CLAIMS + 4)]
-    data = _brief(rows)
-    body = replies.morning_brief(data)
-    ids = replies.morning_brief_claim_ids(data)
-    assert ids == list(range(1, replies.BRIEF_MAX_CLAIMS + 1))
-    assert f"<code>c{replies.BRIEF_MAX_CLAIMS + 1}</code>" not in body
-    assert "yana 3 ta — /davolar" in body
-    markup = keyboards.brief_actions([], [], claim_ids=ids)
-    assert keyboards.claim_ids_in(markup) == ids
-
-
-def test_a_brief_without_claims_reads_as_before():
-    data = _brief([], questions=True, stale=True)
-    assert replies.BRIEF_CLAIMS not in replies.morning_brief(data)
-    legacy = _brief([])
-    del legacy.claims
-    assert replies.BRIEF_CLAIMS not in replies.morning_brief(legacy)
-    assert replies.morning_brief_claim_ids(legacy) == []
-
-
-def test_a_claim_alone_makes_the_brief_worth_sending():
+def test_a_waiting_question_alone_makes_the_brief_worth_sending():
     empty = brief.MorningBrief(now=NOW)
     assert empty.is_empty()
-    assert not brief.MorningBrief(now=NOW, claims=[_claim(12)]).is_empty()
+    waiting = questions_mod.QueueSummary(waiting=1, money=0)
+    assert not brief.MorningBrief(now=NOW, queue=waiting).is_empty()
 
 
 # --- notices and the report ----------------------------------------------------
@@ -487,12 +453,13 @@ def _report_data(**kw) -> reports.ReportData:
     )
 
 
-def test_the_report_carries_one_line_only_when_claims_wait():
-    block = reports.render_data_block(_report_data(claims_pending=3))
-    assert "\n❓ Tasdiqlanmagan da'volar: 3 (/davolar)" in block
-    assert block.index("da'volar: 3") < block.index(reports.H_TOMORROW)
-    assert "da'volar" not in reports.render_data_block(_report_data())
-    assert reports._stats_json(_report_data(claims_pending=3))["claims_pending"] == 3
+def test_the_report_carries_one_line_only_when_questions_wait():
+    queue = questions_mod.QueueSummary(waiting=3, money=1)
+    block = reports.render_data_block(_report_data(queue=queue))
+    assert "\n❓ Yana 3 ta savol navbatda (1 tasi pul bo'yicha) — /savollar" in block
+    assert block.index("Yana 3 ta") < block.index(reports.H_TOMORROW)
+    assert "navbatda" not in reports.render_data_block(_report_data())
+    assert reports._stats_json(_report_data(queue=queue))["questions_waiting"] == 3
 
 
 # --- through the handlers, with real claims ----------------------------------------
@@ -725,29 +692,25 @@ async def test_cmd_tuzat_on_a_claim_after_the_answer_says_so(bound):
     assert message.sent[0][0] == replies.CLAIM_ALREADY
 
 
-async def test_ertalab_carries_the_claim_rows_and_marks_them_asked(bound):
+async def test_ertalab_counts_the_claim_and_asks_nothing(bound):
     claim = await _claimed(bound)
     message = _Message()
 
     await handlers.cmd_brief(message)
 
     [(text, markup)] = message.sent
-    assert replies.BRIEF_CLAIMS in text and f"<code>c{claim.id}</code>" in text
-    assert [f"cl:y:{claim.id}", f"cl:n:{claim.id}", f"cl:e:{claim.id}"] in _payloads(
-        markup
-    )
-    assert (await claims.get(bound, claim.id)).asked_at is not None
+    assert "❓ Yana 1 ta savol navbatda (1 tasi pul bo'yicha) — /savollar" in text
+    assert markup is None
+    assert (await claims.get(bound, claim.id)).asked_at is None
 
 
 async def test_the_gathered_brief_and_report_see_the_pending_claims(session):
     claim = await _claimed(session)
-    data = await brief.gather(session, now=datetime.now(TZ))
-    assert [c.id for c in data.claims] == [claim.id]
-    assert not data.is_empty()
     report = await reports.gather(session, datetime.now(TZ).date())
-    assert report.claims_pending == 1
+    assert report.queue.waiting == 1
     await claims.decline(session, claim.id, by=claims.BY_COMMAND)
-    assert (await reports.gather(session, datetime.now(TZ).date())).claims_pending == 0
+    assert (await reports.gather(session, datetime.now(TZ).date())).queue.waiting == 0
+    assert claim.id
 
 
 async def test_accepting_a_fulfilment_closes_the_promise_and_receipts_it(bound):

@@ -21,13 +21,14 @@ from miya.bot.formatting import (
     full_date,
     missed_line,
     question_line,
+    queue_line,
     quiet_line,
     ref,
 )
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.models import DailyReport
-from miya.services import claims, loops, nudges, planner, queries
+from miya.services import loops, nudges, planner, queries, questions
 from miya.services.loops import MissedCall, QuietCounterparty, UnansweredQuestion
 
 log = logging.getLogger(__name__)
@@ -84,7 +85,8 @@ class ReportData:
     # step 3). A count only: the questions themselves have their buttons on
     # the receipt, the brief and /davolar, and the report is not a place to
     # answer from.
-    claims_pending: int = 0
+    # Everything still waiting for the owner's tap (WP-19): one count line.
+    queue: questions.QueueSummary | None = None
     # Money texts (WP-14): waiting in /tekshir, and ignored today (codes,
     # adverts) — counts only, so the owner knows both exist.
     money_review: int = 0
@@ -115,7 +117,7 @@ def _stats_json(data: ReportData) -> dict[str, Any]:
         "unanswered": len(data.questions),
         "quiet": len(data.quiet),
         "missed": len(data.missed),
-        "claims_pending": data.claims_pending,
+        "questions_waiting": data.queue.waiting if data.queue is not None else 0,
         "money_review": data.money_review,
         "money_ignored": data.money_ignored,
         "settled_debts": len(data.completed.settled_debts),
@@ -259,8 +261,9 @@ def render_data_block(data: ReportData) -> str:
     else:
         lines.append("- yo'q")
 
-    if data.claims_pending:
-        lines.append(f"\n❓ Tasdiqlanmagan da'volar: {data.claims_pending} (/davolar)")
+    line = queue_line(data.queue, markup=False)
+    if line:
+        lines.append("\n" + escape(line))
 
     lines.append("\n" + H_TOMORROW)
     lines.append(data.plan)
@@ -284,7 +287,7 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
         questions=await nudges.unanswered_questions(session),
         quiet=await loops.quiet_counterparties(session),
         missed=await loops.missed_calls(session),
-        claims_pending=await claims.pending_count(session),
+        queue=questions.summarise(await questions.collect(session, for_push=False), []),
         money_review=await queries.money_review_count(session),
         money_ignored=await queries.ignored_money_count(
             session, *queries.day_bounds(day)

@@ -49,6 +49,7 @@ from miya.services import (
     planner,
     purge,
     queries,
+    questions,
     rag,
     records,
     reminders,
@@ -390,16 +391,105 @@ async def cmd_brief(message: Message) -> None:
     MORNING_BRIEF_TIME, with the same buttons. No model call: it is SQL."""
     async with session_scope() as session:
         data = await brief.gather(session)
-        body = replies.morning_brief(data)
-        due, stale = replies.morning_brief_refs(data)
-        keyboard = keyboards.brief_actions(
-            due,
-            stale,
-            claim_ids=replies.morning_brief_claim_ids(data),
-            missed_ids=replies.morning_brief_missed_ids(data),
+        data.queue = questions.summarise(
+            await questions.collect(session, for_push=False), []
         )
-        _ask(data.claims, keyboard)
+        body = replies.morning_brief(data)
+        due, _ = replies.morning_brief_refs(data)
+        keyboard = keyboards.brief_actions(due)
     await _safe_answer(message, body, reply_markup=keyboard)
+
+
+# --- /savollar: everything waiting for a tap, paged (WP-19) -------------------
+
+
+async def _savollar_page(session, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    now = datetime.now(settings.tz)
+    pending = await questions.collect(session, now=now, for_push=False)
+    groups = [p for p in pending if p.kind == questions.KIND_GROUPS]
+    items = [p for p in pending if p.kind != questions.KIND_GROUPS]
+    size = replies.SAVOLLAR_PAGE_SIZE
+    pages = max(1, -(-len(items) // size))
+    page = min(max(page, 1), pages)
+    shown = items[(page - 1) * size : page * size]
+    used = await questions.spent_today(session, now=now)
+    people = {}
+    ids = {
+        p.subject.person_id
+        for p in shown
+        if p.kind == questions.KIND_MEDIA and p.subject.person_id
+    }
+    if ids:
+        people = {
+            person.id: person
+            for person in await session.scalars(
+                sa.select(Person).where(Person.id.in_(ids))
+            )
+        }
+    total = len(items) + sum(len(g.subject) for g in groups)
+    body = replies.savollar(
+        shown,
+        page=page,
+        pages=pages,
+        total=total,
+        used=used,
+        budget=settings.question_budget_per_day,
+        people=people,
+    )
+    markup = keyboards.question_batch(shown)
+    rows = list(markup.inline_keyboard) if markup is not None else []
+    nav = []
+    if page > 1:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"sv:p:{page - 1}"))
+    if page < pages:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"sv:p:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    if groups:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=replies.SAVOLLAR_GROUPS_BUTTON.format(k=len(groups[0].subject)),
+                    callback_data="sv:g",
+                )
+            ]
+        )
+    # A pull: nothing goes into question_log, but a claim the owner now sees
+    # counts as asked for today, as on /davolar.
+    for item in shown:
+        if item.kind == questions.KIND_CLAIM:
+            claims.mark_asked(item.subject, now=now)
+    return body, InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+@router.message(Command("savollar"))
+async def cmd_questions(message: Message) -> None:
+    """`/savollar` — every question waiting for the owner, ranked, paged.
+    Answering here spends none of the day's budget."""
+    async with session_scope() as session:
+        body, keyboard = await _savollar_page(session, 1)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("sv:"))
+async def on_savollar_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    async with session_scope() as session:
+        if parts[1:2] == ["g"]:
+            monitors = await chats.awaiting_join_question(
+                session, limit=settings.question_group_digest_size, for_push=False
+            )
+            body = replies.group_digest(monitors) if monitors else replies.SAVOLLAR_EMPTY
+            keyboard = keyboards.group_digest(monitors) if monitors else None
+        else:
+            page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 1
+            body, keyboard = await _savollar_page(session, page)
+    if callback.message is not None:
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
 
 
 @router.message(Command("reja"))
@@ -503,15 +593,28 @@ async def cmd_status(message: Message) -> None:
     The judgement (services/health.py) is the same one the worker's health
     job alerts on; asking here is only ever a read.
     """
+    waiting: int | None = None
+    used = 0
     try:
         async with session_scope() as session:
             status = await health.gather(session)
+            now = datetime.now(settings.tz)
+            used = await questions.spent_today(session, now=now)
+            waiting = len(await questions.collect(session, now=now, for_push=False))
     except Exception:
         # The one report that must still come out when the database is
         # down: the db_down line and its remedy, from what the bot can see.
         log.exception("/holat: the database did not answer")
         status = health.Status.unreachable(datetime.now(settings.tz))
-    await _safe_answer(message, replies.status_report(status, health.problems(status)))
+    await _safe_answer(
+        message,
+        replies.status_report(
+            status,
+            health.problems(status),
+            questions_waiting=waiting,
+            questions_used=used,
+        ),
+    )
 
 
 @router.message(Command("unut"))

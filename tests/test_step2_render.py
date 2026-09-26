@@ -421,15 +421,8 @@ def test_button_labels_match_the_wording():
     group = keyboards.new_group_question(3)
     assert _labels(group) == ["✅ Ha", "✖️ Yo'q"]
     # The brief reuses the reminder's rows — labelled, since it carries many.
-    brief = keyboards.brief_actions([("debt", 12)], [("promise", 7)])
-    assert _labels(brief) == [
-        "✅ Bajarildi d12",
-        "✏️ Tuzat d12",
-        "🔄 Teskari d12",
-        "Ha p7",
-        "✅ Bajarildi p7",
-        "✖️ Yop p7",
-    ]
+    brief = keyboards.brief_actions([("debt", 12)])
+    assert _labels(brief) == ["✅ Bajarildi d12", "✏️ Tuzat d12", "🔄 Teskari d12"]
 
 
 def test_every_step2_payload_fits_telegrams_64_bytes_for_a_ten_digit_id():
@@ -437,12 +430,14 @@ def test_every_step2_payload_fits_telegrams_64_bytes_for_a_ten_digit_id():
         keyboards.nudge_actions(TEN_DIGITS),
         keyboards.new_group_question(TEN_DIGITS),
         keyboards.brief_actions(
-            [("debt", TEN_DIGITS), ("promise", TEN_DIGITS), ("task", TEN_DIGITS)],
+            [("debt", TEN_DIGITS), ("promise", TEN_DIGITS), ("task", TEN_DIGITS)]
+        ),
+        keyboards.question_actions(
             [
                 ("debt", TEN_DIGITS - 1),
                 ("promise", TEN_DIGITS - 1),
                 ("task", TEN_DIGITS - 1),
-            ],
+            ]
         ),
     ]
     payloads = [p for m in markups for p in _payloads(m)]

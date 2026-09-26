@@ -422,26 +422,13 @@ def missed_actions(interaction_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def brief_actions(
-    due: list[tuple[str, int]],
-    stale: list[tuple[str, int]],
-    claim_ids: list[int] | tuple[int, ...] = (),
-    missed_ids: list[int] | tuple[int, ...] = (),
-) -> InlineKeyboardMarkup | None:
-    """The morning brief's buttons: a ✅ / ✏️ row per due row, a Ha /
-    Bajarildi / Yop row per undated one that has been sitting — the same rows
-    the reminder and the "Hali ochiqmi?" question carry, so he acts from the
-    brief the way he acts from those — a Ha / Yo'q / Tuzat row per claim
-    still waiting for his word, and a ✅ Bog'landim / ⏰ row per missed call.
-    Always labelled: the brief carries many rows, and a bare ✅ would not
-    say which."""
+def brief_actions(due: list[tuple[str, int]]) -> InlineKeyboardMarkup | None:
+    """The morning brief's buttons: a ✅ / ✏️ (/ 🔄) row per due row, the
+    same rows a reminder carries. Always labelled — the brief carries many
+    rows. Questions are not here (WP-19): the brief tells, and the numbered
+    question batch sent after it asks."""
     due = [(k, i) for k, i in due if i is not None]
-    stale = [(k, i) for k, i in stale if i is not None and (k, i) not in due]
-    rows = [record_row(k, i, labelled=True) for k, i in due]
-    rows += [question_row(k, i, labelled=True) for k, i in stale]
-    rows += [claim_row(i) for i in claim_ids if i is not None]
-    rows += [missed_row(i) for i in missed_ids if i is not None]
-    rows = rows[:MAX_ROWS]
+    rows = [record_row(k, i, labelled=True) for k, i in dict.fromkeys(due)][:MAX_ROWS]
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 

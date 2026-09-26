@@ -550,3 +550,21 @@ def timeline_line(entry: TimelineEntry, *, markup: bool = True) -> str:
     if entry.source is InteractionSource.telegram_userbot and entry.direction in _SPEAKER:
         speaker = f"{_SPEAKER[entry.direction]}: "
     return f"{day_label(entry.when)} · {emoji} {word} · {speaker}{_text(body, markup)}"
+
+
+# --- the question queue's count line (WP-19) -----------------------------------
+#
+# Here, not in replies: reports.py renders it too and must not import replies.
+
+
+def queue_line(queue, *, markup: bool = True) -> str | None:
+    """'❓ Yana 10 ta savol navbatda (10 tasi pul bo'yicha) — /savollar', or
+    None when nothing waits. The same text with or without markup."""
+    if queue is None or queue.waiting <= 0:
+        return None
+    if queue.money > 0:
+        return (
+            f"❓ Yana {queue.waiting} ta savol navbatda "
+            f"({queue.money} tasi pul bo'yicha) — /savollar"
+        )
+    return f"❓ Yana {queue.waiting} ta savol navbatda — /savollar"

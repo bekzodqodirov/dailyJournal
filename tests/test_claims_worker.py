@@ -202,23 +202,25 @@ async def test_only_the_claims_the_budget_allows_ride_on_the_receipt(
 # --- the brief and the receipt's source line ---------------------------------
 
 
-async def test_the_brief_keyboard_carries_the_claim_rows(session, monkeypatch):
+async def test_the_batch_after_the_brief_carries_the_claim_rows(session, monkeypatch):
     ids = await _old_claims(session, 2)
     monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
     bot = _KeyboardBot()
 
     assert await worker.brief_job(bot) is True
 
-    [text] = bot.sent
-    assert replies.BRIEF_CLAIMS in text
-    [markup] = bot.markups
+    brief_text, batch_text = bot.sent
+    assert replies.BRIEF_HEADER in brief_text
+    assert batch_text.startswith("❓ <b>Bugungi savollar</b>")
+    brief_markup, markup = bot.markups
+    assert brief_markup is None
     buttons = _buttons(markup)
     for claim_id in ids:
         assert f"cl:y:{claim_id}" in buttons and f"cl:n:{claim_id}" in buttons
 
 
 async def test_a_claim_shown_on_the_brief_is_not_asked_again(session, monkeypatch):
-    """The brief's Ha / Yo'q row is an ask: the sweep must not repeat it."""
+    """The batch after the brief is an ask: the question job must not repeat it."""
     ids = await _old_claims(session, 2)
     monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
     bot = _KeyboardBot()
@@ -227,7 +229,7 @@ async def test_a_claim_shown_on_the_brief_is_not_asked_again(session, monkeypatc
         assert await _asked_at(session, claim_id) is not None
 
     await worker.question_job(bot, now=datetime.now(TZ))
-    assert len(bot.sent) == 1
+    assert len(bot.sent) == 2
 
 
 async def test_a_claim_already_asked_does_not_ride_on_the_receipt_again(

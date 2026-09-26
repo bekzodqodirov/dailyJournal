@@ -21,6 +21,7 @@ from miya.bot.formatting import (
     missed_line,
     money,
     question_line,
+    queue_line,
     quiet_line,
     quote,
     record_line,
@@ -102,6 +103,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /pul — bugungi to'lovlar (x12 raqamlari bilan)
 /ochir x12 — noto'g'ri pul yozuvini o'chirish (↩️ bilan qaytadi)
 /davolar — tasdiqlanmagan da'volar
+/savollar — javob kutayotgan savollar (da'volar, guruhlar, fayllar)
 /unut — ma'lumotni butunlay o'chirish
 /menga — guruhlarda menga yozilganlar
 /guruhlar — guruhlarda nima gaplashildi
@@ -135,6 +137,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("qaytar", "Yopilgan yozuvni qayta ochish"),
     ("tuzat", "Yozuvni tuzatish"),
     ("davolar", "Tasdiqlanmagan da'volar"),
+    ("savollar", "Javob kutayotgan savollar"),
     ("kim", "Odam haqida hamma narsa"),
     ("tarix", "Odam bilan aloqa tarixi"),
     ("eslab", "Odam haqida eslab qolish"),
@@ -1136,7 +1139,6 @@ CLAIM_ALREADY = "Bu da'voga allaqachon javob berilgan."
 CLAIM_EDITED = "✏️ <b>Tuzatildi</b> — endi javob ber:"
 
 # How many claims the brief lists with buttons; the rest wait in /davolar.
-BRIEF_MAX_CLAIMS = 10
 
 
 def claim_question(view: claims.ClaimView) -> str:
@@ -1473,7 +1475,6 @@ BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
 # After the questions and before the claims: an unanswered ring outranks a
 # decision the owner still has time to make.
 BRIEF_MISSED = "📵 <b>Javobsiz qo'ng'iroqlar</b>"
-BRIEF_CLAIMS = "❓ Tasdiqlanmagan da'volar"
 BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
 BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
 
@@ -1517,21 +1518,18 @@ def morning_brief(brief: MorningBrief) -> str:
     if missed:
         lines = [missed_line(m) for m in missed]
         parts.append(f"{BRIEF_MISSED}\n" + bullet_list(lines, empty="—"))
-    shown, hidden = _brief_claims(brief)
-    if shown:
-        lines = [claim_line(claims.view(c)) for c in shown]
-        block = f"<b>{BRIEF_CLAIMS}</b>\n" + bullet_list(lines, empty="—")
-        if hidden:
-            block += f"\n<i>… va yana {hidden} ta — /davolar.</i>"
-        parts.append(block)
-    if getattr(brief, "money_review", 0):
-        parts.append(MONEY_REVIEW_LINE.format(n=brief.money_review))
+
     if loops is not None and loops.stale:
         lines = [stale_line(s) for s in loops.stale]
         parts.append(f"{BRIEF_STALE}\n" + bullet_list(lines, empty="—"))
     if loops is not None and loops.quiet:
         lines = [quiet_line(q) for q in loops.quiet]
         parts.append(f"{BRIEF_QUIET}\n" + bullet_list(lines, empty="—"))
+    if getattr(brief, "money_review", 0):
+        parts.append(MONEY_REVIEW_LINE.format(n=brief.money_review))
+    line = queue_line(getattr(brief, "queue", None))
+    if line:
+        parts.append(line)
 
     return clip("\n\n".join(parts))
 
@@ -1553,23 +1551,6 @@ def morning_brief_refs(
     return due, stale
 
 
-def _brief_claims(brief: MorningBrief) -> tuple[list, int]:
-    """The claims the brief shows, and how many more it only counts.
-
-    Only what is shown gets buttons and is marked as asked; the rest stay
-    pending for /davolar and the worker's one-question messages.
-    """
-    pending = [c for c in getattr(brief, "claims", []) or [] if c.id is not None]
-    shown = pending[:BRIEF_MAX_CLAIMS]
-    return shown, len(pending) - len(shown)
-
-
-def morning_brief_claim_ids(brief: MorningBrief) -> list[int]:
-    """The claims whose line the brief carries, in line order."""
-    shown, _ = _brief_claims(brief)
-    return [c.id for c in shown]
-
-
 def _brief_missed(brief: MorningBrief) -> list[MissedCall]:
     """The missed-call loops the brief shows (build step 6).
 
@@ -1580,12 +1561,6 @@ def _brief_missed(brief: MorningBrief) -> list[MissedCall]:
     if loops is None:
         return []
     return list(getattr(loops, "missed", None) or [])
-
-
-def morning_brief_missed_ids(brief: MorningBrief) -> list[int]:
-    """The missed calls whose line the brief carries, in line order — the
-    interactions the ✅ Bog'landim / ⏰ rows act on."""
-    return [m.interaction_id for m in _brief_missed(brief)]
 
 
 NUDGE_HEADER = "❓ <b>Javobsiz savol</b>"
@@ -1860,7 +1835,13 @@ OWNER_ALIASES_BLANK = (
 )
 
 
-def status_report(status: health.Status, problems: list[health.Problem]) -> str:
+def status_report(
+    status: health.Status,
+    problems: list[health.Problem],
+    *,
+    questions_waiting: int | None = None,
+    questions_used: int = 0,
+) -> str:
     """`/holat`: every part of MIYA on one line each, then what to do."""
     now = status.now.astimezone(settings.tz)
     lines = [
@@ -1882,7 +1863,12 @@ def status_report(status: health.Status, problems: list[health.Problem]) -> str:
             if getattr(status, "money_review", 0)
             else ""
         )
-        + f"da'volar {status.claims_pending} (/davolar)",
+        + (
+            f"savollar {questions_waiting} (/savollar) · "
+            f"bugun {questions_used}/{settings.question_budget_per_day}"
+            if questions_waiting is not None
+            else f"da'volar {status.claims_pending} (/davolar)"
+        ),
         "<b>Xarajat</b>: "
         f"bugun {usd(status.cost_today_usd)} · "
         f"bu oy {usd(status.cost_month_usd)} (/xarajat)",
@@ -1990,3 +1976,44 @@ def question_batch(
         [title, *(f"{n}. {text}" for n, text in enumerate(kept, 1)), QUESTIONS_FOOTER]
     )
     return body, len(kept)
+
+
+QUESTIONS_BRIEF_HEADER = "❓ <b>Bugungi savollar</b> · bugun {used}/{budget}"
+QUESTIONS_EVENING_HEADER = "❓ <b>Kun yakunidagi savollar</b> · bugun {used}/{budget}"
+
+# --- /savollar (WP-19): the pull view; answering here spends nothing ----------
+
+SAVOLLAR_PAGE_SIZE = 8
+SAVOLLAR_HEADER = (
+    "❓ <b>Savollar</b> — {total} ta javob kutmoqda · bugun {used}/{budget} ta so'radim"
+)
+SAVOLLAR_EMPTY = "✅ Javob kutayotgan savol yo'q."
+SAVOLLAR_BUDGET_USED = (
+    "<i>Bugungi {budget} ta savol chegarasi tugadi — qolganlarini ertalab so'rayman. "
+    "Hozir o'zing javob bersang ham bo'ladi.</i>"
+)
+SAVOLLAR_PAGE = "<i>{page}/{pages}-sahifa</i>"
+SAVOLLAR_GROUPS_BUTTON = "👥 Yangi guruhlar ({k} ta)"
+
+
+def savollar(
+    items,
+    *,
+    page: int,
+    pages: int,
+    total: int,
+    used: int,
+    budget: int,
+    people: dict | None = None,
+) -> str:
+    if total == 0:
+        return SAVOLLAR_EMPTY
+    lines = [SAVOLLAR_HEADER.format(total=total, used=used, budget=budget)]
+    lines += [
+        f"{n}. {question_item_line(item, people)}" for n, item in enumerate(items, 1)
+    ]
+    if used >= budget:
+        lines.append(SAVOLLAR_BUDGET_USED.format(budget=budget))
+    if pages > 1:
+        lines.append(SAVOLLAR_PAGE.format(page=page, pages=pages))
+    return clip("\n".join(lines))

@@ -198,15 +198,16 @@ async def test_the_briefs_buttons_are_the_reminders_rows(session):
     data = await brief.gather(session)
 
     due, stale = replies.morning_brief_refs(data)
-    markup = keyboards.brief_actions(due, stale)
+    markup = keyboards.brief_actions(due)
 
     assert due == [("debt", seed.due.id)]
     # Sardor's 40-day undated debt is stale too — oldest first, then the promise.
     assert stale == [("debt", seed.quiet.id), ("promise", seed.stale.id)]
     payloads = _buttons(markup)
-    # The due debt gets ✅ / ✏️ / 🔄; the undated promise Ha / ✅ / Yop.
+    # The due debt gets ✅ / ✏️ / 🔄; the stale rows are asked by the batch
+    # that follows the brief (WP-19), not by the brief itself.
     assert f"rec:d:d{seed.due.id}" in payloads and f"rec:f:d{seed.due.id}" in payloads
-    assert f"rec:o:p{seed.stale.id}" in payloads and f"rec:c:p{seed.stale.id}" in payloads
+    assert f"rec:o:p{seed.stale.id}" not in payloads
     # Labelled: a brief carries many rows.
     labels = [b.text for row in markup.inline_keyboard for b in row]
     assert any(f"d{seed.due.id}" in label for label in labels)
@@ -214,16 +215,16 @@ async def test_the_briefs_buttons_are_the_reminders_rows(session):
 
 def test_the_brief_keyboard_caps_its_rows_and_drops_duplicates():
     due = [("task", i) for i in range(30)]
-    markup = keyboards.brief_actions(due, [("task", 0)])
+    markup = keyboards.brief_actions([*due, ("task", 0)])
     assert len(markup.inline_keyboard) == keyboards.MAX_ROWS
-    assert keyboards.brief_actions([], []) is None
+    assert keyboards.brief_actions([]) is None
 
 
 async def test_an_empty_brief_says_all_clear(session):
     data = await brief.gather(session)
     assert data.is_empty()
     assert replies.BRIEF_ALL_CLEAR in replies.morning_brief(data)
-    assert keyboards.brief_actions(*replies.morning_brief_refs(data)) is None
+    assert keyboards.brief_actions(replies.morning_brief_refs(data)[0]) is None
 
 
 async def test_the_brief_job_sends_one_message_without_a_model_even_at_dawn(
@@ -238,10 +239,11 @@ async def test_the_brief_job_sends_one_message_without_a_model_even_at_dawn(
 
     await worker.brief_job(bot)
 
-    [(text, markup)] = bot.sent
+    (text, markup), (batch, batch_markup) = bot.sent
     assert replies.BRIEF_HEADER in text
     assert "Javobsiz qolganlar" in text
     assert markup is not None and _buttons(markup)
+    assert batch.startswith("❓ <b>Bugungi savollar</b>") and _buttons(batch_markup)
 
 
 async def test_ertalab_is_the_brief_on_demand(bound):  # noqa: F811

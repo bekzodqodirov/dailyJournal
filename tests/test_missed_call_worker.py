@@ -108,17 +108,17 @@ async def _nudged_refs(session) -> list[str]:
 
 
 async def test_the_morning_brief_keyboard_carries_the_missed_rows(session, monkeypatch):
-    """The 09:00 brief the worker sends is the owner's daily surface: the
-    📵 section must arrive with its ✅ Bog'landim / ⏰ rows, not as bare text."""
+    """The 09:00 brief tells; the numbered batch right after it asks: the
+    missed call arrives with its ✅ Bog'landim / ⏰ row (WP-19)."""
     await _missed(session, _event(1, minutes_ago=180))
     interaction_id = await _interaction_id(session, 1)
     bot = _MarkupBot()
 
     assert await worker.brief_job(bot) is True
 
-    [markup] = bot.markups
-    assert markup is not None
-    payloads = [b.callback_data for row in markup.inline_keyboard for b in row]
+    brief_markup, batch = bot.markups
+    assert brief_markup is None
+    payloads = [b.callback_data for row in batch.inline_keyboard for b in row]
     assert f"rec:ma:m{interaction_id}" in payloads
     assert f"rec:ms:m{interaction_id}" in payloads
 

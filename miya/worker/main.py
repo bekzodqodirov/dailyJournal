@@ -63,7 +63,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, clock, escape, short_date
 from miya.config import settings
-from miya.db.models import Claim, DailyReport, Person, ReminderLog
+from miya.db.models import DailyReport, Person, ReminderLog
 from miya.db.session import engine, session_scope
 from miya.services import (
     backup,
@@ -216,14 +216,52 @@ async def embed_job() -> None:
         log.info("embedded %d new memories", embedded)
 
 
-async def report_job(bot: Bot) -> None:
-    """Compose, store and deliver the daily report (cron at REPORT_TIME)."""
-    day = datetime.now(settings.tz).date()
+async def report_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """Compose, store and deliver the daily report (cron at REPORT_TIME),
+    then the evening's question batch (WP-19)."""
+    now = now or datetime.now(settings.tz)
+    day = now.astimezone(settings.tz).date()
     async with session_scope() as session:
         content = await reports.generate_report(session, day)
     # The report is committed before the send: a Telegram failure costs the
     # notification, never the report itself (`/hisobot` re-reads it).
-    await notify(bot, f"{reports.report_header(day)}\n\n{content}")
+    if await notify(bot, f"{reports.report_header(day)}\n\n{content}"):
+        await _slot_questions(
+            bot,
+            slot=questions.SLOT_EVENING,
+            via=questions.VIA_EVENING,
+            header=replies.QUESTIONS_EVENING_HEADER,
+            now=now,
+        )
+
+
+async def _slot_questions(
+    bot: Bot, *, slot: str, via: str, header: str, now: datetime
+) -> int:
+    """The batch after the brief or the report. A failure here never costs
+    the message it follows."""
+    try:
+        async with session_scope() as session:
+            await questions.auto_resolve(session, now=now)
+            await session.commit()
+            pushable = await questions.collect(session, now=now, for_push=True)
+            picked = questions.plan(
+                pushable,
+                spent=await questions.spent_today(session, now=now),
+                slot=slot,
+                now=now,
+                last_push=None,
+                brief_sent=True,
+                interrupting=False,
+            )
+            if not picked:
+                return 0
+            return await send_questions(
+                bot, session, picked, via=via, header=header, now=now
+            )
+    except Exception:
+        log.exception("the %s question batch failed", slot)
+        return 0
 
 
 async def gcal_pull_job() -> None:
@@ -276,7 +314,7 @@ async def window_job(bot: Bot) -> None:
 BRIEF_KIND = brief.BRIEF_KIND
 
 
-async def brief_job(bot: Bot) -> bool:
+async def brief_job(bot: Bot, *, now: datetime | None = None) -> bool:
     """The morning brief (cron at MORNING_BRIEF_TIME). Never skipped.
 
     Deterministic — SQL and the open-loops engine, no model call — so it
@@ -285,30 +323,44 @@ async def brief_job(bot: Bot) -> bool:
     time he chose is not a notification to be suppressed. Returns whether it
     reached him; a sent brief is logged so the startup catch-up can tell a
     missed one from a delivered one.
+
+    The brief tells and carries only the due rows' buttons; right after it,
+    one numbered batch asks the QUESTION_BRIEF_SLOTS most important
+    questions (WP-19), and one line counts what else waits in /savollar.
     """
+    now = now or datetime.now(settings.tz)
     async with session_scope() as session:
-        data = await brief.gather(session)
-        body = replies.morning_brief(data)
-        due, stale = replies.morning_brief_refs(data)
-        claim_ids = replies.morning_brief_claim_ids(data)
-        keyboard = keyboards.brief_actions(
-            due,
-            stale,
-            claim_ids=claim_ids,
-            missed_ids=replies.morning_brief_missed_ids(data),
+        data = await brief.gather(session, now=now)
+        await questions.auto_resolve(session, now=now)
+        await session.commit()
+        pushable = await questions.collect(session, now=now, for_push=True)
+        picked = questions.plan(
+            pushable,
+            spent=await questions.spent_today(session, now=now),
+            slot=questions.SLOT_BRIEF,
+            now=now,
+            last_push=None,
+            brief_sent=True,
+            interrupting=False,
         )
+        data.queue = questions.summarise(
+            await questions.collect(session, now=now, for_push=False), picked
+        )
+        body = replies.morning_brief(data)
+        due, _ = replies.morning_brief_refs(data)
+        keyboard = keyboards.brief_actions(due)
     sent = await notify(bot, body, reply_markup=keyboard)
     if sent:
         async with session_scope() as session:
             session.add(ReminderLog(kind=BRIEF_KIND, ref=data.day.isoformat()))
-            # A claim shown with its Ha / Yo'q row on the brief was asked;
-            # the question job must not repeat it as its own message.
-            if claim_ids:
-                now = datetime.now(settings.tz)
-                for claim in await session.scalars(
-                    sa.select(Claim).where(Claim.id.in_(claim_ids))
-                ):
-                    claims.mark_asked(claim, now=now)
+        if picked:
+            await _slot_questions(
+                bot,
+                slot=questions.SLOT_BRIEF,
+                via=questions.VIA_BRIEF,
+                header=replies.QUESTIONS_BRIEF_HEADER,
+                now=now,
+            )
     return sent
 
 
@@ -959,7 +1011,14 @@ async def catch_up(bot: Bot) -> None:
         try:
             async with session_scope() as session:
                 content = await reports.generate_report(session, day)
-            await notify(bot, f"{reports.report_header(day)}\n\n{content}")
+            if await notify(bot, f"{reports.report_header(day)}\n\n{content}"):
+                await _slot_questions(
+                    bot,
+                    slot=questions.SLOT_EVENING,
+                    via=questions.VIA_EVENING,
+                    header=replies.QUESTIONS_EVENING_HEADER,
+                    now=datetime.now(settings.tz),
+                )
         except Exception:
             log.exception("catch-up report failed")
 
