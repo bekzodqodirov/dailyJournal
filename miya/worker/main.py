@@ -709,8 +709,12 @@ async def money_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
         fresh = queue.fresh
         if fresh and len(fresh) < settings.money_receipts_fold_at:
             for interaction, txn in fresh:
-                text = replies.money_receipt(txn, interaction, txn.counterparty)
-                keyboard = keyboards.record_actions([("transaction", txn.id)])
+                notice = (interaction.meta or {}).get(money_notices.MONEY_NOTICE_KEY, {})
+                if notice.get("typed_match"):
+                    text, keyboard = replies.money_typed_confirmed(txn), None
+                else:
+                    text = replies.money_receipt(txn, interaction, txn.counterparty)
+                    keyboard = keyboards.record_actions([("transaction", txn.id)])
                 if not await notify(bot, text, reply_markup=keyboard, silent=silent):
                     return
                 money_notices.mark_notified(interaction, now=now)

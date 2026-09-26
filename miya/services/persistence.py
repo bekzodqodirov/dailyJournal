@@ -34,7 +34,7 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import claims, codes, memories, records
+from miya.services import claims, codes, memories, money_events, records
 from miya.services.extraction import (
     ExtractedDebt,
     ExtractedFulfilment,
@@ -89,6 +89,9 @@ class Applied:
     owner_named: list[str] = field(default_factory=list)
     # WP-35: (code, person name) the owner's own note linked outright.
     codes_learned: list[tuple[str, str]] = field(default_factory=list)
+    # WP-42: (bank transaction, interaction id, index in meta.money_skipped) —
+    # a typed payment the bank had already booked; not written twice.
+    matched_transactions: list[tuple[Transaction, int, int]] = field(default_factory=list)
 
     def refusals(self) -> int:
         """How many rows were refused for who they named (WP-31)."""
@@ -114,6 +117,7 @@ class Applied:
                 self.identity_conflicts,
                 self.owner_named,
                 self.codes_learned,
+                self.matched_transactions,
             )
         )
 
@@ -454,6 +458,7 @@ async def write_transaction(
     now: datetime,
     claim: Claim | None = None,
     person_hint: Person | None = None,
+    skip_bank_match: bool = False,
 ) -> Transaction | None:
     amount = to_money(item.amount)
     if amount is None:
@@ -466,6 +471,28 @@ async def write_transaction(
         )
         if applied.refusals() > refused:
             return None
+    occurred = interaction.occurred_at or now
+    if not skip_bank_match:
+        bank = await money_events.find_bank_match(
+            session,
+            TransactionType(item.type),
+            amount,
+            Currency(item.currency),
+            occurred,
+        )
+        if bank is not None:
+            _enrich_bank_row(bank, item, counterparty, interaction)
+            skipped = [
+                *(interaction.meta or {}).get("money_skipped", []),
+                item.model_dump(mode="json"),
+            ]
+            interaction.meta = {**(interaction.meta or {}), "money_skipped": skipped}
+            applied.matched_transactions.append((bank, interaction.id, len(skipped) - 1))
+            if claim is not None:
+                claim.person_id = counterparty.id if counterparty else None
+                _claim_result(claim, "transaction", bank.id)
+            await session.flush()
+            return bank
     txn = Transaction(
         type=TransactionType(item.type),
         amount=amount,
@@ -473,7 +500,7 @@ async def write_transaction(
         category=item.category or "other",
         description=item.description or None,
         counterparty_person_id=counterparty.id if counterparty else None,
-        occurred_at=interaction.occurred_at or now,
+        occurred_at=occurred,
         source_interaction_id=interaction.id,
     )
     session.add(txn)
@@ -483,6 +510,50 @@ async def write_transaction(
         _claim_result(claim, "transaction", txn.id)
     applied.transactions.append(txn)
     return txn
+
+
+def _enrich_bank_row(
+    bank: Transaction, item, counterparty: Person | None, interaction: Interaction
+) -> None:
+    """What the owner's words add to the bank's bare record, each change
+    with a history entry; nothing the bank said is overwritten."""
+    at = datetime.now(settings.tz).isoformat()
+    changes = []
+    # A bank row's description is generated from the sender until someone
+    # edits it; an edit leaves a history entry.
+    generated = not any(h.get("field") == "description" for h in bank.history or [])
+    if item.description and (not bank.description or generated):
+        changes.append(("description", bank.description, item.description))
+        bank.description = item.description
+    if item.category and (bank.category or "other") == "other":
+        changes.append(("category", bank.category, item.category))
+        bank.category = item.category
+    if counterparty is not None and bank.counterparty_person_id is None:
+        changes.append(("counterparty", None, counterparty.id))
+        bank.counterparty_person_id = counterparty.id
+    bank.history = [
+        *(bank.history or []),
+        *(
+            {
+                "at": at,
+                "field": name,
+                "old": old,
+                "new": new,
+                "by": "extraction",
+                "interaction_id": interaction.id,
+            }
+            for name, old, new in changes
+        ),
+        {
+            "at": at,
+            "field": "evidence",
+            "old": None,
+            "new": "typed",
+            "by": "extraction",
+            "matched": "typed",
+            "interaction_id": interaction.id,
+        },
+    ]
 
 
 async def write_promise(

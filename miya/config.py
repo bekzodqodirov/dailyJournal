@@ -263,6 +263,11 @@ class Settings(BaseSettings):
     money_receipt_max_age_hours: int = Field(default=12, ge=1)
     # true: receipts arrive silently in quiet hours; false: they wait.
     money_receipts_silent_at_night: bool = False
+    # WP-42: an owner-typed payment and a bank record of the same amount on
+    # the same day within this many hours are one payment (0 disables).
+    money_typed_match_hours: int = Field(default=6, ge=0, le=24)
+    # A receipt when the bank confirms a payment the owner already typed.
+    money_receipt_on_typed_match: bool = False
 
     # --- The question budget (WP-16; owner answer 3: 5-10 taps a day) --------
     # 0 = never push; questions wait for the brief line and /savollar.

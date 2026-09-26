@@ -468,6 +468,15 @@ def confirmation(applied: Applied) -> str:
             f"{escape(txn.category or 'boshqa')}{detail}" + tag("transaction", txn.id)
         )
 
+    for bank, _, _ in applied.matched_transactions:
+        icon = "📈" if bank.type.value == "income" else "📉"
+        label = "Kirim" if bank.type.value == "income" else "Chiqim"
+        lines.append(
+            f"{icon} {label}: {money(bank.amount, bank.currency)} — SMS'dagi"
+            f"{tag('transaction', bank.id)} bilan bir xil to'lov, ikkinchi marta "
+            f"yozilmadi."
+        )
+
     for event in applied.events:
         lines.append(
             f"📅 Uchrashuv: {escape(event.title)} — "
@@ -2321,3 +2330,22 @@ def yuk_report(code: str, lines) -> str:
 def exact_hits_block(lines) -> str:
     shown = [mention_line(line) for line in lines[:QIDIR_EXACT_MAX]]
     return f"{EXACT_HITS_HEADER}\n" + bullet_list(shown, empty="—")
+
+
+def money_split_done(txn) -> str:
+    """The ➕ Bu boshqa to'lov answer (WP-42)."""
+    icon = "📈" if txn.type.value == "income" else "📉"
+    label = "Kirim" if txn.type.value == "income" else "Chiqim"
+    return (
+        f"✅ Alohida yozildi: {icon} {label} {money(txn.amount, txn.currency)}"
+        f"{tag('transaction', txn.id)}"
+    )
+
+
+def money_typed_confirmed(txn) -> str:
+    """The bank confirmed a payment the owner had typed (WP-42, optional)."""
+    amount = money(txn.amount, txn.currency)
+    return f"✉️ SMS tasdiqladi:{tag('transaction', txn.id)} — {amount}."
+
+
+MONEY_SPLIT_GONE = "Bu to'lov allaqachon alohida yozilgan yoki topilmadi."

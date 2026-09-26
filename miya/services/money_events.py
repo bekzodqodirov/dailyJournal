@@ -25,7 +25,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import Currency, TransactionType
+from miya.db.enums import Currency, InteractionSource, TransactionType
 from miya.db.models import Interaction, Transaction, TransactionEvidence
 from miya.services import money_notices, sms_money
 from miya.services.sms_money import ParsedPayment, Verdict
@@ -76,8 +76,105 @@ def _label(interaction: Interaction, channel: str) -> str:
 # --- hooks filled in by later packages ------------------------------------------
 
 
-async def _typed_match(session, interaction, reading, *, channel):  # WP-42
-    return None
+TYPED_SOURCES = (InteractionSource.assistant_bot, InteractionSource.manual)
+
+
+def _local_day(column):
+    return sa.func.date(sa.func.timezone(settings.timezone, column))
+
+
+def _same_payment(txn_type, amount, currency, occurred_at):
+    """Filters shared by both directions of the typed/bank match (WP-42)."""
+    window = timedelta(hours=settings.money_typed_match_hours)
+    return (
+        Transaction.voided_at.is_(None),
+        Transaction.type == txn_type,
+        Transaction.currency == currency,
+        Transaction.amount == amount,
+        Transaction.occurred_at.between(occurred_at - window, occurred_at + window),
+        _local_day(Transaction.occurred_at) == occurred_at.astimezone(settings.tz).date(),
+    )
+
+
+def _nearest(occurred_at):
+    return sa.func.abs(sa.extract("epoch", Transaction.occurred_at - occurred_at))
+
+
+async def find_typed_match(
+    session: AsyncSession, txn_type, amount, currency, occurred_at: datetime
+) -> Transaction | None:
+    """A payment the owner typed that this bank record confirms."""
+    if settings.money_typed_match_hours <= 0:
+        return None
+    return await session.scalar(
+        sa.select(Transaction)
+        .join(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(
+            *_same_payment(txn_type, amount, currency, occurred_at),
+            Transaction.channel.is_(None),
+            Interaction.source.in_(TYPED_SOURCES),
+            ~sa.exists().where(TransactionEvidence.transaction_id == Transaction.id),
+        )
+        .order_by(_nearest(occurred_at))
+        .limit(1)
+        .with_for_update(of=Transaction)
+    )
+
+
+async def find_bank_match(
+    session: AsyncSession, txn_type, amount, currency, occurred_at: datetime
+) -> Transaction | None:
+    """The bank record of a payment the owner is typing now."""
+    if settings.money_typed_match_hours <= 0:
+        return None
+    return await session.scalar(
+        sa.select(Transaction)
+        .where(
+            *_same_payment(txn_type, amount, currency, occurred_at),
+            Transaction.channel.is_not(None),
+            ~Transaction.history.contains([{"matched": "typed"}]),
+        )
+        .order_by(_nearest(occurred_at))
+        .limit(1)
+        .with_for_update()
+    )
+
+
+async def _typed_match(session, interaction, reading, *, channel):
+    """The owner typed this payment before the bank reported it: the bank
+    record becomes the typed row's evidence, not a second row (WP-42)."""
+    typed = await find_typed_match(
+        session, reading.type, reading.amount, reading.currency, interaction.occurred_at
+    )
+    if typed is None:
+        return None
+    session.add(
+        TransactionEvidence(
+            transaction_id=typed.id,
+            interaction_id=interaction.id,
+            channel=channel,
+            card_last4=reading.card_last4,
+        )
+    )
+    typed.channel = channel
+    if typed.card_last4 is None:
+        typed.card_last4 = reading.card_last4
+    typed.history = [
+        *(typed.history or []),
+        {
+            "at": datetime.now(settings.tz).isoformat(),
+            "field": "evidence",
+            "old": None,
+            "new": channel,
+            "by": "dedupe",
+            "matched": "typed",
+            "interaction_id": interaction.id,
+        },
+    ]
+    await session.flush()
+    if settings.money_receipt_on_typed_match:
+        money_notices.note_typed_match(interaction, typed)
+    return typed, True
 
 
 async def _link_gs_code(session, txn, reading) -> None:  # WP-68

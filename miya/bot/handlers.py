@@ -47,6 +47,7 @@ from miya.services import (
     memories,
     money_events,
     nudges,
+    persistence,
     planner,
     purge,
     queries,
@@ -58,6 +59,7 @@ from miya.services import (
 )
 from miya.services import codes as client_codes
 from miya.services.embeddings import EmbeddingError, get_embedder
+from miya.services.extraction import ExtractedTransaction
 from miya.services.ingest import (
     create_interaction,
     describe_into,
@@ -122,6 +124,9 @@ def _receipt(result) -> tuple[str, InlineKeyboardMarkup | None]:
         replies.confirmation_refs(applied), replies.confirmation_claim_ids(applied)
     )
     _ask(applied.claims, keyboard)
+    keyboard = keyboards.with_money_splits(
+        keyboard, [(iid, index) for _, iid, index in applied.matched_transactions]
+    )
     return replies.confirmation(applied), keyboard
 
 
@@ -1738,6 +1743,51 @@ async def _code_lookup_reply(session, kind: str, code: str) -> str:
     if holder is None:
         return replies.code_unknown(code)
     return replies.person_report(await queries.person_summary(session, holder))
+
+
+@router.callback_query(F.data.startswith("mx:split:"))
+async def on_money_split(callback: CallbackQuery) -> None:
+    """➕ Bu boshqa to'lov: the typed payment was a second payment after all."""
+    parts = (callback.data or "").split(":")
+    body = replies.MONEY_SPLIT_GONE
+    if len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        async with session_scope() as session:
+            txn = await _split_typed_payment(session, int(parts[2]), int(parts[3]))
+            if txn is not None:
+                body = replies.money_split_done(txn)
+    markup = callback.message.reply_markup if callback.message is not None else None
+    rows = [
+        row
+        for row in (markup.inline_keyboard if markup is not None else [])
+        if not any(b.callback_data == callback.data for b in row)
+    ]
+    trimmed = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    await _finish_row(callback, trimmed, body)
+
+
+async def _split_typed_payment(session, interaction_id: int, index: int):
+    interaction = await session.get(Interaction, interaction_id, with_for_update=True)
+    if interaction is None:
+        return None
+    meta = interaction.meta or {}
+    skipped = meta.get("money_skipped") or []
+    done = set(meta.get("money_split") or [])
+    if index >= len(skipped) or index in done:
+        return None
+    item = ExtractedTransaction.model_validate(skipped[index])
+    txn = await persistence.write_transaction(
+        session,
+        interaction,
+        item,
+        persistence.Applied(),
+        now=datetime.now(settings.tz),
+        skip_bank_match=True,
+    )
+    if txn is None:
+        return None
+    await session.flush()
+    interaction.meta = {**meta, "money_split": sorted(done | {index})}
+    return txn
 
 
 @router.message(Command("kodlar"), F.document)

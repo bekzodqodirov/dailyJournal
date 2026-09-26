@@ -823,3 +823,21 @@ def client_import(interaction_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def with_money_splits(
+    markup: InlineKeyboardMarkup | None, splits: list[tuple[int, int]]
+) -> InlineKeyboardMarkup | None:
+    """One [➕ Bu boshqa to'lov] row per typed payment matched to a bank row."""
+    if not splits:
+        return markup
+    rows = list(markup.inline_keyboard) if markup is not None else []
+    rows += [
+        [
+            InlineKeyboardButton(
+                text="➕ Bu boshqa to'lov", callback_data=f"mx:split:{iid}:{index}"
+            )
+        ]
+        for iid, index in splits
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

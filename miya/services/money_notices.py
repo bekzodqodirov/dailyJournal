@@ -54,6 +54,14 @@ def note(
     interaction.meta = {**(interaction.meta or {}), MONEY_NOTICE_KEY: notice}
 
 
+def note_typed_match(interaction: Interaction, txn: Transaction) -> None:
+    """ "✉️ SMS tasdiqladi" for a payment the owner typed first (WP-42)."""
+    interaction.meta = {
+        **(interaction.meta or {}),
+        MONEY_NOTICE_KEY: {"txn_id": txn.id, "verdict": "book", "typed_match": True},
+    }
+
+
 @dataclass(slots=True)
 class Pending:
     fresh: list[tuple[Interaction, Transaction]]
