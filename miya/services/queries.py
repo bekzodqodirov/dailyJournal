@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,7 +39,7 @@ from miya.db.models import (
     Transaction,
     UsageLog,
 )
-from miya.services import memories
+from miya.services import codes, memories
 
 
 @dataclass(slots=True)
@@ -92,6 +93,9 @@ class PersonSummary:
     timeline: list[TimelineEntry] = field(default_factory=list)
     profile: str | None = None
     profile_updated_at: datetime | None = None
+    # WP-40: the person's client codes and where others mentioned them.
+    codes: list[str] = field(default_factory=list)
+    code_mentions: list[Any] = field(default_factory=list)
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -429,6 +433,9 @@ async def last_contact_at(session: AsyncSession, person_id: int) -> datetime | N
     return await session.scalar(sa.select(last_contact_expr(person_id)))
 
 
+PERSON_CODE_MENTIONS = 5
+
+
 async def person_summary(
     session: AsyncSession,
     person: Person,
@@ -463,6 +470,14 @@ async def person_summary(
     summary.timeline = await timeline(session, person.id, limit=timeline_limit)
     summary.profile = person.notes
     summary.profile_updated_at = person.profile_updated_at
+    summary.codes = await codes.codes_of(session, person.id)
+    found = []
+    for code in summary.codes:
+        found += await codes.mentions(
+            session, code, limit=PERSON_CODE_MENTIONS, exclude_person_id=person.id
+        )
+    found.sort(key=lambda line: line.when, reverse=True)
+    summary.code_mentions = found[:PERSON_CODE_MENTIONS]
     return summary
 
 

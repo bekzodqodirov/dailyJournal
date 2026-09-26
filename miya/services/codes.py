@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 
 import sqlalchemy as sa
@@ -595,3 +596,76 @@ async def index_pending(session: AsyncSession, *, limit: int = 1000) -> int:
     for interaction in rows:
         await index_interaction(session, interaction)
     return len(rows)
+
+
+# --- exact lookups (WP-40) ----------------------------------------------------------
+
+
+@dataclass(slots=True)
+class MentionLine:
+    when: datetime
+    source: str
+    chat_title: str | None
+    speaker: str | None
+    text: str
+
+
+MENTION_EXCERPT = 300
+
+
+def canonical_waybill_text(text: str) -> str | None:
+    """'yw26 004715' → 'YW26-004715'; None unless the whole text is one."""
+    match = waybill_re().fullmatch((text or "").strip())
+    return canonical_waybill(match) if match else None
+
+
+def canonical_lookup(text: str) -> tuple[str, str] | None:
+    """(kind, code) when ``text`` is exactly one waybill or client code."""
+    waybill = canonical_waybill_text(text)
+    if waybill is not None:
+        return "waybill", waybill
+    code = canonical_client_code(text)
+    if code is not None:
+        return "client", code
+    return None
+
+
+async def mentions(
+    session: AsyncSession,
+    code: str,
+    *,
+    limit: int = 20,
+    exclude_person_id: int | None = None,
+) -> list[MentionLine]:
+    """Where a code or waybill was mentioned, newest first, dated."""
+    from miya.db.models import ChatMonitor, CodeMention, Interaction
+    from miya.services.ingest import text_for_extraction
+
+    query = (
+        sa.select(Interaction, ChatMonitor.title, Person.display_name)
+        .join(CodeMention, CodeMention.interaction_id == Interaction.id)
+        .outerjoin(ChatMonitor, ChatMonitor.tg_chat_id == Interaction.tg_chat_id)
+        .outerjoin(Person, Person.id == Interaction.person_id)
+        .where(CodeMention.code == code)
+        .order_by(CodeMention.occurred_at.desc(), Interaction.id.desc())
+        .limit(limit)
+    )
+    if exclude_person_id is not None:
+        query = query.where(
+            sa.or_(
+                Interaction.person_id.is_(None),
+                Interaction.person_id != exclude_person_id,
+            )
+        )
+    lines: list[MentionLine] = []
+    for interaction, title, speaker in (await session.execute(query)).all():
+        lines.append(
+            MentionLine(
+                when=interaction.occurred_at,
+                source=interaction.source.value,
+                chat_title=title,
+                speaker=speaker,
+                text=text_for_extraction(interaction)[:MENTION_EXCERPT],
+            )
+        )
+    return lines

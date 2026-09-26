@@ -89,6 +89,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /kodlar — xabarlardan topilgan kod takliflari
 /tarix &lt;ism&gt; [N] — odam bilan to'liq aloqa tarixi (oxirgi N ta)
 /eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
+/yuk &lt;YW26-004715 yoki GS367&gt; — yuk xati yoki kod qayerda tilga olingan
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — kunlik hisobot
 /ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
@@ -145,6 +146,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("eslab", "Odam haqida eslab qolish"),
     ("kod", "Mijoz kodini biriktirish"),
     ("kodlar", "Kod takliflari"),
+    ("yuk", "Yuk xati yoki kod qayerda tilga olingan"),
     ("pul", "bugungi to'lovlar ro'yxati"),
     ("ochir", "noto'g'ri pul yozuvini o'chirish"),
 )
@@ -624,9 +626,11 @@ KIM_FACTS = 5
 KIM_TIMELINE = 10
 
 
-def _identity_line(person) -> str:
+def _identity_line(person, codes=()) -> str:
     """Name in bold, then everything that pins down who this is."""
     bits = [f"<b>{escape(person.display_name)}</b>"]
+    if codes:
+        bits.append(f"🏷 {escape(', '.join(codes))}")
     if person.aliases:
         bits.append(f"<i>{escape(', '.join(person.aliases))}</i>")
     if person.telegram_username:
@@ -662,7 +666,8 @@ def person_report(summary: PersonSummary) -> str:
     remembered, the last contacts, and where the full history lives.
     """
     person = summary.person
-    parts = [_identity_line(person), _profile_block(summary)]
+    codes = getattr(summary, "codes", None) or []
+    parts = [_identity_line(person, codes), _profile_block(summary)]
 
     if summary.balances:
         lines = [
@@ -700,6 +705,11 @@ def person_report(summary: PersonSummary) -> str:
         lines = [timeline_line(e) for e in summary.timeline[:KIM_TIMELINE]]
         parts.append("🕐 <b>Oxirgi aloqalar</b>\n" + bullet_list(lines, empty="—"))
 
+    mentioned = getattr(summary, "code_mentions", None) or []
+    if mentioned:
+        lines = [mention_line(line) for line in mentioned]
+        parts.append(f"{CODE_MENTIONS_HEADER}\n" + bullet_list(lines, empty="—"))
+
     tail = []
     last = summary.last_contact_at
     if last is None and summary.last_interactions:
@@ -708,7 +718,8 @@ def person_report(summary: PersonSummary) -> str:
         tail.append(f"Oxirgi aloqa: {day_label(last)} {clock(last)}")
     tail.append(f"jami {summary.total_interactions} ta aloqa")
     parts.append("🕐 " + " · ".join(tail))
-    parts.append(f"<i>/tarix {escape(person.display_name)} — to'liq tarix</i>")
+    handle = codes[0] if len(codes) == 1 else person.display_name
+    parts.append(f"<i>/tarix {escape(handle)} — to'liq tarix</i>")
 
     return clip("\n\n".join(parts))
 
@@ -731,18 +742,22 @@ def _fit_oldest_first(lines_newest_first: list[str], *, budget: int) -> list[str
     return kept
 
 
-def history_report(person, entries: list[TimelineEntry], *, requested: int) -> str:
+def history_report(
+    person, entries: list[TimelineEntry], *, requested: int, codes=()
+) -> str:
     """`/tarix`: a person's contacts, oldest at the top, newest at the bottom."""
     name = escape(person.display_name)
     if not entries:
         return f"🕐 <b>{name}</b> bilan hali aloqa yozilmagan."
     shown_count = min(requested, len(entries))
-    header = f"🕐 <b>{name}</b> — tarix (oxirgi {shown_count} ta)"
+    label = f"<b>{name}</b>" + (f" ({escape(', '.join(codes))})" if codes else "")
+    header = f"🕐 {label} — tarix (oxirgi {shown_count} ta)"
     # Offer more only when there may be more: a short history is complete,
     # and the cap is the cap.
     hint = ""
+    handle = escape(codes[0]) if len(codes) == 1 else name
     if len(entries) >= requested and requested < TARIX_MAX:
-        hint = f"\n\n<i>Ko'proq: /tarix {name} {min(requested * 2, TARIX_MAX)}</i>"
+        hint = f"\n\n<i>Ko'proq: /tarix {handle} {min(requested * 2, TARIX_MAX)}</i>"
     lines = [timeline_line(e) for e in entries]  # newest first, as queried
     budget = TELEGRAM_LIMIT - len(header) - len(hint) - 40
     shown = _fit_oldest_first(lines, budget=budget)
@@ -2273,3 +2288,35 @@ def import_done(written: dict[str, int], conflicts) -> str:
             for code, name, holder in conflicts[:IMPORT_CONFLICTS_MAX]
         ]
     return "\n".join(lines)
+
+
+# --- exact code and waybill lookups (WP-40) -----------------------------------------
+
+CODE_MENTIONS_HEADER = "📦 <b>Kodi tilga olingan xabarlar</b>"
+EXACT_HITS_HEADER = "📦 <b>Aniq topilganlar</b>"
+YUK_USAGE = "Yuk xati raqamini yozing: <code>/yuk YW26-004715</code>"
+QIDIR_EXACT_MAX = 5
+
+
+def mention_line(line) -> str:
+    """'{day} {clock} · {chat yoki odam} · «{excerpt}»'."""
+    where = line.chat_title or line.speaker or "eslatma"
+    return (
+        f"{day_label(line.when)} {clock(line.when)} · {escape(where)} · "
+        f"{quote(line.text, 160)}"
+    )
+
+
+def yuk_report(code: str, lines) -> str:
+    """`/yuk`: every mention, oldest at the top, newest at the bottom."""
+    if not lines:
+        return f"📦 <b>{escape(code)}</b> hech bir xabarda uchramadi."
+    header = f"📦 <b>{escape(code)}</b> — {len(lines)} ta xabarda:"
+    rendered = [mention_line(line) for line in lines]  # newest first
+    shown = _fit_oldest_first(rendered, budget=TELEGRAM_LIMIT - len(header) - 40)
+    return clip(f"{header}\n" + bullet_list(shown, empty="—"))
+
+
+def exact_hits_block(lines) -> str:
+    shown = [mention_line(line) for line in lines[:QIDIR_EXACT_MAX]]
+    return f"{EXACT_HITS_HEADER}\n" + bullet_list(shown, empty="—")

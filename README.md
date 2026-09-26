@@ -196,6 +196,7 @@ it recorded:
 | `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
 | `/kod <ism> <GS kod>` | Attach, show (`/kod GS367`), move or detach (`/kod GS367 o'chir`) a client code |
 | `/kodlar` | Code suggestions learned from chats; send a CSV/.xlsx captioned `/kodlar` to import the client list |
+| `/yuk <YW26-004715 yoki GS367>` | Every message, call and note that mentions a waybill or client code, oldest first; a bare code or waybill sent as a message does the same |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
 | `/hisobot` | Generate and send today's report right now |
 | `/reja` | Tomorrow's time-blocked plan |

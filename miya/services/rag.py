@@ -160,9 +160,33 @@ deganman?":
   score is low and a runner_up is named, DO NOT answer about either person:
   ask back in ONE line naming the candidates, e.g. "Kimni nazarda tutding:
   Akmal GZ yoki Akmal Toshkent?".
+
+Clients — the owner identifies clients by a GS code (GS367) or by name. A code
+is exact: pass it as the name to person_summary, person_timeline or open_debts,
+and call lookup_code to see where it was mentioned. Waybill numbers like
+YW26-004715 are shipments: call lookup_code for them, never search_memories
+alone. Figures still come only from the SQL tools.
 """
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "lookup_code",
+        "description": (
+            "Exact lookup of a client code (GS367) or a waybill number "
+            "(YW26-004715): who holds the code and the newest messages, calls, "
+            "documents and notes that mention it, with dates. Always use it when "
+            "the question contains such a code; semantic search is unreliable "
+            "for codes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+            },
+            "required": ["code"],
+        },
+    },
     {
         "name": "open_debts",
         "description": (
@@ -515,6 +539,42 @@ async def _run_tool(
                 "direction": direction.value if direction else None,
                 "note": UNTRUSTED_NOTE,
                 "results": _jsonable(entries),
+            }
+        )
+
+    if name == "lookup_code":
+        raw = str(args.get("code") or "")
+        found = client_codes.canonical_lookup(raw)
+        if found is None:
+            return _dumps({"error": f"not a client code or waybill: {raw}"})
+        kind, code = found
+        limit = max(1, min(int(args.get("limit") or 10), 30))
+        holder = await client_codes.holder(session, code) if kind == "client" else None
+        lines = await client_codes.mentions(session, code, limit=limit)
+        return _dumps(
+            {
+                "code": code,
+                "kind": kind,
+                "holder": (
+                    {
+                        "display_name": holder.display_name,
+                        "client_codes": await client_codes.codes_of(session, holder.id),
+                        "relationship": holder.relationship_,
+                    }
+                    if holder is not None
+                    else None
+                ),
+                "note": UNTRUSTED_NOTE,
+                "mentions": [
+                    {
+                        "at": _jsonable(line.when),
+                        "source": line.source,
+                        "chat": line.chat_title,
+                        "speaker": line.speaker,
+                        "text": line.text,
+                    }
+                    for line in lines
+                ],
             }
         )
 

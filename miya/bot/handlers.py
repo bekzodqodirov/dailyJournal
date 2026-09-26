@@ -371,14 +371,26 @@ async def cmd_search(message: Message, command: CommandObject) -> None:
         return
 
     await _typing(message)
-    try:
-        async with session_scope() as session:
+    exact = ""
+    async with session_scope() as session:
+        # Codes and waybills are matched exactly, never by embedding (WP-40);
+        # the block survives the embedder being down.
+        found = client_codes.find_waybills(query) + client_codes.find_client_codes(query)
+        lines = []
+        for code in found:
+            lines += await client_codes.mentions(
+                session, code, limit=replies.QIDIR_EXACT_MAX
+            )
+        lines.sort(key=lambda line: line.when, reverse=True)
+        if lines:
+            exact = replies.exact_hits_block(lines)
+        try:
             hits = await memories.search(session, get_embedder(), query, k=8)
-        body = replies.search_results(hits, query)
-    except EmbeddingError:
-        log.warning("semantic search unavailable", exc_info=True)
-        body = replies.SEARCH_UNAVAILABLE
-    await _safe_answer(message, body)
+            body = replies.search_results(hits, query)
+        except EmbeddingError:
+            log.warning("semantic search unavailable", exc_info=True)
+            body = "" if exact else replies.SEARCH_UNAVAILABLE
+    await _safe_answer(message, clip("\n\n".join(p for p in (exact, body) if p)))
 
 
 @router.message(Command("hisobot"))
@@ -1468,7 +1480,8 @@ async def cmd_history(message: Message, command: CommandObject) -> None:
         person, body = await _lookup(session, name, command="tarix")
         if person is not None:
             entries = await queries.timeline(session, person.id, limit=count)
-            body = replies.history_report(person, entries, requested=count)
+            held = await client_codes.codes_of(session, person.id)
+            body = replies.history_report(person, entries, requested=count, codes=held)
     await _safe_answer(message, body)
 
 
@@ -1704,6 +1717,29 @@ async def _code_to_person(session, code: str, name: str, holder: Person | None):
     return replies.code_attached(code, person.display_name, held), None
 
 
+@router.message(Command("yuk"))
+async def cmd_waybill(message: Message, command: CommandObject) -> None:
+    """`/yuk YW26-004715` — every message, call and note that mentions it."""
+    lookup = client_codes.canonical_lookup(command.args or "")
+    if lookup is None:
+        await _safe_answer(message, replies.YUK_USAGE)
+        return
+    async with session_scope() as session:
+        lines = await client_codes.mentions(session, lookup[1], limit=30)
+    await _safe_answer(message, replies.yuk_report(lookup[1], lines))
+
+
+async def _code_lookup_reply(session, kind: str, code: str) -> str:
+    if kind == "waybill":
+        return replies.yuk_report(
+            code, await client_codes.mentions(session, code, limit=30)
+        )
+    holder = await client_codes.holder(session, code)
+    if holder is None:
+        return replies.code_unknown(code)
+    return replies.person_report(await queries.person_summary(session, holder))
+
+
 @router.message(Command("kodlar"), F.document)
 async def cmd_code_import(message: Message, bot: Bot) -> None:
     """The owner's client list sent as a file captioned /kodlar (WP-34).
@@ -1859,6 +1895,25 @@ async def _answer_suggestion(session, row_id: int, *, accept: bool) -> str:
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     await _typing(message)
+    lookup = client_codes.canonical_lookup(
+        (message.text or "").strip().rstrip("?").strip()
+    )
+    if lookup is not None:
+        # A bare code or waybill is a lookup, not a note: SQL answers it and
+        # no model is called (WP-40).
+        async with session_scope() as session:
+            interaction = await create_interaction(
+                session,
+                source=InteractionSource.assistant_bot,
+                direction=Direction.in_,
+                text=message.text,
+                occurred_at=message.date.astimezone(settings.tz),
+                meta={"kind": "question"},
+            )
+            interaction.processed = True
+            reply = await _code_lookup_reply(session, *lookup)
+        await _safe_answer(message, reply)
+        return
     if rag.looks_like_question(message.text):
         # Questions are answered, not extracted — but they still land in
         # interactions ("every input lands here"), marked so `/tekshir` and
