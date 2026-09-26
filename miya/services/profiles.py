@@ -14,7 +14,7 @@ come from ``queries`` directly.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db.enums import DebtDirection, PromiseMadeBy
-from miya.db.models import Debt, Interaction, Memory, Person, Promise, Transaction
+from miya.db.models import (
+    Debt,
+    Interaction,
+    Memory,
+    Person,
+    Promise,
+    Transaction,
+    UsageLog,
+)
 from miya.services import queries
 from miya.services.extraction import API_FAILURES, get_client
 from miya.services.people import set_profile
@@ -201,12 +209,17 @@ def _has_signal():
     )
 
 
-async def stale_people(session: AsyncSession, *, limit: int = 10) -> list[Person]:
-    """People worth a profile whose newest activity is newer than it.
+async def stale_people(
+    session: AsyncSession, *, limit: int = 10, now: datetime | None = None
+) -> list[Person]:
+    """People worth a profile whose newest activity is newer than it, and
+    whose profile is at least PROFILE_MIN_AGE_HOURS old (WP-24).
 
     Oldest-stale first: never profiled before anyone, then by how long ago
     the profile was written.
     """
+    now = now or datetime.now(settings.tz)
+    cooled = now - timedelta(hours=settings.profile_min_age_hours)
     newest = newest_write_expr(Person.id)
     stmt = (
         sa.select(Person)
@@ -214,7 +227,10 @@ async def stale_people(session: AsyncSession, *, limit: int = 10) -> list[Person
         .where(
             sa.or_(
                 Person.profile_updated_at.is_(None),
-                newest > Person.profile_updated_at,
+                sa.and_(
+                    newest > Person.profile_updated_at,
+                    Person.profile_updated_at < cooled,
+                ),
             )
         )
         .order_by(Person.profile_updated_at.asc().nulls_first(), newest, Person.id)
@@ -244,7 +260,7 @@ async def generate_profile(
             session, person, timeline_limit=PROFILE_TIMELINE, facts_limit=PROFILE_FACTS
         )
         response = await get_client().messages.create(
-            model=settings.reason_model,
+            model=settings.profile_model_resolved,
             max_tokens=PROFILE_MAX_TOKENS,
             system=[
                 {
@@ -257,7 +273,7 @@ async def generate_profile(
         )
         await record_anthropic_usage(
             session,
-            model=settings.reason_model,
+            model=settings.profile_model_resolved,
             operation=PROFILE_OPERATION,
             usage=response.usage,
             source_interaction_id=None,
@@ -284,9 +300,24 @@ async def generate_profile(
 async def refresh_stale(
     session: AsyncSession, *, limit: int = 10, now: datetime | None = None
 ) -> int:
-    """Regenerate up to ``limit`` stale profiles, committing each one."""
+    """Regenerate up to ``limit`` stale profiles, committing each one, within
+    PROFILE_DAILY_CAP profile calls a day."""
+    now = now or datetime.now(settings.tz)
+    start, _ = queries.day_bounds(now.astimezone(settings.tz).date())
+    used = int(
+        await session.scalar(
+            sa.select(sa.func.count(UsageLog.id))
+            .where(UsageLog.operation == PROFILE_OPERATION)
+            .where(UsageLog.created_at >= start)
+        )
+        or 0
+    )
+    budget = min(limit, settings.profile_daily_cap - used)
+    if budget <= 0:
+        log.info("profile writer: today's cap of %d reached", settings.profile_daily_cap)
+        return 0
     written = 0
-    for person in await stale_people(session, limit=limit):
+    for person in await stale_people(session, limit=budget, now=now):
         if await generate_profile(session, person, now=now) is None:
             continue
         await session.commit()

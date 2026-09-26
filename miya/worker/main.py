@@ -28,7 +28,7 @@ Jobs:
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
                    for a first import (quiet-hours aware; WP-15)
-  * profile_refresh — every 30 min; rewrites the written profile of up to
+  * profile_refresh — every 60 min; rewrites the written profile of up to
                    PROFILE_REFRESH_PER_RUN people whose activity is newer
                    than their profile (sends nothing; build step 4)
   * heartbeat    — every minute; the worker's own liveness row (build step 5)
@@ -532,12 +532,6 @@ async def _prune_job_heartbeats(session, registered: list[str]) -> int:
     return result.rowcount or 0
 
 
-# Profiles per sweep: one reasoning-model call each, so a first run over a
-# large contact list spreads across a few hours instead of one burst; a
-# person whose activity keeps changing is simply picked up again next sweep.
-PROFILE_REFRESH_PER_RUN = 10
-
-
 async def profile_refresh_job() -> None:
     """Rewrite stale person profiles (build step 4), a few per sweep.
 
@@ -547,7 +541,9 @@ async def profile_refresh_job() -> None:
     that loses the API keeps every profile it already wrote.
     """
     async with session_scope() as session:
-        written = await profiles.refresh_stale(session, limit=PROFILE_REFRESH_PER_RUN)
+        written = await profiles.refresh_stale(
+            session, limit=settings.profile_refresh_per_run
+        )
     if written:
         log.info("refreshed %d person profile(s)", written)
 
@@ -1187,7 +1183,7 @@ async def run() -> None:
     )
     scheduler.add_job(
         profile_refresh_job,
-        IntervalTrigger(minutes=30),
+        IntervalTrigger(minutes=60),
         id="profile_refresh",
         max_instances=1,
         coalesce=True,

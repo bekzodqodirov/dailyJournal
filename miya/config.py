@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     extract_model: str = "claude-haiku-4-5"
     # Reasoning model for the daily report, planner and RAG answers.
     reason_model: str = "claude-sonnet-5"
+    # Person profiles (WP-24): the writer was most of the bill. Blank means
+    # EXTRACT_MODEL; a profile waits PROFILE_MIN_AGE_HOURS before a rewrite,
+    # and at most PROFILE_DAILY_CAP are written a day (0 turns them off).
+    profile_model: str = ""
+    profile_min_age_hours: int = Field(default=24, ge=1)
+    profile_daily_cap: int = Field(default=30, ge=0)
+    profile_refresh_per_run: int = Field(default=5, ge=1)
 
     # --- Transcription ------------------------------------------------------
     elevenlabs_api_key: str = ""
@@ -324,6 +331,10 @@ class Settings(BaseSettings):
     @property
     def tz(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def profile_model_resolved(self) -> str:
+        return self.profile_model.strip() or self.extract_model
 
     @property
     def media_dir(self) -> Path:

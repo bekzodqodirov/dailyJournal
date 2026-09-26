@@ -733,7 +733,7 @@ async def test_stale_people_needs_signal_and_newer_activity(session):
     # A debt recorded after the profile: stale, but profiled once already.
     old = await _person(session, "Eski")
     await _debt(session, old)
-    people.set_profile(old, "profil", now=now - timedelta(days=1))
+    people.set_profile(old, "profil", now=now - timedelta(days=2))
     # A person nobody has dealt with at all.
     await _person(session, "Hech kim")
     await session.flush()
@@ -762,7 +762,7 @@ async def test_generate_profile_writes_notes_stamp_and_usage(session, monkeypatc
     assert akmal.profile_updated_at == when
 
     call = stub.calls[0]
-    assert call["model"] == settings.reason_model
+    assert call["model"] == settings.profile_model_resolved
     assert call["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert call["system"][0]["text"] == profiles.PROFILE_SYSTEM_PROMPT
     assert "ODAM: Akmal" in call["messages"][0]["content"]
@@ -771,7 +771,7 @@ async def test_generate_profile_writes_notes_stamp_and_usage(session, monkeypatc
     await session.flush()
     usage = list(await session.scalars(sa.select(m.UsageLog)))
     assert [u.operation for u in usage] == [profiles.PROFILE_OPERATION]
-    assert usage[0].model == settings.reason_model
+    assert usage[0].model == settings.profile_model_resolved
     assert usage[0].source_interaction_id is None
 
 
@@ -847,3 +847,67 @@ async def test_refresh_stale_skips_failures_and_counts_only_what_was_written(
 
     assert await profiles.refresh_stale(session) == 0
     assert akmal.notes is None and akmal.profile_updated_at is None
+
+
+# --- WP-24: the profile writer's cooldown, cap and model -------------------------
+
+
+async def test_a_fresh_profile_waits_out_the_cooldown(session):
+    now = datetime.now(TZ)
+    recent = await _person(session, "Yaqin")
+    await _debt(session, recent)
+    people.set_profile(recent, "profil", now=now - timedelta(hours=2))
+    old = await _person(session, "Eski")
+    await _debt(session, old)
+    people.set_profile(old, "profil", now=now - timedelta(hours=25))
+    await session.flush()
+    # Activity after both profiles: only the cooled one is rewritten.
+    for person in (recent, old):
+        await _interaction(session, person, at=now)
+    names = [p.display_name for p in await profiles.stale_people(session, now=now)]
+    assert names == ["Eski"]
+
+
+async def _profile_calls(session, n: int) -> None:
+    for _ in range(n):
+        session.add(
+            m.UsageLog(
+                provider="anthropic",
+                model="x",
+                operation=profiles.PROFILE_OPERATION,
+                input_tokens=1,
+                output_tokens=1,
+            )
+        )
+    await session.flush()
+
+
+async def test_the_daily_cap_stops_the_writer(session, monkeypatch):
+    stub = _StubClient(text="profil")
+    monkeypatch.setattr(profiles, "get_client", lambda: stub)
+    for name in ("Bir", "Ikki"):
+        person = await _person(session, name)
+        await _debt(session, person)
+    await _profile_calls(session, settings.profile_daily_cap)
+    assert await profiles.refresh_stale(session, limit=5) == 0
+    assert stub.calls == []
+
+    await session.execute(
+        sa.delete(m.UsageLog).where(
+            m.UsageLog.id.in_(sa.select(m.UsageLog.id).limit(1).scalar_subquery())
+        )
+    )
+    assert await profiles.refresh_stale(session, limit=5) == 1
+    assert len(stub.calls) == 1
+
+
+async def test_profile_uses_the_profile_model(session, monkeypatch):
+    akmal = await _person(session, "Akmal")
+    await _debt(session, akmal)
+    stub = _StubClient(text="profil")
+    monkeypatch.setattr(profiles, "get_client", lambda: stub)
+    monkeypatch.setattr(settings, "profile_model", "")
+    await profiles.generate_profile(session, akmal)
+    monkeypatch.setattr(settings, "profile_model", "custom-model")
+    await profiles.generate_profile(session, akmal)
+    assert [c["model"] for c in stub.calls] == [settings.extract_model, "custom-model"]

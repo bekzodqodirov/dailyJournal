@@ -563,11 +563,13 @@ FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
 
 ## Cost target
 
-~$25–45/month at the expected volume (~50 calls/day plus Telegram): ~$7
-transcription, ~$10–20 Haiku extraction (Batch API at −50% for the userbot
-stream, prompt caching on the static system prompt), ~$5–15 Sonnet reasoning,
-$0 embeddings. Every API call is logged to `usage_log` so the real figure is
-measured, not assumed.
+Every API call is logged to `usage_log`, so the real figure is measured, not
+assumed: `/xarajat` shows this month's spend per operation. The largest item
+used to be the person profiles; they are now written by `PROFILE_MODEL`
+(blank = `EXTRACT_MODEL`), at most once per `PROFILE_MIN_AGE_HOURS` per
+person and at most `PROFILE_DAILY_CAP` a day, and appear in `/xarajat` as
+«odam haqida profil». Extraction uses prompt caching on the static system
+prompt and the Batch API for the userbot stream; embeddings run locally.
 
 ---
 
