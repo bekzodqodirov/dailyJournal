@@ -39,6 +39,7 @@ COUNT_LABEL = {
     "events": "uchrashuv",
     "tasks": "vazifa",
     "claims": "da'vo",
+    "codes": "mijoz kodi",
 }
 
 
@@ -67,6 +68,7 @@ def counts_of(applied: Applied) -> dict[str, int]:
         "events": len(applied.events),
         "tasks": len(applied.tasks),
         "claims": len(applied.claims),
+        "codes": len(applied.codes_learned),
     }
     return {kind: n for kind, n in counts.items() if n}
 

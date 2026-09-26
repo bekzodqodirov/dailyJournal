@@ -65,6 +65,13 @@ Rules:
 - Only extract what is present. Empty arrays are fine. Do NOT invent.
 - Keep person names as written; do not merge or guess IDs.
 - "facts" = durable info (preferences, relationships, recurring context), not trivia.
+- Clients are identified by a GS code: the letters GS followed by digits (GS367),
+  printed on every carton sticker next to a waybill number like YW26-004715. When
+  the text ties a code to a person ('GS367 — Akmal', 'Akmal (GS367)', 'mening kodim
+  GS367'), add that person to people[] with client_code in the form 'GS367'. When
+  an item concerns a client known only by code, use the code itself as the person
+  name ('GS367'). Never invent or complete a code. A waybill number is a shipment,
+  not a person. Copy GS codes and waybill numbers verbatim into summary and facts.
 """
 
 VISION_TRIAGE_PROMPT = """\

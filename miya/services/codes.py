@@ -9,6 +9,7 @@ exactly, never fuzzily. Pure functions only.
 from __future__ import annotations
 
 import functools
+import logging
 import re
 from datetime import datetime
 
@@ -19,6 +20,8 @@ from sqlalchemy.orm import selectinload
 
 from miya.config import settings
 from miya.db.models import ClientCode, Person
+
+log = logging.getLogger(__name__)
 
 # Each Latin prefix letter also accepts its Cyrillic look-alike: a phone
 # keyboard in the other layout still writes the same code.
@@ -478,8 +481,58 @@ async def pending_suggestion_count(session: AsyncSession) -> int:
     )
 
 
+# (person id, code) pairs already looked at in this process: a busy chat
+# must not re-check the same contact name on every message.
+_harvested: set[tuple[int, str]] = set()
+
+
 async def harvest(
-    session: AsyncSession, person: Person, name: str, *, policy: str
+    session: AsyncSession,
+    person: Person,
+    name: str,
+    *,
+    policy: str,
+    source: str | None = None,
+    interaction_id: int | None = None,
 ) -> None:
-    """Learn codes from a name a known person carries (WP-35 fills this in)."""
-    return None
+    """Learn the codes a known person's name carries (WP-35).
+
+    The owner's own words ('attach': a saved contact, the phone book, the
+    owner's note) give the code outright; anyone else's only suggest it. A
+    code active on someone else is left alone — the name does not decide.
+    """
+    if policy == "ignore" or person.id is None:
+        return
+    for code in find_client_codes(name):
+        key = (person.id, code)
+        if key in _harvested:
+            continue
+        current = await holder(session, code)
+        if current is not None and current.id != person.id:
+            log.warning(
+                "name of person %s carries %s, held by person %s",
+                person.id,
+                code,
+                current.id,
+            )
+            _harvested.add(key)
+        elif current is None:
+            if policy == "attach":
+                await attach(
+                    session,
+                    person,
+                    code,
+                    source=source or "extraction",
+                    by=source or "extraction",
+                    interaction_id=interaction_id,
+                )
+            else:
+                await suggest(
+                    session,
+                    person,
+                    code,
+                    source=source or "extraction",
+                    interaction_id=interaction_id,
+                )
+        else:
+            _harvested.add(key)

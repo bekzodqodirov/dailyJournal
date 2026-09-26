@@ -101,6 +101,8 @@ def to_money(value: float | int | str) -> Decimal | None:
 class ExtractedPerson(BaseModel):
     name: str
     context: str = ""
+    # A GS client code the text ties to this person (WP-35), e.g. "GS367".
+    client_code: str | None = None
 
 
 class ExtractedDebt(BaseModel):

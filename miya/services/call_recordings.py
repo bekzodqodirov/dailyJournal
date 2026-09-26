@@ -425,7 +425,14 @@ async def ingest_recording(
         # strips honorifics, matches fuzzily, learns the spelling as an alias
         # and backfills the number. A name guessed out of a filename gets none
         # of that — "random-audio" must never become a Person.
-        person = await resolve_person(session, parsed.counterparty, phone=parsed.phone)
+        # The phone book is the owner's own words: a code in it is attached.
+        person = await resolve_person(
+            session,
+            parsed.counterparty,
+            phone=parsed.phone,
+            code_policy="attach",
+            source="contact",
+        )
     elif parsed.phone:
         person = await find_by_phone(session, parsed.phone)
 

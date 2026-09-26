@@ -34,7 +34,7 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import claims, memories, records
+from miya.services import claims, codes, memories, records
 from miya.services.extraction import (
     ExtractedDebt,
     ExtractedFulfilment,
@@ -87,6 +87,8 @@ class Applied:
     unknown_codes: list[str] = field(default_factory=list)
     identity_conflicts: list[tuple[str, str, str]] = field(default_factory=list)
     owner_named: list[str] = field(default_factory=list)
+    # WP-35: (code, person name) the owner's own note linked outright.
+    codes_learned: list[tuple[str, str]] = field(default_factory=list)
 
     def refusals(self) -> int:
         """How many rows were refused for who they named (WP-31)."""
@@ -111,6 +113,7 @@ class Applied:
                 self.unknown_codes,
                 self.identity_conflicts,
                 self.owner_named,
+                self.codes_learned,
             )
         )
 
@@ -556,6 +559,57 @@ async def write_fulfilment(
 # --- per-person memory (build step 4) ---------------------------------------
 
 
+async def _link_codes(
+    session: AsyncSession,
+    interaction: Interaction,
+    result: ExtractionResult,
+    applied: Applied,
+) -> None:
+    """people[] items the text tied to a GS code (WP-35).
+
+    The owner's own note gives the code outright; anything else only
+    suggests it. Never creates a person; a code held by someone else is a
+    conflict for review, never a move. Safe to run twice.
+    """
+    own_note = (
+        interaction.source is InteractionSource.assistant_bot
+        and (interaction.meta or {}).get("kind") is None
+    )
+    policy = "attach" if own_note else "suggest"
+    for item in result.people:
+        code = codes.canonical_client_code(item.client_code or "")
+        if code is None or not item.name.strip():
+            continue
+        held_before = await codes.holder(session, code)
+        try:
+            person = await resolve_person(
+                session,
+                f"{item.name} {code}",
+                create=False,
+                code_policy=policy,
+                source="extraction",
+                source_interaction_id=interaction.id,
+                strict=True,
+            )
+        except UnknownCode:
+            continue
+        except IdentityConflict as exc:
+            conflict = (exc.code, exc.holder.display_name, exc.named)
+            if conflict not in applied.identity_conflicts:
+                _flag_identity(
+                    interaction,
+                    {"conflict": exc.code, "holder": exc.holder.id, "named": exc.named},
+                )
+                applied.identity_conflicts.append(conflict)
+            continue
+        except OwnerNamed:
+            continue
+        if person is None or held_before is not None:
+            continue
+        if (await codes.holder(session, code)) is person:
+            applied.codes_learned.append((code, person.display_name))
+
+
 async def _persist_people(
     session: AsyncSession,
     interaction: Interaction,
@@ -667,6 +721,10 @@ async def apply_extraction(
     if result.summary:
         interaction.summary = result.summary
 
+    # Codes first, so a debt naming "GS367" finds the Akmal the same note
+    # tied it to; again after the writers, for the people they created.
+    await _link_codes(session, interaction, result, applied)
+
     for item in result.debts:
         now = datetime.now(tz)
         if not await _gate(
@@ -733,6 +791,7 @@ async def apply_extraction(
         session.add(task)
         applied.tasks.append(task)
 
+    await _link_codes(session, interaction, result, applied)
     # After the money and promise rows, so the people they name exist.
     people_written = await _persist_people(
         session, interaction, result, applied, occurred=occurred

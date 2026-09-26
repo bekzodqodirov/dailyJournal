@@ -281,12 +281,17 @@ async def _counterparty(session, message, monitor: ChatMonitor):
 
     if entity is None or not isinstance(entity, User):
         return None
+    # A contact the owner saved carries the owner's own spelling, codes and
+    # all (WP-35); anyone else's profile name only suggests a code.
+    saved = bool(getattr(entity, "contact", False))
     return await resolve_person(
         session,
         display_name_of(entity),
         telegram_id=entity.id,
         telegram_username=getattr(entity, "username", None),
         phone=getattr(entity, "phone", None),
+        code_policy="attach" if saved else "suggest",
+        source="contact" if saved else "tg_name",
     )
 
 

@@ -396,6 +396,9 @@ def confirmation(applied: Applied) -> str:
             f"(masalan: «{escape(name)} menga {money(amount, currency)} qaytardi»)"
         )
 
+    for code, name in applied.codes_learned:
+        lines.append(f"🏷 {escape(code)} → {escape(name)} biriktirildi.")
+
     for code in applied.unknown_codes:
         lines.append(
             f"⚠️ <b>{escape(code)}</b> kodi hech kimga biriktirilmagan — yozmadim "

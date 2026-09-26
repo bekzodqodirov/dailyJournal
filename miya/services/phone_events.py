@@ -352,7 +352,10 @@ async def _insert_call_event(
         # The phone's address book is trusted, exactly as the recording
         # sidecar's counterparty_name is: resolve fuzzily, learn the
         # spelling, backfill the number.
-        person = await resolve_person(session, contact_name, phone=digits)
+        # The phone book is the owner's own words: a code in it is attached.
+        person = await resolve_person(
+            session, contact_name, phone=digits, code_policy="attach", source="contact"
+        )
     elif number:
         # A bare number never creates a Person; it may match one.
         person = await find_by_phone(session, number)

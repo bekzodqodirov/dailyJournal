@@ -401,7 +401,14 @@ async def resolve_person(
                 existing.telegram_username = telegram_username
             if phone and not existing.phone:
                 existing.phone = phone
-            await codes.harvest(session, existing, name or "", policy=code_policy)
+            await codes.harvest(
+                session,
+                existing,
+                name or "",
+                policy=code_policy,
+                source=source,
+                interaction_id=source_interaction_id,
+            )
             return existing
 
     name = (name or "").strip()
@@ -423,7 +430,6 @@ async def resolve_person(
                 source=source,
                 interaction_id=source_interaction_id,
             )
-            await codes.harvest(session, by_phone, name, policy=code_policy)
             return by_phone
 
     # The bot and the call-recording worker are separate processes; without a
@@ -557,6 +563,17 @@ async def resolve_person(
     )
     session.add(person)
     await session.flush()
+    if telegram_id is not None and code_policy != "attach":
+        # A stranger's own profile name (WP-35): the code is only suggested.
+        await _give_codes(
+            session,
+            person,
+            q_codes,
+            policy=code_policy,
+            source=source,
+            interaction_id=source_interaction_id,
+        )
+        return person
     for code in q_codes:
         # A brand-new person cannot conflict: nobody held these codes.
         await codes.attach(
