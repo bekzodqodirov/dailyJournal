@@ -432,4 +432,6 @@ async def auto_resolve(session: AsyncSession, *, now: datetime) -> dict[str, int
     return {
         "media_expired": await approvals.expire_stale(session, now=now),
         "groups_decided": await chats.apply_default_rules(session, now=now),
+        "claims_linked": await claims.collapse_duplicates(session, now=now),
+        "claims_superseded": len(await claims.resolve_superseded(session, now=now)),
     }

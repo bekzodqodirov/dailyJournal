@@ -1340,9 +1340,11 @@ async def cmd_claims(message: Message) -> None:
     async with session_scope() as session:
         pending = await claims.pending(session)
         shown = pending[: keyboards.MAX_ROWS]
-        body = replies.claims_list(
-            [claims.view(c) for c in shown], hidden=len(pending) - len(shown)
-        )
+        repeats = await claims.duplicate_counts(session, [c.id for c in shown])
+        views = [claims.view(c) for c in shown]
+        for view in views:
+            view.repeats = repeats.get(view.id, 0)
+        body = replies.claims_list(views, hidden=len(pending) - len(shown))
         keyboard = keyboards.claim_actions([c.id for c in shown])
         _ask(shown, keyboard)
     await _safe_answer(message, body, reply_markup=keyboard)

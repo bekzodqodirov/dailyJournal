@@ -873,7 +873,11 @@ async def test_pending_lists_oldest_first_and_only_pending(session):
         session, first, claims.KIND_DEBT, _debt(), now=NOW - timedelta(hours=2)
     )
     newer = await claims.create(
-        session, second, claims.KIND_DEBT, _debt(), now=NOW - timedelta(hours=1)
+        session,
+        second,
+        claims.KIND_DEBT,
+        _debt(amount=6_000_000),
+        now=NOW - timedelta(hours=1),
     )
     answered = await claims.create(
         session, second, claims.KIND_TRANSACTION, _transaction(), now=NOW
@@ -892,10 +896,18 @@ async def test_unasked_waits_for_age_and_skips_what_was_shown(session):
         session, interaction, claims.KIND_DEBT, _debt(), now=NOW - timedelta(minutes=30)
     )
     shown = await claims.create(
-        session, interaction, claims.KIND_DEBT, _debt(), now=NOW - timedelta(minutes=30)
+        session,
+        interaction,
+        claims.KIND_DEBT,
+        _debt(amount=6_000_000),
+        now=NOW - timedelta(minutes=30),
     )
     fresh = await claims.create(
-        session, interaction, claims.KIND_DEBT, _debt(), now=NOW - timedelta(minutes=2)
+        session,
+        interaction,
+        claims.KIND_DEBT,
+        _debt(amount=7_000_000),
+        now=NOW - timedelta(minutes=2),
     )
     claims.mark_asked(shown, now=NOW - timedelta(minutes=20))
     await session.flush()

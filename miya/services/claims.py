@@ -39,10 +39,17 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import Currency, DebtDirection, PromiseMadeBy
-from miya.db.models import Claim, Interaction, Person
+from miya.db.enums import Currency, DebtDirection, PromiseMadeBy, TransactionType
+from miya.db.models import (
+    Claim,
+    Debt,
+    DebtPayment,
+    Interaction,
+    Person,
+    Transaction,
+)
 from miya.services import codes as client_codes
-from miya.services import persistence, records
+from miya.services import people, persistence, records
 from miya.services.extraction import (
     ExtractedDebt,
     ExtractedFulfilment,
@@ -62,6 +69,10 @@ KIND_FULFILMENT = "fulfilment"
 PENDING = "pending"
 ACCEPTED = "accepted"
 DECLINED = "declined"
+AUTO = "auto"
+BY_AUTO_DUPLICATE = "auto:duplicate"
+BY_AUTO_OWN = "auto:own"
+MONEY_KINDS = ("debt", "settlement", "transaction")
 
 # Who answered — the claim's ``answered_by`` and the "by" of the history entry
 # the accepted row gets. The same words as records.BY_BUTTON / BY_COMMAND.
@@ -167,13 +178,265 @@ async def create(
         claim.created_at = now
     session.add(claim)
     await session.flush()
+    primary = await _primary_for(session, claim, now or datetime.now(settings.tz))
+    if primary is not None:
+        # The same thing said again: linked to the first, never asked twice.
+        claim.duplicate_of = primary.id
+        await session.flush()
     return claim
 
 
+# --- claims that answer themselves (WP-43) -------------------------------------
+
+
+def _is_automatic(claim: Claim) -> bool:
+    """Automatic rules leave alone what the owner undid (WP-45) and what the
+    extractor could not attribute (WP-71)."""
+    if (claim.payload or {}).get("origin") == "ambiguous":
+        return False
+    return not any(h.get("field") == "auto_undone" for h in claim.history or [])
+
+
+def _person_key(claim: Claim):
+    return claim.person_id or people.normalise(claim.person_name or "")
+
+
+def signature(claim: Claim) -> tuple | None:
+    """What makes two claims the same claim."""
+    payload = claim.payload or {}
+    if claim.kind in MONEY_KINDS:
+        amount = _money(payload.get("amount"))
+        if amount is None:
+            return None
+        return (
+            claim.kind,
+            _person_key(claim),
+            amount,
+            payload.get("currency"),
+            payload.get("direction") or payload.get("type"),
+        )
+    description = people.normalise(payload.get("description") or "")
+    if not description:
+        return None
+    return (claim.kind, _person_key(claim), description)
+
+
+async def _primary_for(session: AsyncSession, claim: Claim, now: datetime):
+    if not _is_automatic(claim):
+        return None
+    mine = signature(claim)
+    if mine is None:
+        return None
+    since = now - timedelta(days=settings.claim_duplicate_days)
+    candidates = await session.scalars(
+        sa.select(Claim)
+        .where(
+            Claim.state == PENDING,
+            Claim.kind == claim.kind,
+            Claim.duplicate_of.is_(None),
+            Claim.id != claim.id,
+            Claim.created_at >= since,
+        )
+        .order_by(Claim.created_at, Claim.id)
+    )
+    for other in candidates:
+        if _is_automatic(other) and signature(other) == mine:
+            return other
+    return None
+
+
+async def collapse_duplicates(session: AsyncSession, *, now: datetime) -> int:
+    """The same link as ``create`` makes, as a sweep over older claims."""
+    linked = 0
+    rows = list(
+        await session.scalars(
+            _pending_stmt().where(
+                Claim.created_at >= now - timedelta(days=settings.claim_duplicate_days)
+            )
+        )
+    )
+    for claim in rows:
+        if claim.duplicate_of is not None:
+            continue
+        primary = await _primary_for(session, claim, now)
+        if primary is not None and primary.created_at <= claim.created_at:
+            claim.duplicate_of = primary.id
+            linked += 1
+    await session.flush()
+    return linked
+
+
+async def duplicates_of(session: AsyncSession, primary_id: int) -> list[Claim]:
+    return list(
+        await session.scalars(
+            sa.select(Claim)
+            .where(Claim.duplicate_of == primary_id, Claim.state == PENDING)
+            .with_for_update()
+        )
+    )
+
+
+async def duplicate_counts(session: AsyncSession, ids) -> dict[int, int]:
+    ids = list(ids)
+    if not ids:
+        return {}
+    rows = await session.execute(
+        sa.select(Claim.duplicate_of, sa.func.count(Claim.id))
+        .where(Claim.duplicate_of.in_(ids), Claim.state == PENDING)
+        .group_by(Claim.duplicate_of)
+    )
+    return dict(rows.all())
+
+
+async def _settle_duplicates(
+    session: AsyncSession, primary: Claim, *, state: str, now: datetime
+) -> None:
+    for dup in await duplicates_of(session, primary.id):
+        dup.state = state
+        dup.answered_by = BY_AUTO_DUPLICATE
+        dup.answered_at = now
+        if state == AUTO:
+            dup.result_kind = primary.result_kind
+            dup.result_id = primary.result_id
+
+
+def _auto_note(claim: Claim, handle: str, now: datetime) -> None:
+    claim.history = [
+        *(claim.history or []),
+        {
+            "at": now.isoformat(),
+            "field": "auto",
+            "old": None,
+            "new": handle,
+            "by": BY_AUTO_OWN,
+        },
+    ]
+
+
+async def _claimed(session: AsyncSession, kind: str, row_id) -> bool:
+    return bool(
+        await session.scalar(
+            sa.select(
+                sa.exists().where(Claim.result_kind == kind, Claim.result_id == row_id)
+            )
+        )
+    )
+
+
+async def _claim_person_id(session: AsyncSession, claim: Claim) -> int | None:
+    if claim.person_id:
+        return claim.person_id
+    match = await people.find_person(session, claim.person_name or "")
+    if (
+        match.person is None
+        or match.ambiguous
+        or match.score < people.MATCH_THRESHOLD
+        or (
+            match.runner_up is not None
+            and match.runner_up_score >= people.MATCH_THRESHOLD
+        )
+    ):
+        return None
+    return match.person.id
+
+
+async def _owners_row(session: AsyncSession, claim: Claim, person_id: int, since):
+    """(result kind, row id, ref) of the owner's own matching row, if any."""
+    payload = claim.payload or {}
+    amount = _money(payload.get("amount"))
+    currency = payload.get("currency") or "UZS"
+    if amount is None:
+        return None
+    if claim.kind == KIND_DEBT:
+        rows = await session.scalars(
+            sa.select(Debt)
+            .where(
+                Debt.person_id == person_id,
+                Debt.direction == DebtDirection(payload.get("direction")),
+                Debt.currency == Currency(currency),
+                Debt.amount == amount,
+                Debt.created_at >= since,
+            )
+            .order_by(Debt.id)
+        )
+        for debt in rows:
+            if not await _claimed(session, "debt", debt.id):
+                return "debt", debt.id, f"d{debt.id}"
+    elif claim.kind == KIND_SETTLEMENT:
+        query = (
+            sa.select(DebtPayment)
+            .join(Debt, Debt.id == DebtPayment.debt_id)
+            .where(
+                Debt.person_id == person_id,
+                Debt.currency == Currency(currency),
+                DebtPayment.amount == amount,
+                DebtPayment.paid_at >= since,
+            )
+            .order_by(DebtPayment.id)
+        )
+        if payload.get("direction"):
+            query = query.where(Debt.direction == DebtDirection(payload["direction"]))
+        for payment in await session.scalars(query):
+            if not await _claimed(session, "payment", payment.id):
+                return "payment", payment.id, f"d{payment.debt_id}"
+    elif claim.kind == KIND_TRANSACTION and payload.get("type"):
+        rows = await session.scalars(
+            sa.select(Transaction)
+            .where(
+                Transaction.counterparty_person_id == person_id,
+                Transaction.type == TransactionType(payload["type"]),
+                Transaction.currency == Currency(currency),
+                Transaction.amount == amount,
+                Transaction.channel.is_(None),
+                Transaction.voided_at.is_(None),
+                Transaction.created_at >= since,
+            )
+            .order_by(Transaction.id)
+        )
+        for txn in rows:
+            if not await _claimed(session, "transaction", txn.id):
+                return "transaction", txn.id, f"x{txn.id}"
+    return None
+
+
+async def resolve_superseded(session: AsyncSession, *, now: datetime) -> list[Claim]:
+    """Pending money claims the owner has already written himself: closed
+    without a tap, pointing at his row. Nothing new is written."""
+    resolved: list[Claim] = []
+    rows = list(
+        await session.scalars(
+            sa.select(Claim)
+            .where(Claim.state == PENDING, Claim.kind.in_(MONEY_KINDS))
+            .order_by(Claim.id)
+            .with_for_update(skip_locked=True)
+        )
+    )
+    for claim in rows:
+        if not _is_automatic(claim):
+            continue
+        person_id = await _claim_person_id(session, claim)
+        if person_id is None:
+            continue
+        since = claim.created_at - timedelta(days=settings.claim_duplicate_days)
+        found = await _owners_row(session, claim, person_id, since)
+        if found is None:
+            continue
+        kind, row_id, handle = found
+        claim.state = AUTO
+        claim.answered_by = BY_AUTO_OWN
+        claim.answered_at = now
+        claim.result_kind, claim.result_id = kind, row_id
+        _auto_note(claim, handle, now)
+        resolved.append(claim)
+    await session.flush()
+    return resolved
+
+
 def _pending_stmt() -> sa.Select:
+    # A duplicate is answered through its primary, never asked on its own.
     return (
         sa.select(Claim)
-        .where(Claim.state == PENDING)
+        .where(Claim.state == PENDING, Claim.duplicate_of.is_(None))
         .order_by(Claim.created_at, Claim.id)
     )
 
@@ -182,7 +445,9 @@ async def pending_count(session: AsyncSession) -> int:
     """How many claims wait for an answer — uncapped, for the report."""
     return int(
         await session.scalar(
-            sa.select(sa.func.count()).select_from(Claim).where(Claim.state == PENDING)
+            sa.select(sa.func.count())
+            .select_from(Claim)
+            .where(Claim.state == PENDING, Claim.duplicate_of.is_(None))
         )
         or 0
     )
@@ -307,6 +572,8 @@ class ClaimView:
     state: str
     # income / expense for a transaction, so the question can say kirim / chiqim.
     txn_type: str | None = None
+    # How many later claims repeat this one (WP-43).
+    repeats: int = 0
 
 
 def _money(value: object) -> Decimal | None:
@@ -428,6 +695,9 @@ async def accept(
     claim = await _locked_pending(session, claim_id)
     if claim is None:
         return None
+    if claim.duplicate_of is not None:
+        # "Ha" on a repeat is "Ha" on the first time it was said.
+        return await accept(session, claim.duplicate_of, by=by, now=now)
     interaction = await session.get(Interaction, claim.interaction_id)
     if interaction is None:  # the FK cascades, so this is a race at most
         return None
@@ -473,6 +743,8 @@ async def accept(
         claim.state = PENDING
         claim.answered_at = None
         claim.answered_by = None
+    else:
+        await _settle_duplicates(session, claim, state=AUTO, now=now)
     await session.flush()
     return Accepted(claim, applied, written=written)
 
@@ -489,9 +761,12 @@ async def decline(
     claim = await _locked_pending(session, claim_id)
     if claim is None:
         return None
+    if claim.duplicate_of is not None:
+        return await decline(session, claim.duplicate_of, by=by, now=now)
     claim.state = DECLINED
     claim.answered_at = now
     claim.answered_by = by
+    await _settle_duplicates(session, claim, state=DECLINED, now=now)
     await session.flush()
     return claim
 

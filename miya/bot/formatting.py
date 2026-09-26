@@ -496,7 +496,9 @@ def claim_line(view: ClaimView, *, markup: bool = True) -> str:
     handle = f"<code>{handle}</code>" if markup else handle
     who = _name(view.person_name or "Kimdir", markup)
     question = "va'dasi bajarilganmi?" if view.kind == "fulfilment" else "to'g'rimi?"
-    return f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}"
+    repeats = getattr(view, "repeats", 0)
+    suffix = f" (+{repeats} takror)" if repeats else ""
+    return f"❓ {handle} {who} aytdi: {_claim_body(view, markup)} — {question}{suffix}"
 
 
 # --- one person's history: one line per contact ----------------------------

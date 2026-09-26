@@ -9,6 +9,7 @@ per sweep, never inside quiet hours, never twice. The brief lists them too.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta
 
 import sqlalchemy as sa
@@ -45,11 +46,16 @@ def _buttons(markup) -> list[str]:
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
+_AMOUNTS = itertools.count(5_000_000, 1_000)
+
+
 def _them_debt(person: str = "Akmal") -> ex.ExtractedDebt:
+    # A distinct amount each time: identical claims are linked as repeats
+    # (WP-43) and these tests are about claims that are not.
     return ex.ExtractedDebt(
         direction="i_owe_them",
         person=person,
-        amount=5_000_000,
+        amount=next(_AMOUNTS),
         reason="yuk haqi",
         asserted_by="them",
     )

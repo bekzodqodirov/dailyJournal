@@ -873,6 +873,11 @@ async def apply_extraction(
         applied.tasks.append(task)
 
     await _link_codes(session, interaction, result, applied)
+    if applied.debts or applied.settlements or applied.transactions:
+        # The owner just wrote what a counterparty's pending claim says
+        # (WP-43): that claim answers itself.
+        await session.flush()
+        await claims.resolve_superseded(session, now=datetime.now(tz))
     # After the money and promise rows, so the people they name exist.
     people_written = await _persist_people(
         session, interaction, result, applied, occurred=occurred
