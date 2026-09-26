@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -28,6 +28,7 @@ from miya.db.models import (
     ChatMonitor,
     Claim,
     ConversationWindow,
+    DailyReport,
     Debt,
     DebtPayment,
     Event,
@@ -36,6 +37,7 @@ from miya.db.models import (
     Passage,
     Person,
     Promise,
+    RecapDigest,
     Task,
     Transaction,
 )
@@ -89,6 +91,9 @@ class PurgePlan:
     names: list[str] = field(default_factory=list)
     # What stays, said out loud in the preview.
     kept: dict[str, int] = field(default_factory=dict)
+    # WP-72: stored recaps of the affected days, and AI digests about them.
+    report_days: list[date] = field(default_factory=list)
+    digest_ids: list[int] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         if self.kind == "person":
@@ -97,6 +102,8 @@ class PurgePlan:
             not self.interaction_ids
             and not self.counts.get("debts")
             and not self.memory_ids
+            and not self.digest_ids
+            and not self.counts.get("reports")
         )
 
 
@@ -159,7 +166,65 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
             .distinct()
         )
         plan.window_ids = [w for w in window_ids if w]
+    await _collect_recaps(session, plan)
     return plan
+
+
+async def _collect_recaps(session: AsyncSession, plan: PurgePlan) -> None:
+    """Stored recap text quotes names and words; the days and the digests
+    that could hold any of the purged rows go too (WP-72)."""
+    ids = plan.interaction_ids
+    days: set[date] = set()
+    if ids:
+        local_day = sa.cast(
+            sa.func.timezone(settings.timezone, Interaction.occurred_at), sa.Date
+        )
+        days |= set(
+            await session.scalars(
+                sa.select(local_day).where(Interaction.id.in_(ids)).distinct()
+            )
+        )
+    if plan.kind == "range" and plan.date_from and plan.date_to:
+        day = plan.date_from
+        while day <= plan.date_to:
+            days.add(day)
+            day += timedelta(days=1)
+    plan.report_days = sorted(days)
+
+    who = []
+    if plan.kind == "person" and plan.person_id is not None:
+        who.append(RecapDigest.person_id == plan.person_id)
+    if ids:
+        who.append(RecapDigest.source_interaction_ids.overlap(ids))
+    if plan.kind == "chat" and plan.tg_chat_id is not None:
+        who.append(RecapDigest.tg_chat_id == plan.tg_chat_id)
+    if plan.kind == "range" and plan.date_from and plan.date_to:
+        who.append(RecapDigest.digest_date.between(plan.date_from, plan.date_to))
+    plan.digest_ids = (
+        sorted(await session.scalars(sa.select(RecapDigest.id).where(sa.or_(*who))))
+        if who
+        else []
+    )
+    plan.counts["reports"] = (
+        await session.scalar(
+            sa.select(sa.func.count())
+            .select_from(DailyReport)
+            .where(_report_rows(plan.report_days))
+        )
+        if plan.report_days
+        else 0
+    ) or 0
+    plan.counts["digests"] = len(plan.digest_ids)
+
+
+def _report_rows(days: list[date]):
+    """The recaps of those days — and the next mornings, which quote the
+    late evening window."""
+    mornings = [d + timedelta(days=1) for d in days]
+    return sa.or_(
+        DailyReport.report_date.in_(days),
+        sa.and_(DailyReport.kind == "morning", DailyReport.report_date.in_(mornings)),
+    )
 
 
 def person_names(person: Person) -> list[str]:
@@ -422,6 +487,14 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         claims=len(plan.claim_ids),
     )
 
+    if plan.digest_ids:
+        await session.execute(
+            sa.delete(RecapDigest).where(RecapDigest.id.in_(plan.digest_ids))
+        )
+    if plan.report_days:
+        await session.execute(
+            sa.delete(DailyReport).where(_report_rows(plan.report_days))
+        )
     if plan.claim_ids:
         await session.execute(sa.delete(Claim).where(Claim.id.in_(plan.claim_ids)))
     if plan.memory_ids:

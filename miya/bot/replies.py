@@ -1511,7 +1511,14 @@ _COUNT_LABEL = {
     "claims": "da'vo",
     "group_lines": "guruhlardagi xabari",
     "person_card": "odam kartasi (ism, telefon, taxalluslar)",
+    "reports": "kunlik xulosa",
+    "digests": "AI xulosa",
 }
+PURGE_REPORTS_NOTE = (
+    "<i>O'sha kunlarning saqlangan kunlik xulosalari butunlay o'chadi (boshqa "
+    "odamlar haqidagi qatorlari bilan birga); pul va qarz yozuvlari o'z joyida "
+    "qoladi.</i>"
+)
 _KEPT_LABEL = {
     "transactions_kept": "pul harakati: {n} ta — summa qoladi, ism olib tashlanadi",
     "mentions_kept": "boshqa yozuvlarda tilga olingan: {n} ta",
@@ -1546,6 +1553,7 @@ def purge_preview(plan) -> str:
         f"{_PURGE_KIND.get(plan.kind, plan.kind)}: <b>{escape(plan.label)}</b>\n\n"
         + bullet_list(lines, empty="—")
         + kept_block
+        + (f"\n\n{PURGE_REPORTS_NOTE}" if plan.counts.get("reports") else "")
         + "\n\n<i>Bu amalni ortga qaytarib bo'lmaydi.</i>"
     )
 
