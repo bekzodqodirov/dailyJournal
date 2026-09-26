@@ -149,6 +149,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
 | `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
 | `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
+| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.

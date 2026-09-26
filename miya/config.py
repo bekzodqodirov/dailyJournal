@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import (
@@ -189,6 +189,14 @@ class Settings(BaseSettings):
     # The same text through the same channel within this many seconds is a
     # re-posted notification, not a second payment.
     payment_repeat_seconds: int = Field(default=120, ge=0, le=3600)
+    # A Telegram receipt per booked payment (WP-15): "each" or "off".
+    money_receipts: Literal["each", "off"] = "each"
+    # This many fresh receipts or more at once are folded into one message.
+    money_receipts_fold_at: int = Field(default=4, ge=2)
+    # Older events (a first import, a backlog) are only summarised.
+    money_receipt_max_age_hours: int = Field(default=12, ge=1)
+    # true: receipts arrive silently in quiet hours; false: they wait.
+    money_receipts_silent_at_night: bool = False
 
     # --- Backups (spec §10) -------------------------------------------------
     backup_dir: str = "/data/backups"

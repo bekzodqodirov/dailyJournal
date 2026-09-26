@@ -1000,6 +1000,75 @@ PUL_USAGE = (
     "Qaysi kun? <code>/pul</code> — bugun · <code>/pul kecha</code> · "
     "<code>/pul 2026-09-20</code>"
 )
+# --- money receipts (WP-15) ---------------------------------------------------
+
+MONEY_FOLDED_HEADER = "💳 <b>{n} ta yangi to'lov</b>"
+MONEY_FOLDED_MAX_LINES = 15
+MONEY_FOLDED_TAIL = "… yana {n} ta — /pul"
+MONEY_IMPORT_SUMMARY = (
+    "📥 Telefondan eski xabarlar yuklandi: {booked} ta to'lov yozildi, "
+    "{review} tasi /tekshir'da, {ignored} tasi e'tiborsiz qoldirildi "
+    "(kod, reklama). Ro'yxat: /pul"
+)
+
+
+def _receipt_parts(txn, interaction) -> tuple[str, str | None, str | None]:
+    """(what, app label, sms?) — the merchant as read, else the description."""
+    media = interaction.media or {}
+    merchant = (media.get("money") or {}).get("merchant") or txn.description
+    if interaction.source.value == "phone_notification":
+        return merchant, media.get("app_label") or "ilova", None
+    return merchant, None, "sms"
+
+
+def money_receipt(txn, interaction, person=None) -> str:
+    """'📉 Chiqim: <b>250 ming so'm</b> · KORZINKA.UZ · karta *1234 · 14:30 · ✉️ x12'"""
+    income = txn.type.value == "income"
+    what, app, sms = _receipt_parts(txn, interaction)
+    parts = [
+        f"{'📈' if income else '📉'} {'Kirim' if income else 'Chiqim'}: "
+        f"<b>{money(txn.amount, txn.currency)}</b>"
+    ]
+    if what:
+        parts.append(escape(what))
+    if txn.card_last4:
+        parts.append(f"karta *{txn.card_last4}")
+    if person is not None:
+        parts.append(f"👤 {escape(person.display_name)}")
+    if app:
+        parts.append(f"🔔 {escape(app)}")
+    parts.append(clock(txn.occurred_at))
+    if sms:
+        parts.append("✉️")
+    return " · ".join(parts) + f" <code>x{txn.id}</code>"
+
+
+def money_receipts_folded(items) -> str:
+    """Several receipts at once: one line each, at most MONEY_FOLDED_MAX_LINES."""
+    lines = []
+    for interaction, txn in items[:MONEY_FOLDED_MAX_LINES]:
+        what, _, _ = _receipt_parts(txn, interaction)
+        icon = "📈" if txn.type.value == "income" else "📉"
+        lines.append(
+            f"• {icon} x{txn.id} {clock(txn.occurred_at)} · "
+            f"{money(txn.amount, txn.currency)}" + (f" · {escape(what)}" if what else "")
+        )
+    hidden = len(items) - MONEY_FOLDED_MAX_LINES
+    if hidden > 0:
+        lines.append(MONEY_FOLDED_TAIL.format(n=hidden))
+    return clip(
+        MONEY_FOLDED_HEADER.format(n=len(items))
+        + "\n"
+        + "\n".join(lines)
+        + "\n"
+        + TXN_LIST_FOOTER
+    )
+
+
+def money_import_summary(booked: int, review: int, ignored: int) -> str:
+    return MONEY_IMPORT_SUMMARY.format(booked=booked, review=review, ignored=ignored)
+
+
 TXN_LIST_EMPTY = "Bu kunda pul harakati yo'q."
 TXN_LIST_FOOTER = (
     "Tuzatish: <code>/tuzat x12 …</code> · O'chirish: <code>/ochir x12</code>"

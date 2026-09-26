@@ -30,6 +30,9 @@ Jobs:
   * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
                    claim no receipt has shown after CLAIM_ASK_AFTER, a few
                    per sweep (quiet-hours aware; build step 3)
+  * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
+                   payment the phone booked, folded for bursts, one summary
+                   for a first import (quiet-hours aware; WP-15)
   * profile_refresh — every 30 min; rewrites the written profile of up to
                    PROFILE_REFRESH_PER_RUN people whose activity is newer
                    than their profile (sends nothing; build step 4)
@@ -78,6 +81,7 @@ from miya.services import (
     gcal,
     health,
     memories,
+    money_notices,
     nudges,
     profiles,
     reminders,
@@ -89,7 +93,7 @@ from miya.services.embeddings import EmbeddingError, get_embedder
 log = logging.getLogger(__name__)
 
 
-async def notify(bot: Bot, text: str, *, reply_markup=None) -> bool:
+async def notify(bot: Bot, text: str, *, reply_markup=None, silent: bool = False) -> bool:
     """Send to the owner; retry as plain text if Telegram rejects the HTML.
 
     Report and reminder bodies carry names and descriptions that a
@@ -99,7 +103,10 @@ async def notify(bot: Bot, text: str, *, reply_markup=None) -> bool:
     """
     try:
         await bot.send_message(
-            settings.owner_telegram_id, clip(text), reply_markup=reply_markup
+            settings.owner_telegram_id,
+            clip(text),
+            reply_markup=reply_markup,
+            disable_notification=silent,
         )
         return True
     except Exception:
@@ -110,6 +117,7 @@ async def notify(bot: Bot, text: str, *, reply_markup=None) -> bool:
             clip(text),
             parse_mode=None,
             reply_markup=reply_markup,
+            disable_notification=silent,
         )
         return True
     except Exception:
@@ -644,6 +652,60 @@ async def chat_notice_job(bot: Bot) -> None:
     )
 
 
+async def money_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """A receipt for each payment the phone booked, within the minute (WP-15).
+
+    Fewer than MONEY_RECEIPTS_FOLD_AT go out one by one with ✏️ Tuzat and
+    🗑 O'chir; a burst is folded into one message; everything older than
+    MONEY_RECEIPT_MAX_AGE_HOURS becomes one import summary. In quiet hours
+    the receipts wait, or arrive silently when the owner chose that. A row
+    is stamped only after its message went out, one commit per message.
+    """
+    now = now or datetime.now(settings.tz)
+    silent = False
+    if reminders.in_quiet_hours(now):
+        if not settings.money_receipts_silent_at_night:
+            return
+        silent = True
+    async with _notice_lock, session_scope() as session:
+        queue = await money_notices.pending(session)
+        await session.commit()  # stale notices stamped by pending()
+
+        fresh = queue.fresh
+        if fresh and len(fresh) < settings.money_receipts_fold_at:
+            for interaction, txn in fresh:
+                text = replies.money_receipt(txn, interaction, txn.counterparty)
+                keyboard = keyboards.record_actions([("transaction", txn.id)])
+                if not await notify(bot, text, reply_markup=keyboard, silent=silent):
+                    return
+                money_notices.mark_notified(interaction, now=now)
+                await session.commit()
+        elif fresh:
+            text = replies.money_receipts_folded(fresh)
+            keyboard = keyboards.record_actions(
+                [("transaction", txn.id) for _, txn in fresh[:8]]
+            )
+            if not await notify(bot, text, reply_markup=keyboard, silent=silent):
+                return
+            for interaction, _ in fresh:
+                money_notices.mark_notified(interaction, now=now)
+            await session.commit()
+
+        if queue.backfill:
+            counts = {"book": 0, "review": 0, "ignore": 0}
+            for _, verdict, _ in queue.backfill:
+                if verdict in counts:
+                    counts[verdict] += 1
+            text = replies.money_import_summary(
+                counts["book"], counts["review"], counts["ignore"]
+            )
+            if not await notify(bot, text, silent=silent):
+                return
+            for interaction, _, _ in queue.backfill:
+                money_notices.mark_notified(interaction, now=now)
+            await session.commit()
+
+
 async def backup_job(bot: Bot) -> None:
     """Nightly encrypted pg_dump (spec §10), then a copy to Telegram.
 
@@ -1124,6 +1186,14 @@ async def run() -> None:
         IntervalTrigger(minutes=2),
         args=[bot],
         id="claim_ask",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        money_notice_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="money_notices",
         max_instances=1,
         coalesce=True,
     )
