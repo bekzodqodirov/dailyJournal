@@ -150,6 +150,12 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
 | `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
+| `QUESTION_BUDGET_PER_DAY`, `QUESTION_BRIEF_SLOTS`, `QUESTION_EVENING_SLOTS` | 10 / 5 / 3 — how many taps a day MIYA may ask for, and how many ride the brief and the evening report (`0` = never push) |
+| `QUESTION_BATCH_MAX`, `QUESTION_PUSH_GAP_MINUTES`, `QUESTION_URGENT_MIN_UZS` | 5 / 120 / 5 mln — questions per pushed message, the gap between pushes, the stake that moves a question up |
+| `QUESTION_GROUP_DIGEST_SIZE`, `QUESTION_GROUP_MAX_SHOWS`, `QUESTION_GROUP_MIN_MESSAGES`, `QUESTION_ASK_CHANNELS` | 3 / 2 / 1 / `false` — the new-groups digest |
+| `CLAIM_ASK_AFTER_MINUTES`, `CLAIM_DUPLICATE_DAYS`, `CLAIM_BANK_MATCH_HOURS` | 10 / 14 / 48 — when an unshown claim is queued, when a repeat folds into the first, how far a bank payment can settle a claim |
+| `CLAIM_BANK_AUTOCLOSE_TRANSACTIONS`, `CLAIM_BANK_AUTOACCEPT_SETTLEMENTS` | `true` / `false` — what bank evidence may settle without asking |
+| `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.

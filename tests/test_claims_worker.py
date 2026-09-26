@@ -3,7 +3,7 @@
 A claim is a row nobody wrote yet, so the only thing that makes it real is
 the question. The receipt for a window carries it with ✅ / ✖️ / ✏️ buttons;
 what no receipt shows — the batch overflow, a bot or call interaction, a
-clipped keyboard — the worker asks on its own after CLAIM_ASK_AFTER, a few
+clipped keyboard — the worker asks on its own after CLAIM_ASK_AFTER_MINUTES, a few
 per sweep, never inside quiet hours, never twice. The brief lists them too.
 """
 
@@ -25,6 +25,7 @@ from tests.test_batch import _window
 from tests.test_chat_notices import _Bot, _monitored, _parked, _result
 
 TZ = settings.tz
+ASK_AFTER = timedelta(minutes=settings.claim_ask_after_minutes)
 
 
 class _KeyboardBot(_Bot):
@@ -68,8 +69,8 @@ async def _interaction(session) -> m.Interaction:
 
 
 async def _old_claims(session, count: int, *, age: timedelta | None = None) -> list[int]:
-    """Pending claims created ``age`` ago (older than CLAIM_ASK_AFTER by default)."""
-    age = worker.CLAIM_ASK_AFTER + timedelta(minutes=1) if age is None else age
+    """Pending claims created ``age`` ago (by default just past the ask delay)."""
+    age = ASK_AFTER + timedelta(minutes=1) if age is None else age
     interaction = await _interaction(session)
     created = datetime.now(TZ) - age
     ids = []
@@ -170,7 +171,7 @@ async def test_only_the_claims_whose_buttons_fit_count_as_asked(session, monkeyp
                 interaction,
                 claims.KIND_DEBT,
                 _them_debt(),
-                now=now - worker.CLAIM_ASK_AFTER - timedelta(seconds=total - i),
+                now=now - ASK_AFTER - timedelta(seconds=total - i),
             )
         ).id
         for i in range(total)
@@ -194,8 +195,8 @@ async def test_only_the_claims_whose_buttons_fit_count_as_asked(session, monkeyp
 # --- the sweep asks the rest -------------------------------------------------
 
 
-def test_the_sweep_is_tuned_for_twenty_odd_confirmations_a_day():
-    assert timedelta(minutes=10) == worker.CLAIM_ASK_AFTER
+def test_the_sweep_waits_claim_ask_after_minutes():
+    assert settings.claim_ask_after_minutes == 10
     assert worker.CLAIM_MAX_PER_SWEEP == 5
     source = inspect.getsource(worker.run)
     assert 'id="claim_ask"' in source

@@ -28,7 +28,7 @@ Jobs:
   * new_chat_ask — every 2 min; "Yangi guruh: … — o'qiymi?" once per new
                    group or channel (quiet-hours aware)
   * claim_ask    — every 2 min; one "— to'g'rimi?" question per counterparty
-                   claim no receipt has shown after CLAIM_ASK_AFTER, a few
+                   claim no receipt has shown after CLAIM_ASK_AFTER_MINUTES, a few
                    per sweep (quiet-hours aware; build step 3)
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
@@ -453,7 +453,6 @@ async def new_chat_ask_job(bot: Bot) -> None:
 # rest. Ten minutes leaves the receipt path time to run first (the window job
 # ticks every five), and five per sweep keeps a backlog from becoming a wall
 # of questions — the owner tolerates twenty-odd confirmations a day.
-CLAIM_ASK_AFTER = timedelta(minutes=10)
 CLAIM_MAX_PER_SWEEP = 5
 
 
@@ -463,7 +462,7 @@ async def claim_ask_job(bot: Bot) -> None:
     The receipt normally carries the question; a claim from the batch path
     with its receipt folded into the overflow summary, from a bot or a call
     interaction, or one whose receipt keyboard was clipped, has nobody to
-    ask it. Once such a claim is CLAIM_ASK_AFTER old it is asked here, one
+    ask it. Once such a claim is CLAIM_ASK_AFTER_MINUTES old it is asked here, one
     message each with its own ✅ / ✖️ / ✏️ row, at most CLAIM_MAX_PER_SWEEP
     per sweep. Quiet-hours aware like every other ping: the claim keeps.
 
@@ -480,7 +479,9 @@ async def claim_ask_job(bot: Bot) -> None:
     asked = 0
     async with session_scope() as session:
         waiting = await claims.unasked(
-            session, older_than=CLAIM_ASK_AFTER, limit=CLAIM_MAX_PER_SWEEP
+            session,
+            older_than=timedelta(minutes=settings.claim_ask_after_minutes),
+            limit=CLAIM_MAX_PER_SWEEP,
         )
         for claim in waiting:
             body = replies.claim_question(claims.view(claim))

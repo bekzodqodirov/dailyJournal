@@ -198,6 +198,29 @@ class Settings(BaseSettings):
     # true: receipts arrive silently in quiet hours; false: they wait.
     money_receipts_silent_at_night: bool = False
 
+    # --- The question budget (WP-16; owner answer 3: 5-10 taps a day) --------
+    # 0 = never push; questions wait for the brief line and /savollar.
+    question_budget_per_day: int = Field(default=10, ge=0)
+    question_brief_slots: int = Field(default=5, ge=0)
+    question_evening_slots: int = Field(default=3, ge=0)
+    question_batch_max: int = Field(default=5, ge=1, le=10)
+    question_push_gap_minutes: int = Field(default=120, ge=5)
+    # An ordering weight only (loops.rank_stake), never shown.
+    question_urgent_min_uzs: int = Field(default=5_000_000, ge=0)
+    # Each listed group is one tap-request and costs one budget slot.
+    question_group_digest_size: int = Field(default=3, ge=1, le=10)
+    question_group_max_shows: int = Field(default=2, ge=1)
+    question_group_min_messages: int = Field(default=1, ge=0)
+    question_ask_channels: bool = False
+    claim_ask_after_minutes: int = Field(default=10, ge=0)
+    claim_duplicate_days: int = Field(default=14, ge=0)
+    claim_bank_match_hours: int = Field(default=48, ge=0)
+    claim_bank_autoclose_transactions: bool = True
+    claim_bank_autoaccept_settlements: bool = False
+    media_ask_in_groups: bool = False
+    media_ask_outgoing: bool = False
+    media_unasked_expiry_days: int = Field(default=7, ge=1)
+
     # --- Backups (spec §10) -------------------------------------------------
     backup_dir: str = "/data/backups"
     backup_retention_days: int = 14

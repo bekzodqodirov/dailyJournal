@@ -104,6 +104,20 @@ class ChatMonitor(Base):
     backfill_attempts: Mapped[int] = mapped_column(
         sa.Integer, nullable=False, server_default="0"
     )
+    # The question budget (WP-16, 0014): who decided whether the group is
+    # read — 'owner' | 'rule:channel' | 'rule:ignored' | 'rule:legacy' —
+    # and the activity that ranks an undecided group in the digest.
+    decided_by: Mapped[str | None] = mapped_column(sa.String(16))
+    offered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    digest_shows: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    seen_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0"
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    owner_active_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    addressed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
@@ -516,13 +530,13 @@ class Claim(Base):
     # debt | settlement | transaction | promise | fulfilment
     kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
-    # pending | accepted | declined
+    # pending | accepted | declined | auto
     state: Mapped[str] = mapped_column(
         sa.String(16), nullable=False, server_default="pending"
     )
     asked_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
-    # button | command
+    # button | command | auto:bank | auto:own | auto:duplicate
     answered_by: Mapped[str | None] = mapped_column(sa.String(16))
     # What accepting wrote: debt | payment | transaction | promise | fulfilment
     # (the promise a fulfilment closed). Null when accepting only produced a
@@ -534,10 +548,63 @@ class Claim(Base):
         JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
     )
     created_at: Mapped[datetime] = created_at_column()
+    # The question budget (WP-16, 0014): the claim this one repeats, and the
+    # bank transaction that settles it without asking.
+    duplicate_of: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("claims.id", ondelete="SET NULL")
+    )
+    evidence_txn_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("transactions.id", ondelete="SET NULL")
+    )
 
     __table_args__ = (
         sa.Index("ix_claims_interaction", "interaction_id"),
         sa.Index("ix_claims_state_created", "state", "created_at"),
+        sa.Index(
+            "ix_claims_duplicate_of",
+            "duplicate_of",
+            postgresql_where=sa.text("duplicate_of IS NOT NULL"),
+        ),
+        sa.Index(
+            "ux_claims_evidence_txn",
+            "evidence_txn_id",
+            unique=True,
+            postgresql_where=sa.text("evidence_txn_id IS NOT NULL"),
+        ),
+    )
+
+
+class QuestionLog(Base):
+    """One tap-request slot spent (WP-16): what was put in front of the owner,
+    how, and when. Answers to the owner's own commands are never logged."""
+
+    __tablename__ = "question_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # claim | missed | still_open | nudge | groups | media | money
+    kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    # 'c12' | 'm881' | 'debt:3:they_owe_me:UZS' | 'promise:7' | 'task:3' |
+    # 'q990' | 'g41' | 'i55' | 's990'
+    ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # push | brief | evening | receipt
+    via: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    # Always written by the app (record_shown(now=...)); the default is a
+    # fallback only.
+    sent_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "kind IN ('claim','missed','still_open','nudge','groups','media','money')",
+            name="ck_question_log_kind",
+        ),
+        sa.CheckConstraint(
+            "via IN ('push','brief','evening','receipt')", name="ck_question_log_via"
+        ),
+        sa.Index("ix_question_log_sent_at", "sent_at"),
+        sa.Index("ix_question_log_kind_ref", "kind", "ref", "sent_at"),
     )
 
 
@@ -668,6 +735,7 @@ __all__ = [
     "Memory",
     "Person",
     "Promise",
+    "QuestionLog",
     "ReminderLog",
     "Task",
     "Transaction",

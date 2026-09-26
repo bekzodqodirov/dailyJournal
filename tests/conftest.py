@@ -68,6 +68,7 @@ async def _truncate(session) -> None:
     await session.execute(sa.delete(m.Heartbeat))
     for model in (
         # Claims reference interactions and people, so they go before both.
+        m.QuestionLog,
         m.Claim,
         m.ReminderLog,
         m.UsageLog,

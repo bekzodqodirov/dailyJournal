@@ -945,7 +945,8 @@ def test_the_claims_table_is_wiped_before_what_it_references():
         for line in py_inspect.getsource(conftest._truncate).splitlines()
         if line.strip().startswith("m.")
     ]
-    assert order[0] == "m.Claim,"
+    # The question log references nothing, so it may go first (WP-16).
+    assert order[:2] == ["m.QuestionLog,", "m.Claim,"]
     assert order.index("m.Claim,") < order.index("m.Interaction,")
     assert order.index("m.Claim,") < order.index("m.Person,")
 
@@ -977,7 +978,12 @@ def test_the_claim_model_matches_the_contract():
         "created_at",
     }
     fks = {fk.column.table.name: fk.ondelete for fk in table.foreign_keys}
-    assert fks == {"interactions": "CASCADE", "people": "SET NULL"}
+    assert fks == {
+        "interactions": "CASCADE",
+        "people": "SET NULL",
+        "claims": "SET NULL",  # duplicate_of (WP-16)
+        "transactions": "SET NULL",  # evidence_txn_id (WP-16)
+    }
     assert {i.name for i in table.indexes} >= {
         "ix_claims_state_created",
         "ix_claims_interaction",
