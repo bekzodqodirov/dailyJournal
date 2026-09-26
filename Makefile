@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
-.PHONY: help reprice env up down restart logs ps health migrate revision downgrade psql \
+.PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
         backfill backup backup-key backup-key-show restore doctor
 
@@ -72,6 +72,9 @@ backfill: ## Backfill one chat's history: make backfill CHAT=@akmal DAYS=7
 
 reprice: ## Recompute Anthropic costs from stored tokens: make reprice SINCE=2026-09-01 [DRY=1]
 	$(COMPOSE) run --rm worker python -m miya.tools.reprice_usage "$(SINCE)" $(if $(DRY),--dry,)
+
+import-clients: ## Import the client-code list: make import-clients FILE=/data/clients.xlsx [APPLY=1]
+	$(COMPOSE) run --rm worker python -m miya.tools.import_clients "$(FILE)" $(if $(APPLY),--apply,)
 
 backup-key: ## Create the backup key and print the .env line
 	@test ! -e secrets/backup-key.txt || { echo "secrets/backup-key.txt allaqachon bor — yangisi yaratilmaydi (eski zaxiralar faqat eski kalit bilan ochiladi)."; exit 1; }

@@ -810,3 +810,16 @@ def code_suggestions(rows) -> InlineKeyboardMarkup | None:
             for row in rows
         ]
     )
+
+
+def client_import(interaction_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Ha, yoz", callback_data=f"kod:imp:{interaction_id}"
+                ),
+                InlineKeyboardButton(text="Bekor", callback_data="kod:impno"),
+            ]
+        ]
+    )

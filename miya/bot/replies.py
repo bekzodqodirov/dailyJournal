@@ -2209,3 +2209,42 @@ def code_suggestion_rejected(code: str, name: str) -> str:
         f"✖️ Rad etildi: <b>{escape(code)}</b> → <b>{escape(name)}</b>. "
         f"Qayta so'ramayman."
     )
+
+
+# --- client-list import (WP-34) -------------------------------------------------
+
+IMPORT_BAD_FILE = (
+    "⚠️ Faylni o'qib bo'lmadi. Kerakli ustunlar: <code>kod</code>, <code>ism</code> "
+    "(ixtiyoriy: <code>telefon</code>, <code>telegram</code>, <code>izoh</code>). "
+    "CSV yoki Excel (.xlsx)."
+)
+IMPORT_CANCELLED = "Bekor qilindi — hech narsa yozilmadi."
+IMPORT_CONFLICTS_MAX = 10
+
+
+def import_preview(filename: str, counts: dict[str, int]) -> str:
+    return (
+        f"📋 <b>Mijozlar ro'yxati</b> ({escape(filename)})\n"
+        f"• Kod biriktiriladi: {counts['attach']}\n"
+        f"• Yangi odam qo'shiladi: {counts['create']}\n"
+        f"• Allaqachon to'g'ri: {counts['same']}\n"
+        f"• To'qnashuv (kod boshqa odamda): {counts['conflict']}\n"
+        f"• O'qib bo'lmadi: {counts['bad']}\n\n"
+        f"Yozaymi?"
+    )
+
+
+def import_done(written: dict[str, int], conflicts) -> str:
+    """``conflicts``: (code, the name in the file, who holds it)."""
+    lines = [
+        f"✅ Yozildi: {written['attach']} ta kod, {written['create']} ta yangi odam."
+    ]
+    conflicts = list(conflicts)
+    if conflicts:
+        lines[0] += " To'qnashuvlar o'zgartirilmadi:"
+        lines += [
+            f"• <b>{escape(code)}</b>: faylda «{escape(name)}», "
+            f"bazada <b>{escape(holder)}</b>"
+            for code, name, holder in conflicts[:IMPORT_CONFLICTS_MAX]
+        ]
+    return "\n".join(lines)

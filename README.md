@@ -102,6 +102,7 @@ every service refuses a blank or short API token.
 | `make userbot-login` | One-time Telethon login (prints `TELETHON_SESSION`) |
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
+| `make import-clients FILE=… [APPLY=1]` | Import the client-code list (CSV/.xlsx); a dry run unless APPLY=1 |
 | `make doctor` | Check `.env` and the server before `make up` |
 | `make backup-key` | Create the backup key and print the `.env` line |
 | `make backup-key-show` | Print the secret backup key (store it off the server) |
@@ -189,9 +190,11 @@ it recorded:
 | `/pul [kecha\|YYYY-MM-DD]` | One day's money rows by ref (`x12`), each with ✏️ Tuzat and 🗑 O'chir; voided rows marked 🗑 |
 | `/ochir x12` | Void one wrong money row: it leaves every total, stays in the history, and ↩️ Qaytar (or `/qaytar x12`) restores it |
 | `/tuzat x12 …` | Correct a money row: amount, currency, `kirim`/`chiqim`/`teskari`, `kim <ism>`, `sana kecha`, `izoh …`, `turkum …` |
-| `/kim <ism>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
+| `/kim <ism yoki GS kod>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
 | `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
 | `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
+| `/kod <ism> <GS kod>` | Attach, show (`/kod GS367`), move or detach (`/kod GS367 o'chir`) a client code |
+| `/kodlar` | Code suggestions learned from chats; send a CSV/.xlsx captioned `/kodlar` to import the client list |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
 | `/hisobot` | Generate and send today's report right now |
 | `/reja` | Tomorrow's time-blocked plan |

@@ -41,6 +41,7 @@ from miya.services import (
     brief,
     chats,
     claims,
+    client_import,
     documents,
     health,
     memories,
@@ -1616,6 +1617,241 @@ async def _process_on_demand(
     return _receipt(result)
 
 
+# --- client codes by hand (WP-33) ---------------------------------------------
+
+_DETACH_WORDS = {"o'chir", "ochir", "olib tashla", "-"}
+
+
+def _code_args(args: str) -> tuple[list[str], str]:
+    """(the codes in the arguments, what is left once they are taken out)."""
+    found = client_codes.find_client_codes(args)
+    rest = client_codes.client_code_re().sub(" ", args)
+    return found, " ".join(rest.split())
+
+
+@router.message(Command("kod"))
+async def cmd_code(message: Message, command: CommandObject) -> None:
+    """`/kod Akmal GS367` — say in one line which client a code is."""
+    args = fold_apostrophes((command.args or "").strip())
+    if not args:
+        await _safe_answer(message, replies.KOD_USAGE)
+        return
+    found, rest = _code_args(args)
+    if len(found) != 1:
+        body = replies.code_bad(args) if not found else replies.KOD_USAGE
+        await _safe_answer(message, body)
+        return
+    code = found[0]
+    keyboard = None
+    async with session_scope() as session:
+        holder = await client_codes.holder(session, code)
+        if not rest:
+            if holder is None:
+                body = replies.code_unknown(code)
+            else:
+                summary = await queries.person_summary(session, holder)
+                body = replies.person_report(summary)
+        elif rest.lower() in _DETACH_WORDS:
+            gone = await client_codes.detach(session, code, by=records.BY_COMMAND)
+            body = (
+                replies.code_detached(code, gone.display_name)
+                if gone is not None
+                else replies.code_unknown(code)
+            )
+        elif rest.lower().startswith("yangi "):
+            if holder is not None:
+                body = replies.code_already(code, holder.display_name)
+            else:
+                person = Person(display_name=rest[6:].strip(), aliases=[])
+                session.add(person)
+                await session.flush()
+                await client_codes.attach(
+                    session, person, code, source="command", by=records.BY_COMMAND
+                )
+                body = replies.code_attached(code, person.display_name, [code])
+        else:
+            body, keyboard = await _code_to_person(session, code, rest, holder)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _code_to_person(session, code: str, name: str, holder: Person | None):
+    match = await find_person(session, name)
+    if match.person is None:
+        return replies.code_person_not_found(name, code), None
+    if match.ambiguous:
+        held = await client_codes.codes_of_many(
+            session, [p.id for p in (match.person, match.runner_up) if p is not None]
+        )
+        return replies.person_ambiguous(match, command="kod", codes=held), None
+    person = match.person
+    if holder is not None and holder.id == person.id:
+        return replies.code_already(code, person.display_name), None
+    if holder is not None:
+        row = await session.scalar(
+            sa.select(ClientCode).where(
+                ClientCode.code == code, ClientCode.status == "active"
+            )
+        )
+        return (
+            replies.code_taken(code, holder.display_name, person.display_name),
+            keyboards.code_move(row_id=row.id, person_id=person.id),
+        )
+    await client_codes.attach(
+        session, person, code, source="command", by=records.BY_COMMAND
+    )
+    held = await client_codes.codes_of(session, person.id)
+    return replies.code_attached(code, person.display_name, held), None
+
+
+@router.message(Command("kodlar"), F.document)
+async def cmd_code_import(message: Message, bot: Bot) -> None:
+    """The owner's client list sent as a file captioned /kodlar (WP-34).
+
+    Read by code, never by the model: the file is stored as a processed
+    interaction and only a preview comes back, with one Ha to write it.
+    """
+    document = message.document
+    suffix = Path(document.file_name or "").suffix.lower() or ".bin"
+    path = _media_path(suffix)
+    if not await _download(bot, message, document, path):
+        return
+    async with session_scope() as session:
+        interaction = Interaction(
+            source=InteractionSource.assistant_bot,
+            direction=Direction.in_,
+            occurred_at=message.date.astimezone(settings.tz),
+            raw_text=message.caption,
+            media={
+                "type": "document",
+                "path": str(path),
+                "filename": document.file_name,
+            },
+            meta={"kind": "client_import"},
+            processed=True,
+        )
+        session.add(interaction)
+        await session.flush()
+        try:
+            rows = client_import.read_rows(path)
+        except client_import.BadFile:
+            body, keyboard = replies.IMPORT_BAD_FILE, None
+        else:
+            plan = await client_import.plan_import(session, rows)
+            body = replies.import_preview(document.file_name or path.name, plan.counts())
+            keyboard = keyboards.client_import(interaction.id)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _apply_client_import(session, interaction_id: int) -> str:
+    """Re-read and re-plan at press time, the way /unut re-derives its plan:
+    what is written is what the file and the database say now."""
+    interaction = await session.get(Interaction, interaction_id)
+    if interaction is None or (interaction.meta or {}).get("kind") != "client_import":
+        return replies.CODE_STALE
+    try:
+        rows = client_import.read_rows((interaction.media or {}).get("path", ""))
+    except (client_import.BadFile, OSError):
+        return replies.IMPORT_BAD_FILE
+    plan = await client_import.plan_import(session, rows)
+    written = await client_import.apply_import(session, plan, by=records.BY_BUTTON)
+    conflicts = [(p.code, p.row.name, p.against) for p in plan.conflict]
+    return replies.import_done(written, conflicts)
+
+
+@router.message(Command("kodlar"))
+async def cmd_code_suggestions(message: Message) -> None:
+    """Code suggestions learned from chats — pulled here, never pushed."""
+    async with session_scope() as session:
+        rows = await client_codes.pending_suggestions(session, limit=10)
+        lines = []
+        for row in rows:
+            source = (
+                await session.get(Interaction, row.source_interaction_id)
+                if row.source_interaction_id
+                else None
+            )
+            excerpt = text_for_extraction(source)[:80] if source is not None else ""
+            day = short_date(row.created_at.astimezone(settings.tz).date())
+            lines.append(
+                replies.code_suggestion_line(
+                    row.code, row.person.display_name, day, excerpt
+                )
+            )
+    if not rows:
+        await _safe_answer(message, replies.KODLAR_EMPTY)
+        return
+    body = "\n".join([replies.KODLAR_HEADER, *lines])
+    await _safe_answer(message, body, reply_markup=keyboards.code_suggestions(rows))
+
+
+@router.callback_query(F.data.startswith("kod:"))
+async def on_code_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "no":
+        await _edit_callback(callback, replies.CODE_MOVE_DECLINED)
+        return
+    if action == "impno":
+        await _edit_callback(callback, replies.IMPORT_CANCELLED)
+        return
+    if action == "imp" and len(parts) == 3 and parts[2].isdigit():
+        async with session_scope() as session:
+            body = await _apply_client_import(session, int(parts[2]))
+        await _edit_callback(callback, body)
+        return
+    if action == "mv" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
+        async with session_scope() as session:
+            body = await _move_code(session, int(parts[2]), int(parts[3]))
+        await _edit_callback(callback, body)
+        return
+    if action in ("sy", "sn") and len(parts) == 3 and parts[2].isdigit():
+        row_id = int(parts[2])
+        async with session_scope() as session:
+            body = await _answer_suggestion(session, row_id, accept=action == "sy")
+        await _finish_row(callback, _trimmed(callback, "kod", row_id), body)
+        return
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
+async def _move_code(session, row_id: int, person_id: int) -> str:
+    """Re-validated at press time: a row that is no longer the active one,
+    or a person since forgotten, makes the question stale."""
+    row = await session.get(ClientCode, row_id)
+    target = await session.get(Person, person_id)
+    if row is None or row.status != "active" or target is None:
+        return replies.CODE_STALE
+    if row.person_id == target.id:
+        return replies.code_already(row.code, target.display_name)
+    holder = await session.get(Person, row.person_id)
+    await client_codes.move(session, row.code, target, by=records.BY_BUTTON)
+    return replies.code_moved(row.code, target.display_name, holder.display_name)
+
+
+async def _answer_suggestion(session, row_id: int, *, accept: bool) -> str:
+    try:
+        if accept:
+            row = await client_codes.accept_suggestion(
+                session, row_id, by=records.BY_BUTTON
+            )
+        else:
+            row = await client_codes.reject_suggestion(
+                session, row_id, by=records.BY_BUTTON
+            )
+    except client_codes.CodeTaken as exc:
+        row = await session.get(ClientCode, row_id)
+        wanted = await session.get(Person, row.person_id)
+        return replies.code_taken(row.code, exc.holder.display_name, wanted.display_name)
+    if row is None:
+        return replies.CODE_STALE
+    person = await session.get(Person, row.person_id)
+    if accept:
+        return replies.code_suggestion_accepted(row.code, person.display_name)
+    return replies.code_suggestion_rejected(row.code, person.display_name)
+
+
 # --- content ----------------------------------------------------------------
 
 
@@ -1883,175 +2119,3 @@ def build_reject_router() -> Router:
         )
 
     return reject
-
-
-# --- client codes by hand (WP-33) ---------------------------------------------
-
-_DETACH_WORDS = {"o'chir", "ochir", "olib tashla", "-"}
-
-
-def _code_args(args: str) -> tuple[list[str], str]:
-    """(the codes in the arguments, what is left once they are taken out)."""
-    found = client_codes.find_client_codes(args)
-    rest = client_codes.client_code_re().sub(" ", args)
-    return found, " ".join(rest.split())
-
-
-@router.message(Command("kod"))
-async def cmd_code(message: Message, command: CommandObject) -> None:
-    """`/kod Akmal GS367` — say in one line which client a code is."""
-    args = fold_apostrophes((command.args or "").strip())
-    if not args:
-        await _safe_answer(message, replies.KOD_USAGE)
-        return
-    found, rest = _code_args(args)
-    if len(found) != 1:
-        body = replies.code_bad(args) if not found else replies.KOD_USAGE
-        await _safe_answer(message, body)
-        return
-    code = found[0]
-    keyboard = None
-    async with session_scope() as session:
-        holder = await client_codes.holder(session, code)
-        if not rest:
-            if holder is None:
-                body = replies.code_unknown(code)
-            else:
-                summary = await queries.person_summary(session, holder)
-                body = replies.person_report(summary)
-        elif rest.lower() in _DETACH_WORDS:
-            gone = await client_codes.detach(session, code, by=records.BY_COMMAND)
-            body = (
-                replies.code_detached(code, gone.display_name)
-                if gone is not None
-                else replies.code_unknown(code)
-            )
-        elif rest.lower().startswith("yangi "):
-            if holder is not None:
-                body = replies.code_already(code, holder.display_name)
-            else:
-                person = Person(display_name=rest[6:].strip(), aliases=[])
-                session.add(person)
-                await session.flush()
-                await client_codes.attach(
-                    session, person, code, source="command", by=records.BY_COMMAND
-                )
-                body = replies.code_attached(code, person.display_name, [code])
-        else:
-            body, keyboard = await _code_to_person(session, code, rest, holder)
-    await _safe_answer(message, body, reply_markup=keyboard)
-
-
-async def _code_to_person(session, code: str, name: str, holder: Person | None):
-    match = await find_person(session, name)
-    if match.person is None:
-        return replies.code_person_not_found(name, code), None
-    if match.ambiguous:
-        held = await client_codes.codes_of_many(
-            session, [p.id for p in (match.person, match.runner_up) if p is not None]
-        )
-        return replies.person_ambiguous(match, command="kod", codes=held), None
-    person = match.person
-    if holder is not None and holder.id == person.id:
-        return replies.code_already(code, person.display_name), None
-    if holder is not None:
-        row = await session.scalar(
-            sa.select(ClientCode).where(
-                ClientCode.code == code, ClientCode.status == "active"
-            )
-        )
-        return (
-            replies.code_taken(code, holder.display_name, person.display_name),
-            keyboards.code_move(row_id=row.id, person_id=person.id),
-        )
-    await client_codes.attach(
-        session, person, code, source="command", by=records.BY_COMMAND
-    )
-    held = await client_codes.codes_of(session, person.id)
-    return replies.code_attached(code, person.display_name, held), None
-
-
-@router.message(Command("kodlar"))
-async def cmd_code_suggestions(message: Message) -> None:
-    """Code suggestions learned from chats — pulled here, never pushed."""
-    async with session_scope() as session:
-        rows = await client_codes.pending_suggestions(session, limit=10)
-        lines = []
-        for row in rows:
-            source = (
-                await session.get(Interaction, row.source_interaction_id)
-                if row.source_interaction_id
-                else None
-            )
-            excerpt = text_for_extraction(source)[:80] if source is not None else ""
-            day = short_date(row.created_at.astimezone(settings.tz).date())
-            lines.append(
-                replies.code_suggestion_line(
-                    row.code, row.person.display_name, day, excerpt
-                )
-            )
-    if not rows:
-        await _safe_answer(message, replies.KODLAR_EMPTY)
-        return
-    body = "\n".join([replies.KODLAR_HEADER, *lines])
-    await _safe_answer(message, body, reply_markup=keyboards.code_suggestions(rows))
-
-
-@router.callback_query(F.data.startswith("kod:"))
-async def on_code_button(callback: CallbackQuery) -> None:
-    parts = (callback.data or "").split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    if action == "no":
-        await _edit_callback(callback, replies.CODE_MOVE_DECLINED)
-        return
-    if action == "mv" and len(parts) == 4 and parts[2].isdigit() and parts[3].isdigit():
-        async with session_scope() as session:
-            body = await _move_code(session, int(parts[2]), int(parts[3]))
-        await _edit_callback(callback, body)
-        return
-    if action in ("sy", "sn") and len(parts) == 3 and parts[2].isdigit():
-        row_id = int(parts[2])
-        async with session_scope() as session:
-            body = await _answer_suggestion(session, row_id, accept=action == "sy")
-        await _finish_row(callback, _trimmed(callback, "kod", row_id), body)
-        return
-    try:
-        await callback.answer()
-    except Exception:
-        log.debug("could not acknowledge the callback", exc_info=True)
-
-
-async def _move_code(session, row_id: int, person_id: int) -> str:
-    """Re-validated at press time: a row that is no longer the active one,
-    or a person since forgotten, makes the question stale."""
-    row = await session.get(ClientCode, row_id)
-    target = await session.get(Person, person_id)
-    if row is None or row.status != "active" or target is None:
-        return replies.CODE_STALE
-    if row.person_id == target.id:
-        return replies.code_already(row.code, target.display_name)
-    holder = await session.get(Person, row.person_id)
-    await client_codes.move(session, row.code, target, by=records.BY_BUTTON)
-    return replies.code_moved(row.code, target.display_name, holder.display_name)
-
-
-async def _answer_suggestion(session, row_id: int, *, accept: bool) -> str:
-    try:
-        if accept:
-            row = await client_codes.accept_suggestion(
-                session, row_id, by=records.BY_BUTTON
-            )
-        else:
-            row = await client_codes.reject_suggestion(
-                session, row_id, by=records.BY_BUTTON
-            )
-    except client_codes.CodeTaken as exc:
-        row = await session.get(ClientCode, row_id)
-        wanted = await session.get(Person, row.person_id)
-        return replies.code_taken(row.code, exc.holder.display_name, wanted.display_name)
-    if row is None:
-        return replies.CODE_STALE
-    person = await session.get(Person, row.person_id)
-    if accept:
-        return replies.code_suggestion_accepted(row.code, person.display_name)
-    return replies.code_suggestion_rejected(row.code, person.display_name)
