@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.enums import Currency, DebtDirection, PromiseMadeBy
-from miya.db.models import Claim, Interaction
+from miya.db.models import Claim, Interaction, Person
 from miya.services import codes as client_codes
 from miya.services import persistence, records
 from miya.services.extraction import (
@@ -437,26 +437,29 @@ async def accept(
     claim.answered_at = now
     claim.answered_by = by
 
+    # The person the question showed (WP-32); a purged one leaves NULL and
+    # the name is resolved as on the day.
+    hint = await session.get(Person, claim.person_id) if claim.person_id else None
     applied = persistence.Applied()
     if claim.kind == KIND_DEBT:
         row = await persistence.write_debt(
-            session, interaction, item, applied, now=now, claim=claim
+            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     elif claim.kind == KIND_SETTLEMENT:
         row = await persistence.write_settlement(
-            session, interaction, item, applied, now=now, claim=claim
+            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     elif claim.kind == KIND_TRANSACTION:
         row = await persistence.write_transaction(
-            session, interaction, item, applied, now=now, claim=claim
+            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     elif claim.kind == KIND_PROMISE:
         row = await persistence.write_promise(
-            session, interaction, item, applied, now=now, claim=claim
+            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     else:
         row = await persistence.write_fulfilment(
-            session, interaction, item, applied, now=now, claim=claim
+            session, interaction, item, applied, now=now, claim=claim, person_hint=hint
         )
     if row is None and applied.is_empty():
         # The writer refused the item the way it would have refused it on

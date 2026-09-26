@@ -1023,3 +1023,44 @@ async def test_migration_0009_round_trips():
         _alembic("upgrade", "head")
     assert await _has_claims_table()
     _alembic("check")
+
+
+# --- WP-32: the accepted row lands on the person the question showed ----------
+
+
+async def test_an_accepted_claim_writes_to_the_person_it_already_resolved(session):
+    first = await _person(session, "Akmal")
+    second = m.Person(display_name="Akmal", aliases=[], telegram_id=7)
+    session.add(second)
+    await session.flush()
+    interaction = await _interaction(session, "sen menga qarzsan", person_id=second.id)
+    applied = await apply_extraction(
+        session, interaction, ex.ExtractionResult(debts=[_debt()])
+    )
+    [claim] = applied.claims
+    assert claim.person_id == second.id
+
+    await claims.accept(session, claim.id, by=claims.BY_BUTTON, now=NOW)
+
+    [debt] = list(await session.scalars(sa.select(m.Debt)))
+    assert debt.person_id == second.id != first.id
+
+
+async def test_a_corrected_claim_resolves_the_new_name(session):
+    akmal = m.Person(display_name="Akmal", aliases=[], telegram_id=7)
+    session.add(akmal)
+    sardor = await _person(session, "Sardor")
+    interaction = await _interaction(session, "sen menga qarzsan", person_id=akmal.id)
+    applied = await apply_extraction(
+        session, interaction, ex.ExtractionResult(debts=[_debt()])
+    )
+    [claim] = applied.claims
+    await claims.edit(
+        session, claim.id, records.Edit("person", "Sardor"), by=claims.BY_COMMAND
+    )
+    assert claim.person_id is None
+
+    await claims.accept(session, claim.id, by=claims.BY_BUTTON, now=NOW)
+
+    [debt] = list(await session.scalars(sa.select(m.Debt)))
+    assert debt.person_id == sardor.id

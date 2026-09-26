@@ -332,9 +332,16 @@ async def _person_for(
     applied: Applied,
     *,
     create: bool = True,
+    hint: Person | None = None,
 ) -> Person | None:
     """resolve_person for a writer: the identity refusals become a review
-    flag and a receipt line instead of a row about the wrong person."""
+    flag and a receipt line instead of a row about the wrong person.
+
+    ``hint`` is the person an accepted claim already resolved (WP-32): the
+    one the question showed, so the row lands there, not on a namesake.
+    """
+    if hint is not None:
+        return hint
     try:
         return await resolve_person(
             session,
@@ -368,12 +375,15 @@ async def write_debt(
     *,
     now: datetime,
     claim: Claim | None = None,
+    person_hint: Person | None = None,
 ) -> Debt | None:
     amount = to_money(item.amount)
     if amount is None:
         log.warning("dropping debt with non-positive amount: %r", item.amount)
         return None
-    person = await _person_for(session, interaction, item, item.person, applied)
+    person = await _person_for(
+        session, interaction, item, item.person, applied, hint=person_hint
+    )
     if person is None:
         return None
     debt = Debt(
@@ -403,11 +413,14 @@ async def write_settlement(
     *,
     now: datetime,
     claim: Claim | None = None,
+    person_hint: Person | None = None,
 ) -> None:
     amount = to_money(item.amount)
     if amount is None:
         return
-    person = await _person_for(session, interaction, item, item.person, applied)
+    person = await _person_for(
+        session, interaction, item, item.person, applied, hint=person_hint
+    )
     if person is None:
         return
     before = len(applied.settlements)
@@ -437,15 +450,16 @@ async def write_transaction(
     *,
     now: datetime,
     claim: Claim | None = None,
+    person_hint: Person | None = None,
 ) -> Transaction | None:
     amount = to_money(item.amount)
     if amount is None:
         return None
     counterparty = None
-    if item.counterparty:
+    if item.counterparty or person_hint is not None:
         refused = applied.refusals()
         counterparty = await _person_for(
-            session, interaction, item, item.counterparty, applied
+            session, interaction, item, item.counterparty, applied, hint=person_hint
         )
         if applied.refusals() > refused:
             return None
@@ -476,8 +490,11 @@ async def write_promise(
     *,
     now: datetime,
     claim: Claim | None = None,
+    person_hint: Person | None = None,
 ) -> Promise | None:
-    person = await _person_for(session, interaction, item, item.person, applied)
+    person = await _person_for(
+        session, interaction, item, item.person, applied, hint=person_hint
+    )
     if person is None or not item.description.strip():
         return None
     promise = Promise(
@@ -505,6 +522,7 @@ async def write_fulfilment(
     *,
     now: datetime,
     claim: Claim | None = None,
+    person_hint: Person | None = None,
 ) -> None:
     if not item.description.strip():
         return
@@ -512,7 +530,7 @@ async def write_fulfilment(
     # a promise on the books, or it matches nothing either way.
     refused = applied.refusals()
     person = await _person_for(
-        session, interaction, item, item.person, applied, create=False
+        session, interaction, item, item.person, applied, create=False, hint=person_hint
     )
     if person is None:
         if applied.refusals() == refused:
