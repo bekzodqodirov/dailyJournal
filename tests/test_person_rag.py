@@ -204,6 +204,7 @@ async def test_person_summary_carries_everything_held_about_the_person(session):
     }
     assert output["identity"] == {
         "display_name": "Akmal",
+        "client_codes": [],
         "aliases": ["Akmal aka"],
         "telegram_username": "akmal_gz",
         "phone": "+998901234567",

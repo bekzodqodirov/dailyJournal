@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.enums import DebtDirection, Direction
 from miya.db.models import Interaction, Memory, Person
+from miya.services import codes as client_codes
 from miya.services import memories as memories_svc
 from miya.services import queries
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
@@ -353,11 +354,14 @@ def _match_info(match: Match) -> dict[str, Any]:
     }
 
 
-def _not_found(name: str) -> str:
+def _not_found(name: str, match: Match | None = None) -> str:
+    if match is not None and match.unknown_code:
+        # A stable key: the model must not retry the same code in a loop.
+        return _dumps({"error": f"client code not assigned: {match.unknown_code}"})
     return _dumps({"error": f"person not found: {name}"})
 
 
-def _ambiguous(match: Match) -> str:
+async def _ambiguous(session: AsyncSession, match: Match) -> str:
     """A tool that returns rows for one person must not pick between two.
 
     person_summary carries the match info inside its answer; the row tools
@@ -365,7 +369,14 @@ def _ambiguous(match: Match) -> str:
     balance is never quoted for the wrong Akmal.
     """
     # Only reached when match.ambiguous, which guarantees both people exist.
-    candidates = [p.display_name for p in (match.person, match.runner_up) if p]
+    people = [p for p in (match.person, match.runner_up) if p]
+    held = await client_codes.codes_of_many(session, [p.id for p in people])
+    candidates = [
+        f"{p.display_name} ({', '.join(held[p.id])})"
+        if held.get(p.id)
+        else p.display_name
+        for p in people
+    ]
     return _dumps(
         {
             "error": "ambiguous person — ask the owner which one he means",
@@ -375,9 +386,10 @@ def _ambiguous(match: Match) -> str:
     )
 
 
-def _identity(person: Person) -> dict[str, Any]:
+def _identity(person: Person, codes: list[str]) -> dict[str, Any]:
     return {
         "display_name": person.display_name,
+        "client_codes": codes,
         "aliases": list(person.aliases or []),
         "telegram_username": person.telegram_username,
         "phone": person.phone,
@@ -409,9 +421,9 @@ async def _run_tool(
         if args.get("person"):
             match = await _find_person(session, args["person"])
             if match.person is None:
-                return _not_found(args["person"])
+                return _not_found(args["person"], match)
             if match.ambiguous:
-                return _ambiguous(match)
+                return await _ambiguous(session, match)
             person = match.person
         direction = DebtDirection(args["direction"]) if args.get("direction") else None
         balances = await queries.open_debts(
@@ -436,14 +448,15 @@ async def _run_tool(
     if name == "person_summary":
         match = await _find_person(session, args.get("name", ""))
         if match.person is None:
-            return _not_found(args.get("name", ""))
+            return _not_found(args.get("name", ""), match)
         person = match.person
         summary = await queries.person_summary(session, person)
+        held = await client_codes.codes_of(session, person.id)
         return _dumps(
             {
                 "person": person.display_name,
                 "match": _match_info(match),
-                "identity": _identity(person),
+                "identity": _identity(person, held),
                 "profile_note": (
                     "MIYA's own earlier prose about this person. Never a source "
                     "of figures — amounts come from balances and open_promises."
@@ -481,9 +494,9 @@ async def _run_tool(
     if name == "person_timeline":
         match = await _find_person(session, args.get("person", ""))
         if match.person is None:
-            return _not_found(args.get("person", ""))
+            return _not_found(args.get("person", ""), match)
         if match.ambiguous:
-            return _ambiguous(match)
+            return await _ambiguous(session, match)
         direction = Direction(args["direction"]) if args.get("direction") else None
         limit = max(1, min(int(args.get("limit") or 30), 100))
         days = int(args.get("days") or 0)
@@ -616,9 +629,9 @@ async def _run_tool(
         if args.get("person"):
             match = await _find_person(session, args["person"])
             if match.person is None:
-                return _not_found(args["person"])
+                return _not_found(args["person"], match)
             if match.ambiguous:
-                return _ambiguous(match)
+                return await _ambiguous(session, match)
             person = match.person
         rows = await queries.recent_interactions(
             session,

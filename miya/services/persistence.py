@@ -17,6 +17,7 @@ from miya.db.enums import (
     DebtDirection,
     DebtStatus,
     EventSource,
+    InteractionSource,
     PromiseMadeBy,
     PromiseStatus,
     TaskPriority,
@@ -43,7 +44,15 @@ from miya.services.extraction import (
     ExtractionResult,
     to_money,
 )
-from miya.services.people import MATCH_THRESHOLD, best_match, normalise, resolve_person
+from miya.services.people import (
+    MATCH_THRESHOLD,
+    IdentityConflict,
+    OwnerNamed,
+    UnknownCode,
+    best_match,
+    normalise,
+    resolve_person,
+)
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +82,17 @@ class Applied:
     # What a counterparty asserted: parked as a question, not written (build
     # step 3, docs/owner-decisions.md "Counterparty claims").
     claims: list[Claim] = field(default_factory=list)
+    # WP-31: rows not written because of who they named — a code nobody
+    # holds, a code held by someone other than the named person, the owner.
+    unknown_codes: list[str] = field(default_factory=list)
+    identity_conflicts: list[tuple[str, str, str]] = field(default_factory=list)
+    owner_named: list[str] = field(default_factory=list)
+
+    def refusals(self) -> int:
+        """How many rows were refused for who they named (WP-31)."""
+        return (
+            len(self.unknown_codes) + len(self.identity_conflicts) + len(self.owner_named)
+        )
 
     def is_empty(self) -> bool:
         return not any(
@@ -88,6 +108,9 @@ class Applied:
                 self.fulfilled,
                 self.unmatched_fulfilments,
                 self.claims,
+                self.unknown_codes,
+                self.identity_conflicts,
+                self.owner_named,
             )
         )
 
@@ -285,6 +308,58 @@ def _claim_result(claim: Claim | None, kind: str, row_id: int | None) -> None:
         claim.result_id = row_id
 
 
+def _code_policy(interaction: Interaction, item) -> str:
+    """The owner's own message may give a person a code outright; anything
+    else only suggests it."""
+    if (
+        getattr(item, "asserted_by", "me") == "me"
+        and interaction.source is InteractionSource.assistant_bot
+    ):
+        return "attach"
+    return "suggest"
+
+
+def _flag_identity(interaction: Interaction, detail: dict) -> None:
+    interaction.needs_review = True
+    interaction.meta = {**(interaction.meta or {}), "identity": detail}
+
+
+async def _person_for(
+    session: AsyncSession,
+    interaction: Interaction,
+    item,
+    name: str,
+    applied: Applied,
+    *,
+    create: bool = True,
+) -> Person | None:
+    """resolve_person for a writer: the identity refusals become a review
+    flag and a receipt line instead of a row about the wrong person."""
+    try:
+        return await resolve_person(
+            session,
+            name,
+            create=create,
+            code_policy=_code_policy(interaction, item),
+            source_interaction_id=interaction.id,
+            source="extraction",
+            strict=True,
+        )
+    except UnknownCode as exc:
+        _flag_identity(interaction, {"unknown_code": exc.code})
+        applied.unknown_codes.append(exc.code)
+    except IdentityConflict as exc:
+        _flag_identity(
+            interaction,
+            {"conflict": exc.code, "holder": exc.holder.id, "named": exc.named},
+        )
+        applied.identity_conflicts.append((exc.code, exc.holder.display_name, exc.named))
+    except OwnerNamed as exc:
+        _flag_identity(interaction, {"owner_named": exc.name})
+        applied.owner_named.append(exc.name)
+    return None
+
+
 async def write_debt(
     session: AsyncSession,
     interaction: Interaction,
@@ -298,7 +373,7 @@ async def write_debt(
     if amount is None:
         log.warning("dropping debt with non-positive amount: %r", item.amount)
         return None
-    person = await resolve_person(session, item.person)
+    person = await _person_for(session, interaction, item, item.person, applied)
     if person is None:
         return None
     debt = Debt(
@@ -332,7 +407,7 @@ async def write_settlement(
     amount = to_money(item.amount)
     if amount is None:
         return
-    person = await resolve_person(session, item.person)
+    person = await _person_for(session, interaction, item, item.person, applied)
     if person is None:
         return
     before = len(applied.settlements)
@@ -366,9 +441,14 @@ async def write_transaction(
     amount = to_money(item.amount)
     if amount is None:
         return None
-    counterparty = (
-        await resolve_person(session, item.counterparty) if item.counterparty else None
-    )
+    counterparty = None
+    if item.counterparty:
+        refused = applied.refusals()
+        counterparty = await _person_for(
+            session, interaction, item, item.counterparty, applied
+        )
+        if applied.refusals() > refused:
+            return None
     txn = Transaction(
         type=TransactionType(item.type),
         amount=amount,
@@ -397,7 +477,7 @@ async def write_promise(
     now: datetime,
     claim: Claim | None = None,
 ) -> Promise | None:
-    person = await resolve_person(session, item.person)
+    person = await _person_for(session, interaction, item, item.person, applied)
     if person is None or not item.description.strip():
         return None
     promise = Promise(
@@ -430,9 +510,13 @@ async def write_fulfilment(
         return
     # Never creates a person: a fulfilment names someone who already has
     # a promise on the books, or it matches nothing either way.
-    person = await resolve_person(session, item.person, create=False)
+    refused = applied.refusals()
+    person = await _person_for(
+        session, interaction, item, item.person, applied, create=False
+    )
     if person is None:
-        applied.unmatched_fulfilments.append((item.person, item.description))
+        if applied.refusals() == refused:
+            applied.unmatched_fulfilments.append((item.person, item.description))
         return
     before = len(applied.fulfilled)
     await _apply_fulfilment(

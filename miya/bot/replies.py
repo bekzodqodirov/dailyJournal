@@ -299,20 +299,56 @@ _AMBIGUOUS_HINT = {
     "kim": "/kim {name}",
     "tarix": "/tarix {name}",
     "eslab": "/eslab {name}: …",
+    "unut": "/unut {name}",
 }
 
 
-def person_ambiguous(match: Match, *, command: str = "kim") -> str:
+def person_ambiguous(
+    match: Match, *, command: str = "kim", codes: dict[int, list[str]] | None = None
+) -> str:
     """Two people score alike — name both and ask, never guess.
 
-    Kimni nazarda tutding: Akmal GZ yoki Akmal Toshkent? (/kim Akmal GZ)
+    Kimni nazarda tutding: Akmal (GS367) yoki Akmal (GS412)? (/kim GS367)
+    A person's client codes tell two namesakes apart; the hint uses the
+    first person's code when they hold exactly one.
     """
-    first = match.person.display_name if match.person else ""
-    second = match.runner_up.display_name if match.runner_up else ""
-    hint = _AMBIGUOUS_HINT.get(command, _AMBIGUOUS_HINT["kim"]).format(name=first)
+    codes = codes or {}
+
+    def label(person) -> tuple[str, list[str]]:
+        if person is None:
+            return "", []
+        held = codes.get(person.id, [])
+        text = f"<b>{escape(person.display_name)}</b>"
+        if held:
+            text += f" ({escape(', '.join(held))})"
+        return text, held
+
+    first, first_codes = label(match.person)
+    second, _ = label(match.runner_up)
+    name = match.person.display_name if match.person else ""
+    if len(first_codes) == 1:
+        name = first_codes[0]
+    hint = _AMBIGUOUS_HINT.get(command, _AMBIGUOUS_HINT["kim"]).format(name=name)
     return (
-        f"❓ Kimni nazarda tutding: <b>{escape(first)}</b> yoki "
-        f"<b>{escape(second)}</b>? (<code>{escape(hint)}</code>)"
+        f"❓ Kimni nazarda tutding: {first} yoki {second}? "
+        f"(<code>{escape(hint)}</code>)"
+    )
+
+
+def code_unknown(code: str) -> str:
+    """A client code nobody holds (WP-31)."""
+    return (
+        f"❓ <b>{escape(code)}</b> hech kimga biriktirilmagan. "
+        f"Biriktirish: <code>/kod Ism {escape(code)}</code>"
+    )
+
+
+def identity_conflict(code: str, holder: str, named: str) -> str:
+    """A code held by someone other than the person named with it."""
+    return (
+        f"⚠️ <b>{escape(code)}</b> bazada <b>{escape(holder)}</b> nomida, "
+        f"xabarda esa «{escape(named)}». Kod noto'g'ri bo'lsa: "
+        f"<code>/kod {escape(named)} {escape(code)}</code>"
     )
 
 
@@ -353,6 +389,20 @@ def confirmation(applied: Applied) -> str:
             f"❓ {escape(name)} bilan {money(amount, currency)} to'lov: "
             f"ikkalangizning ham ochiq qarzingiz bor — kim to'laganini yozing "
             f"(masalan: «{escape(name)} menga {money(amount, currency)} qaytardi»)"
+        )
+
+    for code in applied.unknown_codes:
+        lines.append(
+            f"⚠️ <b>{escape(code)}</b> kodi hech kimga biriktirilmagan — yozmadim "
+            f"(/tekshir ro'yxatida). Avval <code>/kod Ism {escape(code)}</code>, "
+            f"keyin xabarni qayta yuboring."
+        )
+
+    for code, holder, named in applied.identity_conflicts:
+        lines.append(
+            f"⚠️ <b>{escape(code)}</b> bazada <b>{escape(holder)}</b> nomida, xabarda "
+            f"esa «{escape(named)}». Yozmadim — /tekshir ro'yxatida. Kod noto'g'ri "
+            f"bo'lsa: <code>/kod {escape(named)} {escape(code)}</code>"
         )
 
     for promise in applied.promises:

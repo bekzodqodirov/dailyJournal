@@ -40,6 +40,8 @@ from miya.db.enums import (
     TransactionType,
 )
 from miya.db.models import Debt, DebtPayment, Person, Promise, Task, Transaction
+from miya.services import codes as client_codes
+from miya.services import people
 from miya.services.people import resolve_person
 
 Record = Debt | Promise | Task | Transaction
@@ -134,6 +136,23 @@ class UnknownPerson(RecordError):
     def __init__(self, name: str) -> None:
         super().__init__(name)
         self.name = name
+
+
+class UnknownCode(RecordError):
+    """`/tuzat d12 GS999` when nobody holds GS999: never a new person named
+    after a code (WP-31)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class IdentityConflict(RecordError):
+    """`/tuzat d12 Sardor GS367` while Akmal holds GS367."""
+
+    def __init__(self, code: str, holder: str, named: str) -> None:
+        super().__init__(code)
+        self.code, self.holder, self.named = code, holder, named
 
 
 @dataclass(slots=True)
@@ -778,7 +797,21 @@ async def _person_named(session: AsyncSession, name: str, *, create: bool) -> Pe
     the advisory lock keeps a concurrent ingestion from creating the same
     Sardor twice.
     """
-    person = await resolve_person(session, name, create=create)
+    try:
+        person = await resolve_person(
+            session,
+            name,
+            create=create,
+            code_policy="attach",
+            source="owner",
+            strict=True,
+        )
+    except people.UnknownCode as exc:
+        raise UnknownCode(exc.code) from exc
+    except people.IdentityConflict as exc:
+        raise IdentityConflict(exc.code, exc.holder.display_name, exc.named) from exc
+    except people.OwnerNamed as exc:
+        raise NotEditable("person") from exc
     if person is None:
         if not name.strip():  # a blank name; parse_edit never lets one through
             raise NotEditable("person")
@@ -996,6 +1029,9 @@ def parse_edit(text: str, *, today: date | None = None) -> Edit | None:
     prefix = _PREFIXES.get(head.lower())
     if prefix:
         return _parse_as(prefix, rest[0].strip(), today) if rest else None
+    code = client_codes.canonical_client_code(raw)
+    if code is not None:  # "GS 367" is a client, never an amount
+        return Edit("person", code)
 
     lowered = raw.lower()
     if lowered in ("teskari", "aksincha", "teskarisi"):
@@ -1018,7 +1054,9 @@ def parse_edit(text: str, *, today: date | None = None) -> Edit | None:
 
 def _parse_as(field: str, value: str, today: date | None) -> Edit | None:
     if field == "person":
-        return Edit("person", value) if value else None
+        if not value:
+            return None
+        return Edit("person", client_codes.canonical_client_code(value) or value)
     if field == "amount":
         amount = parse_amount(value)
         return Edit("amount", amount) if amount else None

@@ -12,6 +12,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 import sqlalchemy as sa
 from rapidfuzz import fuzz
@@ -145,6 +146,10 @@ class Match:
     # The query equals one person's name or alias exactly. "Akmal" next to
     # "Akmal Toshkent" scores 100 against both; the exact one is meant.
     exact: bool = False
+    # WP-31: the person was found by a client code, or the code in the
+    # query is held by nobody.
+    via_code: str | None = None
+    unknown_code: str | None = None
 
     @property
     def ambiguous(self) -> bool:
@@ -172,6 +177,50 @@ async def find_person(
     target = _name_and_codes(name or "")
     if not (target[0] or target[1]):
         return Match(person=None, score=0.0, runner_up=None, runner_up_score=0.0)
+    unknown_code: str | None = None
+    if target[1]:
+        # Codes first (WP-31): a held code is that person, never a guess.
+        holders: list[tuple[str, Person]] = []
+        for code in sorted(target[1]):
+            held = await codes.holder(session, code)
+            if held is not None and held.id not in {h.id for _, h in holders}:
+                holders.append((code, held))
+        if len(holders) == 1:
+            code, held = holders[0]
+            return Match(
+                person=held,
+                score=100.0,
+                runner_up=None,
+                runner_up_score=0.0,
+                exact=True,
+                via_code=code,
+            )
+        if len(holders) > 1:
+            return Match(
+                person=holders[0][1],
+                score=100.0,
+                runner_up=holders[1][1],
+                runner_up_score=100.0,
+            )
+        unknown_code = sorted(target[1])[0]
+        if not target[0]:
+            return Match(
+                person=None,
+                score=0.0,
+                runner_up=None,
+                runner_up_score=0.0,
+                unknown_code=unknown_code,
+            )
+        # A code nobody holds next to a name: look the name up alone.
+        target = (target[0], frozenset())
+    match = await _find_by_name(session, target, threshold=threshold)
+    match.unknown_code = unknown_code
+    return match
+
+
+async def _find_by_name(
+    session: AsyncSession, target: NameKey, *, threshold: float
+) -> Match:
     people = list(await session.scalars(sa.select(Person).order_by(Person.id)))
     # Stable sort: on a tie the earlier row wins, as in best_match.
     ranked = sorted(
@@ -224,6 +273,98 @@ def set_relationship(person: Person, text: str | None) -> None:
     person.relationship_ = (text or "").strip() or None
 
 
+class UnknownCode(Exception):
+    """A code nobody holds, with no name beside it (WP-31)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class IdentityConflict(Exception):
+    """The code belongs to one person, the name to another (WP-31)."""
+
+    def __init__(self, code: str, holder: Person, named: str, other: Person | None):
+        super().__init__(f"{code}: {holder.display_name} vs {named}")
+        self.code = code
+        self.holder = holder
+        self.named = named
+        self.other = other
+
+
+class OwnerNamed(Exception):
+    """The name is the owner's own (raised by the owner guard, WP-36)."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.name = name
+
+
+CodePolicy = Literal["attach", "suggest", "ignore"]
+
+
+def _backfill(
+    person: Person,
+    *,
+    telegram_id: int | None,
+    telegram_username: str | None,
+    phone: str | None,
+) -> None:
+    if telegram_id is not None and person.telegram_id is None:
+        person.telegram_id = telegram_id
+    if telegram_username and not person.telegram_username:
+        person.telegram_username = telegram_username
+    if phone and not person.phone:
+        person.phone = phone
+
+
+def _learn_alias(person: Person, spelling: str) -> None:
+    """Keep a new spelling (never one with a code in it, WP-29); a spelling
+    in the other script is kept too (WP-28)."""
+    if not spelling:
+        return
+    names = [person.display_name, *(person.aliases or [])]
+    known = {normalise(codes.strip_codes(n)) for n in names}
+    new_script = _is_cyrillic(spelling) not in {_is_cyrillic(n) for n in names if n}
+    if normalise(spelling) not in known or new_script:
+        # ORM change tracking does not see in-place list mutation.
+        person.aliases = [*(person.aliases or []), spelling]
+
+
+async def _give_codes(
+    session: AsyncSession,
+    person: Person,
+    wanted: list[str],
+    *,
+    policy: CodePolicy,
+    source: str | None,
+    interaction_id: int | None,
+) -> None:
+    """Attach or suggest the codes nobody holds yet, per the policy."""
+    if policy == "ignore":
+        return
+    for code in wanted:
+        if await codes.holder(session, code) is not None:
+            continue
+        if policy == "attach":
+            await codes.attach(
+                session,
+                person,
+                code,
+                source=source or "extraction",
+                by=source or "extraction",
+                interaction_id=interaction_id,
+            )
+        else:
+            await codes.suggest(
+                session,
+                person,
+                code,
+                source=source or "extraction",
+                interaction_id=interaction_id,
+            )
+
+
 async def resolve_person(
     session: AsyncSession,
     name: str,
@@ -232,11 +373,22 @@ async def resolve_person(
     telegram_username: str | None = None,
     phone: str | None = None,
     create: bool = True,
+    code_policy: CodePolicy = "suggest",
+    source_interaction_id: int | None = None,
+    source: str | None = None,
+    strict: bool = False,
 ) -> Person | None:
     """Find or create the person `name` refers to.
 
-    A matched person gains `name` as an alias when it is a new spelling, so the
-    index improves with use.
+    Codes first (WP-31): a code someone holds is that person, whatever the
+    name; a code nobody holds with no name is UnknownCode; a code held by one
+    person next to another person's name is IdentityConflict. Then the phone,
+    then the name, fuzzily. A matched person gains a new spelling as an
+    alias, never one with a code in it.
+
+    Only callers that handle the identity exceptions pass ``strict=True``;
+    everyone else gets None (or, for a conflict, a lookup by the name alone)
+    and can never lose a message to identity.
     """
     if telegram_id is not None:
         existing = await session.scalar(
@@ -249,11 +401,30 @@ async def resolve_person(
                 existing.telegram_username = telegram_username
             if phone and not existing.phone:
                 existing.phone = phone
+            await codes.harvest(session, existing, name or "", policy=code_policy)
             return existing
 
     name = (name or "").strip()
     if not name:
         return None
+    q_codes, rest = codes.split_codes(name)
+
+    # Phone first: a number the owner's contacts hold is that contact.
+    if phone and len(re.sub(r"\D", "", phone)) >= 7:
+        by_phone = await find_by_phone(session, phone)
+        if by_phone is not None:
+            if rest and best_match(rest, [by_phone])[1] >= MATCH_THRESHOLD:
+                _learn_alias(by_phone, rest)
+            await _give_codes(
+                session,
+                by_phone,
+                q_codes,
+                policy=code_policy,
+                source=source,
+                interaction_id=source_interaction_id,
+            )
+            await codes.harvest(session, by_phone, name, policy=code_policy)
+            return by_phone
 
     # The bot and the call-recording worker are separate processes; without a
     # lock, two concurrent ingestions naming the same new person both pass the
@@ -261,10 +432,11 @@ async def resolve_person(
     # constraint — matching is fuzzy). A transaction-scoped advisory lock on
     # the normalised name serialises exactly the conflicting pair: the second
     # writer waits for the first commit and then finds the person it created.
+    lock_key = normalise(rest) if rest else q_codes[0]
     await session.execute(
         sa.select(
             sa.func.pg_advisory_xact_lock(
-                sa.func.hashtext("miya:person"), sa.func.hashtext(normalise(name))
+                sa.func.hashtext("miya:person"), sa.func.hashtext(lock_key)
             )
         )
     )
@@ -279,32 +451,105 @@ async def resolve_person(
         people = [
             p for p in people if p.telegram_id is None or p.telegram_id == telegram_id
         ]
+
+    if q_codes:
+        holders = {c: await codes.holder(session, c) for c in q_codes}
+        distinct = {h.id: h for h in holders.values() if h is not None}
+        conflict: IdentityConflict | None = None
+        if len(distinct) > 1:
+            first, second = list(distinct.values())[:2]
+            conflict = IdentityConflict(q_codes[0], first, rest or name, second)
+        elif len(distinct) == 1:
+            held = next(iter(distinct.values()))
+            code = next(c for c, h in holders.items() if h is not None)
+            if rest and best_match(rest, [held])[1] < QUESTION_THRESHOLD:
+                other, score = best_match(rest, [p for p in people if p.id != held.id])
+                if other is not None and score >= MATCH_THRESHOLD:
+                    conflict = IdentityConflict(code, held, rest, other)
+                elif telegram_id is not None:
+                    # A Telegram account's own name: a code in it that belongs
+                    # to someone named differently does not make it theirs.
+                    conflict = IdentityConflict(code, held, rest, None)
+            if (
+                conflict is None
+                and telegram_id is not None
+                and held.telegram_id not in (None, telegram_id)
+            ):
+                conflict = IdentityConflict(code, held, rest or name, None)
+            if conflict is None:
+                await _give_codes(
+                    session,
+                    held,
+                    [c for c in q_codes if holders[c] is None],
+                    policy=code_policy,
+                    source=source,
+                    interaction_id=source_interaction_id,
+                )
+                _backfill(
+                    held,
+                    telegram_id=telegram_id,
+                    telegram_username=telegram_username,
+                    phone=phone,
+                )
+                return held
+        elif not rest:
+            if strict:
+                raise UnknownCode(q_codes[0])
+            return None
+        if conflict is not None:
+            if strict:
+                raise conflict
+            log.warning(
+                "identity conflict on %s (holder %s, named %r); resolving by name only",
+                conflict.code,
+                conflict.holder.id,
+                conflict.named,
+            )
+            q_codes, name = [], rest
+            if not rest:
+                return None
+        else:
+            # Anyone holding a *different* code is someone else.
+            held_by = await codes.codes_of_many(session, [p.id for p in people])
+            people = [
+                p
+                for p in people
+                if not held_by.get(p.id) or set(held_by[p.id]) & set(q_codes)
+            ]
+
     person, score = best_match(name, people)
 
     if person is not None and score >= MATCH_THRESHOLD:
-        names = [person.display_name, *(person.aliases or [])]
-        known = {normalise(codes.strip_codes(n)) for n in names}
-        # Never an alias with a code in it (WP-29): codes are identities, not
-        # spellings. A spelling in the other script is kept too (WP-28).
-        spelling = codes.strip_codes(name)
-        new_script = _is_cyrillic(spelling) not in {_is_cyrillic(n) for n in names if n}
-        if spelling and (normalise(spelling) not in known or new_script):
-            # ORM change tracking does not see in-place list mutation.
-            person.aliases = [*(person.aliases or []), spelling]
-        if telegram_id is not None and person.telegram_id is None:
-            person.telegram_id = telegram_id
-        if telegram_username and not person.telegram_username:
-            person.telegram_username = telegram_username
-        if phone and not person.phone:
-            person.phone = phone
+        _learn_alias(person, rest)
+        _backfill(
+            person,
+            telegram_id=telegram_id,
+            telegram_username=telegram_username,
+            phone=phone,
+        )
+        await _give_codes(
+            session,
+            person,
+            q_codes,
+            policy=code_policy,
+            source=source,
+            interaction_id=source_interaction_id,
+        )
         return person
 
     if not create:
         return None
 
-    log.info("creating person %r (best score %.0f)", name, score)
+    try:
+        await _owner_guard(session, rest or name)
+    except OwnerNamed:
+        if strict:
+            raise
+        return None
+
+    log.info("creating person %r (best score %.0f)", rest or name, score)
     person = Person(
-        display_name=codes.strip_codes(name) or name,
+        display_name=rest or name,
         aliases=[],
         telegram_id=telegram_id,
         telegram_username=telegram_username,
@@ -312,7 +557,22 @@ async def resolve_person(
     )
     session.add(person)
     await session.flush()
+    for code in q_codes:
+        # A brand-new person cannot conflict: nobody held these codes.
+        await codes.attach(
+            session,
+            person,
+            code,
+            source=source or "extraction",
+            by=source or "extraction",
+            interaction_id=source_interaction_id,
+        )
     return person
+
+
+async def _owner_guard(session: AsyncSession, name: str) -> None:
+    """Never create a person who is the owner (WP-36 fills this in)."""
+    return None
 
 
 async def find_by_phone(session: AsyncSession, phone: str) -> Person | None:

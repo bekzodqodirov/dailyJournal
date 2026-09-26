@@ -57,7 +57,10 @@ def counts_of(applied: Applied) -> dict[str, int]:
         "debts": len(applied.debts),
         "settlements": len(applied.settlements) + len(applied.unmatched_settlements),
         "questions": len(applied.ambiguous_settlements)
-        + len(applied.unmatched_fulfilments),
+        + len(applied.unmatched_fulfilments)
+        + len(applied.unknown_codes)
+        + len(applied.identity_conflicts)
+        + len(applied.owner_named),
         "promises": len(applied.promises),
         "fulfilled": len(applied.fulfilled),
         "transactions": len(applied.transactions),

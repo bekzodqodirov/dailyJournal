@@ -41,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.enums import Currency, DebtDirection, PromiseMadeBy
 from miya.db.models import Claim, Interaction
+from miya.services import codes as client_codes
 from miya.services import persistence, records
 from miya.services.extraction import (
     ExtractedDebt,
@@ -92,6 +93,14 @@ _REF = re.compile(r"^\s*#?c(\d{1,9})\s*$", re.IGNORECASE)
 
 class AlreadyAnswered(Exception):
     """accept / decline / edit on a claim that is no longer pending."""
+
+
+class UnknownCode(ValueError):
+    """`/tuzat c5 GS999`: a client code nobody holds (WP-31)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"client code not assigned: {code}")
+        self.code = code
 
 
 # --- the gate ----------------------------------------------------------------
@@ -551,11 +560,21 @@ async def edit(
         if not name:
             raise ValueError("a person needs a name")
         key = "counterparty" if claim.kind == KIND_TRANSACTION else "person"
-        _set(claim, key, name, field=field, by=by, now=now)
-        claim.person_name = name
-        # Whoever the window knew is no longer who the claim names; the
-        # accept resolves the new name.
-        claim.person_id = None
+        code = client_codes.canonical_client_code(name)
+        if code is not None:
+            # A client code is one known person or nobody — never a name.
+            holder = await client_codes.holder(session, code)
+            if holder is None:
+                raise UnknownCode(code)
+            _set(claim, key, code, field=field, by=by, now=now)
+            claim.person_id = holder.id
+            claim.person_name = f"{holder.display_name} ({code})"
+        else:
+            _set(claim, key, name, field=field, by=by, now=now)
+            claim.person_name = name
+            # Whoever the window knew is no longer who the claim names; the
+            # accept resolves the new name.
+            claim.person_id = None
 
     elif field == "amount":
         amount, currency = change.value  # type: ignore[misc]

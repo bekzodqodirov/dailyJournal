@@ -142,6 +142,16 @@ def find_client_codes(text: str) -> list[str]:
     return found
 
 
+def canonicalise_codes(text: str) -> str:
+    """Every code in ``text`` written canonically: '/tarix GS 367 20' has its
+    code as one token ('GS367 20'), so a count after it is not misread."""
+
+    def one(match: re.Match[str]) -> str:
+        return _canonical(match) + match.group("tail") if _counts(match) else match[0]
+
+    return client_code_re().sub(one, text or "")
+
+
 _EDGE = re.compile(r"^[\s()\[\]—–\-,:]+|[\s()\[\]—–\-,:]+$")
 
 
@@ -466,3 +476,10 @@ async def pending_suggestion_count(session: AsyncSession) -> int:
         )
         or 0
     )
+
+
+async def harvest(
+    session: AsyncSession, person: Person, name: str, *, policy: str
+) -> None:
+    """Learn codes from a name a known person carries (WP-35 fills this in)."""
+    return None

@@ -55,6 +55,7 @@ from miya.services import (
     reminders,
     reports,
 )
+from miya.services import codes as client_codes
 from miya.services.embeddings import EmbeddingError, get_embedder
 from miya.services.ingest import (
     create_interaction,
@@ -62,7 +63,7 @@ from miya.services.ingest import (
     process_interaction,
     transcribe_into,
 )
-from miya.services.people import best_match, find_person
+from miya.services.people import find_person
 
 log = logging.getLogger(__name__)
 
@@ -627,6 +628,11 @@ async def cmd_purge(message: Message, command: CommandObject) -> None:
 
     async with session_scope() as session:
         plan, payload = await _build_purge_plan(session, argument)
+        if isinstance(plan, str):
+            # Two people answer to the name, or a code nobody holds: ask,
+            # and offer nothing to press — a destructive command never guesses.
+            await _safe_answer(message, plan)
+            return
         body = replies.purge_preview(plan) if plan and not plan.is_empty() else None
 
     if body is None:
@@ -680,10 +686,17 @@ async def _build_purge_plan(session, argument: str):
             f"unut:d:{start.isoformat()}:{end.isoformat()}",
         )
 
-    people = list(await session.scalars(sa.select(Person)))
-    person, score = best_match(argument, people)
-    if person is None or score < 70:
+    match = await find_person(session, argument)
+    if match.person is None:
+        if match.unknown_code:
+            return replies.code_unknown(match.unknown_code), ""
         return None, ""
+    if match.ambiguous:
+        codes = await client_codes.codes_of_many(
+            session, [p.id for p in (match.person, match.runner_up) if p is not None]
+        )
+        return replies.person_ambiguous(match, command="unut", codes=codes), ""
+    person = match.person
     return await purge.plan_person(session, person), f"unut:p:{person.id}"
 
 
@@ -991,6 +1004,10 @@ async def cmd_edit(message: Message, command: CommandObject) -> None:
                 body = replies.debt_payments_exceed(ref_of(record), exc)
             except records.PaymentsExist:
                 body = replies.DEBT_CURRENCY_LOCKED.format(ref=ref_of(record))
+            except records.UnknownCode as exc:
+                body = replies.code_unknown(exc.code)
+            except records.IdentityConflict as exc:
+                body = replies.identity_conflict(exc.code, exc.holder, exc.named)
             except records.UnknownPerson as exc:
                 index = records.ask_new_person(record, exc.name, by=records.BY_COMMAND)
                 body = replies.new_person_question(exc.name)
@@ -1008,6 +1025,8 @@ async def _edit_claim(
         claim = await claims.edit(session, claim_id, edit, by=claims.BY_COMMAND)
     except claims.AlreadyAnswered:
         return replies.CLAIM_ALREADY, None
+    except claims.UnknownCode as exc:
+        return replies.code_unknown(exc.code), None
     except ValueError:
         claim = await claims.get(session, claim_id)
         if claim is None:
@@ -1390,9 +1409,14 @@ async def _lookup(
     """
     match = await find_person(session, name)
     if match.person is None:
+        if match.unknown_code:
+            return None, replies.code_unknown(match.unknown_code)
         return None, replies.person_not_found(name)
     if match.ambiguous:
-        return None, replies.person_ambiguous(match, command=command)
+        codes = await client_codes.codes_of_many(
+            session, [p.id for p in (match.person, match.runner_up) if p is not None]
+        )
+        return None, replies.person_ambiguous(match, command=command, codes=codes)
     return match.person, None
 
 
@@ -1420,7 +1444,7 @@ def _parse_history_args(args: str) -> tuple[str, int]:
     The count is clamped to [1, TARIX_MAX]: a request for a thousand lines
     is a request for as many as one message can carry.
     """
-    args = args.strip()
+    args = client_codes.canonicalise_codes(args.strip())
     found = _TARIX_COUNT.match(args)
     if found is None:
         return args, replies.TARIX_DEFAULT
