@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,9 +34,9 @@ from telethon.tl.types import Channel, Chat, User
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
-from miya.db.models import ChatMonitor, Interaction
+from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import engine, session_scope
-from miya.services import approvals, audio, documents
+from miya.services import approvals, audio, chats, documents, health, owner_address
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
@@ -46,6 +47,11 @@ from miya.services.media_policy import (
     plan_for,
 )
 from miya.services.people import resolve_person
+from miya.services.text import (  # noqa: F401 - transliterate is re-exported
+    alias_pattern,
+    fold_apostrophes,
+    transliterate,
+)
 from miya.services.transcription import TranscriptionError, get_transcriber
 from miya.services.vision import describe_image
 
@@ -199,6 +205,48 @@ async def fetch_media(
     return outcome
 
 
+def _media_pushable(message, monitor: ChatMonitor) -> bool:
+    if getattr(message, "out", False) and not settings.media_ask_outgoing:
+        return False
+    return monitor.chat_type is ChatType.private or settings.media_ask_in_groups
+
+
+async def _recheck_to_me(session, interaction: Interaction) -> None:
+    """A group voice note is only words once transcribed: look for the
+    owner's names again, before the window closes over it (WP-37)."""
+    meta = interaction.meta or {}
+    if (
+        meta.get("to_me")
+        or interaction.window_id is not None
+        or interaction.direction is not Direction.in_
+        or interaction.tg_chat_id is None
+        or not interaction.transcript
+    ):
+        return
+    chat_type = await session.scalar(
+        sa.select(ChatMonitor.chat_type).where(
+            ChatMonitor.tg_chat_id == interaction.tg_chat_id
+        )
+    )
+    if chat_type is not ChatType.group:
+        return
+    if mentions_owner(interaction.transcript):
+        sender = (
+            await session.get(Person, interaction.person_id)
+            if interaction.person_id
+            else None
+        )
+        interaction.meta = await owner_address.demote_if_namesake(
+            session,
+            {**meta, "to_me": True, "to_me_via": "transcript"},
+            interaction.transcript,
+            mentioned=False,
+            chat_id=interaction.tg_chat_id,
+            sender=sender,
+            aliases=_owner_aliases(),
+        )
+
+
 async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
     """Write what `fetch_media` produced. Short, and inside one transaction."""
     media = dict(interaction.media or {})
@@ -226,6 +274,7 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
                 **(interaction.meta or {}),
                 "asr_language": outcome.transcript.language,
             }
+        await _recheck_to_me(session, interaction)
 
     if outcome.vision is not None:
         if outcome.vision.usage is not None:
@@ -275,12 +324,17 @@ async def _counterparty(session, message, monitor: ChatMonitor):
 
     if entity is None or not isinstance(entity, User):
         return None
+    # A contact the owner saved carries the owner's own spelling, codes and
+    # all (WP-35); anyone else's profile name only suggests a code.
+    saved = bool(getattr(entity, "contact", False))
     return await resolve_person(
         session,
         display_name_of(entity),
         telegram_id=entity.id,
         telegram_username=getattr(entity, "username", None),
         phone=getattr(entity, "phone", None),
+        code_policy="attach" if saved else "suggest",
+        source="contact" if saved else "tg_name",
     )
 
 
@@ -326,6 +380,9 @@ async def already_stored(session, tg_chat_id: int, message) -> bool:
     return any((meta or {}).get("tg_message_id") == message.id for meta in rows)
 
 
+TG_MESSAGE_INDEX = "ux_interactions_tg_message"
+
+
 async def ingest_message(client: TelegramClient, message) -> bool:
     """Store one Telegram message. Extraction is the window job's business.
 
@@ -351,7 +408,24 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             ),
         )
         if not monitor.monitor_enabled:
+            if monitor.chat_type is not ChatType.private and monitor.decided_by is None:
+                # Activity only — counters and timestamps rank the group in
+                # the owner's next digest (WP-20); nothing it says is kept.
+                await chats.note_activity(
+                    session,
+                    monitor,
+                    out=bool(getattr(message, "out", False)),
+                    addressed=addressed_to_owner(message, monitor.chat_type),
+                    now=datetime.now(settings.tz),
+                )
             return False
+
+        # The catch-up cursor (WP-21): every message seen in an allowed chat
+        # advances it, stickers and service messages included.
+        if isinstance(getattr(message, "id", None), int):
+            monitor.last_seen_message_id = max(
+                monitor.last_seen_message_id or 0, message.id
+            )
 
         plan = plan_for(
             kind,
@@ -387,19 +461,43 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 media["approval"] = {
                     "state": approvals.PENDING,
                     "reason": plan.ask_reason,
+                    # WP-46: the owner's own files and group files wait in
+                    # /savollar; only what others send privately is pushed.
+                    "pushable": _media_pushable(message, monitor),
                 }
 
-        interaction = await create_interaction(
+        meta = await owner_address.demote_if_namesake(
             session,
-            source=InteractionSource.telegram_userbot,
-            direction=Direction.out if message.out else Direction.in_,
-            person_id=person.id if person else None,
-            tg_chat_id=message.chat_id,
-            text=text,
-            occurred_at=message.date.astimezone(settings.tz),
-            media=media,
-            meta=_message_meta(message, monitor),
+            _message_meta(message, monitor),
+            text or "",
+            mentioned=bool(getattr(message, "mentioned", False)),
+            chat_id=message.chat_id,
+            sender=person,
+            aliases=_owner_aliases(),
         )
+        try:
+            async with session.begin_nested():
+                interaction = await create_interaction(
+                    session,
+                    source=InteractionSource.telegram_userbot,
+                    direction=Direction.out if message.out else Direction.in_,
+                    person_id=person.id if person else None,
+                    tg_chat_id=message.chat_id,
+                    text=text,
+                    occurred_at=message.date.astimezone(settings.tz),
+                    media=media,
+                    meta=meta,
+                )
+        except sa.exc.IntegrityError as exc:
+            # The catch-up and the live handler raced for the same message:
+            # the other path stored it (ux_interactions_tg_message).
+            constraint = getattr(
+                getattr(getattr(exc, "orig", None), "diag", None), "constraint_name", None
+            )
+            if constraint != TG_MESSAGE_INDEX:
+                raise
+            log.debug("message %s in %s already stored", message.id, message.chat_id)
+            return False
         interaction_id = interaction.id
         if media is None or plan.ask:
             return True
@@ -417,19 +515,49 @@ async def ingest_message(client: TelegramClient, message) -> bool:
     return True
 
 
+# --- who a message was aimed at ----------------------------------------------
+#
+# The Latin→Cyrillic table and alias_pattern live in services/text.py (WP-28).
+
+
 def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
     """Was this message aimed at the owner rather than at the room?
 
     Only meaningful in a group: in a private chat every message is addressed
-    to him, so the flag would mark everything and distinguish nothing.
+    to him, so the flag would mark everything and distinguish nothing. His
+    own outgoing messages are never addressed to him either — he writes his
+    company's name and signs with his own, and a flag there would list his
+    words under "Sizga murojaatlar" and put the group on the instant path.
 
     Telethon sets `mentioned` for both an @-mention and a reply to one of the
     owner's own messages, which is exactly the question being asked — the two
-    are the same act from where he is sitting.
+    are the same act from where he is sitting. People mostly do neither: they
+    type "Bekzod aka, konteyner qachon?" in plain text, so the message text is
+    also searched for the owner's aliases (OWNER_ALIASES), whole word, either
+    script, any case.
     """
-    if chat_type is ChatType.private:
+    if chat_type in (ChatType.private, ChatType.channel):
+        # A channel post is a broadcast: it can never be aimed at the owner.
         return False
-    return bool(getattr(message, "mentioned", False))
+    if getattr(message, "out", False):
+        return False
+    if getattr(message, "mentioned", False):
+        return True
+    return mentions_owner(getattr(message, "message", None) or "")
+
+
+# The owner's own @username, learned from get_me() at start (WP-37): it need
+# not be written into .env to count.
+_RUNTIME_ALIASES: tuple[str, ...] = ()
+
+
+def _owner_aliases() -> tuple[str, ...]:
+    return settings.owner_aliases_parsed + _RUNTIME_ALIASES
+
+
+def mentions_owner(text: str) -> bool:
+    pattern = alias_pattern(_owner_aliases())
+    return bool(pattern and pattern.search(fold_apostrophes(text or "")))
 
 
 def _message_meta(message: object, monitor: ChatMonitor) -> dict:
@@ -499,14 +627,160 @@ async def fetch_approved(client: TelegramClient) -> int:
     return done
 
 
-async def approved_media_loop(client: TelegramClient) -> None:
+async def fetch_backfills(client: TelegramClient) -> int:
+    """Read the last week of every group the owner just said yes to.
+
+    The same shape as ``fetch_approved``: the bot recorded the request on the
+    monitor row (``chats.accept_join``), and this process — the only one with
+    a Telegram user session — performs it. The reading itself is delegated to
+    ``miya.tools.backfill``, so this package still contains no history call
+    of its own. A chat is stamped done after one successful pass; a failing
+    one is retried a bounded number of sweeps and then left alone, switched
+    on, with the failure in the log.
+    """
+    from miya.tools import backfill as backfill_tool
+
+    async with session_scope() as session:
+        jobs = [
+            (monitor.id, monitor.tg_chat_id, monitor.title)
+            for monitor in await chats.pending_backfills(session)
+        ]
+
+    done = 0
+    for monitor_id, chat_id, title in jobs:
+        try:
+            stored = await backfill_tool.backfill_chat(
+                client, chat_id, chats.BACKFILL_DAYS
+            )
+        except Exception:
+            log.exception("backfill of %s (%s) failed", title, chat_id)
+            stored = None
+        async with session_scope() as session:
+            monitor = await session.get(ChatMonitor, monitor_id)
+            if monitor is None:
+                continue
+            if stored is None:
+                chats.mark_backfill_failed(monitor)
+            else:
+                chats.mark_backfilled(monitor)
+                done += 1
+                log.info("backfilled %s (%s): %d message(s)", title, chat_id, stored)
+    return done
+
+
+async def beat_userbot(
+    *, enabled: bool, connected: bool | None = None, user_id: int | None = None
+) -> bool:
+    """The userbot's heartbeat (build step 5). Never raises.
+
+    ``{"enabled": false}`` is the switched-off process saying so once, which
+    /holat shows as ⏸ rather than ❌; a live one records whether Telethon is
+    still connected and as whom. A database hiccup is a log line: the reader
+    and its loop must not stop over a missed beat.
+    """
+    detail: dict = {"enabled": enabled}
+    if enabled:
+        detail.update({"connected": bool(connected), "user": user_id})
+        # A catch-up line must survive the next beat, which rewrites the
+        # detail whole (WP-21).
+        detail.update(_last_catch_up or {})
+    try:
+        async with session_scope() as session:
+            await health.beat(session, "userbot", detail=detail)
+        return True
+    except Exception:
+        log.warning("userbot heartbeat could not be written", exc_info=True)
+        return False
+
+
+async def approved_media_loop(
+    client: TelegramClient, *, user_id: int | None = None
+) -> None:
+    """The owner's answers, polled: approved attachments and requested backfills.
+
+    Every pass also beats the ``userbot`` heartbeat, so a reader whose
+    Telegram session died shows up as silent within USERBOT_STALE_MINUTES.
+    """
+    last_catch_up = time.monotonic()
     while True:
+        if time.monotonic() - last_catch_up >= settings.userbot_catchup_minutes * 60:
+            last_catch_up = time.monotonic()
+            try:
+                await catch_up_sweep(client)
+            except Exception:
+                log.exception("catch-up sweep failed")
+        await beat_userbot(enabled=True, connected=client.is_connected(), user_id=user_id)
         try:
             await fetch_approved(client)
         except Exception:
             # A failure here must never take the reader down with it.
             log.exception("approved-media sweep failed")
+        try:
+            await fetch_backfills(client)
+        except Exception:
+            log.exception("backfill sweep failed")
         await asyncio.sleep(APPROVED_POLL_SECONDS)
+
+
+# --- catch-up after downtime (WP-21) ------------------------------------------
+#
+# Telethon's live handler sees only what arrives while it runs, and a
+# StringSession keeps no update state, so every restart, deploy or network
+# drop used to lose what was said meanwhile. After each dialog sync the
+# chats whose newest message is past the cursor are read forward from it —
+# never before the chat was switched on — through the same ingestion path.
+
+_last_catch_up: dict | None = None
+_dialog_tops: dict[int, int] = {}
+
+
+async def catch_up_sweep(client: TelegramClient) -> int:
+    """Read every allowed chat forward from its cursor; returns messages stored."""
+    from miya.tools import backfill as backfill_tool
+
+    global _last_catch_up
+    await sync_from_client(client)
+    async with session_scope() as session:
+        monitors = list(
+            await session.scalars(
+                sa.select(ChatMonitor)
+                .where(ChatMonitor.monitor_enabled.is_(True))
+                .order_by(ChatMonitor.monitoring_since.nulls_first(), ChatMonitor.id)
+            )
+        )
+        jobs = [
+            (m.id, m.tg_chat_id, m.last_seen_message_id, m.monitoring_since)
+            for m in monitors
+            if (_dialog_tops.get(m.tg_chat_id) or 0) > (m.last_seen_message_id or 0)
+        ][: settings.userbot_catchup_max_chats]
+
+    stored = chats_read = 0
+    now = datetime.now(settings.tz)
+    for monitor_id, chat_id, after_id, since in jobs:
+        n, top = await backfill_tool.catch_up_chat(
+            client,
+            chat_id,
+            after_id=after_id,
+            since=since or now,
+            limit=settings.userbot_catchup_max_per_chat,
+        )
+        async with session_scope() as session:
+            monitor = await session.get(ChatMonitor, monitor_id)
+            if monitor is not None and top:
+                monitor.last_seen_message_id = max(monitor.last_seen_message_id or 0, top)
+        stored += n
+        chats_read += 1
+    if stored:
+        _last_catch_up = {"caught_up": stored, "caught_up_at": now.isoformat()}
+        log.info("caught up %d message(s) in %d chat(s)", stored, chats_read)
+    return stored
+
+
+async def _startup_catch_up(client: TelegramClient) -> None:
+    try:
+        await catch_up_sweep(client)
+    except Exception:
+        log.exception("startup catch-up failed")
 
 
 # --- dialog sync -------------------------------------------------------------
@@ -523,10 +797,15 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
                 chat_type=chat_type_of(entity),
                 title=chat_title_of(entity),
                 is_bot=bool(getattr(entity, "bot", False)),
+                top_message_id=getattr(getattr(dialog, "message", None), "id", None),
             )
         )
     async with session_scope() as session:
         created, renamed = await sync_dialogs(session, dialogs)
+    global _dialog_tops
+    _dialog_tops = {
+        d.tg_chat_id: d.top_message_id for d in dialogs if d.top_message_id is not None
+    }
     log.info(
         "dialog sync: %d chats seen, %d new, %d renamed", len(dialogs), created, renamed
     )
@@ -550,6 +829,11 @@ async def run() -> None:
         # unless-stopped` (so it survives a VPS reboot), and a clean exit here
         # would make Docker restart it in a tight loop forever.
         log.warning("USERBOT_ENABLED=false — the passive reader stays off")
+        # Said once, so /holat shows the reader as switched off, not silent.
+        # The pool is released afterwards: an idle process holds no
+        # connection for weeks.
+        await beat_userbot(enabled=False)
+        await engine.dispose()
         await _idle_forever()
         return
     if not (
@@ -611,7 +895,11 @@ async def run() -> None:
             )
 
         me = await client.get_me()
+        global _RUNTIME_ALIASES
+        if getattr(me, "username", None):
+            _RUNTIME_ALIASES = ("@" + me.username,)
         log.info("userbot connected as %s (read-only)", display_name_of(me))
+        await beat_userbot(enabled=True, connected=True, user_id=me.id)
         await sync_from_client(client)
 
         async def _on_message(event) -> None:
@@ -624,12 +912,16 @@ async def run() -> None:
 
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
-        sweeper = asyncio.create_task(approved_media_loop(client))
+        sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
+        # Whatever was said while this process was down (WP-21), read once
+        # the live handlers are in place so nothing falls between the two.
+        catcher = asyncio.create_task(_startup_catch_up(client))
         log.info("listening for new messages in monitored chats")
         try:
             await client.run_until_disconnected()
         finally:
             sweeper.cancel()
+            catcher.cancel()
     finally:
         await client.disconnect()
         await engine.dispose()

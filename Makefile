@@ -1,8 +1,8 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
-.PHONY: help env up down restart logs ps health migrate revision downgrade psql \
+.PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill backup
+        backfill backup backup-key backup-key-show restore doctor
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -12,7 +12,11 @@ env: ## Create .env from .env.example if it does not exist
 	@test -f .env || (cp .env.example .env && echo "Created .env — fill it in before 'make up'")
 
 # --- Docker -----------------------------------------------------------------
-up: env ## Build and start everything, then run migrations
+doctor: ## Check .env and the server before make up
+	$(COMPOSE) build api
+	$(COMPOSE) run --rm --no-deps api python -m miya.tools.doctor
+
+up: env $(if $(SKIP_DOCTOR),,doctor) ## Build and start everything, then run migrations (SKIP_DOCTOR=1 to skip the check)
 	$(COMPOSE) up -d --build db api
 	$(MAKE) migrate
 	$(COMPOSE) up -d --build bot worker userbot
@@ -66,10 +70,32 @@ userbot-login: ## One-time Telethon login; prints TELETHON_SESSION for .env
 backfill: ## Backfill one chat's history: make backfill CHAT=@akmal DAYS=7
 	$(COMPOSE) run --rm userbot python -m miya.tools.backfill "$(CHAT)" --days $${DAYS:-7}
 
+reprice: ## Recompute Anthropic costs from stored tokens: make reprice SINCE=2026-09-01 [DRY=1]
+	$(COMPOSE) run --rm worker python -m miya.tools.reprice_usage "$(SINCE)" $(if $(DRY),--dry,)
+
+import-clients: ## Import the client-code list: make import-clients FILE=/data/clients.xlsx [APPLY=1]
+	$(COMPOSE) run --rm worker python -m miya.tools.import_clients "$(FILE)" $(if $(APPLY),--apply,)
+
+backup-key: ## Create the backup key and print the .env line
+	@test ! -e secrets/backup-key.txt || { echo "secrets/backup-key.txt allaqachon bor — yangisi yaratilmaydi (eski zaxiralar faqat eski kalit bilan ochiladi)."; exit 1; }
+	$(COMPOSE) up init
+	$(COMPOSE) run --rm --no-deps worker age-keygen -o /app/secrets/backup-key.txt
+	@echo "Quyidagi qatorni .env faylidagi BACKUP_AGE_RECIPIENT= o'rniga yoz:"
+	@$(COMPOSE) run --rm --no-deps worker sh -c 'printf "BACKUP_AGE_RECIPIENT=%s\n" "$$(age-keygen -y /app/secrets/backup-key.txt)"'
+	@echo "Maxfiy kalitni server tashqarisida saqla: make backup-key-show — chiqqan qatorlarni parol menejeriga ko'chir."
+
+backup-key-show: ## Print the secret backup key (store it off the server)
+	$(COMPOSE) run --rm --no-deps worker cat /app/secrets/backup-key.txt
+
 backup: ## Run the encrypted database backup now
-	$(COMPOSE) run --rm worker python -c \
+	$(COMPOSE) run --rm --no-deps worker python -c \
 		"import asyncio; from miya.services.backup import create_backup; \
 		 print(asyncio.run(create_backup()))"
+
+restore: ## Restore a backup: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]
+	@test -n "$(FILE)" || (echo "usage: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]" && exit 1)
+	$(COMPOSE) run --rm --no-deps worker python -m miya.tools.restore "$(FILE)" \
+		--identity /app/secrets/backup-key.txt $(if $(DRY),--dry-run,) $(if $(FORCE),--force,)
 
 gcal-auth: ## One-time Google Calendar OAuth (use with: ssh -L 8765:127.0.0.1:8765)
 	$(COMPOSE) run --rm -p 127.0.0.1:8765:8765 -v ./secrets:/app/secrets worker \

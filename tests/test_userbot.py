@@ -342,3 +342,42 @@ async def test_persist_media_flags_a_failure_for_review(session):
     await ub.persist_media(session, interaction, ub.MediaOutcome(failed=True))
 
     assert interaction.needs_review is True
+
+
+async def test_a_group_voice_note_naming_the_owner_is_rechecked(session, monkeypatch):
+    from datetime import datetime
+
+    from miya.config import settings
+    from miya.db import models as m
+    from miya.db.enums import Direction, InteractionSource
+    from miya.services.transcription import Transcript
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(settings, "owner_aliases", "Bekzod, Bekzod aka")
+    session.add(m.ChatMonitor(tg_chat_id=-4242, chat_type=ChatType.group, title="Ish"))
+    interaction = m.Interaction(
+        source=InteractionSource.telegram_userbot,
+        direction=Direction.in_,
+        tg_chat_id=-4242,
+        occurred_at=datetime.now(settings.tz),
+        media={"type": "voice", "processed": False},
+        meta={"tg_message_id": 1},
+    )
+    session.add(interaction)
+    await session.flush()
+
+    class _Scribe:
+        model = "scribe_v1"
+
+    monkeypatch.setattr(ub, "get_transcriber", lambda: _Scribe())
+    await ub.persist_media(
+        session,
+        interaction,
+        ub.MediaOutcome(
+            transcript=Transcript(
+                text="Bekzod aka, yuk keldi", language="uz", duration=3.0
+            )
+        ),
+    )
+    assert interaction.meta["to_me"] is True
+    assert interaction.meta["to_me_via"] == "transcript"

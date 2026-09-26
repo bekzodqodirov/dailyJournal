@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
@@ -85,6 +86,92 @@ def test_defaults_match_the_spec_schema():
         ex.ExtractedDebt(direction="i_owe_them", person="X", amount=1).currency == "UZS"
     )
     assert ex.ExtractedTask(description="X").priority == "med"
+
+
+# --- who asserted a money item ----------------------------------------------
+#
+# "You owe me 5 mln" typed by a supplier used to come back indistinguishable
+# from the owner typing it himself. The extractor says who said it, and the
+# persistence layer parks a "them" as a claim to ask about (tests/test_claims.py).
+
+
+def test_counterparty_claims_come_back_marked_as_theirs():
+    body = (
+        '{"summary":"Akmal 5 mln talab qildi",'
+        '"debts":[{"direction":"i_owe_them","person":"Akmal","amount":5000000,'
+        '"asserted_by":"them"}],'
+        '"debt_settlements":[{"person":"Akmal","amount":1000000,'
+        '"direction":"they_owe_me","asserted_by":"them"}],'
+        '"promises":[{"made_by":"them","person":"Akmal",'
+        '"description":"juma kuni to\'laydi","asserted_by":"them"}],'
+        '"transactions":[{"type":"income","amount":3000000,"asserted_by":"them"}]}'
+    )
+
+    result = ex.parse_extraction_json(body)
+
+    assert result is not None
+    assert result.debts[0].asserted_by == "them"
+    assert result.debt_settlements[0].asserted_by == "them"
+    assert result.promises[0].asserted_by == "them"
+    assert result.transactions[0].asserted_by == "them"
+    # The claim is still extracted in full — marked, never dropped or softened.
+    assert result.debts[0].direction == "i_owe_them"
+    assert result.debts[0].amount == 5_000_000
+
+
+def test_asserted_by_defaults_to_the_owner():
+    """Every existing caller, and a reply that omits the field, keeps its meaning."""
+    assert (
+        ex.ExtractedDebt(direction="they_owe_me", person="X", amount=1).asserted_by
+        == "me"
+    )
+    assert ex.ExtractedSettlement(person="X", amount=1).asserted_by == "me"
+    promise = ex.ExtractedPromise(made_by="them", person="X", description="d")
+    assert promise.asserted_by == "me"  # who promised is not who reported it
+    assert ex.ExtractedTransaction(type="expense", amount=1).asserted_by == "me"
+
+    omitted = '{"debts":[{"direction":"i_owe_them","person":"Akmal","amount":1}]}'
+    assert ex.parse_extraction_json(omitted).debts[0].asserted_by == "me"
+
+
+def test_asserted_by_accepts_nothing_but_me_or_them():
+    body = (
+        '{"debts":[{"direction":"i_owe_them","person":"Akmal","amount":1,'
+        '"asserted_by":"supplier"}]}'
+    )
+    assert ex.parse_extraction_json(body) is None
+
+
+_ASSERTING_MODELS = (
+    "ExtractedDebt",
+    "ExtractedSettlement",
+    "ExtractedPromise",
+    "ExtractedTransaction",
+)
+
+
+def test_both_schema_paths_carry_asserted_by():
+    """The grammar and the prompted-JSON fallback are generated from the same
+    models, so the field reaches the model whichever route is in use."""
+    prompted = ex.extraction_system_block(with_schema=True)[0]["text"]
+    prompted_schema = json.loads(prompted[prompted.index("{") :])
+    grammar_schema = ex.extraction_output_config()["format"]["schema"]
+
+    for schema in (prompted_schema, grammar_schema):
+        for name in _ASSERTING_MODELS:
+            field = schema["$defs"][name]["properties"]["asserted_by"]
+            assert field["enum"] == ["me", "them"], (name, field)
+    assert "asserted_by" not in prompted_schema["$defs"]["ExtractedEvent"]["properties"]
+
+
+def test_the_prompt_requires_the_field_and_names_them_claims():
+    from miya.services.prompts import EXTRACTION_SYSTEM_PROMPT
+
+    assert '"asserted_by"' in EXTRACTION_SYSTEM_PROMPT
+    assert "CLAIM" in EXTRACTION_SYSTEM_PROMPT
+    # The one example the prompt gives is the exact attack: a supplier's
+    # "you owe me" is a debt the owner owes, asserted by the supplier.
+    assert 'asserted_by "them"' in EXTRACTION_SYSTEM_PROMPT
 
 
 # --- prompt construction ----------------------------------------------------
@@ -387,3 +474,25 @@ async def test_a_fenced_fallback_reply_still_produces_a_debt(stub):
 
     assert outcome.ok, outcome.error
     assert outcome.result.debts[0].person == "Akmal"
+
+
+# --- WP-35: client codes in the extraction -----------------------------------
+
+
+def test_the_schema_carries_a_client_code_on_people():
+    grammar_schema = ex.extraction_output_config()["format"]["schema"]
+    assert "client_code" in grammar_schema["$defs"]["ExtractedPerson"]["properties"]
+
+
+def test_the_prompt_explains_gs_codes_and_waybills():
+    from miya.services.prompts import EXTRACTION_SYSTEM_PROMPT
+
+    assert "GS367" in EXTRACTION_SYSTEM_PROMPT
+    assert "YW26-004715" in EXTRACTION_SYSTEM_PROMPT
+
+
+def test_the_system_block_is_byte_stable():
+    assert ex.extraction_system_block() == ex.extraction_system_block()
+    assert ex.extraction_system_block(with_schema=True) == ex.extraction_system_block(
+        with_schema=True
+    )

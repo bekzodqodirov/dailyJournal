@@ -506,10 +506,7 @@ async def _plain(value):
 
 async def test_a_hostile_contact_name_cannot_break_the_daily_report(session, monkeypatch):
     """A Telegram contact picks their own name; it lands in an HTML message."""
-    from miya.services import planner, reports
-
-    # gather() builds tomorrow's plan; keep the model out of this test.
-    monkeypatch.setattr(planner, "plan_for", lambda *a, **k: _plain("REJA"))
+    from tests import recap_helpers
 
     person = await resolve_person(session, "<b>Akmal</b>")
     interaction = await _interaction(session)
@@ -525,8 +522,7 @@ async def test_a_hostile_contact_name_cannot_break_the_daily_report(session, mon
     )
     await session.flush()
 
-    data = await reports.gather(session, datetime.now(TZ).date())
-    block = reports.render_data_block(data)
+    block = await recap_helpers.recap_of(session)
 
     assert "<b>Akmal</b>" not in block
     assert "&lt;b&gt;Akmal&lt;/b&gt;" in block

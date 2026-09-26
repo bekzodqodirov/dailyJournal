@@ -1,0 +1,133 @@
+# The Python side: lint, format, migrations and drift, the full suite on the
+# same PostgreSQL 16 + pgvector image production runs, the suite again at
+# other moments (calendar rot), and a Compose parse of .env.example.
+name: Python CI
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "android/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        # The image docker-compose.yml runs: it ships the vector extension,
+        # and POSTGRES_USER is a superuser there, so 0001's CREATE EXTENSION
+        # works.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: miya
+          POSTGRES_PASSWORD: miya
+          POSTGRES_DB: miya
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U miya -d miya"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+psycopg://miya:miya@localhost:5432/miya
+      MIYA_MIGRATION_DATABASE_URL: postgresql+psycopg://miya:miya@localhost:5432/miya_c
+      TZ: Asia/Tashkent
+      MIYA_REQUIRE_DB: "1"
+      # Empty until the owner adds the secret; then the username guard runs.
+      MIYA_FORBIDDEN_STRINGS: ${{ secrets.MIYA_FORBIDDEN_STRINGS }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install (CPU torch first)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements-dev.txt
+      - name: ruff check
+        run: ruff check .
+      - name: ruff format
+        run: ruff format --check .
+      - name: Migration round-trip database
+        run: |
+          PGPASSWORD=miya psql -h localhost -U miya -d miya -c 'CREATE DATABASE miya_c'
+          DATABASE_URL=$MIYA_MIGRATION_DATABASE_URL alembic upgrade head
+      - name: alembic upgrade head
+        run: alembic upgrade head
+      - name: alembic check (no drift)
+        run: alembic check
+      - name: Downgrade to base and back
+        run: alembic downgrade base && alembic upgrade head
+      - name: pytest
+        run: pytest -q -p no:cacheprovider
+
+  time-travel:
+    # Python's clock travels, PostgreSQL's does not: database tests skip here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: postgresql+psycopg://none:none@127.0.0.1:1/none
+      TZ: Asia/Tashkent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Install (CPU torch first)
+        run: |
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r requirements-dev.txt
+      - name: The next new year
+        run: pytest -q -p no:cacheprovider
+        env:
+          MIYA_TIME_TRAVEL: newyear
+      - name: 400 days from now
+        run: pytest -q -p no:cacheprovider
+        env:
+          MIYA_TIME_TRAVEL: +400d
+
+  compose-env:
+    # A trailing "# comment" on a KEY= line once became the value itself.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse .env.example through Compose
+        run: |
+          cp .env.example .env
+          docker compose config --format json > compose.json
+          python3 - <<'PY'
+          import json
+
+          config = json.load(open("compose.json"))
+          bad = [
+              f"{name}.{key}"
+              for name, service in config["services"].items()
+              for key, value in (service.get("environment") or {}).items()
+              if isinstance(value, str) and value.lstrip().startswith("#")
+          ]
+          assert not bad, f"comment-shaped values: {bad}"
+          api = config["services"]["api"].get("environment") or {}
+          for key in ("TELETHON_API_ID", "API_BEARER_TOKEN"):
+              assert api.get(key, "") == "", f"api {key} should be empty: {api.get(key)!r}"
+          print("compose env ok")
+          PY

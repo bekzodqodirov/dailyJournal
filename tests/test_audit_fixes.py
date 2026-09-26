@@ -346,7 +346,7 @@ async def test_ingest_uses_mtime_when_the_stamp_disagrees(session, tmp_path, mon
 
     from miya.services import ingest as ingest_svc
 
-    async def _no_transcribe(session_, interaction, path):
+    async def _no_transcribe(session_, interaction, path, **hints):
         interaction.transcript = "salom"
         return "salom"
 

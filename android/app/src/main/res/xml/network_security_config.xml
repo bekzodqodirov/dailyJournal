@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Cleartext HTTP is blocked by default for any app targeting API 28 or newer,
+  and this one targets 36. Without this file every request to the design's
+  `http://<tailnet>:8000` server dies inside OkHttp as
+
+      java.net.UnknownServiceException:
+      CLEARTEXT communication to 100.x.y.z not permitted by network security policy
+
+  which, because UnknownServiceException extends IOException, would be
+  classified as a transient network error and retried forever. Nothing would
+  ever upload, on any phone.
+
+  The blunt fix is android:usesCleartextTraffic="true" on <application>. It is
+  deliberately NOT used here: it would also permit plaintext to any host the
+  owner ever types into Settings, including one on the open internet, in front
+  of every transcript and contact they have.
+
+  What this file does instead: plaintext is refused everywhere except inside
+  the private tunnel.
+
+  ===========================================================================
+  THE TRADE-OFF, STATED HONESTLY
+
+  Android's network security config matches DOMAIN NAMES. It has no notion of
+  an IP range, so Tailscale's whole 100.64.0.0/10 CGNAT block CANNOT be
+  expressed here — `<domain>100.64.0.0</domain>` matches that one literal
+  address and nothing else, and `includeSubdomains` extends a name to the LEFT
+  ("x.example.com" under "example.com"), which is meaningless for an IP.
+
+  So there are exactly two supported ways to address the server:
+
+    1. RECOMMENDED - the tailnet MagicDNS name, e.g.
+         http://vps.tailnet-name.ts.net:8000
+       MagicDNS is on by default in Tailscale, every name in every tailnet
+       lives under `ts.net`, and the entry below permits cleartext to that
+       namespace and nowhere else. Nothing needs editing and nothing outside
+       the tunnel is reachable in plaintext.
+
+    2. A RAW TAILNET IP - uncomment the block at the bottom and put the exact
+       address in it, then rebuild. One address per <domain> line; there is no
+       wildcard.
+
+  Anything else stays blocked, and the app now says so in plain words on the
+  Settings screen ("Android blocks plaintext HTTP to <host>…") instead of
+  reporting a tunnel problem that does not exist.
+-->
+<network-security-config>
+
+    <!-- Everything not named below: no plaintext, system CAs only. -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+      Tailscale MagicDNS. Every host in every tailnet is <machine>.<tailnet>.ts.net,
+      so this permits plaintext inside the tunnel and nowhere on the public
+      internet. `ts.net` itself is a Tailscale-operated zone; a name under it
+      only resolves for a device that is signed in to that tailnet.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">ts.net</domain>
+    </domain-config>
+
+    <!-- `adb reverse tcp:8000 tcp:8000` while testing against a laptop. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+
+    <!--
+      EDIT AND UNCOMMENT ME if you address the server by raw tailnet IP rather
+      than by MagicDNS name. Put the exact address in, add one <domain> line
+      per address, and rebuild. Do NOT widen this to a range: it cannot be
+      done here, and every address you add is one more host this phone will
+      talk to in plaintext.
+
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">100.101.102.103</domain>
+    </domain-config>
+    -->
+
+</network-security-config>

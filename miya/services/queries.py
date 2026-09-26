@@ -10,24 +10,37 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from miya.config import settings
-from miya.db.enums import Currency, DebtDirection, DebtStatus, PromiseStatus, TaskStatus
+from miya.db.enums import (
+    Currency,
+    DebtDirection,
+    DebtStatus,
+    Direction,
+    InteractionSource,
+    PromiseStatus,
+    TaskStatus,
+)
 from miya.db.models import (
     ChatMonitor,
     Debt,
     DebtPayment,
     Event,
     Interaction,
+    Memory,
     Person,
     Promise,
     Task,
     Transaction,
+    TransactionEvidence,
     UsageLog,
 )
+from miya.services import codes, memories
 
 
 @dataclass(slots=True)
@@ -38,6 +51,8 @@ class DebtBalance:
     outstanding: Decimal
     earliest_due: date | None
     count: int
+    # The debt rows behind this balance, so a line can carry their d-refs.
+    ids: list[int] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -54,12 +69,34 @@ class DaySummary:
 
 
 @dataclass(slots=True)
+class TimelineEntry:
+    """One row of a person's history, as a surface shows it (build step 4)."""
+
+    interaction: Interaction
+    when: datetime
+    source: InteractionSource
+    direction: Direction
+    # The summary when extraction wrote one, else the words themselves.
+    text: str
+
+
+@dataclass(slots=True)
 class PersonSummary:
     person: Person
     balances: list[DebtBalance] = field(default_factory=list)
     open_promises: list[Promise] = field(default_factory=list)
     last_interactions: list[Interaction] = field(default_factory=list)
     total_interactions: int = 0
+    # Per-person memory (build step 4). ``profile`` is MIYA's own prose
+    # (people.notes) and never a source of figures; the figures are above.
+    last_contact_at: datetime | None = None
+    facts: list[Memory] = field(default_factory=list)
+    timeline: list[TimelineEntry] = field(default_factory=list)
+    profile: str | None = None
+    profile_updated_at: datetime | None = None
+    # WP-40: the person's client codes and where others mentioned them.
+    codes: list[str] = field(default_factory=list)
+    code_mentions: list[Any] = field(default_factory=list)
 
 
 def day_bounds(day: date) -> tuple[datetime, datetime]:
@@ -69,8 +106,17 @@ def day_bounds(day: date) -> tuple[datetime, datetime]:
     return start, start + timedelta(days=1)
 
 
+# The rows that count as money (WP-11). Every total over transactions MUST
+# carry this filter: a voided row (a correction, a reinstall duplicate) and
+# an internal transfer between the owner's own accounts are not income or
+# expense. A test fails when a sum over Transaction.amount lacks it.
+ACTIVE_TXN = sa.and_(Transaction.voided_at.is_(None), Transaction.is_internal.is_(False))
+
+
 # `debts.amount` minus everything paid against it — the outstanding balance.
-_OUTSTANDING = Debt.amount - sa.func.coalesce(
+# Public: loops.py ranks open loops by this same figure, so there is one
+# definition of "what is still owed" in the codebase.
+OUTSTANDING = Debt.amount - sa.func.coalesce(
     sa.select(sa.func.sum(DebtPayment.amount))
     .where(DebtPayment.debt_id == Debt.id)
     .correlate(Debt)
@@ -91,14 +137,15 @@ async def open_debts(
             Person,
             Debt.direction,
             Debt.currency,
-            sa.func.sum(_OUTSTANDING).label("outstanding"),
+            sa.func.sum(OUTSTANDING).label("outstanding"),
             sa.func.min(Debt.due_date).label("earliest_due"),
             sa.func.count(Debt.id).label("count"),
+            sa.func.array_agg(sa.distinct(Debt.id)).label("ids"),
         )
         .join(Person, Person.id == Debt.person_id)
         .where(Debt.status != DebtStatus.settled)
         .group_by(Person.id, Debt.direction, Debt.currency)
-        .having(sa.func.sum(_OUTSTANDING) > 0)
+        .having(sa.func.sum(OUTSTANDING) > 0)
         .order_by(Debt.direction, sa.desc("outstanding"))
     )
     if direction is not None:
@@ -114,6 +161,7 @@ async def open_debts(
             outstanding=row[3],
             earliest_due=row[4],
             count=row[5],
+            ids=sorted(row[6] or []),
         )
         for row in (await session.execute(stmt)).all()
     ]
@@ -167,6 +215,7 @@ async def _top_expenses(
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .subquery()
     )
     return list(
@@ -179,73 +228,408 @@ async def _top_expenses(
     )
 
 
-async def day_summary(session: AsyncSession, day: date | None = None) -> DaySummary:
-    """Everything that happened on one local day (`/bugun`)."""
-    day = day or datetime.now(settings.tz).date()
-    start, end = day_bounds(day)
-    summary = DaySummary(day=day)
+@dataclass(slots=True)
+class RepaymentLine:
+    payment_id: int
+    debt_id: int
+    person_id: int
+    person_name: str
+    direction: DebtDirection
+    amount: Decimal
+    currency: Currency
+    paid_at: datetime
 
+
+@dataclass(slots=True)
+class CheckableTxn:
+    id: int
+    type: str
+    amount: Decimal
+    currency: Currency
+    occurred_at: datetime
+    description: str | None
+    source: str
+    channel: str | None
+
+
+@dataclass(slots=True)
+class MoneyDay:
+    """Every money figure of a recap window (WP-51) — SQL only, Decimal,
+    per currency, never mixed."""
+
+    income: dict[Currency, Decimal] = field(default_factory=dict)
+    expense: dict[Currency, Decimal] = field(default_factory=dict)
+    by_category: list[tuple[str, Currency, Decimal]] = field(default_factory=list)
+    biggest: list[Transaction] = field(default_factory=list)
+    repayments: list[RepaymentLine] = field(default_factory=list)
+    by_source: dict[str, int] = field(default_factory=dict)
+    checkable: list[CheckableTxn] = field(default_factory=list)
+    checkable_total: int = 0
+    from_phone: int = 0
+    merged: int = 0
+    review_pending: int = 0
+    ignored: int = 0
+    voided: int = 0
+
+
+CHECKABLE_LIMIT = 10
+
+
+async def money_between(
+    session: AsyncSession, start: datetime, end: datetime
+) -> MoneyDay:
+    """The money of [start, end): totals, categories, repayments, and what
+    the phone booked — every sum filtered by ACTIVE_TXN."""
+    money = MoneyDay()
+    in_window = (Transaction.occurred_at >= start, Transaction.occurred_at < end)
     totals = await session.execute(
-        sa.select(
-            Transaction.type,
-            Transaction.currency,
-            sa.func.sum(Transaction.amount),
-        )
-        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        sa.select(Transaction.type, Transaction.currency, sa.func.sum(Transaction.amount))
+        .where(*in_window)
+        .where(ACTIVE_TXN)
         .group_by(Transaction.type, Transaction.currency)
     )
     for txn_type, currency, total in totals.all():
-        bucket = summary.income if txn_type.value == "income" else summary.expense
+        bucket = money.income if txn_type.value == "income" else money.expense
         bucket[currency] = total
-
     categories = await session.execute(
         sa.select(
             sa.func.coalesce(Transaction.category, "other"),
             Transaction.currency,
             sa.func.sum(Transaction.amount).label("total"),
         )
-        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(*in_window)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .group_by(Transaction.category, Transaction.currency)
         .order_by(sa.desc("total"))
         .limit(10)
     )
-    summary.by_category = [(c, cur, total) for c, cur, total in categories.all()]
+    money.by_category = [(c, cur, total) for c, cur, total in categories.all()]
+    money.biggest = await _top_expenses(session, start, end)
+
+    rows = await session.execute(
+        sa.select(
+            DebtPayment.id,
+            DebtPayment.amount,
+            DebtPayment.currency,
+            DebtPayment.paid_at,
+            Debt.id,
+            Debt.direction,
+            Person.id,
+            Person.display_name,
+        )
+        .join(Debt, Debt.id == DebtPayment.debt_id)
+        .join(Person, Person.id == Debt.person_id)
+        .where(DebtPayment.paid_at >= start, DebtPayment.paid_at < end)
+        .order_by(DebtPayment.paid_at)
+    )
+    money.repayments = [
+        RepaymentLine(
+            payment_id=pid,
+            debt_id=did,
+            person_id=person_id,
+            person_name=name,
+            direction=direction,
+            amount=amount,
+            currency=currency,
+            paid_at=paid_at,
+        )
+        for pid, amount, currency, paid_at, did, direction, person_id, name in rows.all()
+    ]
+
+    source = sa.func.coalesce(sa.cast(Interaction.source, sa.Text), "manual")
+    by_source = await session.execute(
+        sa.select(source, sa.func.count(Transaction.id))
+        .select_from(Transaction)
+        .outerjoin(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(*in_window)
+        .where(ACTIVE_TXN)
+        .group_by(source)
+    )
+    money.by_source = dict(by_source.all())
+
+    phone = (*in_window, ACTIVE_TXN, Transaction.channel.is_not(None))
+    checkable = await session.execute(
+        sa.select(Transaction, source)
+        .outerjoin(Interaction, Interaction.id == Transaction.source_interaction_id)
+        .where(*phone)
+        .order_by(Transaction.occurred_at, Transaction.id)
+        .limit(CHECKABLE_LIMIT)
+    )
+    money.checkable = [
+        CheckableTxn(
+            id=t.id,
+            type=t.type.value,
+            amount=t.amount,
+            currency=t.currency,
+            occurred_at=t.occurred_at,
+            description=t.description,
+            source=src,
+            channel=t.channel,
+        )
+        for t, src in checkable.all()
+    ]
+    money.checkable_total = int(
+        await session.scalar(sa.select(sa.func.count(Transaction.id)).where(*phone)) or 0
+    )
+    money.from_phone = int(
+        await session.scalar(
+            sa.select(sa.func.count(Transaction.id)).where(
+                Transaction.created_at >= start,
+                Transaction.created_at < end,
+                Transaction.channel.is_not(None),
+            )
+        )
+        or 0
+    )
+    money.merged = int(
+        await session.scalar(
+            sa.select(sa.func.count(TransactionEvidence.id))
+            .join(Transaction, Transaction.id == TransactionEvidence.transaction_id)
+            .where(
+                TransactionEvidence.created_at >= start,
+                TransactionEvidence.created_at < end,
+                sa.or_(
+                    Transaction.source_interaction_id.is_(None),
+                    TransactionEvidence.interaction_id
+                    != Transaction.source_interaction_id,
+                ),
+            )
+        )
+        or 0
+    )
+    money.review_pending = await money_review_count(session)
+    money.ignored = await ignored_money_count(session, start, end)
+    money.voided = int(
+        await session.scalar(
+            sa.select(sa.func.count(Transaction.id)).where(
+                Transaction.voided_at >= start, Transaction.voided_at < end
+            )
+        )
+        or 0
+    )
+    return money
+
+
+async def day_summary(session: AsyncSession, day: date | None = None) -> DaySummary:
+    """Everything that happened on one local day (`/bugun`)."""
+    day = day or datetime.now(settings.tz).date()
+    start, end = day_bounds(day)
+    summary = DaySummary(day=day)
+
+    money = await money_between(session, start, end)
+    summary.income, summary.expense = money.income, money.expense
+    summary.by_category = money.by_category
 
     people = await session.execute(
         sa.select(Person, sa.func.count(Interaction.id).label("n"))
         .join(Interaction, Interaction.person_id == Person.id)
         .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        .where(_not_window_row())
         .group_by(Person.id)
         .order_by(sa.desc("n"))
     )
     summary.people_seen = [(row[0], row[1]) for row in people.all()]
 
+    # People are loaded eagerly: `/bugun` lists each new debt and promise by
+    # name and ref, and the relationships are lazy="raise".
     summary.new_debts = list(
         await session.scalars(
-            sa.select(Debt).where(Debt.created_at >= start, Debt.created_at < end)
+            sa.select(Debt)
+            .options(selectinload(Debt.person))
+            .where(Debt.created_at >= start, Debt.created_at < end)
+            .order_by(Debt.id)
         )
     )
     summary.new_promises = list(
         await session.scalars(
-            sa.select(Promise).where(
-                Promise.created_at >= start, Promise.created_at < end
-            )
+            sa.select(Promise)
+            .options(selectinload(Promise.person))
+            .where(Promise.created_at >= start, Promise.created_at < end)
+            .order_by(Promise.id)
         )
     )
     summary.interactions = await session.scalar(
-        sa.select(sa.func.count(Interaction.id)).where(
-            Interaction.occurred_at >= start, Interaction.occurred_at < end
-        )
+        sa.select(sa.func.count(Interaction.id))
+        .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        .where(_not_window_row())
     )
-    summary.biggest = await _top_expenses(session, start, end)
+    summary.biggest = money.biggest
     return summary
 
 
+# --- one person's history (build step 4) ------------------------------------
+
+# Sources whose every row is one contact worth a timeline line: a call, an
+# SMS (a money SMS must appear in /tarix), a note the owner typed or spoke
+# into the bot, a receipt. The userbot is different — its member messages
+# are one-liners, and the row worth showing is the window's own synthetic
+# interaction (meta.kind == "window"), which carries the summary of the
+# whole conversation.
+TIMELINE_SOURCES: tuple[InteractionSource, ...] = (
+    InteractionSource.phone_call,
+    InteractionSource.phone_sms,
+    InteractionSource.assistant_bot,
+    InteractionSource.manual,
+    InteractionSource.receipt_photo,
+    InteractionSource.phone_notification,
+)
+
+
+def _is_window_row():
+    # ``.astext`` on the nested key: ``metadata`` holds JSON null for rows
+    # written without one, and a missing key must simply not match.
+    return sa.and_(
+        Interaction.source == InteractionSource.telegram_userbot,
+        Interaction.meta["kind"].astext == "window",
+    )
+
+
+def _not_window_row():
+    """Every row but a window's own; a NULL kind is not a window (WP-48)."""
+    return sa.or_(
+        Interaction.source != InteractionSource.telegram_userbot,
+        sa.func.coalesce(Interaction.meta["kind"].astext, "") != "window",
+    )
+
+
+def is_member_message():
+    """A userbot message as it was sent — not the window row summarising it.
+
+    Members keep ``window_id`` after the flush, so ``window_id`` cannot tell
+    the two apart; the window row's metadata can.
+    """
+    return sa.and_(
+        Interaction.source == InteractionSource.telegram_userbot,
+        sa.func.coalesce(Interaction.meta["kind"].astext, "") != "window",
+    )
+
+
+def timeline_filter(direction: Direction | None = None):
+    """Which interaction rows a timeline shows.
+
+    Without a direction: the window rows and every row of TIMELINE_SOURCES;
+    raw userbot member lines stay out. With one: the member lines *are* the
+    point — "what did I say to him" is the owner's own DM lines (direction
+    out), "what did he say" his — so only userbot rows with that direction
+    count. The owner's own notes to the bot are stored as direction ``in``
+    too, and a call transcript holds both voices; neither is "his lines".
+    The window row itself has direction ``na`` and drops out on its own.
+    """
+    if direction is not None:
+        return sa.and_(
+            Interaction.source == InteractionSource.telegram_userbot,
+            Interaction.direction == direction,
+        )
+    return sa.or_(_is_window_row(), Interaction.source.in_(TIMELINE_SOURCES))
+
+
+def timeline_text(interaction: Interaction, *, limit: int = 300) -> str:
+    if interaction.summary:
+        return interaction.summary.strip()
+    body = interaction.transcript or interaction.raw_text or ""
+    return body.strip()[:limit]
+
+
+def timeline_entry(interaction: Interaction) -> TimelineEntry:
+    return TimelineEntry(
+        interaction=interaction,
+        when=interaction.occurred_at,
+        source=interaction.source,
+        direction=interaction.direction,
+        text=timeline_text(interaction),
+    )
+
+
+async def timeline(
+    session: AsyncSession,
+    person_id: int,
+    *,
+    limit: int = 20,
+    before: datetime | None = None,
+    since: datetime | None = None,
+    direction: Direction | None = None,
+) -> list[TimelineEntry]:
+    """A person's contact history, newest first, in one query.
+
+    ``before`` pages backwards (strictly earlier rows), ``since`` bounds the
+    window (rows at or after it); the query walks
+    ``ix_interactions_person_occurred``.
+    """
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.person_id == person_id)
+        .where(timeline_filter(direction))
+        .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
+        .limit(limit)
+    )
+    if before is not None:
+        stmt = stmt.where(Interaction.occurred_at < before)
+    if since is not None:
+        stmt = stmt.where(Interaction.occurred_at >= since)
+    return [timeline_entry(row) for row in await session.scalars(stmt)]
+
+
+def _last_of(column, *conditions) -> sa.ScalarSelect:
+    # Correlated on Person so the same expression serves a per-person scan
+    # (profiles.stale_people) and a single lookup by id.
+    return (
+        sa.select(sa.func.max(column))
+        .where(*conditions)
+        .correlate(Person)
+        .scalar_subquery()
+    )
+
+
+def last_contact_expr(person_id):
+    """GREATEST of every timestamp that proves contact with ``person_id``.
+
+    The same definition as loops.quiet_counterparties: an interaction either
+    way, a transaction with them, a debt or promise recorded about them, or a
+    payment on one of their debts — the owner types debts and repayments into
+    the bot with no interaction row of their own, and the row's timestamp is
+    still proof of contact. GREATEST skips NULLs in PostgreSQL and is NULL
+    only when nothing at all is recorded.
+    """
+    return sa.func.greatest(
+        _last_of(Interaction.occurred_at, Interaction.person_id == person_id),
+        # A voided row proves nothing; an internal transfer is still contact.
+        _last_of(
+            Transaction.occurred_at,
+            Transaction.counterparty_person_id == person_id,
+            Transaction.voided_at.is_(None),
+        ),
+        _last_of(Debt.created_at, Debt.person_id == person_id),
+        _last_of(Promise.created_at, Promise.person_id == person_id),
+        _last_of(
+            DebtPayment.paid_at,
+            DebtPayment.debt_id == Debt.id,
+            Debt.person_id == person_id,
+        ),
+    )
+
+
+async def last_contact_at(session: AsyncSession, person_id: int) -> datetime | None:
+    """When the owner last had anything to do with this person, or None."""
+    return await session.scalar(sa.select(last_contact_expr(person_id)))
+
+
+PERSON_CODE_MENTIONS = 5
+
+
 async def person_summary(
-    session: AsyncSession, person: Person, *, recent: int = 5
+    session: AsyncSession,
+    person: Person,
+    *,
+    recent: int = 5,
+    timeline_limit: int = 10,
+    facts_limit: int = 8,
 ) -> PersonSummary:
-    """Debts, promises and recent contact for one person (`/kim`)."""
+    """Everything held about one person (`/kim`, the API, the RAG tool).
+
+    Seven queries, whatever the person's history: balances, open promises,
+    the last interactions and their count, last contact, facts, timeline.
+    """
     summary = PersonSummary(person=person)
     summary.balances = await open_debts(session, person_id=person.id)
     summary.open_promises = [
@@ -262,6 +646,19 @@ async def person_summary(
     summary.total_interactions = await session.scalar(
         sa.select(sa.func.count(Interaction.id)).where(Interaction.person_id == person.id)
     )
+    summary.last_contact_at = await last_contact_at(session, person.id)
+    summary.facts = await memories.facts_for(session, person.id, limit=facts_limit)
+    summary.timeline = await timeline(session, person.id, limit=timeline_limit)
+    summary.profile = person.notes
+    summary.profile_updated_at = person.profile_updated_at
+    summary.codes = await codes.codes_of(session, person.id)
+    found = []
+    for code in summary.codes:
+        found += await codes.mentions(
+            session, code, limit=PERSON_CODE_MENTIONS, exclude_person_id=person.id
+        )
+    found.sort(key=lambda line: line.when, reverse=True)
+    summary.code_mentions = found[:PERSON_CODE_MENTIONS]
     return summary
 
 
@@ -316,6 +713,23 @@ class SpendingSummary:
     biggest: list[Transaction] = field(default_factory=list)
 
 
+async def transactions_on(
+    session: AsyncSession, day: date, *, include_voided: bool = False
+) -> list[Transaction]:
+    """One local day's money rows, oldest first (`/pul`). Voided rows are
+    listed only on request — they are shown, never counted."""
+    start, end = day_bounds(day)
+    stmt = (
+        sa.select(Transaction)
+        .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .options(selectinload(Transaction.counterparty))
+        .order_by(Transaction.occurred_at, Transaction.id)
+    )
+    if not include_voided:
+        stmt = stmt.where(Transaction.voided_at.is_(None))
+    return list(await session.scalars(stmt))
+
+
 async def spending_summary(
     session: AsyncSession, date_from: date, date_to: date
 ) -> SpendingSummary:
@@ -327,6 +741,7 @@ async def spending_summary(
     totals = await session.execute(
         sa.select(Transaction.type, Transaction.currency, sa.func.sum(Transaction.amount))
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
+        .where(ACTIVE_TXN)
         .group_by(Transaction.type, Transaction.currency)
     )
     for txn_type, currency, total in totals.all():
@@ -341,6 +756,7 @@ async def spending_summary(
         )
         .where(Transaction.occurred_at >= start, Transaction.occurred_at < end)
         .where(Transaction.type == "expense")
+        .where(ACTIVE_TXN)
         .group_by(Transaction.category, Transaction.currency)
         .order_by(sa.desc("total"))
         .limit(10)
@@ -374,7 +790,13 @@ class CompletedToday:
 
 async def completed_on(session: AsyncSession, day: date) -> CompletedToday:
     """What got closed out on one local day (for the daily report)."""
-    start, end = day_bounds(day)
+    return await completed_between(session, *day_bounds(day))
+
+
+async def completed_between(
+    session: AsyncSession, start: datetime, end: datetime
+) -> CompletedToday:
+    """What got closed out in [start, end)."""
     return CompletedToday(
         settled_debts=list(
             await session.scalars(
@@ -387,11 +809,14 @@ async def completed_on(session: AsyncSession, day: date) -> CompletedToday:
         ),
         done_promises=list(
             await session.scalars(
-                sa.select(Promise).where(
+                sa.select(Promise)
+                .options(selectinload(Promise.person))
+                .where(
                     Promise.status == PromiseStatus.done,
                     Promise.completed_at >= start,
                     Promise.completed_at < end,
                 )
+                .order_by(Promise.completed_at)
             )
         ),
         done_tasks=list(
@@ -412,12 +837,15 @@ async def recent_interactions(
     person_id: int | None = None,
     days: int = 7,
     limit: int = 20,
+    now: datetime | None = None,
 ) -> list[Interaction]:
-    """Recent interaction summaries, newest first (RAG context)."""
-    since = datetime.now(settings.tz) - timedelta(days=days)
+    """Recent interaction summaries, newest first (RAG context). Questions
+    the owner asked the bot are not interactions with anyone (WP-57)."""
+    since = (now or datetime.now(settings.tz)) - timedelta(days=days)
     stmt = (
         sa.select(Interaction)
         .where(Interaction.occurred_at >= since)
+        .where(sa.func.coalesce(Interaction.meta["kind"].astext, "") != "question")
         .order_by(Interaction.occurred_at.desc())
         .limit(limit)
     )
@@ -446,6 +874,9 @@ class UsageSummary:
     rows: list[UsageRow] = field(default_factory=list)
     total_usd: Decimal = Decimal("0")
     today_usd: Decimal = Decimal("0")
+    # Anthropic calls with no price (a model missing from the table): their
+    # cost is unknown, not zero (WP-25).
+    unpriced_calls: int = 0
 
     @property
     def cached_share(self) -> float:
@@ -495,6 +926,15 @@ async def usage_summary(
             )
         )
     summary.total_usd = sum((r.cost_usd for r in summary.rows), Decimal("0"))
+    summary.unpriced_calls = int(
+        await session.scalar(
+            sa.select(sa.func.count(UsageLog.id))
+            .where(UsageLog.created_at >= start, UsageLog.created_at < end)
+            .where(UsageLog.provider == "anthropic")
+            .where(UsageLog.cost_usd.is_(None))
+        )
+        or 0
+    )
 
     today_start, today_end = day_bounds(datetime.now(settings.tz).date())
     summary.today_usd = Decimal(
@@ -508,16 +948,105 @@ async def usage_summary(
     return summary
 
 
+# Phone money texts (WP-14): read deterministically, never re-extracted,
+# reviewed in /tekshir's own money block.
+MONEY_SOURCES: tuple[InteractionSource, ...] = (
+    InteractionSource.phone_sms,
+    InteractionSource.phone_notification,
+)
+# Ignored readings that are not worth showing even in /tekshir hammasi.
+IGNORED_HIDDEN_REASONS = ("repeat", "not_payment_app")
+
+
+def _is_money_row():
+    return sa.and_(
+        Interaction.source.in_(MONEY_SOURCES),
+        Interaction.media.has_key("money"),
+    )
+
+
 async def flagged_interactions(
     session: AsyncSession, *, limit: int = 10
 ) -> tuple[list[Interaction], int]:
-    """Interactions whose processing failed (`/tekshir`): newest first, plus count."""
-    stmt = sa.select(Interaction).where(Interaction.needs_review.is_(True))
+    """Interactions whose processing failed (`/tekshir`): newest first, plus
+    count. Money texts have their own block (flagged_money), never both."""
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(sa.not_(_is_money_row()))
+    )
     total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
     rows = list(
         await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
     )
     return rows, total or 0
+
+
+async def flagged_money(
+    session: AsyncSession, *, limit: int = 15
+) -> tuple[list[Interaction], int]:
+    """Money texts waiting for the owner's one tap: newest first, plus count."""
+    stmt = (
+        sa.select(Interaction)
+        .where(Interaction.needs_review.is_(True))
+        .where(_is_money_row())
+    )
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = list(
+        await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
+    )
+    return rows, total or 0
+
+
+def _ignored_money():
+    money = Interaction.media["money"]
+    return sa.and_(
+        _is_money_row(),
+        money["verdict"].astext == "ignore",
+        sa.func.coalesce(money["reason"].astext, "").notin_(IGNORED_HIDDEN_REASONS),
+        sa.not_(money.has_key("resolved")),
+    )
+
+
+async def ignored_money(
+    session: AsyncSession, since: datetime, *, limit: int = 15
+) -> tuple[list[Interaction], int]:
+    """Money texts the reader ignored (codes, adverts) since ``since``: never
+    out of the owner's reach (`/tekshir hammasi`)."""
+    stmt = (
+        sa.select(Interaction)
+        .where(_ignored_money())
+        .where(Interaction.occurred_at >= since)
+    )
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = list(
+        await session.scalars(stmt.order_by(Interaction.occurred_at.desc()).limit(limit))
+    )
+    return rows, total or 0
+
+
+async def ignored_money_count(
+    session: AsyncSession, start: datetime, end: datetime
+) -> int:
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(_ignored_money())
+            .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+        )
+        or 0
+    )
+
+
+async def money_review_count(session: AsyncSession) -> int:
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(Interaction.needs_review.is_(True))
+            .where(_is_money_row())
+        )
+        or 0
+    )
 
 
 async def retryable_interactions(
@@ -534,6 +1063,10 @@ async def retryable_interactions(
     stmt = (
         sa.select(Interaction)
         .where(Interaction.needs_review.is_(True))
+        # Only rows never applied: re-extracting an applied row doubles its
+        # debts (WP-14), and a money text is read by rules, never a model.
+        .where(Interaction.processed.is_(False))
+        .where(Interaction.source.notin_(MONEY_SOURCES))
         .where(
             sa.or_(
                 sa.func.length(sa.func.coalesce(Interaction.raw_text, "")) > 0,
@@ -570,14 +1103,41 @@ def _addressed_to_owner():
 
 
 async def messages_to_me(
-    session: AsyncSession, day: date | None = None, *, limit: int = 30
+    session: AsyncSession,
+    day: date | None = None,
+    *,
+    limit: int = 30,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> list[Interaction]:
-    """Group messages that mentioned the owner or replied to him, newest last."""
-    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    """Group messages that mentioned the owner or replied to him, newest last.
+    A day, or any [start, end) window (WP-51)."""
+    if start is None or end is None:
+        start, end = day_bounds(day or datetime.now(settings.tz).date())
     return list(
         await session.scalars(
             sa.select(Interaction)
             .where(_addressed_to_owner())
+            .where(Interaction.occurred_at >= start)
+            .where(Interaction.occurred_at < end)
+            .order_by(Interaction.occurred_at)
+            .limit(limit)
+        )
+    )
+
+
+async def messages_maybe_to_me(
+    session: AsyncSession, day: date | None = None, *, limit: int = 30
+) -> list[Interaction]:
+    """Bare-first-name lines in a group where a namesake speaks (WP-38).
+
+    Shown apart in /menga; never fed to windows, loops or the instant path.
+    """
+    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    return list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.meta["to_me_maybe"].astext == "true")
             .where(Interaction.occurred_at >= start)
             .where(Interaction.occurred_at < end)
             .order_by(Interaction.occurred_at)
@@ -594,7 +1154,8 @@ async def chat_digests(
     Two different rows feed this. The window interactions carry the summaries
     the extractor wrote — one per closed conversation — while the member
     messages are what gets counted. Counting the windows instead would report
-    "3 messages" for a chat that saw ninety.
+    "3 messages" for a chat that saw ninety. Members keep ``window_id`` once
+    their window is flushed, so the two are told apart by metadata (WP-48).
     """
     start, end = day_bounds(day or datetime.now(settings.tz).date())
     in_day = (Interaction.occurred_at >= start, Interaction.occurred_at < end)
@@ -609,7 +1170,7 @@ async def chat_digests(
         await session.execute(
             sa.select(Interaction.tg_chat_id, sa.func.count(Interaction.id))
             .where(Interaction.tg_chat_id.isnot(None))
-            .where(Interaction.window_id.is_(None))  # members, not the window row
+            .where(is_member_message())
             .where(*in_day)
             .group_by(Interaction.tg_chat_id)
         )
@@ -618,7 +1179,7 @@ async def chat_digests(
     summaries: dict[int, list[str]] = {}
     rows = await session.execute(
         sa.select(Interaction.tg_chat_id, Interaction.summary)
-        .where(Interaction.window_id.isnot(None))
+        .where(_is_window_row())
         .where(Interaction.summary.isnot(None))
         .where(*in_day)
         .order_by(Interaction.occurred_at)
@@ -633,15 +1194,16 @@ async def chat_digests(
     ):
         addressed.setdefault(interaction.tg_chat_id or 0, []).append(interaction)
 
+    counted = dict(counts)
     digests = [
         ChatDigest(
             tg_chat_id=chat_id,
             title=titles.get(chat_id) or str(chat_id),
-            messages=count,
+            messages=counted.get(chat_id, 0),
             summaries=summaries.get(chat_id, []),
             to_me=addressed.get(chat_id, []),
         )
-        for chat_id, count in counts
+        for chat_id in sorted(set(counted) | set(summaries))
     ]
     digests.sort(key=lambda d: d.messages, reverse=True)
     return digests
