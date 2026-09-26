@@ -1761,6 +1761,25 @@ def _userbot_line(status: health.Status) -> str:
     return f"✅ Telegram o'quvchi — ulangan · {last}"
 
 
+CATCH_UP_LINE = "🔄 Telegram: uzilishdan keyin {n} ta xabar qayta o'qildi ({soat})."
+
+
+def _catch_up_line(status: health.Status) -> str | None:
+    """For a day after a catch-up that stored anything (WP-21)."""
+    userbot = status.components.get("userbot")
+    detail = (userbot.detail if userbot is not None else None) or {}
+    count, at = detail.get("caught_up"), detail.get("caught_up_at")
+    if not count or not at:
+        return None
+    try:
+        when = datetime.fromisoformat(at)
+    except (TypeError, ValueError):
+        return None
+    if status.now - when > timedelta(hours=24):
+        return None
+    return CATCH_UP_LINE.format(n=count, soat=clock(when))
+
+
 def _worker_line(status: health.Status) -> str:
     worker = status.components["worker"]
     if not worker.stale:
@@ -1861,6 +1880,7 @@ def status_report(
         f"{STATUS_HEADER} · {short_date(now.date())} {clock(now)}",
         _bot_line(status),
         _userbot_line(status),
+        *([line] if (line := _catch_up_line(status)) else []),
         _worker_line(status),
         _db_line(status),
         _disk_line(status),

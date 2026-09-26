@@ -118,6 +118,10 @@ class ChatMonitor(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     owner_active_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     addressed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # Catch-up after downtime (WP-21, 0015): when the chat was switched on
+    # (never read before it) and the newest message id the userbot saw.
+    monitoring_since: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_seen_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
@@ -257,6 +261,17 @@ class Interaction(Base):
             sa.text("(media ->> 'content_key')"),
             unique=True,
             postgresql_where=sa.text("media ->> 'content_key' IS NOT NULL"),
+        ),
+        # One row per Telegram message (WP-21): the catch-up sweep and the
+        # live handler may ingest the same message at once.
+        sa.Index(
+            "ux_interactions_tg_message",
+            "tg_chat_id",
+            sa.text("((metadata ->> 'tg_message_id')::bigint)"),
+            unique=True,
+            postgresql_where=sa.text(
+                "source = 'telegram_userbot' AND metadata ? 'tg_message_id'"
+            ),
         ),
         sa.Index(
             "ix_interactions_money_notice_pending",

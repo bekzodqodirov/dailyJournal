@@ -7,6 +7,7 @@ at the owner, and a sense of what the room spent the day on.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta
 
 from miya.bot import replies
@@ -17,6 +18,7 @@ from miya.services import queries
 from miya.services.windows import render_window
 
 CHAT = -1001
+_MESSAGE_IDS = itertools.count(1)
 OTHER = -1002
 
 
@@ -58,7 +60,8 @@ async def _msg(
     summary=None,
     at=None,
 ):
-    meta = {"tg_message_id": 1}
+    # Unique per chat, as Telegram numbers them (ux_interactions_tg_message).
+    meta = {"tg_message_id": next(_MESSAGE_IDS)}
     if to_me:
         meta["to_me"] = True
     interaction = Interaction(

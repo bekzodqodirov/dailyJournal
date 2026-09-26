@@ -9,6 +9,7 @@ group counts as aimed at the owner, the same as an @-mention.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -32,6 +33,7 @@ from miya.services import loops, reminders
 from miya.userbot import main as userbot
 
 TZ = settings.tz
+_MESSAGE_IDS = itertools.count(1)
 PRIVATE = 1001
 GROUP = -1002
 ALIASES = "Bekzod, Begi, Bekzod aka, Begika, Bega, GSR Logistics"
@@ -75,7 +77,8 @@ async def _msg(
     to_me=False,
     transcript=None,
 ):
-    meta = {"tg_message_id": 1}
+    # Unique per chat, as Telegram numbers them (ux_interactions_tg_message).
+    meta = {"tg_message_id": next(_MESSAGE_IDS)}
     if to_me:
         meta["to_me"] = True
     row = m.Interaction(

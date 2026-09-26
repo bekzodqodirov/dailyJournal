@@ -51,6 +51,9 @@ class DialogInfo:
     chat_type: ChatType
     title: str | None
     is_bot: bool = False
+    # The newest message id in the dialog list (WP-21): the catch-up reads a
+    # chat only when this is past the last id the userbot saw.
+    top_message_id: int | None = None
 
 
 # Telegram's own service account: login codes and 2FA notifications arrive
@@ -89,12 +92,14 @@ async def sync_dialogs(
     for dialog in dialogs:
         monitor = existing.get(dialog.tg_chat_id)
         if monitor is None:
+            enabled = default_monitor_enabled(dialog)
             session.add(
                 ChatMonitor(
                     tg_chat_id=dialog.tg_chat_id,
                     chat_type=dialog.chat_type,
                     title=dialog.title,
-                    monitor_enabled=default_monitor_enabled(dialog),
+                    monitor_enabled=enabled,
+                    monitoring_since=datetime.now(settings.tz) if enabled else None,
                     # vision/docs: schema defaults, see the module docstring.
                 )
             )
@@ -129,13 +134,15 @@ async def ensure_monitor(session: AsyncSession, dialog: DialogInfo) -> ChatMonit
     if monitor is not None:
         return monitor
 
+    enabled = default_monitor_enabled(dialog)
     await session.execute(
         insert(ChatMonitor)
         .values(
             tg_chat_id=dialog.tg_chat_id,
             chat_type=dialog.chat_type,
             title=dialog.title,
-            monitor_enabled=default_monitor_enabled(dialog),
+            monitor_enabled=enabled,
+            monitoring_since=datetime.now(settings.tz) if enabled else None,
             # vision/docs: schema defaults, see the module docstring.
         )
         .on_conflict_do_nothing(index_elements=[ChatMonitor.tg_chat_id])
@@ -182,6 +189,12 @@ async def toggle(
     if monitor is None:
         return None
     setattr(monitor, field, not getattr(monitor, field))
+    if field == "monitor_enabled" and monitor.monitor_enabled:
+        _switched_on(monitor, _now(now))
+        if monitor.chat_type is ChatType.private and monitor.backfill_done_at is None:
+            # A private chat switched back on gets the same week as a group.
+            monitor.backfill_requested_at = _now(now)
+            monitor.backfill_attempts = 0
     if field == "monitor_enabled":
         # Switching a chat on or off from /chats is the owner's answer to
         # "o'qiymi?", whether or not the question ever went out: a group he
@@ -265,6 +278,11 @@ async def awaiting_join_question(
         ChatMonitor.id,
     ).limit(limit)
     return list(await session.scalars(stmt))
+
+
+def _switched_on(monitor: ChatMonitor, now: datetime) -> None:
+    """The catch-up never reads a chat before the moment it was allowed."""
+    monitor.monitoring_since = now
 
 
 def mark_asked(monitor: ChatMonitor, *, now: datetime | None = None) -> None:
@@ -364,6 +382,8 @@ async def accept_join(
     if monitor is None:
         return None
     now = _now(now)
+    if not monitor.monitor_enabled:
+        _switched_on(monitor, now)
     monitor.monitor_enabled = True
     monitor.decided_by = "owner"
     if monitor.backfill_done_at is None:

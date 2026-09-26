@@ -140,6 +140,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `TRANSCRIBER` | `elevenlabs`; a local Whisper backend can be swapped in later |
 | `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` | The bot rejects every other user |
 | `USERBOT_ENABLED` | One-flag kill switch for the passive Telegram reader |
+| `USERBOT_CATCHUP_MINUTES`, `USERBOT_CATCHUP_MAX_PER_CHAT`, `USERBOT_CATCHUP_MAX_CHATS` | 30 / 500 / 20 — after downtime the userbot re-reads allowed chats past the last message it saw, never before a chat was switched on |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
 | `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |

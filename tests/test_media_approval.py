@@ -11,6 +11,7 @@ So the tests exercise the state, not the transport.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta
 
 import pytest
@@ -22,6 +23,8 @@ from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Interaction
 from miya.services import approvals
 from miya.services.media_policy import MediaKind, forced_plan, plan_for
+
+_MESSAGE_IDS = itertools.count(77)
 
 
 def plan(kind, *, vision=True, docs=True, size=None, filename=None):
@@ -49,7 +52,7 @@ async def _pending(session, *, kind="video", size=90_000_000, occurred_at=None):
             "processed": False,
             "approval": {"state": approvals.PENDING, "reason": kind},
         },
-        meta={"tg_message_id": 77},
+        meta={"tg_message_id": next(_MESSAGE_IDS)},
     )
     session.add(interaction)
     await session.flush()

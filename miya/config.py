@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     # as an @-mention. Empty by default: the aliases are the owner's own and
     # belong in .env, not in code.
     owner_aliases: str = ""
+    # Catch-up after downtime (WP-21): how often the userbot re-reads allowed
+    # chats past the last message it saw, and how much per pass.
+    userbot_catchup_minutes: int = Field(default=30, ge=5)
+    userbot_catchup_max_per_chat: int = Field(default=500, ge=1)
+    userbot_catchup_max_chats: int = Field(default=20, ge=1)
 
     # --- Open loops (docs/owner-decisions.md, build step 2) -----------------
     # A question nobody answered is nudged after this many hours.

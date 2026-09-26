@@ -23,6 +23,7 @@ import functools
 import logging
 import re
 import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -329,6 +330,9 @@ async def already_stored(session, tg_chat_id: int, message) -> bool:
     return any((meta or {}).get("tg_message_id") == message.id for meta in rows)
 
 
+TG_MESSAGE_INDEX = "ux_interactions_tg_message"
+
+
 async def ingest_message(client: TelegramClient, message) -> bool:
     """Store one Telegram message. Extraction is the window job's business.
 
@@ -366,6 +370,13 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 )
             return False
 
+        # The catch-up cursor (WP-21): every message seen in an allowed chat
+        # advances it, stickers and service messages included.
+        if isinstance(getattr(message, "id", None), int):
+            monitor.last_seen_message_id = max(
+                monitor.last_seen_message_id or 0, message.id
+            )
+
         plan = plan_for(
             kind,
             vision_enabled=monitor.vision_enabled,
@@ -402,17 +413,29 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                     "reason": plan.ask_reason,
                 }
 
-        interaction = await create_interaction(
-            session,
-            source=InteractionSource.telegram_userbot,
-            direction=Direction.out if message.out else Direction.in_,
-            person_id=person.id if person else None,
-            tg_chat_id=message.chat_id,
-            text=text,
-            occurred_at=message.date.astimezone(settings.tz),
-            media=media,
-            meta=_message_meta(message, monitor),
-        )
+        try:
+            async with session.begin_nested():
+                interaction = await create_interaction(
+                    session,
+                    source=InteractionSource.telegram_userbot,
+                    direction=Direction.out if message.out else Direction.in_,
+                    person_id=person.id if person else None,
+                    tg_chat_id=message.chat_id,
+                    text=text,
+                    occurred_at=message.date.astimezone(settings.tz),
+                    media=media,
+                    meta=_message_meta(message, monitor),
+                )
+        except sa.exc.IntegrityError as exc:
+            # The catch-up and the live handler raced for the same message:
+            # the other path stored it (ux_interactions_tg_message).
+            constraint = getattr(
+                getattr(getattr(exc, "orig", None), "diag", None), "constraint_name", None
+            )
+            if constraint != TG_MESSAGE_INDEX:
+                raise
+            log.debug("message %s in %s already stored", message.id, message.chat_id)
+            return False
         interaction_id = interaction.id
         if media is None or plan.ask:
             return True
@@ -662,6 +685,9 @@ async def beat_userbot(
     detail: dict = {"enabled": enabled}
     if enabled:
         detail.update({"connected": bool(connected), "user": user_id})
+        # A catch-up line must survive the next beat, which rewrites the
+        # detail whole (WP-21).
+        detail.update(_last_catch_up or {})
     try:
         async with session_scope() as session:
             await health.beat(session, "userbot", detail=detail)
@@ -679,7 +705,14 @@ async def approved_media_loop(
     Every pass also beats the ``userbot`` heartbeat, so a reader whose
     Telegram session died shows up as silent within USERBOT_STALE_MINUTES.
     """
+    last_catch_up = time.monotonic()
     while True:
+        if time.monotonic() - last_catch_up >= settings.userbot_catchup_minutes * 60:
+            last_catch_up = time.monotonic()
+            try:
+                await catch_up_sweep(client)
+            except Exception:
+                log.exception("catch-up sweep failed")
         await beat_userbot(enabled=True, connected=client.is_connected(), user_id=user_id)
         try:
             await fetch_approved(client)
@@ -691,6 +724,67 @@ async def approved_media_loop(
         except Exception:
             log.exception("backfill sweep failed")
         await asyncio.sleep(APPROVED_POLL_SECONDS)
+
+
+# --- catch-up after downtime (WP-21) ------------------------------------------
+#
+# Telethon's live handler sees only what arrives while it runs, and a
+# StringSession keeps no update state, so every restart, deploy or network
+# drop used to lose what was said meanwhile. After each dialog sync the
+# chats whose newest message is past the cursor are read forward from it —
+# never before the chat was switched on — through the same ingestion path.
+
+_last_catch_up: dict | None = None
+_dialog_tops: dict[int, int] = {}
+
+
+async def catch_up_sweep(client: TelegramClient) -> int:
+    """Read every allowed chat forward from its cursor; returns messages stored."""
+    from miya.tools import backfill as backfill_tool
+
+    global _last_catch_up
+    await sync_from_client(client)
+    async with session_scope() as session:
+        monitors = list(
+            await session.scalars(
+                sa.select(ChatMonitor)
+                .where(ChatMonitor.monitor_enabled.is_(True))
+                .order_by(ChatMonitor.monitoring_since.nulls_first(), ChatMonitor.id)
+            )
+        )
+        jobs = [
+            (m.id, m.tg_chat_id, m.last_seen_message_id, m.monitoring_since)
+            for m in monitors
+            if (_dialog_tops.get(m.tg_chat_id) or 0) > (m.last_seen_message_id or 0)
+        ][: settings.userbot_catchup_max_chats]
+
+    stored = chats_read = 0
+    now = datetime.now(settings.tz)
+    for monitor_id, chat_id, after_id, since in jobs:
+        n, top = await backfill_tool.catch_up_chat(
+            client,
+            chat_id,
+            after_id=after_id,
+            since=since or now,
+            limit=settings.userbot_catchup_max_per_chat,
+        )
+        async with session_scope() as session:
+            monitor = await session.get(ChatMonitor, monitor_id)
+            if monitor is not None and top:
+                monitor.last_seen_message_id = max(monitor.last_seen_message_id or 0, top)
+        stored += n
+        chats_read += 1
+    if stored:
+        _last_catch_up = {"caught_up": stored, "caught_up_at": now.isoformat()}
+        log.info("caught up %d message(s) in %d chat(s)", stored, chats_read)
+    return stored
+
+
+async def _startup_catch_up(client: TelegramClient) -> None:
+    try:
+        await catch_up_sweep(client)
+    except Exception:
+        log.exception("startup catch-up failed")
 
 
 # --- dialog sync -------------------------------------------------------------
@@ -707,10 +801,15 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
                 chat_type=chat_type_of(entity),
                 title=chat_title_of(entity),
                 is_bot=bool(getattr(entity, "bot", False)),
+                top_message_id=getattr(getattr(dialog, "message", None), "id", None),
             )
         )
     async with session_scope() as session:
         created, renamed = await sync_dialogs(session, dialogs)
+    global _dialog_tops
+    _dialog_tops = {
+        d.tg_chat_id: d.top_message_id for d in dialogs if d.top_message_id is not None
+    }
     log.info(
         "dialog sync: %d chats seen, %d new, %d renamed", len(dialogs), created, renamed
     )
@@ -815,11 +914,15 @@ async def run() -> None:
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
         sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
+        # Whatever was said while this process was down (WP-21), read once
+        # the live handlers are in place so nothing falls between the two.
+        catcher = asyncio.create_task(_startup_catch_up(client))
         log.info("listening for new messages in monitored chats")
         try:
             await client.run_until_disconnected()
         finally:
             sweeper.cancel()
+            catcher.cancel()
     finally:
         await client.disconnect()
         await engine.dispose()

@@ -61,6 +61,50 @@ async def backfill_chat(
     return stored
 
 
+# A FloodWait longer than this ends the pass; the next sweep resumes.
+FLOOD_WAIT_MAX_SECONDS = 60
+
+
+async def catch_up_chat(
+    client, chat_id: int, *, after_id: int | None, since: datetime, limit: int
+) -> tuple[int, int]:
+    """Read one allowed chat forward from ``after_id`` (WP-21).
+
+    Never reads before ``since`` (the moment the chat was switched on).
+    Returns (stored, the newest message id seen); on a long FloodWait it
+    returns what it has, and the next sweep continues from there.
+    """
+    from telethon.errors import FloodWaitError
+
+    from miya.userbot.main import ingest_message
+
+    kwargs = {"reverse": True, "limit": limit}
+    if after_id:
+        kwargs["min_id"] = after_id
+    else:
+        kwargs["offset_date"] = since
+    stored = top = 0
+    while True:
+        try:
+            async for message in client.iter_messages(chat_id, **kwargs):
+                if message.date.astimezone(settings.tz) < since:
+                    continue
+                if await ingest_message(client, message):
+                    stored += 1
+                top = max(top, message.id)
+            return stored, top
+        except FloodWaitError as exc:
+            if exc.seconds > FLOOD_WAIT_MAX_SECONDS:
+                log.warning(
+                    "catch-up of %s paused by FloodWait %ss", chat_id, exc.seconds
+                )
+                return stored, top
+            await asyncio.sleep(exc.seconds)
+            if top:
+                kwargs.pop("offset_date", None)
+                kwargs["min_id"] = top
+
+
 def _as_target(chat: str | int) -> str | int:
     """A chat id stays an int (Telethon needs the type); a title or @name a str."""
     if isinstance(chat, int):
