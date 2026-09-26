@@ -460,6 +460,7 @@ def question_candidates(cutoff: datetime, *, max_days: int | None = None) -> sa.
         .join(ChatMonitor, ChatMonitor.tg_chat_id == Interaction.tg_chat_id)
         .outerjoin(last_out, last_out.c.tg_chat_id == Interaction.tg_chat_id)
         .where(*_is_message(), Interaction.direction == Direction.in_)
+        .where(queries.not_archive())
         .where(Interaction.occurred_at >= floor, Interaction.occurred_at <= cutoff)
         .where(sa.or_(last_out.c.at.is_(None), Interaction.occurred_at > last_out.c.at))
         .where(ChatMonitor.monitor_enabled.is_(True))

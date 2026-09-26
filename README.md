@@ -93,6 +93,7 @@ every service refuses a blank or short API token.
 | Target | What it does |
 |---|---|
 | `make up` | Build and start db, api, bot, worker and userbot, then migrate |
+| `make import-history DAYS=30 [TRANSCRIBE=1]` | Import allowed private chats' older history for search only — never extracted, never an open question; voice is left untranscribed unless `TRANSCRIBE=1`; safe to re-run |
 | `make update` | Back up, `git pull --ff-only`, stop bot/worker/userbot, `make up`, restart Syncthing if it was running, prune old images |
 | `make down` | Stop everything (the database volume is kept) |
 | `make migrate` | Apply migrations |

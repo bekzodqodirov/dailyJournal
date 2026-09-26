@@ -389,6 +389,8 @@ async def already_stored(session, tg_chat_id: int, message) -> bool:
 
 
 TG_MESSAGE_INDEX = "ux_interactions_tg_message"
+# Media an archive import leaves untranscribed unless asked (WP-76).
+_SPOKEN_KINDS = (MediaKind.voice, MediaKind.audio, MediaKind.video_note, MediaKind.video)
 # How many earlier versions of an edited message are kept (WP-74).
 MAX_EDITS = 10
 
@@ -450,11 +452,21 @@ async def record_edit(client: TelegramClient, message) -> bool:
     return True
 
 
-async def ingest_message(client: TelegramClient, message) -> bool:
+async def ingest_message(
+    client: TelegramClient,
+    message,
+    *,
+    archive: bool = False,
+    transcribe_media: bool = True,
+) -> bool:
     """Store one Telegram message. Extraction is the window job's business.
 
     Takes a Telethon ``Message`` rather than an event so the live handler and
     the explicit backfill tool share exactly one ingestion path.
+
+    ``archive`` (WP-76): an old message imported for search only — stored
+    processed, never windowed or extracted, never an open question. Without
+    ``transcribe_media`` its voice and video are kept as metadata only.
     """
     kind = kind_of(message)
     filename, size, mime = _file_info(message)
@@ -522,7 +534,14 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                 "caption": text,
                 "processed": False,
             }
-            if plan.ask:
+            skip_archive = archive and (
+                plan.ask or (not transcribe_media and kind in _SPOKEN_KINDS)
+            )
+            if skip_archive:
+                # An archive import asks nothing and spends nothing unless told.
+                media["processed"] = True
+                media["skipped"] = "archive"
+            elif plan.ask:
                 # Nothing is downloaded now. The worker turns this into a
                 # question in Telegram, and only a yes brings the file over.
                 media["approval"] = {
@@ -553,8 +572,10 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                     text=text,
                     occurred_at=message.date.astimezone(settings.tz),
                     media=media,
-                    meta=meta,
+                    meta={**meta, "archive": True} if archive else meta,
                 )
+                if archive:
+                    interaction.processed = True
         except sa.exc.IntegrityError as exc:
             # The catch-up and the live handler raced for the same message:
             # the other path stored it (ux_interactions_tg_message).
@@ -566,7 +587,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
             log.debug("message %s in %s already stored", message.id, message.chat_id)
             return False
         interaction_id = interaction.id
-        if media is None or plan.ask:
+        if media is None or plan.ask or media.get("skipped") == "archive":
             return True
 
     # The message is durable now. Everything slow happens with no database

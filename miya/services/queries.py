@@ -1146,6 +1146,12 @@ class ChatDigest:
     to_me: list[Interaction] = field(default_factory=list)
 
 
+def not_archive():
+    """Rows imported as archive (WP-76) are for search only: never an open
+    question, never "to me"."""
+    return sa.func.coalesce(Interaction.meta["archive"].astext, "") != "true"
+
+
 def _addressed_to_owner():
     """Rows the userbot marked as aimed at the owner.
 
@@ -1171,6 +1177,7 @@ async def messages_to_me(
         await session.scalars(
             sa.select(Interaction)
             .where(_addressed_to_owner())
+            .where(not_archive())
             .where(Interaction.occurred_at >= start)
             .where(Interaction.occurred_at < end)
             .order_by(Interaction.occurred_at)

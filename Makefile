@@ -2,7 +2,7 @@
 COMPOSE := docker compose
 .PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill backup backup-key backup-key-show restore doctor update
+        backfill import-history backup backup-key backup-key-show restore doctor update
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -85,6 +85,11 @@ userbot-login: ## One-time Telethon login; prints TELETHON_SESSION for .env
 
 backfill: ## Backfill one chat's history: make backfill CHAT=@akmal DAYS=7
 	$(COMPOSE) run --rm userbot python -m miya.tools.backfill "$(CHAT)" --days $${DAYS:-7}
+
+import-history: ## Archive allowed private chats for search only: make import-history DAYS=30 [TRANSCRIBE=1]
+	@test -n "$(DAYS)" || (echo "usage: make import-history DAYS=30 [TRANSCRIBE=1]" && exit 1)
+	$(COMPOSE) run --rm userbot python -m miya.tools.backfill --archive --all-private \
+		--days $(DAYS) $(if $(TRANSCRIBE),--transcribe,)
 
 reprice: ## Recompute Anthropic costs from stored tokens: make reprice SINCE=2026-09-01 [DRY=1]
 	$(COMPOSE) run --rm worker python -m miya.tools.reprice_usage "$(SINCE)" $(if $(DRY),--dry,)

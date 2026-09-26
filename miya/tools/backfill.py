@@ -23,6 +23,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from miya.config import settings
@@ -105,11 +106,140 @@ async def catch_up_chat(
                 kwargs["min_id"] = top
 
 
+@dataclass(slots=True)
+class ArchiveCounts:
+    """What one chat's archive import did (WP-76)."""
+
+    title: str
+    stored: int = 0
+    transcribed: int = 0
+    skipped: int = 0
+    paused: bool = False
+
+
+async def archive_chat(
+    client,
+    chat_id: int,
+    *,
+    since: datetime,
+    transcribe: bool = False,
+    title: str = "",
+) -> ArchiveCounts:
+    """Import one allowed chat's history back to ``since`` for search only:
+    stored processed, never extracted (WP-76). Newest first; messages
+    already stored are skipped, so a stopped run resumes by running again."""
+    from telethon.errors import FloodWaitError
+
+    from miya.userbot.main import _SPOKEN_KINDS, ingest_message, kind_of
+
+    counts = ArchiveCounts(title=title or str(chat_id))
+    offset_id = 0
+    while True:
+        try:
+            async for message in client.iter_messages(chat_id, offset_id=offset_id):
+                if message.date.astimezone(settings.tz) < since:
+                    return counts
+                offset_id = message.id
+                if not await ingest_message(
+                    client, message, archive=True, transcribe_media=transcribe
+                ):
+                    continue
+                counts.stored += 1
+                if kind_of(message) in _SPOKEN_KINDS:
+                    if transcribe:
+                        counts.transcribed += 1
+                    else:
+                        counts.skipped += 1
+            return counts
+        except FloodWaitError as exc:
+            if exc.seconds > FLOOD_WAIT_MAX_SECONDS:
+                log.warning("archive of %s paused by FloodWait %ss", chat_id, exc.seconds)
+                counts.paused = True
+                return counts
+            await asyncio.sleep(exc.seconds)
+
+
+async def archive_private_chats(
+    client, days: int, *, transcribe: bool = False
+) -> list[ArchiveCounts]:
+    """Every allowed private chat, ``days`` back (WP-76)."""
+    import sqlalchemy as sa
+
+    from miya.db.enums import ChatType
+    from miya.db.models import ChatMonitor
+    from miya.db.session import session_scope
+
+    since = datetime.now(settings.tz) - timedelta(days=days)
+    async with session_scope() as session:
+        chats = list(
+            (
+                await session.execute(
+                    sa.select(ChatMonitor.tg_chat_id, ChatMonitor.title).where(
+                        ChatMonitor.monitor_enabled.is_(True),
+                        ChatMonitor.chat_type == ChatType.private,
+                    )
+                )
+            ).all()
+        )
+    results = []
+    for chat_id, title in chats:
+        counts = await archive_chat(
+            client, chat_id, since=since, transcribe=transcribe, title=title or ""
+        )
+        log.info(
+            "archived %s: %d stored, %d transcribed, %d skipped",
+            counts.title,
+            counts.stored,
+            counts.transcribed,
+            counts.skipped,
+        )
+        results.append(counts)
+    return results
+
+
+ARCHIVE_SUMMARY = (
+    "📥 {chat}: {n} ta eski xabar arxivga olindi (qarz/va'da sifatida "
+    "o'qilmadi, faqat qidiruv uchun)."
+)
+
+
 def _as_target(chat: str | int) -> str | int:
     """A chat id stays an int (Telethon needs the type); a title or @name a str."""
     if isinstance(chat, int):
         return chat
     return int(chat) if _is_id(chat) else chat
+
+
+async def _connected():
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    if not (
+        settings.telethon_api_id
+        and settings.telethon_api_hash
+        and settings.telethon_session
+    ):
+        raise SystemExit("TELETHON_* settings are required for backfill")
+    client = TelegramClient(
+        StringSession(settings.telethon_session),
+        settings.telethon_api_id,
+        settings.telethon_api_hash,
+    )
+    await client.connect()
+    if not await client.is_user_authorized():
+        await client.disconnect()
+        raise SystemExit("TELETHON_SESSION is not authorised")
+    return client
+
+
+async def archive(days: int, *, transcribe: bool) -> list[ArchiveCounts]:
+    """The command-line archive import: every allowed private chat."""
+    client = await _connected()
+    try:
+        return await archive_private_chats(client, days, transcribe=transcribe)
+    finally:
+        await client.disconnect()
+        await engine.dispose()
 
 
 async def backfill(chat: str, days: int, *, limit: int = DEFAULT_LIMIT) -> int:
@@ -145,17 +275,47 @@ def _is_id(value: str) -> bool:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("chat", help="chat id, @username, or exact title")
-    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument("chat", nargs="?", help="chat id, @username, or exact title")
+    parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="store for search only: no extraction, no questions (WP-76)",
+    )
+    parser.add_argument(
+        "--all-private", action="store_true", help="every allowed private chat"
+    )
+    parser.add_argument(
+        "--transcribe", action="store_true", help="also transcribe voice (costs money)"
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=settings.log_level.upper(),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
     )
+    if args.archive:
+        if not args.days or not args.all_private:
+            print("--archive needs --all-private and --days N", file=sys.stderr)
+            return 2
+        try:
+            results = asyncio.run(archive(args.days, transcribe=args.transcribe))
+        except SystemExit as exc:
+            print(exc.code, file=sys.stderr)
+            return 1
+        for counts in results:
+            tail = " (FloodWait: qayta ishga tushiring)" if counts.paused else ""
+            print(
+                f"{counts.title}: {counts.stored} stored, {counts.transcribed} "
+                f"transcribed, {counts.skipped} skipped{tail}"
+            )
+        return 0
+    if not args.chat:
+        print("a chat is required (or --archive --all-private)", file=sys.stderr)
+        return 2
     try:
-        stored = asyncio.run(backfill(args.chat, args.days, limit=args.limit))
+        stored = asyncio.run(backfill(args.chat, args.days or 7, limit=args.limit))
     except SystemExit as exc:
         print(exc.code, file=sys.stderr)
         return 1
