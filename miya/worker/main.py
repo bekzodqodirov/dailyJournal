@@ -419,30 +419,26 @@ async def new_chat_ask_job(bot: Bot) -> None:
     if reminders.in_quiet_hours():
         return
 
+    # Marked asked only after Telegram accepted the message, and committed
+    # per group: a failed send used to mark the group asked forever, so it
+    # was never offered again. A crash between send and commit repeats at
+    # most one question, which is the accepted cost.
     async with session_scope() as session:
-        questions = []
         for monitor in await chats.awaiting_join_question(session):
-            questions.append(
-                (
-                    monitor.id,
-                    replies.new_group_question(
-                        monitor.title, monitor.tg_chat_id, chat_type=monitor.chat_type
-                    ),
+            body = replies.new_group_question(
+                monitor.title, monitor.tg_chat_id, chat_type=monitor.chat_type
+            )
+            try:
+                await bot.send_message(
+                    settings.owner_telegram_id,
+                    clip(body),
+                    reply_markup=keyboards.new_group_question(monitor.id),
                 )
-            )
-            # Marked before the send, like the media question: asked twice
-            # is worse than once lost, and /chats still lists it.
+            except Exception:
+                log.exception("could not ask about chat monitor %s", monitor.id)
+                break
             chats.mark_asked(monitor)
-
-    for monitor_id, body in questions:
-        try:
-            await bot.send_message(
-                settings.owner_telegram_id,
-                clip(body),
-                reply_markup=keyboards.new_group_question(monitor_id),
-            )
-        except Exception:
-            log.exception("could not ask about chat monitor %s", monitor_id)
+            await session.commit()
 
 
 # A claim rides on its window's receipt when there is one; these are for the
@@ -463,11 +459,12 @@ async def claim_ask_job(bot: Bot) -> None:
     message each with its own ✅ / ✖️ / ✏️ row, at most CLAIM_MAX_PER_SWEEP
     per sweep. Quiet-hours aware like every other ping: the claim keeps.
 
-    Marked asked and committed *before* the send, as the media question is:
-    a question asked twice is worse than one lost to a failed send, and a
-    claim is never lost — it stays pending, in /davolar and in the morning
-    brief, until he answers it. The sweep stops at the first undelivered
-    message; the rest wait for the next one.
+    Marked asked only *after* Telegram accepted the message, and committed
+    per claim: a failed send leaves it unasked, so the next sweep asks it
+    again. A crash between the send and the commit repeats at most one
+    question. The sweep stops at the first undelivered message; the rest
+    wait for the next one. A claim is never lost either way — it stays
+    pending, in /davolar and in the morning brief, until the owner answers it.
     """
     if reminders.in_quiet_hours():
         return
@@ -480,10 +477,10 @@ async def claim_ask_job(bot: Bot) -> None:
         for claim in waiting:
             body = replies.claim_question(claims.view(claim))
             keyboard = keyboards.claim_actions([claim.id])
-            claims.mark_asked(claim)
-            await session.commit()
             if not await notify(bot, body, reply_markup=keyboard):
                 break
+            claims.mark_asked(claim)
+            await session.commit()
             asked += 1
     if asked:
         log.info("asked about %d claim(s), %d more waiting", asked, len(waiting) - asked)
@@ -523,39 +520,35 @@ async def media_ask_job(bot: Bot) -> None:
     if reminders.in_quiet_hours():
         return
 
+    # Marked asked only after Telegram accepted the message: a question
+    # marked before a failed send used to expire unseen after 48 hours.
     async with session_scope() as session:
-        pending = await approvals.awaiting_question(session)
-        questions = []
-        for interaction in pending:
+        for interaction in await approvals.awaiting_question(session):
             person = (
                 await session.get(Person, interaction.person_id)
                 if interaction.person_id
                 else None
             )
-            questions.append(
-                (
-                    interaction.id,
-                    replies.media_question(
-                        who=person.display_name if person else None,
-                        media=dict(interaction.media or {}),
-                        reason=approvals.reason_of(interaction),
-                    ),
+            body = replies.media_question(
+                who=person.display_name if person else None,
+                media=dict(interaction.media or {}),
+                reason=approvals.reason_of(interaction),
+            )
+            try:
+                await bot.send_message(
+                    settings.owner_telegram_id,
+                    clip(body),
+                    reply_markup=keyboards.media_approval(interaction.id),
                 )
+            except Exception:
+                log.exception("could not ask about attachment %s", interaction.id)
+                break
+            approvals.set_state(
+                interaction,
+                approvals.ASKED,
+                shown_at=datetime.now(settings.tz).isoformat(),
             )
-            # Marked before the send, not after: a question asked twice is
-            # worse than one lost to a failed send, which the owner can see
-            # is missing anyway.
-            approvals.set_state(interaction, approvals.ASKED)
-
-    for interaction_id, body in questions:
-        try:
-            await bot.send_message(
-                settings.owner_telegram_id,
-                clip(body),
-                reply_markup=keyboards.media_approval(interaction_id),
-            )
-        except Exception:
-            log.exception("could not ask about attachment %s", interaction_id)
+            await session.commit()
 
 
 async def batch_submit_job() -> None:

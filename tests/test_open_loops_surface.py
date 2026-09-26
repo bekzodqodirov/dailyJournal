@@ -782,6 +782,28 @@ async def test_the_worker_asks_once_with_two_buttons(session, monkeypatch):
     assert monitor.asked_at is not None and monitor.monitor_enabled is False
 
 
+async def test_a_failed_group_question_is_offered_again(session, monkeypatch):
+    """Marked asked only after Telegram accepted it: a failed send used to
+    mark the group asked forever, so it was never offered again."""
+    await chats.sync_dialogs(session, [_dialog(-222, ChatType.group, "GZ")])
+    await session.commit()
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+    down = _Bot(reachable=False)
+
+    await worker.new_chat_ask_job(down)
+
+    monitor = await chats.get_monitor(session, -222)
+    await session.refresh(monitor)
+    assert monitor.asked_at is None
+    assert [w.tg_chat_id for w in await chats.awaiting_join_question(session)] == [-222]
+
+    up = _Bot()
+    await worker.new_chat_ask_job(up)
+    assert len(up.sent) == 1
+    await session.refresh(monitor)
+    assert monitor.asked_at is not None
+
+
 async def test_the_worker_does_not_ask_at_night(session, monkeypatch):
     await chats.sync_dialogs(session, [_dialog(-222, ChatType.group, "GZ")])
     await session.commit()

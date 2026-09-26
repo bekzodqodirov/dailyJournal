@@ -22,6 +22,7 @@ from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Interaction
 from miya.services import approvals
 from miya.services.media_policy import MediaKind, forced_plan, plan_for
+from miya.worker import main as worker
 
 
 def plan(kind, *, vision=True, docs=True, size=None, filename=None):
@@ -226,3 +227,35 @@ def test_the_question_escapes_a_caption_the_sender_controls():
     )
     assert "<script>" not in body
     assert "&lt;script&gt;" in body
+
+
+# --- the worker asks only what Telegram accepted (WP-09) ---------------------
+
+
+class _Bot:
+    def __init__(self, *, reachable: bool = True) -> None:
+        self.reachable = reachable
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id, text, **kwargs) -> None:
+        if not self.reachable:
+            raise RuntimeError("telegram is down")
+        self.sent.append(text)
+
+
+async def test_a_failed_media_question_stays_pending(session, monkeypatch):
+    interaction = await _pending(session, occurred_at=datetime.now(settings.tz))
+    await session.commit()
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+
+    await worker.media_ask_job(_Bot(reachable=False))
+
+    await session.refresh(interaction)
+    assert approvals.state_of(interaction) == approvals.PENDING
+
+    bot = _Bot()
+    await worker.media_ask_job(bot)
+    await session.refresh(interaction)
+    assert len(bot.sent) == 1
+    assert approvals.state_of(interaction) == approvals.ASKED
+    assert interaction.media["approval"]["shown_at"]

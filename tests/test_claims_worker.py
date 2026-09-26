@@ -268,9 +268,9 @@ async def test_a_backlog_is_asked_a_few_per_sweep_oldest_first(session, monkeypa
 
 
 async def test_an_undelivered_question_stops_the_sweep(session, monkeypatch):
-    """Marked before the send, like the media question: the first claim is
-    asked at most once even if the message was lost, and it is not lost —
-    it stays pending for /davolar and the brief. The rest wait."""
+    """Marked only after Telegram accepted it: an undelivered question stays
+    unasked, so the next sweep asks it again — and it stays pending for
+    /davolar and the brief meanwhile. The sweep stops at the first failure."""
     first, *rest = await _old_claims(session, 3)
     monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
     bot = _KeyboardBot(reachable=False)
@@ -278,13 +278,14 @@ async def test_an_undelivered_question_stops_the_sweep(session, monkeypatch):
     await worker.claim_ask_job(bot)
 
     assert bot.sent == []
-    assert await _asked_at(session, first) is not None
+    assert await _asked_at(session, first) is None
     assert not any([await _asked_at(session, i) for i in rest])
     assert [c.id for c in await claims.pending(session)] == [first, *rest]
 
     bot.reachable = True
     await worker.claim_ask_job(bot)
-    assert [_buttons(k)[0] for k in bot.markups] == [f"cl:y:{i}" for i in rest]
+    assert [_buttons(k)[0] for k in bot.markups] == [f"cl:y:{i}" for i in (first, *rest)]
+    assert all([await _asked_at(session, i) for i in (first, *rest)])
 
 
 # --- the brief and the receipt's source line ---------------------------------
