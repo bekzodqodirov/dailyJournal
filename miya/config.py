@@ -177,6 +177,9 @@ class Settings(BaseSettings):
     # the built-in list in services/sms_money.py. Matching ignores case,
     # spaces and punctuation.
     payment_sms_senders: str = ""
+    # Bank adverts ("5% keshbek ...") are ignored by default; true sends
+    # them to /tekshir instead.
+    payment_adverts_to_review: bool = False
 
     # --- Backups (spec §10) -------------------------------------------------
     backup_dir: str = "/data/backups"

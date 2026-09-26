@@ -243,15 +243,30 @@ async def test_a_money_sms_becomes_one_transaction_and_costs_no_tokens(session, 
 
 async def test_a_low_confidence_sms_waits_for_the_owners_eye(session, device):
     response = device.post(
-        "/v1/phone/sms", json=_sms_payload(_sms(body="Vash parol: 1234"))
+        "/v1/phone/sms", json=_sms_payload(_sms(body="Oplata 25 000 sum"))
     )
 
     assert response.json()["accepted"] == 1
     [row] = await _rows(session)
     assert row.needs_review is True
+    assert row.media["payment_verdict"] == {"verdict": "review", "reason": "no_evidence"}
     assert list(await session.scalars(sa.select(m.Transaction))) == []
     # /tekshir names the source instead of leaking the enum value.
     assert replies.SOURCE_LABEL["phone_sms"] == "sms"
+
+
+async def test_a_one_time_code_is_stored_but_never_asks(session, device):
+    response = device.post(
+        "/v1/phone/sms", json=_sms_payload(_sms(body="Vash parol: 1234"))
+    )
+
+    assert response.json()["accepted"] == 1
+    [row] = await _rows(session)
+    assert row.needs_review is False
+    assert row.raw_text == "Vash parol: 1234"
+    assert row.media["payment_verdict"] == {"verdict": "ignore", "reason": "otp"}
+    assert "payment" not in row.media
+    assert list(await session.scalars(sa.select(m.Transaction))) == []
 
 
 # --- the phone heartbeat --------------------------------------------------------

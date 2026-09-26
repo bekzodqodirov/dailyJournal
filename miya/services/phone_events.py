@@ -362,7 +362,7 @@ async def _insert_sms(
 
     # Deterministic, token-free: a bank SMS is the bank's record, so it goes
     # through sms_money.parse and never through extraction or the claim gate.
-    parsed = sms_money.parse(sender, body)
+    parsed = sms_money.parse(sender, body, received_at=fields["received_at"])
     media: dict = {
         "type": MEDIA_SMS,
         "event_key": key,
@@ -382,9 +382,15 @@ async def _insert_sms(
             ),
         }
     elif parsed is not None:
-        # The sender is a bank but the figures could not be read with
-        # certainty: the owner's /tekshir eye, nothing invented.
-        needs_review = True
+        # The verdict and its reason stay on the row for /tekshir; no
+        # "payment" key, because nothing was booked.
+        media["payment_verdict"] = {
+            "verdict": parsed.verdict.value,
+            "reason": parsed.reason,
+        }
+        # A bank text that could not be read with certainty waits for the
+        # owner's eye; a one-time code or an advert is simply stored.
+        needs_review = parsed.verdict is sms_money.Verdict.REVIEW
 
     interaction = Interaction(
         source=InteractionSource.phone_sms,

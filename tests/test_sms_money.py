@@ -17,6 +17,11 @@ from miya.config import settings
 from miya.db.enums import Currency, TransactionType
 from miya.services import sms_money
 
+# Evidence that a payment completed (WP-10): a bare "Oplata 25 000 sum" has
+# a direction and an amount but nothing proving it happened, so it waits in
+# /tekshir. The HIGH cases below carry a card mask on its own line.
+CARD = "\nKarta *1234"
+
 
 def parse(sender, body):
     return sms_money.parse(sender, body)
@@ -53,7 +58,7 @@ def test_payment_sms_senders_extends_the_list_the_same_way(monkeypatch):
     assert sms_money.is_payment_sender("777")
     assert "mybank" in sms_money.known_senders()
     assert sms_money.known_senders().issuperset(sms_money.DEFAULT_SENDERS)
-    assert parse("My-Bank", "Oplata 25 000 sum").confidence == sms_money.HIGH
+    assert parse("My-Bank", "Oplata 25 000 sum" + CARD).confidence == sms_money.HIGH
 
 
 # --- direction keywords, one by one ------------------------------------------
@@ -79,7 +84,7 @@ def test_payment_sms_senders_extends_the_list_the_same_way(monkeypatch):
     ],
 )
 def test_every_expense_keyword(body):
-    parsed = parse("Payme", body)
+    parsed = parse("Payme", body + CARD)
     assert parsed.confidence == sms_money.HIGH
     assert parsed.type is TransactionType.expense
     assert parsed.amount == Decimal("25000.00")
@@ -101,7 +106,7 @@ def test_every_expense_keyword(body):
     ],
 )
 def test_every_income_keyword(body):
-    parsed = parse("Payme", body)
+    parsed = parse("Payme", body + CARD)
     assert parsed.confidence == sms_money.HIGH
     assert parsed.type is TransactionType.income
     assert parsed.amount == Decimal("1500000.00")
@@ -125,7 +130,7 @@ def test_every_income_keyword(body):
     ],
 )
 def test_thousand_separators_and_both_decimal_marks(body, amount):
-    parsed = parse("Payme", body)
+    parsed = parse("Payme", body + CARD)
     assert parsed.confidence == sms_money.HIGH
     assert parsed.amount == amount
 
@@ -137,7 +142,7 @@ def test_the_amount_may_come_from_a_summa_line():
     assert parsed.amount == Decimal("99000.00")
     assert parsed.balance_after == Decimal("1000000.00")
 
-    cyrillic = parse("Click", "Покупка\nСумма: 45 000 сум")
+    cyrillic = parse("Click", "Покупка\nСумма: 45 000 сум" + CARD)
     assert cyrillic.confidence == sms_money.HIGH
     assert cyrillic.amount == Decimal("45000.00")
 
@@ -203,7 +208,7 @@ def test_the_balance_clause_feeds_balance_after_next_to_a_real_amount():
     ],
 )
 def test_currency_comes_from_the_adjacent_token_and_defaults_to_uzs(body, currency):
-    parsed = parse("Payme", body)
+    parsed = parse("Payme", body + CARD)
     assert parsed.confidence == sms_money.HIGH
     assert parsed.currency is currency
 
@@ -260,8 +265,10 @@ def test_the_keyword_category_map(merchant, body, category):
 # --- confidence ---------------------------------------------------------------
 
 
-def test_a_bank_sms_with_no_direction_is_low_and_amountless():
+def test_a_one_time_code_from_a_bank_is_ignored_and_amountless():
     parsed = parse("Payme", "Vash kod: 1234. Nikomu ne soobshchayte")
+    assert parsed.verdict is sms_money.Verdict.IGNORE
+    assert parsed.reason == sms_money.OTP
     assert parsed.confidence == sms_money.LOW
     assert parsed.amount is None
     assert parsed.sender == "Payme"
