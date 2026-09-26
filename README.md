@@ -163,6 +163,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
+| `RECAP_PROSE_ENABLED`, `RECAP_MODEL`, `RECAP_MAX_PEOPLE`, `RECAP_MAX_GROUPS`, `RECAP_SUBJECT_INPUT_CHARS`, `RECAP_INPUT_MAX_CHARS`, `RECAP_MAX_OUTPUT_TOKENS`, `RECAP_MODEL_TIMEOUT_SECONDS` | `true` / blank (= `REASON_MODEL`) / 8 / 5 / 1200 / 12000 / 1200 / 60 — one capped call per recap writes a sentence or two per person and group; prose with any digit or currency word is dropped, and the recap falls back to its SQL lines when the model is down |
 | `EXTRACT_MODEL_PRICE`, `REASON_MODEL_PRICE` | Blank — "input,output" USD per million tokens for the two model roles; set them when you change a model, then `make reprice SINCE=…` |
 | `SPEND_ALERT_DAILY_USD`, `SPEND_ALERT_MONTHLY_USD` | 5 / 60 — a Telegram warning when MIYA's own API spend passes either (0 = off); the hard cap is the Anthropic Console limit |
 | `QUESTION_BUDGET_PER_DAY`, `QUESTION_BRIEF_SLOTS`, `QUESTION_EVENING_SLOTS` | 10 / 5 / 3 — how many taps a day MIYA may ask for, and how many ride the brief and the evening report (`0` = never push) |
@@ -535,7 +536,7 @@ else leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
-| **Anthropic API** | Message text, call transcripts, document text, receipt images | Extraction, daily report, planner, RAG answers |
+| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names) | Extraction, the recap's prose, planner, RAG answers |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
@@ -588,7 +589,10 @@ assumed: `/xarajat` shows this month's spend per operation. The largest item
 used to be the person profiles; they are now written by `PROFILE_MODEL`
 (blank = `EXTRACT_MODEL`), at most once per `PROFILE_MIN_AGE_HOURS` per
 person and at most `PROFILE_DAILY_CAP` a day, and appear in `/xarajat` as
-«odam haqida profil». Extraction uses prompt caching on the static system
+«odam haqida profil». The evening recap makes one capped call to
+`RECAP_MODEL` (blank = `REASON_MODEL`) for its prose, cached per input so a
+repeated `/hisobot` with nothing new costs nothing; it appears as «kunlik
+xulosa (AI)». Extraction uses prompt caching on the static system
 prompt and the Batch API for the userbot stream; embeddings run locally.
 
 ---

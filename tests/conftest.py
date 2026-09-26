@@ -99,6 +99,7 @@ async def _truncate(session) -> None:
         m.Interaction,
         m.ConversationWindow,
         m.ChatMonitor,
+        m.RecapDigest,
         m.Person,
     ):
         await session.execute(sa.delete(model))

@@ -268,6 +268,16 @@ class Settings(BaseSettings):
     money_typed_match_hours: int = Field(default=6, ge=0, le=24)
     # WP-50: a long evening report goes out in at most this many messages.
     recap_max_parts: int = Field(default=4, ge=1, le=8)
+    # WP-52: one capped model call per recap writes a sentence or two per
+    # person and group — prose only, never a figure. Blank model = REASON_MODEL.
+    recap_prose_enabled: bool = True
+    recap_model: str = ""
+    recap_max_people: int = Field(default=8, ge=1)
+    recap_max_groups: int = Field(default=5, ge=1)
+    recap_subject_input_chars: int = Field(default=1200, ge=1)
+    recap_input_max_chars: int = Field(default=12000, ge=1)
+    recap_max_output_tokens: int = Field(default=1200, ge=1)
+    recap_model_timeout_seconds: int = Field(default=60, ge=1)
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

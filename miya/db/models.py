@@ -943,3 +943,43 @@ def _reindex_changed_text(session, flush_context, instances) -> None:
             obj.codes_indexed_at = None
         if getattr(obj, "search_indexed_at", None) is not None:
             obj.search_indexed_at = None
+
+
+class RecapDigest(Base):
+    """One or two model-written sentences about a person or a group in a
+    recap window (WP-52, 0020), cached by the input they were written from.
+    Never a source of figures: the prose is refused if it holds a digit."""
+
+    __tablename__ = "recap_digests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    digest_date: Mapped[date] = mapped_column(sa.Date, nullable=False)
+    subject_key: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="CASCADE")
+    )
+    tg_chat_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    window_start: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    window_end: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False
+    )
+    input_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    source_interaction_ids: Mapped[list[int]] = mapped_column(
+        ARRAY(sa.Integer), nullable=False, server_default="{}"
+    )
+    prose: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    model: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    created_at: Mapped[datetime] = created_at_column()
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "digest_date",
+            "subject_key",
+            "input_hash",
+            name="uq_recap_digests_subject_input",
+        ),
+        sa.Index("ix_recap_digests_date_end", "digest_date", "window_end"),
+        sa.Index("ix_recap_digests_person", "person_id"),
+    )

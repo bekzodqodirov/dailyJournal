@@ -1342,6 +1342,7 @@ SEARCH_UNAVAILABLE = (
 
 
 OPERATION_LABEL = {
+    "recap": "kunlik xulosa (AI)",
     "extract": "xabarlardan ajratish",
     "extract_window": "telegram suhbatlari (batch)",
     "extract_window_instant": "telegram suhbatlari (tezkor)",
