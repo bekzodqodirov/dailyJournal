@@ -39,4 +39,25 @@
    - Haftasiga 2 marta /xarajat'ni Anthropic Console'dagi summa bilan solishtir.
    - Bir marta: make restore FILE=/data/backups/<oxirgi fayl> DRY=1 → ichidagi jadvallar ro'yxati chiqsin.
 10b) Tashqi kuzatuvchi: healthchecks.io'da «MIYA» tekshiruvini yarat (davr 5 daqiqa, kutish 15 daqiqa), Telegram integratsiyasini ulab, ping manzilini .env'dagi DEADMAN_PING_URL= ga yoz, keyin docker compose up -d --force-recreate worker.
-11) Telefon ilovasi: faqat Telegramga kelgan yangi imzoli APK'ni, serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda, WP-63 qo'shadi).
+11) Telefon ilovasi: faqat Telegramga kelgan yangi imzoli APK'ni, serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda).
+
+## Telefon ilovasi: yangi kalitga bir martalik o'tish
+
+Yangi APK boshqa kalit bilan imzolangan, shuning uchun eski ilova ustidan o'rnatilmaydi — eski ilovani bir marta o'chirish kerak.
+
+```
+1) Dasturchi serverdagi telefon tuzatishlari o'rnatilganini tasdiqlasin.
+2) Eski ilovani och → «Navbat»: kutayotganlar 0 bo'lsin; bo'lmasa internet/Tailscale'ni yoq va kut.
+3) Botda /holat → «📱 Telefon» qatori yaqin vaqtni ko'rsatsin.
+4) Server manzilini yozib ol; token serverda: grep UPLOAD_TOKENS .env
+5) Eski ilovani o'chir: Sozlamalar → Ilovalar → MIYA Companion → O'chirish.
+6) Yangi APK'ni o'rnat:
+   6.1) Telegram'da APK faylini bos. «Noma'lum ilovalarni o'rnatish» so'ralsa: Telegram → Ruxsat berish.
+   6.2) Play Protect ogohlantirsa: «Batafsil» → «Baribir o'rnatish».
+   6.3) Ilovani och va sozlashni qaytadan o't: server manzili, token, yozuvlar papkasi, SMS rejimi.
+   6.4) Har bir ruxsatni yoq: qo'ng'iroqlar ro'yxati, SMS, «MIYA — to'lov xabarlari» (bildirishnomalar). Tugma kulrang bo'lsa yoki ruxsat berilmasa: Sozlamalar → Ilovalar → MIYA Companion → ⋮ → «Cheklangan sozlamalarga ruxsat berish», keyin qaytadan urinib ko'r.
+   6.5) SMS ruxsati baribir berilmasa — bu normal: Payme xabarlari bildirishnoma orqali keladi. SMS rejimini «O'chiq» qil.
+   6.6) Batareya cheklovini o'chir, avtostartni yoq (Xiaomi, Samsung).
+   6.7) Sozlamalar → «To'lov ilovalari»: Payme ro'yxatda bo'lsa, belgisi qo'yilganini tekshir.
+7) 15 daqiqadan keyin /holat'da telefon qatori yangilanganini va /bugun'da takror xarajat yo'qligini tekshir.
+```

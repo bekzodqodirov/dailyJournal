@@ -16,21 +16,26 @@ android {
         // whole scoped-storage story is different.
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        // CI passes the run number, so every release installs over the last.
+        val ciVersionCode = System.getenv("MIYA_VERSION_CODE")?.toIntOrNull() ?: 1
+        versionCode = ciVersionCode
+        versionName = "1.0.$ciVersionCode"
     }
 
+    // Debug builds use each developer's own ~/.android/debug.keystore. The
+    // release key lives only in the "release" GitHub environment (master
+    // only); CI decodes it to a temp file and passes the path here. Without
+    // it the release APK stays unsigned and will not install — loud, not
+    // silent.
+    val releaseKeystore = System.getenv("MIYA_KEYSTORE_PATH")
     signingConfigs {
-        // A committed DEBUG keystore (password "android", protecting nothing)
-        // so every CI build signs identically: without a stable signature an
-        // update from the rolling release would refuse to install over the
-        // previous one. It is not a secret; the server token never goes near
-        // it, and anyone able to abuse it already holds the unlocked phone.
-        getByName("debug") {
-            storeFile = rootProject.file("debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv("MIYA_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("MIYA_KEY_ALIAS")
+                keyPassword = System.getenv("MIYA_KEY_PASSWORD")
+            }
         }
     }
 
@@ -43,6 +48,9 @@ android {
             // and a stripped stack trace on an OEM-specific failure costs far
             // more than the few hundred KB saved.
             isMinifyEnabled = false
+            if (releaseKeystore != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

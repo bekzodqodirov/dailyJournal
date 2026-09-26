@@ -331,17 +331,56 @@ than breaks. SMS bodies are never logged, not even redacted
 ## Building it
 
 **Without Android Studio (recommended):** every push touching `android/`
-runs the GitHub Actions workflow `.github/workflows/android-apk.yml`,
-which builds the debug APK and publishes it on the rolling release
-`companion-apk` — the download link never changes:
+runs `.github/workflows/android-apk.yml`, in two jobs:
+
+- **`build`** (every branch, no secrets): the JVM unit tests, a debug APK
+  uploaded as the artifact `miya-companion-ci-debug`, and a guard that fails
+  if any keystore is tracked. That APK is signed with the runner's throwaway
+  debug key, so it can never install over the owner's app.
+- **`release`** (master only, GitHub environment `release`): decodes the
+  release keystore into a temp file, builds `assembleRelease` with the run
+  number as `versionCode`, checks with `apksigner` that the certificate's
+  SHA-256 equals `ANDROID_CERT_SHA256`, deletes the keystore, and publishes
+  the APK on the rolling release `companion-apk` — the link never changes:
 
 ```
 https://github.com/<owner>/<repo>/releases/download/companion-apk/miya-companion.apk
 ```
 
-Open it in the phone's browser, install, done. Every build signs with the
-committed `android/debug.keystore` (a debug key protecting nothing), so a
-new APK always installs over the old one.
+If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_OWNER_ID` are set, the same APK is sent
+to the owner in Telegram, silently.
+
+**Release signing, set up once.** On a trusted machine with a JDK:
+
+```bash
+keytool -genkeypair -v -keystore miya-release.jks -storetype PKCS12 -alias miya \
+  -keyalg RSA -keysize 4096 -validity 10000 -dname "CN=MIYA Companion, O=GSR Logistics, C=UZ"
+# password: openssl rand -base64 24 (with PKCS12 the store and key passwords are the same)
+keytool -list -v -keystore miya-release.jks -alias miya | grep 'SHA256:' \
+  | sed 's/.*SHA256: //; s/://g' | tr 'A-F' 'a-f'     # the fingerprint
+```
+
+Keep the `.jks` and its password in a password manager. Then in GitHub →
+Settings → Environments, create `release` with a deployment-branch rule that
+allows only `master`, and add:
+
+| Kind | Name | Value |
+|---|---|---|
+| secret | `ANDROID_KEYSTORE_BASE64` | `base64 -w0 miya-release.jks` |
+| secret | `ANDROID_KEYSTORE_PASSWORD` | the password |
+| secret | `ANDROID_KEY_ALIAS` | `miya` |
+| secret | `ANDROID_KEY_PASSWORD` | the password |
+| variable | `ANDROID_CERT_SHA256` | the fingerprint |
+| secret (optional) | `TELEGRAM_BOT_TOKEN` | the assistant bot's token |
+| secret (optional) | `TELEGRAM_OWNER_ID` | the owner's Telegram id |
+
+Delete any local base64 copy afterwards. A workflow edited on another branch
+cannot read these. Without `MIYA_KEYSTORE_PATH` a local `assembleRelease`
+produces an unsigned APK that will not install — on purpose.
+
+Switching from the old debug-signed app to the release-signed one needs one
+uninstall; the steps are in `docs/ornatish.md` («Telefon ilovasi: yangi
+kalitga bir martalik o'tish»).
 
 ### Building it locally instead
 
