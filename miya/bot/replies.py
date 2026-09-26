@@ -257,15 +257,31 @@ def _line_of(interaction, limit: int = 160) -> str:
     return escape(body[:limit])
 
 
-def to_me_report(interactions: list, titles: dict[int, str]) -> str:
-    """`/menga`: what was aimed at the owner in a group today."""
-    if not interactions:
+def to_me_report(
+    interactions: list, titles: dict[int, str], maybe: list | None = None
+) -> str:
+    """`/menga`: what was aimed at the owner in a group today; lines that
+    name only a first name a namesake in the group shares come apart."""
+    maybe = maybe or []
+    if not interactions and not maybe:
         return TO_ME_EMPTY
-    lines = [f"📨 <b>Sizga {len(interactions)} ta murojaat</b>"]
-    for interaction in interactions:
+
+    def line(interaction) -> str:
         where = escape(titles.get(interaction.tg_chat_id or 0, "guruh"))
         when = interaction.occurred_at.astimezone(settings.tz).strftime("%H:%M")
-        lines.append(f"• {when} · <b>{where}</b> — {_line_of(interaction)}")
+        return f"• {when} · <b>{where}</b> — {_line_of(interaction)}"
+
+    lines = [TO_ME_EMPTY]
+    if interactions:
+        lines = [f"📨 <b>Sizga {len(interactions)} ta murojaat</b>"]
+        lines += [line(i) for i in interactions]
+    if maybe:
+        stem = (maybe[0].meta or {}).get("namesake") or ""
+        lines.append(
+            f"\n❔ <b>Balki sizga</b> <i>(guruhda boshqa «{escape(stem.capitalize())}» "
+            f"ham bor)</i>"
+        )
+        lines += [line(i) for i in maybe]
     return "\n".join(lines)
 
 

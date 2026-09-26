@@ -914,6 +914,26 @@ async def messages_to_me(
     )
 
 
+async def messages_maybe_to_me(
+    session: AsyncSession, day: date | None = None, *, limit: int = 30
+) -> list[Interaction]:
+    """Bare-first-name lines in a group where a namesake speaks (WP-38).
+
+    Shown apart in /menga; never fed to windows, loops or the instant path.
+    """
+    start, end = day_bounds(day or datetime.now(settings.tz).date())
+    return list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.meta["to_me_maybe"].astext == "true")
+            .where(Interaction.occurred_at >= start)
+            .where(Interaction.occurred_at < end)
+            .order_by(Interaction.occurred_at)
+            .limit(limit)
+        )
+    )
+
+
 async def chat_digests(
     session: AsyncSession, day: date | None = None
 ) -> list[ChatDigest]:

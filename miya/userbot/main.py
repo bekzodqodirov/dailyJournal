@@ -34,9 +34,9 @@ from telethon.tl.types import Channel, Chat, User
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource
-from miya.db.models import ChatMonitor, Interaction
+from miya.db.models import ChatMonitor, Interaction, Person
 from miya.db.session import engine, session_scope
-from miya.services import approvals, audio, chats, documents, health
+from miya.services import approvals, audio, chats, documents, health, owner_address
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
 from miya.services.ingest import create_interaction
@@ -225,7 +225,20 @@ async def _recheck_to_me(session, interaction: Interaction) -> None:
     if chat_type is not ChatType.group:
         return
     if mentions_owner(interaction.transcript):
-        interaction.meta = {**meta, "to_me": True, "to_me_via": "transcript"}
+        sender = (
+            await session.get(Person, interaction.person_id)
+            if interaction.person_id
+            else None
+        )
+        interaction.meta = await owner_address.demote_if_namesake(
+            session,
+            {**meta, "to_me": True, "to_me_via": "transcript"},
+            interaction.transcript,
+            mentioned=False,
+            chat_id=interaction.tg_chat_id,
+            sender=sender,
+            aliases=_owner_aliases(),
+        )
 
 
 async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
@@ -444,6 +457,15 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                     "reason": plan.ask_reason,
                 }
 
+        meta = await owner_address.demote_if_namesake(
+            session,
+            _message_meta(message, monitor),
+            text or "",
+            mentioned=bool(getattr(message, "mentioned", False)),
+            chat_id=message.chat_id,
+            sender=person,
+            aliases=_owner_aliases(),
+        )
         try:
             async with session.begin_nested():
                 interaction = await create_interaction(
@@ -455,7 +477,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
                     text=text,
                     occurred_at=message.date.astimezone(settings.tz),
                     media=media,
-                    meta=_message_meta(message, monitor),
+                    meta=meta,
                 )
         except sa.exc.IntegrityError as exc:
             # The catch-up and the live handler raced for the same message:
@@ -520,8 +542,12 @@ def addressed_to_owner(message: object, chat_type: ChatType) -> bool:
 _RUNTIME_ALIASES: tuple[str, ...] = ()
 
 
+def _owner_aliases() -> tuple[str, ...]:
+    return settings.owner_aliases_parsed + _RUNTIME_ALIASES
+
+
 def mentions_owner(text: str) -> bool:
-    pattern = alias_pattern(settings.owner_aliases_parsed + _RUNTIME_ALIASES)
+    pattern = alias_pattern(_owner_aliases())
     return bool(pattern and pattern.search(fold_apostrophes(text or "")))
 
 

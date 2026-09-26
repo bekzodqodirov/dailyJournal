@@ -262,3 +262,130 @@ def test_the_runtime_username_counts_without_env(monkeypatch):
     assert userbot.addressed_to_owner(
         _group_message("@owner_test123 salom"), ChatType.group
     )
+
+
+# --- WP-38: the namesake guard ------------------------------------------------
+
+from datetime import timedelta  # noqa: E402
+
+from miya.services import owner_address  # noqa: E402
+
+NAMESAKE_CHAT = 2001
+QUIET_CHAT = 2002
+
+
+@pytest.fixture
+def namesake_env(monkeypatch):
+    monkeypatch.setattr(settings, "owner_aliases", NEW_ALIASES)
+    owner_address.clear_cache()
+    yield
+    owner_address.clear_cache()
+
+
+async def _spoke(session, name: str, chat: int, *, days_ago: float = 1) -> m.Person:
+    person = m.Person(display_name=name, aliases=[])
+    session.add(person)
+    await session.flush()
+    session.add(
+        m.Interaction(
+            source=InteractionSource.telegram_userbot,
+            direction=Direction.in_,
+            person_id=person.id,
+            tg_chat_id=chat,
+            occurred_at=datetime.now(settings.tz) - timedelta(days=days_ago),
+            raw_text="salom",
+        )
+    )
+    await session.flush()
+    return person
+
+
+async def _meta(session, text: str, chat: int, *, sender=None, mentioned=False) -> dict:
+    meta = {"tg_message_id": 1}
+    if mentioned or userbot.mentions_owner(text):
+        meta["to_me"] = True
+    return await owner_address.demote_if_namesake(
+        session,
+        meta,
+        text,
+        mentioned=mentioned,
+        chat_id=chat,
+        sender=sender,
+        aliases=settings.owner_aliases_parsed,
+    )
+
+
+def test_alias_stems():
+    assert owner_address.alias_stem("Bekzod aka") == "bekzod"
+    assert owner_address.alias_stem("bekzodaka") == "bekzod"
+    assert owner_address.alias_stem("Begika") == "begika"
+    assert owner_address.alias_stem("GSR Logistics") == "gsr"
+    assert owner_address.alias_stem("@owner_test123") is None
+
+
+async def test_a_bare_first_name_is_only_maybe_where_a_namesake_speaks(
+    session, namesake_env
+):
+    await _spoke(session, "Bekzod Karimov", NAMESAKE_CHAT)
+    demoted = await _meta(session, "Bekzod, yuk keldimi?", NAMESAKE_CHAT)
+    assert "to_me" not in demoted
+    assert demoted["to_me_maybe"] is True and demoted["namesake"] == "bekzod"
+    kept = await _meta(session, "Bekzod, yuk keldimi?", QUIET_CHAT)
+    assert kept["to_me"] is True and "to_me_maybe" not in kept
+
+
+@pytest.mark.parametrize(
+    "text", ["Bekzod aka, yuk keldimi?", "bekzodaka, qarang", "@owner_test123 qarang"]
+)
+async def test_the_forms_the_owner_named_always_count(session, namesake_env, text):
+    await _spoke(session, "Bekzod Karimov", NAMESAKE_CHAT)
+    assert (await _meta(session, text, NAMESAKE_CHAT))["to_me"] is True
+    assert (await _meta(session, text, QUIET_CHAT))["to_me"] is True
+
+
+async def test_mentions_and_other_aliases_are_untouched(session, namesake_env):
+    await _spoke(session, "Bekzod Karimov", NAMESAKE_CHAT)
+    mention = await _meta(session, "Bekzod", NAMESAKE_CHAT, mentioned=True)
+    assert mention["to_me"] is True
+    assert (await _meta(session, "Bega, qarang", NAMESAKE_CHAT))["to_me"] is True
+
+
+async def test_a_cyrillic_namesake_shadows_the_latin_alias(session, namesake_env):
+    await _spoke(session, "Бекзод", NAMESAKE_CHAT)
+    assert "to_me" not in await _meta(session, "Bekzod, qarang", NAMESAKE_CHAT)
+
+
+async def test_the_namesakes_own_message_is_demoted(session, namesake_env):
+    sender = m.Person(display_name="Bekzod Karimov", aliases=[])
+    session.add(sender)
+    await session.flush()
+    meta = await _meta(session, "Bekzod shu yerda", QUIET_CHAT, sender=sender)
+    assert "to_me" not in meta and meta["to_me_maybe"] is True
+
+
+async def test_a_namesake_long_gone_does_not_count(session, namesake_env):
+    await _spoke(session, "Bekzod Karimov", NAMESAKE_CHAT, days_ago=91)
+    assert (await _meta(session, "Bekzod, qarang", NAMESAKE_CHAT))["to_me"] is True
+
+
+def test_menga_shows_the_maybe_section_apart():
+    now = datetime.now(settings.tz)
+    sure = SimpleNamespace(
+        tg_chat_id=1,
+        occurred_at=now,
+        raw_text="Bekzod aka, qarang",
+        transcript=None,
+        media=None,
+        meta={"to_me": True},
+    )
+    maybe = SimpleNamespace(
+        tg_chat_id=1,
+        occurred_at=now,
+        raw_text="Bekzod, qarang",
+        transcript=None,
+        media=None,
+        meta={"to_me_maybe": True, "namesake": "bekzod"},
+    )
+    text = replies.to_me_report([sure], {1: "Ish"}, [maybe])
+    assert "Sizga 1 ta murojaat" in text
+    assert "❔ <b>Balki sizga</b> <i>(guruhda boshqa «Bekzod» ham bor)</i>" in text

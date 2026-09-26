@@ -212,7 +212,8 @@ async def cmd_to_me(message: Message) -> None:
                 )
             ).all()
         )
-        body = replies.to_me_report(addressed, titles)
+        maybe = await queries.messages_maybe_to_me(session)
+        body = replies.to_me_report(addressed, titles, maybe)
     await _safe_answer(message, body)
 
 

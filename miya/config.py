@@ -153,6 +153,9 @@ class Settings(BaseSettings):
     # as an @-mention. Empty by default: the aliases are the owner's own and
     # belong in .env, not in code.
     owner_aliases: str = ""
+    # WP-38: a bare first name another member of a group carries counts as
+    # "maybe to you" when that member spoke there within this many days.
+    owner_alias_namesake_days: int = Field(default=90, ge=1)
     # Client codes (GS367) and waybills (YW26-004715), WP-29: compared
     # exactly, never fuzzily. Comma-separated prefixes.
     client_code_prefixes: str = "GS"
