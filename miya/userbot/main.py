@@ -19,9 +19,7 @@ Safety properties, all deliberate:
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
-import re
 import sys
 import time
 import uuid
@@ -49,7 +47,11 @@ from miya.services.media_policy import (
     plan_for,
 )
 from miya.services.people import resolve_person
-from miya.services.text import fold_apostrophes
+from miya.services.text import (  # noqa: F401 - transliterate is re-exported
+    alias_pattern,
+    fold_apostrophes,
+    transliterate,
+)
 from miya.services.transcription import TranscriptionError, get_transcriber
 from miya.services.vision import describe_image
 
@@ -455,88 +457,7 @@ async def ingest_message(client: TelegramClient, message) -> bool:
 
 # --- who a message was aimed at ----------------------------------------------
 #
-# Uzbek Latin → Cyrillic, longest digraphs first. Enough to spell a name the
-# way the other script would: "Bekzod aka" → "бекзод ака", "G'ani" → "ғани".
-# Everything is lower-cased first; the match itself ignores case.
-_LATIN_TO_CYRILLIC = (
-    ("sh", "ш"),
-    ("ch", "ч"),
-    ("ng", "нг"),
-    ("yo", "ё"),
-    ("yu", "ю"),
-    ("ya", "я"),
-    ("ye", "е"),
-    ("ts", "ц"),
-    ("o'", "ў"),
-    ("g'", "ғ"),
-    ("a", "а"),
-    ("b", "б"),
-    ("c", "к"),
-    ("d", "д"),
-    ("e", "е"),
-    ("f", "ф"),
-    ("g", "г"),
-    ("h", "ҳ"),
-    ("i", "и"),
-    ("j", "ж"),
-    ("k", "к"),
-    ("l", "л"),
-    ("m", "м"),
-    ("n", "н"),
-    ("o", "о"),
-    ("p", "п"),
-    ("q", "қ"),
-    ("r", "р"),
-    ("s", "с"),
-    ("t", "т"),
-    ("u", "у"),
-    ("v", "в"),
-    ("w", "в"),
-    ("x", "х"),
-    ("y", "й"),
-    ("z", "з"),
-    ("'", "ъ"),
-)
-
-
-def transliterate(latin: str) -> str:
-    """A Latin-script Uzbek word in Cyrillic, lower-cased. Cyrillic input is
-    returned unchanged (nothing in the table matches it)."""
-    text = fold_apostrophes(latin.lower())
-    out: list[str] = []
-    i = 0
-    while i < len(text):
-        for src, dst in _LATIN_TO_CYRILLIC:
-            if text.startswith(src, i):
-                out.append(dst)
-                i += len(src)
-                break
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
-
-
-@functools.lru_cache(maxsize=8)
-def alias_pattern(aliases: tuple[str, ...]) -> re.Pattern[str] | None:
-    """One regex that matches any alias as a whole word, in either script.
-
-    Whole word means no letter or digit on either side — so "Bega" does not
-    fire on "Begalar" but does on "Bega," and "(Bega)". Inner whitespace in a
-    multi-word alias matches any run of whitespace. Cached per alias tuple,
-    so the userbot compiles it once and a test that changes the setting
-    gets a fresh one.
-    """
-    spellings: list[str] = []
-    for alias in aliases:
-        latin = fold_apostrophes(alias.strip())
-        for spelling in (latin, transliterate(latin)):
-            if spelling and spelling.lower() not in (s.lower() for s in spellings):
-                spellings.append(spelling)
-    if not spellings:
-        return None
-    words = (r"\s+".join(re.escape(part) for part in s.split()) for s in spellings)
-    return re.compile(r"(?<![\w'])(?:" + "|".join(words) + r")(?![\w'])", re.IGNORECASE)
+# The Latin→Cyrillic table and alias_pattern live in services/text.py (WP-28).
 
 
 def addressed_to_owner(message: object, chat_type: ChatType) -> bool:

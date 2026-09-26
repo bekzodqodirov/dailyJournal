@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.models import Person
+from miya.services.text import fold_apostrophes, to_latin
 
 log = logging.getLogger(__name__)
 
@@ -53,10 +54,15 @@ _HONORIFICS = {
 }
 
 
+def _is_cyrillic(text: str) -> bool:
+    return any("\u0400" <= ch <= "\u04ff" for ch in text)
+
+
 def normalise(name: str) -> str:
-    """Casefold, drop punctuation and honorifics, collapse whitespace."""
-    cleaned = re.sub(r"[^\w\s'’]", " ", name, flags=re.UNICODE).casefold()
-    cleaned = cleaned.replace("’", "'")
+    """Casefold, Cyrillic to Latin, drop punctuation and honorifics, collapse
+    whitespace. "Бекзод ака" and "Bekzod" compare equal (WP-28)."""
+    cleaned = to_latin(fold_apostrophes(name).casefold())
+    cleaned = re.sub(r"[^\w\s']", " ", cleaned, flags=re.UNICODE)
     tokens = [t for t in cleaned.split() if t and t not in _HONORIFICS]
     return " ".join(tokens) or cleaned.strip()
 
@@ -248,8 +254,12 @@ async def resolve_person(
     person, score = best_match(name, people)
 
     if person is not None and score >= MATCH_THRESHOLD:
-        known = {normalise(n) for n in [person.display_name, *(person.aliases or [])]}
-        if normalise(name) not in known:
+        names = [person.display_name, *(person.aliases or [])]
+        known = {normalise(n) for n in names}
+        # A spelling in the other script is kept too (WP-28): "Akmal" for
+        # "Акмал" compares equal but is how the owner will type it.
+        new_script = _is_cyrillic(name) not in {_is_cyrillic(n) for n in names if n}
+        if normalise(name) not in known or new_script:
             # ORM change tracking does not see in-place list mutation.
             person.aliases = [*(person.aliases or []), name]
         if telegram_id is not None and person.telegram_id is None:
