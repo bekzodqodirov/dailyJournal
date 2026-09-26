@@ -26,7 +26,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
@@ -499,5 +499,192 @@ async def ingest_sms(
         _insert_sms,
         content_key_of=lambda fields: sms_content_key(
             fields["sender"], fields["received_at"], fields["body"]
+        ),
+    )
+
+
+# --- payment-app notifications (WP-41) ---------------------------------------------
+
+MEDIA_NOTIFICATION = "notification"
+# The API caps the batch to this: 50 notifications fit the 1 MiB body cap.
+NOTIFICATION_MAX_BATCH = 50
+NOTIFICATION_TEXT_MAX = 4096
+NOTIFICATION_SHORT_MAX = 512
+NOTIFICATION_LINES_MAX = 20
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_PACKAGE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
+
+
+def notification_body(
+    text: str | None, big_text: str | None, lines: list[str] | None
+) -> str:
+    """big_text, else text, then the inbox lines; '' counts as missing,
+    exactly as the phone's takeIf { it.isNotEmpty() } does."""
+    body = big_text or text or ""
+    if lines:
+        body += "\n" + "\n".join(lines)
+    return body
+
+
+def _epoch_ms(moment: datetime) -> int:
+    """Integer milliseconds since the epoch — never float timestamp()*1000,
+    which can round one off; the phone computes the same key."""
+    return (moment - EPOCH) // timedelta(milliseconds=1)
+
+
+def notification_event_key(
+    device_id: str,
+    package: str,
+    notification_id: int,
+    tag: str | None,
+    when_at: datetime,
+    title: str | None,
+    body: str,
+) -> str:
+    """The dedupe key of one posted notification; mirrored byte for byte by
+    the Android app (PaymentApps.kt)."""
+    material = f"{notification_id}|{tag or ''}|{_epoch_ms(when_at)}|{title or ''}|{body}"
+    digest = hashlib.sha256(material.encode()).hexdigest()[:16]
+    return f"{device_id}:ntf:{package}:{digest}"
+
+
+def notification_content_key(
+    package: str, when_at: datetime, title: str | None, body: str
+) -> str:
+    """The same push after a reinstall or on a second device."""
+    material = (
+        f"{CONTENT_KEY_VERSION}|{package.lower()}|{_epoch(when_at)}|"
+        f"{title or ''}|{_norm_body(body)}"
+    )
+    return "ntfc:" + hashlib.sha256(material.encode()).hexdigest()[:32]
+
+
+def _validate_notification(item: dict) -> tuple[dict | None, str | None]:
+    package = item.get("package")
+    if not isinstance(package, str) or not _PACKAGE_RE.match(package.strip()):
+        return None, "bad package"
+    posted_at = _parse_ts(item.get("posted_at"))
+    if posted_at is None:
+        return None, "bad posted_at (ISO-8601 with offset required)"
+    when_at = None
+    if item.get("when_at") is not None:
+        when_at = _parse_ts(item.get("when_at"))
+        if when_at is None:
+            return None, "bad when_at (ISO-8601 with offset required)"
+    fields: dict = {
+        "package": package.strip(),
+        "posted_at": posted_at,
+        "when_at": when_at,
+    }
+    for name, limit in (
+        ("title", NOTIFICATION_SHORT_MAX),
+        ("text", NOTIFICATION_TEXT_MAX),
+        ("big_text", NOTIFICATION_TEXT_MAX),
+        ("sub_text", NOTIFICATION_SHORT_MAX),
+        ("tag", 255),
+        ("channel_id", 255),
+        ("category", 64),
+    ):
+        value = item.get(name)
+        if value is not None and not isinstance(value, str):
+            return None, f"bad {name}"
+        if value is not None and len(value) > limit:
+            return None, f"{name} over {limit} chars"
+        fields[name] = value
+    lines = item.get("lines") or []
+    if not isinstance(lines, list) or len(lines) > NOTIFICATION_LINES_MAX:
+        return None, "bad lines"
+    if any(not isinstance(x, str) or len(x) > NOTIFICATION_SHORT_MAX for x in lines):
+        return None, "bad lines"
+    fields["lines"] = lines
+    notification_id = item.get("notification_id", 0)
+    if _int(notification_id) is None:
+        return None, "bad notification_id"
+    fields["notification_id"] = notification_id
+    fields["body"] = notification_body(fields["text"], fields["big_text"], lines)
+    if not (fields["title"] or fields["body"].strip()):
+        return None, "empty notification"
+    return fields, None
+
+
+def _when(fields: dict) -> datetime:
+    return fields["when_at"] or fields["posted_at"]
+
+
+async def _insert_notification(
+    session: AsyncSession, device_id: str, key: str, fields: dict
+) -> Interaction:
+    parts = [
+        fields["title"],
+        fields["big_text"] or fields["text"],
+        *fields["lines"],
+    ]
+    text = "\n".join(p for p in parts if p)
+    occurred = _when(fields)
+    package = fields["package"]
+    interaction = Interaction(
+        source=InteractionSource.phone_notification,
+        direction=Direction.in_,
+        occurred_at=occurred,
+        raw_text=text,
+        processed=True,
+        needs_review=False,
+        media={
+            "type": MEDIA_NOTIFICATION,
+            "event_key": key,
+            "content_key": fields.get("content_key"),
+            "package": package,
+            "device_id": device_id,
+            "title": fields["title"],
+            "channel_id": fields["channel_id"],
+            "category": fields["category"],
+        },
+    )
+    session.add(interaction)
+    await session.flush()
+
+    allowed = settings.payment_app_packages_parsed
+    if allowed and package.lower() not in allowed:
+        interaction.media = {
+            **interaction.media,
+            "money": {"verdict": "ignore", "reason": "not_payment_app"},
+        }
+        return interaction
+    # The same reader and the same booking service as a bank SMS: neither
+    # channel can book what the other would refuse.
+    reading = sms_money.read(text, received_at=occurred)
+    await money_events.apply_reading(
+        session,
+        interaction,
+        reading,
+        channel=money_events.channel_for_app(package),
+        now=datetime.now(settings.tz),
+    )
+    return interaction
+
+
+async def ingest_notifications(
+    session: AsyncSession, device_id: str, items: list[dict]
+) -> EventOutcome:
+    """One batch of posted notifications → interactions; a completed payment
+    becomes one transaction (or evidence on the matching SMS one). The
+    caller commits."""
+    return await _ingest_batch(
+        session,
+        device_id,
+        items,
+        _validate_notification,
+        lambda device, fields: notification_event_key(
+            device,
+            fields["package"],
+            fields["notification_id"],
+            fields["tag"],
+            _when(fields),
+            fields["title"],
+            fields["body"],
+        ),
+        _insert_notification,
+        content_key_of=lambda fields: notification_content_key(
+            fields["package"], _when(fields), fields["title"], fields["body"]
         ),
     )

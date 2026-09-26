@@ -512,6 +512,7 @@ SOURCE_EMOJI = {
     InteractionSource.manual: "✍️",
     InteractionSource.receipt_photo: "🧾",
     InteractionSource.calendar: "📅",
+    InteractionSource.phone_notification: "🔔",
 }
 
 SOURCE_WORD = {
@@ -522,6 +523,7 @@ SOURCE_WORD = {
     InteractionSource.manual: "yozuv",
     InteractionSource.receipt_photo: "chek",
     InteractionSource.calendar: "uchrashuv",
+    InteractionSource.phone_notification: "ilova",
 }
 
 # A DM line shown on its own (``/tarix`` with a direction, the RAG tool)

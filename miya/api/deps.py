@@ -21,7 +21,7 @@ _UNAUTHORIZED = {"WWW-Authenticate": "Bearer"}
 # The metadata streams the companion uploads next to its recordings (build
 # step 6): call-log events and SMS. Exact paths, no prefix — a device token
 # must not grow into new routes by accident.
-PHONE_EVENT_PATHS = ("/v1/phone/calls", "/v1/phone/sms")
+PHONE_EVENT_PATHS = ("/v1/phone/calls", "/v1/phone/sms", "/v1/phone/notifications")
 
 
 def is_upload_path(path: str) -> bool:

@@ -916,6 +916,34 @@ class SmsIn(BaseModel):
     sim_slot: int | None = None
 
 
+class NotificationIn(BaseModel):
+    """One posted notification of a payment app (WP-41)."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    package: str = Field(min_length=1, max_length=255)
+    posted_at: datetime | str
+    when_at: datetime | str | None = None
+    title: str | None = Field(default=None, max_length=512)
+    text: str | None = Field(default=None, max_length=4096)
+    big_text: str | None = Field(default=None, max_length=4096)
+    sub_text: str | None = Field(default=None, max_length=512)
+    lines: list[str] = Field(default_factory=list, max_length=20)
+    notification_id: int = 0
+    tag: str | None = Field(default=None, max_length=255)
+    channel_id: str | None = Field(default=None, max_length=255)
+    category: str | None = Field(default=None, max_length=64)
+
+
+class NotificationsRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    device_id: str = Field(min_length=1, max_length=128)
+    notifications: list[NotificationIn] = Field(
+        max_length=phone_events.NOTIFICATION_MAX_BATCH
+    )
+
+
 class CallEventsRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -984,6 +1012,21 @@ async def upload_sms(body: SmsRequest, session: SessionDep) -> dict[str, Any]:
     await session.commit()
     if outcome.accepted:
         await _phone_beat(session, body.device_id, "sms", outcome.accepted)
+    return _outcome_json(outcome)
+
+
+@api.post("/phone/notifications", tags=["phone"])
+async def upload_notifications(
+    body: NotificationsRequest, session: SessionDep
+) -> dict[str, Any]:
+    """One batch of payment-app notifications → interactions; a completed
+    payment is read by the same rules as a bank SMS — no model call."""
+    outcome = await phone_events.ingest_notifications(
+        session, body.device_id, [item.model_dump() for item in body.notifications]
+    )
+    await session.commit()
+    if outcome.accepted:
+        await _phone_beat(session, body.device_id, "notifications", outcome.accepted)
     return _outcome_json(outcome)
 
 

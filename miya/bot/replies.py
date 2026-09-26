@@ -1442,6 +1442,7 @@ SOURCE_LABEL = {
     "manual": "qo'lda",
     "receipt_photo": "rasm",
     "calendar": "kalendar",
+    "phone_notification": "ilova",
 }
 
 

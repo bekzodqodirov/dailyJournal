@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -242,6 +243,9 @@ class Settings(BaseSettings):
     # Bank adverts ("5% keshbek ...") are ignored by default; true sends
     # them to /tekshir instead.
     payment_adverts_to_review: bool = False
+    # WP-41: package ids of the payment apps whose pushes may book money,
+    # comma- or space-separated. Empty trusts the phone's own allow-list.
+    payment_app_packages: str = ""
     # The emergency brake while the parser is tuned: false sends every
     # completed payment to /tekshir instead of booking it.
     money_autobook: bool = True
@@ -414,6 +418,12 @@ class Settings(BaseSettings):
     @property
     def morning_brief_time_parsed(self) -> time:
         return _parse_hhmm(self.morning_brief_time)
+
+    @property
+    def payment_app_packages_parsed(self) -> tuple[str, ...]:
+        return tuple(
+            p.lower() for p in re.split(r"[,\s]+", self.payment_app_packages) if p
+        )
 
     @property
     def owner_aliases_parsed(self) -> tuple[str, ...]:

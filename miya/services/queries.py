@@ -312,6 +312,7 @@ TIMELINE_SOURCES: tuple[InteractionSource, ...] = (
     InteractionSource.assistant_bot,
     InteractionSource.manual,
     InteractionSource.receipt_photo,
+    InteractionSource.phone_notification,
 )
 
 
