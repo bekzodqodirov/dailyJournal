@@ -14,7 +14,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import sqlalchemy as sa
@@ -28,6 +28,7 @@ from miya.db.models import (
     ChatMonitor,
     Claim,
     ConversationWindow,
+    DailyReport,
     Debt,
     Interaction,
     Person,
@@ -142,6 +143,9 @@ class DayActivity:
             money.income
             or money.expense
             or money.repayments
+            or money.ignored
+            or money.voided
+            or money.checkable_total
             or self.new_debts
             or self.new_promises
             or self.people
@@ -772,3 +776,142 @@ async def write_prose(
         )
     await session.flush()
     return ProseResult(prose=prose, status="model")
+
+
+# --- the evening recap (WP-53) ----------------------------------------------------------
+
+EVENING = "evening"
+
+
+@dataclass(slots=True)
+class Tomorrow:
+    events: list = field(default_factory=list)
+    debts: list = field(default_factory=list)
+    promises: list = field(default_factory=list)
+    tasks: list = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class RecapResult:
+    parts: list[str]
+    stats: dict
+    prose_status: str
+    window_start: datetime
+    window_end: datetime
+
+
+async def _tomorrow(session: AsyncSession, day) -> Tomorrow:
+    nxt = day + timedelta(days=1)
+    start, end = queries.day_bounds(nxt)
+    due = await queries.due_items(session, horizon_days=1)
+    return Tomorrow(
+        events=await queries.events_between(session, start, end),
+        debts=[b for b in due.get("debts", []) if b.earliest_due == nxt],
+        promises=[
+            (p, person) for p, person in due.get("promises", []) if p.due_date == nxt
+        ],
+        tasks=[t for t in due.get("tasks", []) if t.due_date == nxt],
+    )
+
+
+def _stats(activity: DayActivity, prose: ProseResult, queue, parts) -> dict:
+    money = activity.money
+    return {
+        "income": {c.value: str(v) for c, v in money.income.items()},
+        "expense": {c.value: str(v) for c, v in money.expense.items()},
+        "repayments": len(money.repayments),
+        "new_debts": len(activity.new_debts),
+        "new_promises": len(activity.new_promises),
+        "people": len(activity.people),
+        "groups": len(activity.groups),
+        "calls": activity.calls.total,
+        "subjects": [s.key for s in activity.people] + [g.key for g in activity.groups],
+        "prose_status": prose.status,
+        "prose_subjects": sorted(prose.prose),
+        "queue": getattr(queue, "waiting", 0) if queue is not None else 0,
+        "parts": len(parts),
+    }
+
+
+async def build_evening(
+    session: AsyncSession, day, *, now: datetime, store: bool
+) -> RecapResult:
+    """The evening recap of ``day`` up to ``now``: SQL figures, labelled
+    prose, stored as the day's evening row when ``store``. A row already
+    partly delivered is returned as stored, so a resume never mixes versions."""
+    from miya.bot import recap_text  # the renderer; it imports no services
+    from miya.services import codes as client_codes
+    from miya.services import questions
+
+    start, day_end = queries.day_bounds(day)
+    end = min(now, day_end)
+    if store:
+        existing = await session.scalar(
+            sa.select(DailyReport).where(
+                DailyReport.report_date == day, DailyReport.kind == EVENING
+            )
+        )
+        if existing is not None and existing.parts_sent > 0 and not existing.delivered_at:
+            return RecapResult(
+                parts=list(existing.parts),
+                stats=existing.stats or {},
+                prose_status=existing.prose_status,
+                window_start=existing.window_start or start,
+                window_end=existing.window_end or end,
+            )
+
+    activity = await gather_activity(session, start, end, now=now)
+    subjects = [
+        *activity.people[: settings.recap_max_people],
+        *activity.groups[: settings.recap_max_groups],
+    ]
+    prose = await write_prose(
+        session, subjects, digest_date=day, window_start=start, window_end=end
+    )
+    queue = questions.summarise(
+        await questions.collect(session, now=now, for_push=False), []
+    )
+    auto = (await questions.auto_resolved_since(session, start)).total
+    held = await client_codes.codes_of_many(
+        session, [p.person.id for p in activity.people[: settings.recap_max_people]]
+    )
+    report_at = datetime.combine(day, settings.report_time_parsed, tzinfo=settings.tz)
+    parts = recap_text.evening_parts(
+        activity,
+        prose.prose,
+        await _tomorrow(session, day),
+        queue,
+        day=day,
+        tz=settings.tz,
+        partial_until=end if end < report_at else None,
+        max_parts=settings.recap_max_parts,
+        codes=held,
+        prose_status=prose.status,
+        max_people=settings.recap_max_people,
+        max_groups=settings.recap_max_groups,
+        auto_resolved=auto,
+    )
+    stats = _stats(activity, prose, queue, parts)
+    if store:
+        values = {
+            "content": "\n\n".join(parts),
+            "stats": stats,
+            "parts": parts,
+            "window_start": start,
+            "window_end": end,
+            "prose_status": prose.status,
+            "updated_at": now,
+        }
+        await session.execute(
+            insert(DailyReport)
+            .values(report_date=day, kind=EVENING, **values)
+            .on_conflict_do_update(constraint="uq_daily_reports_date_kind", set_=values)
+        )
+        await session.flush()
+    return RecapResult(
+        parts=parts,
+        stats=stats,
+        prose_status=prose.status,
+        window_start=start,
+        window_end=end,
+    )

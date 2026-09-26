@@ -473,10 +473,11 @@ async def ask(body: AskRequest, session: SessionDep) -> dict[str, str]:
 
 @api.post("/report/today", tags=["intelligence"])
 async def report_today(session: SessionDep) -> dict[str, str]:
-    """Generate today's report; not stored, so it never stands in for the
+    """Today's recap so far; not stored, so it never stands in for the
     evening report the worker delivers."""
     content = await reports.generate_report(session, store=False)
-    return {"report": content}
+    await session.commit()  # the recap's usage row and cached prose
+    return {"content": content}
 
 
 @api.get("/plan/tomorrow", tags=["intelligence"])

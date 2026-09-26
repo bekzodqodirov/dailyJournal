@@ -14,7 +14,8 @@ from miya.bot import handlers, keyboards, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import Direction, InteractionSource
-from miya.services import brief, health, ingest, money_events, queries, reports, sms_money
+from miya.services import brief, health, ingest, money_events, queries, sms_money
+from tests import recap_helpers
 from tests.test_close_and_correct import _Callback, _command, _Message
 from tests.test_pipeline import _open_debt
 
@@ -229,15 +230,14 @@ async def test_hammasi_lists_ignored_texts_and_books_them(bound):
 
 
 async def test_the_report_counts_ignored_texts(session):
-    today = datetime.now(TZ).date()
-    data = await reports.gather(session, today)
-    assert "e'tiborsiz" not in reports.render_data_block(data)
+    now = datetime.now(TZ).replace(hour=20, minute=0, second=0, microsecond=0)
+    assert "e'tiborsiz" not in await recap_helpers.recap_of(session, now=now)
 
-    noon = datetime.now(TZ).replace(hour=12, minute=0, second=0, microsecond=0)
+    noon = now.replace(hour=12)
     await _money_text(session, "Vash kod: 1234. Nikomu ne soobshchayte", at=noon)
     await _money_text(session, "Vash kod: 5678. Nikomu ne soobshchayte", at=noon)
-    data = await reports.gather(session, today)
-    assert reports.REPORT_IGNORED_LINE.format(n=2) in reports.render_data_block(data)
+    text = await recap_helpers.recap_of(session, now=now)
+    assert "- e'tiborsiz qoldirildi: 2 ta (kod, reklama) — /tekshir hammasi" in text
 
 
 async def test_health_backlog_ignores_money_rows(session):

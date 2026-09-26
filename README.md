@@ -202,7 +202,7 @@ it recorded:
 | `/kodlar` | Code suggestions learned from chats; send a CSV/.xlsx captioned `/kodlar` to import the client list |
 | `/yuk <YW26-004715 yoki GS367>` | Every message, call and note that mentions a waybill or client code, oldest first; a bare code or waybill sent as a message does the same |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
-| `/hisobot` | Generate and send today's report right now |
+| `/hisobot` | Today's recap so far ("🌆 Bugun nima bo'ldi", up to now) |
 | `/reja` | Tomorrow's time-blocked plan |
 | `/chats` | Which Telegram chats the userbot reads, with per-chat toggles |
 | `/process` | Reply to a video/document/voice to process it on demand |
@@ -320,13 +320,18 @@ the only source of financial figures; `search_memories` covers contextual
 questions. If the model or a tool fails, the owner gets an honest "try again
 later" instead of a guess.
 
-**Daily report.** At `REPORT_TIME` the worker gathers the day from SQL and
-renders the report deterministically, with Uzbek section headings; no model
-touches it, so no figure can be mis-copied on the owner's evening money
-surface. The result is stored in `daily_reports` (upsert per date) and sent
-to the owner. `/hisobot` runs the same path on demand. Its "📅 Ertaga" section
-is tomorrow's SQL listing; `/reja` is the only model-written plan, and the
-model writing it never sees an amount (debts are named by person and ref).
+**Evening recap.** At `REPORT_TIME` the worker sends "🌆 Bugun nima bo'ldi":
+the day's money per currency, repayments and what the phone booked (with
+`x` refs to check), new and closed records, then a block per person — messages,
+calls, what they asked and whether it was answered, claims and refs — and per
+group, the calls, what was aimed at the owner in groups, what is still open,
+and tomorrow. Every figure comes from SQL (`services/recaps.py`); one capped
+model call adds at most a labelled sentence or two per person and group, with
+any digit or currency word refused, and the recap arrives complete without it
+when the model is down. It is stored in `daily_reports`, split into at most
+`RECAP_MAX_PARTS` messages and delivered part by part. `/hisobot` shows the
+same recap up to now without storing it; `/reja` is the model-written plan for
+tomorrow.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
 Google Cloud Console, save it to `secrets/google_oauth.json`, then

@@ -42,7 +42,7 @@ async def test_lunchtime_hisobot_does_not_cause_a_second_evening_send(session):
 
     bot = _Bot()
     await worker.report_job(bot, now=_at(19))
-    assert sum(1 for t in bot.texts if "Kunlik hisobot" in t) == 1
+    assert sum(1 for t in bot.texts if "Bugun nima bo'ldi" in t) == 1
     row = await _row(session, day)
     assert row.delivered_at is not None and row.parts_sent == 1
     assert await worker._evening_to_resume(_at(20)) is None
@@ -72,7 +72,7 @@ async def test_a_partly_delivered_report_resumes_without_repeating(session):
     assert (await _row(session, day)).parts_sent == 1
 
     # A resume at 19:30 keeps the stored parts and sends only B.
-    assert await reports.generate_report(session, day, now=_at(19, 30)) == "A\nB"
+    assert await reports.generate_report(session, day, now=_at(19, 30)) == "A\n\nB"
     await session.commit()
     second = _Bot()
     assert await worker.deliver_report(second, day) is True
@@ -166,3 +166,108 @@ def test_the_migration_counts_history_as_delivered():
             )
         engine.dispose()
         _alembic(url, "upgrade", "head")
+
+
+# --- WP-53: the evening recap end to end ----------------------------------------
+
+
+class _ProseClient:
+    def __init__(self, reply: str) -> None:
+        self.reply = reply
+        self.messages = self
+
+    def with_options(self, **kwargs):
+        return self
+
+    async def create(self, **kwargs):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=self.reply)],
+            usage=SimpleNamespace(
+                input_tokens=10,
+                output_tokens=5,
+                cache_read_input_tokens=0,
+                cache_creation_input_tokens=0,
+            ),
+        )
+
+
+async def _seed_chat(session, day_at: datetime) -> m.Person:
+    from miya.db.enums import ChatType, Direction, InteractionSource
+
+    akmal = m.Person(display_name="Akmal", aliases=[])
+    session.add(akmal)
+    session.add(m.ChatMonitor(tg_chat_id=4401, chat_type=ChatType.private, title="Akmal"))
+    await session.flush()
+    session.add(
+        m.Interaction(
+            source=InteractionSource.telegram_userbot,
+            direction=Direction.in_,
+            person_id=akmal.id,
+            tg_chat_id=4401,
+            occurred_at=day_at,
+            raw_text="Yuk qachon keladi?",
+            meta={"tg_message_id": 1},
+        )
+    )
+    await session.commit()
+    return akmal
+
+
+async def test_evening_recap_end_to_end_with_stub_model(session, monkeypatch):
+    from miya.services import recaps
+
+    akmal = await _seed_chat(session, _at(11))
+    monkeypatch.setattr(
+        recaps,
+        "get_client",
+        lambda: _ProseClient(f'{{"p:{akmal.id}": "Yuk haqida so\'radi"}}'),
+    )
+    bot = _Bot()
+    await worker.report_job(bot, now=_at(19))
+    recap, markup = bot.sent[0]
+    assert recap.startswith("🌆 <b>Bugun nima bo'ldi</b>") and markup is None
+    assert "🤖 <i>Yuk haqida so'radi</i>" in recap
+    row = await _row(session, _at(19).date())
+    assert row.delivered_at is not None and row.prose_status == "model"
+
+
+async def test_hisobot_on_demand_writes_no_ledger_row_and_says_until_when(session):
+    from miya.services import recaps
+
+    await _seed_chat(session, _at(9))
+    result = await recaps.build_evening(session, _at(12).date(), now=_at(12), store=False)
+    assert "12:00 gacha" in result.parts[0]
+    assert await _row(session, _at(12).date()) is None
+
+
+async def test_api_report_today_returns_the_joined_recap(session, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from miya.api.main import app
+
+    token = "test-token-" + "x" * 53
+    monkeypatch.setattr(settings, "api_bearer_token", token)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/report/today", headers={"Authorization": f"Bearer {token}"}
+        )
+    assert response.status_code == 200
+    assert response.json()["content"].startswith("🌆 <b>Bugun nima bo'ldi</b>")
+
+
+async def test_evening_batch_follows_the_recap(session, monkeypatch):
+    from miya.bot import replies
+
+    sent_batches = []
+
+    async def batch(bot, *, slot, via, header, now):
+        sent_batches.append(header)
+        return 0
+
+    monkeypatch.setattr(worker, "_slot_questions", batch)
+    bot = _Bot()
+    await worker.report_job(bot, now=_at(19))
+    assert bot.texts[0].startswith("🌆 <b>Bugun nima bo'ldi</b>")
+    assert sent_batches == [replies.QUESTIONS_EVENING_HEADER]

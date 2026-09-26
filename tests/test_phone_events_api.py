@@ -24,11 +24,12 @@ from fastapi.testclient import TestClient
 
 from miya.api import main
 from miya.api.main import app
-from miya.bot import formatting, handlers, keyboards, replies
+from miya.bot import formatting, handlers, keyboards, recap_text, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import Direction, InteractionSource, TransactionType
-from miya.services import loops, nudges, phone_events, queries, reports
+from miya.services import loops, nudges, phone_events, queries
+from tests import recap_helpers
 from tests.test_claims_surface import _claim
 from tests.test_close_and_correct import _Callback, _Message
 from tests.test_step2_render import NOW, _question, _stale
@@ -576,23 +577,16 @@ async def test_a_stale_missed_button_says_gone(bound):
 # --- the report -------------------------------------------------------------------
 
 
-async def test_the_report_carries_the_missed_section_with_hostile_names(bound):
+async def test_the_recap_lists_missed_calls_with_hostile_names_escaped(bound):
     await _missed_call_row(bound, contact_name="<b>Yovuz</b>")
 
-    data = await reports.gather(bound, _now().date())
-    block = reports.render_data_block(data)
+    text = await recap_helpers.recap_of(bound, _now().date(), now=_now())
 
-    assert len(data.missed) == 1
-    assert reports.H_MISSED in block
-    section = block[block.index(reports.H_MISSED) :]
-    assert "&lt;b&gt;Yovuz&lt;/b&gt;" in section.split("🤫")[0]
-    assert block.index(reports.H_QUESTIONS) < block.index(reports.H_MISSED)
-    assert block.index(reports.H_MISSED) < block.index(reports.H_QUIET)
-    assert reports._stats_json(data)["missed"] == 1
+    [section] = [b for b in text.split("\n\n") if b.startswith(recap_text.RECAP_OPEN)]
+    assert "&lt;b&gt;Yovuz&lt;/b&gt;" in section
+    assert "<b>Yovuz</b>" not in text
 
 
-async def test_a_report_without_missed_calls_has_no_empty_section(session):
-    data = await reports.gather(session, _now().date())
-    block = reports.render_data_block(data)
-    assert reports.H_MISSED not in block
-    assert reports._stats_json(data)["missed"] == 0
+async def test_a_recap_without_missed_calls_has_no_open_section(session):
+    text = await recap_helpers.recap_of(session, _now().date(), now=_now())
+    assert recap_text.RECAP_OPEN not in text

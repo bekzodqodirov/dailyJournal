@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from aiogram.filters import CommandObject
 
 from miya.bot import formatting as f
-from miya.bot import handlers, keyboards, replies
+from miya.bot import handlers, keyboards, recap_text, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import (
@@ -30,10 +30,11 @@ from miya.db.enums import (
     TaskStatus,
 )
 from miya.services import extraction as ex
-from miya.services import queries, records, reminders, reports
+from miya.services import queries, records, reminders
 from miya.services.people import resolve_person
 from miya.services.persistence import Applied, apply_extraction
 from miya.worker import main as worker
+from tests import recap_helpers
 from tests.test_pipeline import _interaction, _open_debt
 
 TZ = settings.tz
@@ -953,20 +954,18 @@ async def test_bajarilganlar_lists_the_promise_closed_today_and_not_the_dropped_
     assert [p.id for p in completed.done_promises] == [kept.id]
     assert [t.id for t in completed.done_tasks] == [task.id]
 
-    data = await reports.gather(session, _today())
-    block = reports.render_data_block(data)
-    section = block[block.index(reports.H_DONE) : block.index(reports.H_CHATS)]
-    assert "va'da bajarildi: Akmal — invoice yuboradi" in section
-    assert "vazifa bajarildi: hujjat topshirish" in section
+    text = await recap_helpers.recap_of(session, _today())
+    [section] = [b for b in text.split("\n\n") if b.startswith(recap_text.RECAP_DONE)]
+    assert "invoice yuboradi" in section
+    assert "hujjat topshirish" in section
     assert "kelmaydi" not in section
 
 
 async def test_the_reports_open_items_carry_refs(session):
     _, debt = await _open_debt(session, due=_today())
     _, promise = await _promise(session, "pul beradi", due=_today())
-    data = await reports.gather(session, _today())
-    block = reports.render_data_block(data)
-    assert f"[d{debt.id}]" in block and f"[p{promise.id}]" in block
+    text = await recap_helpers.recap_of(session, _today())
+    assert f"<code>d{debt.id}</code>" in text and f"<code>p{promise.id}</code>" in text
 
 
 async def test_bugun_lists_the_days_new_rows_by_ref(session):

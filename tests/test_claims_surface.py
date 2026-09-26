@@ -21,10 +21,11 @@ from miya.bot import handlers, keyboards, notices, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import Currency, DebtDirection, PromiseMadeBy, PromiseStatus
-from miya.services import brief, claims, reports
+from miya.services import brief, claims, recaps
 from miya.services import extraction as ex
 from miya.services import questions as questions_mod
 from miya.services.persistence import Applied, apply_extraction
+from tests import recap_helpers
 from tests.test_close_and_correct import _Callback, _command, _Message
 from tests.test_pipeline import _interaction
 from tests.test_step2_render import NOW, _question, _stale
@@ -436,30 +437,11 @@ def test_the_notice_counts_claims_as_their_own_kind():
     assert "2 da'vo" in summary
 
 
-def _report_data(**kw) -> reports.ReportData:
-    summary = SimpleNamespace(
-        income={},
-        expense={},
-        by_category=[],
-        biggest=[],
-        interactions=0,
-        people_seen=[],
-        new_debts=[],
-        new_promises=[],
-    )
-    completed = SimpleNamespace(settled_debts=[], done_promises=[], done_tasks=[])
-    return reports.ReportData(
-        day=NOW.date(), summary=summary, completed=completed, due={}, plan="—", **kw
-    )
-
-
 def test_the_report_carries_one_line_only_when_questions_wait():
     queue = questions_mod.QueueSummary(waiting=3, money=1)
-    block = reports.render_data_block(_report_data(queue=queue))
-    assert "\n❓ Yana 3 ta savol navbatda (1 tasi pul bo'yicha) — /savollar" in block
-    assert block.index("Yana 3 ta") < block.index(reports.H_TOMORROW)
-    assert "navbatda" not in reports.render_data_block(_report_data())
-    assert reports._stats_json(_report_data(queue=queue))["questions_waiting"] == 3
+    text = recap_helpers.render(queue=queue)
+    assert "❓ Yana 3 ta savol navbatda (1 tasi pul bo'yicha) — /savollar" in text
+    assert "navbatda" not in recap_helpers.render()
 
 
 # --- through the handlers, with real claims ----------------------------------------
@@ -706,11 +688,12 @@ async def test_ertalab_counts_the_claim_and_asks_nothing(bound):
 
 async def test_the_gathered_brief_and_report_see_the_pending_claims(session):
     claim = await _claimed(session)
-    report = await reports.gather(session, datetime.now(TZ).date())
-    assert report.queue.waiting == 1
+    now = datetime.now(TZ)
+    recap = await recaps.build_evening(session, now.date(), now=now, store=False)
+    assert recap.stats["queue"] == 1
     await claims.decline(session, claim.id, by=claims.BY_COMMAND)
-    assert (await reports.gather(session, datetime.now(TZ).date())).queue.waiting == 0
-    assert claim.id
+    recap = await recaps.build_evening(session, now.date(), now=now, store=False)
+    assert recap.stats["queue"] == 0
 
 
 async def test_accepting_a_fulfilment_closes_the_promise_and_receipts_it(bound):

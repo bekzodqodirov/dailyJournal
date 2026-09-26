@@ -19,7 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from miya.bot import formatting as f
-from miya.bot import keyboards, replies
+from miya.bot import keyboards, recap_text, replies
 from miya.config import settings
 from miya.db.enums import (
     ChatType,
@@ -30,9 +30,9 @@ from miya.db.enums import (
     PromiseStatus,
     TaskStatus,
 )
-from miya.services import reports
 from miya.services.loops import QuietCounterparty, StaleCommitment, UnansweredQuestion
 from miya.services.queries import DebtBalance
+from tests import recap_helpers
 
 NOW = datetime(2026, 9, 15, 9, 0, tzinfo=settings.tz)
 TEN_DIGITS = 9_999_999_999
@@ -163,10 +163,10 @@ def test_age_label_lives_in_formatting_and_replies_reexports_it():
     assert f.age_label(timedelta(seconds=-5)) == "0 daqiqa"
 
 
-def test_reports_no_longer_imports_the_bots_reply_module():
-    """reports → replies → brief → nudges → loops → queries: one import of
-    reports from anywhere on that chain would be a cycle."""
-    imported = _imported_modules(Path(reports.__file__))
+def test_the_recap_renderer_does_not_import_the_bots_reply_module():
+    """recap_text imports only formatting: the services build the recap and
+    call it, so it can never be part of an import cycle (WP-53)."""
+    imported = _imported_modules(Path(recap_text.__file__))
     assert not any(name.startswith("miya.bot.replies") for name in imported)
     assert "miya.bot.formatting" in imported
     # formatting itself never imports the services at runtime — that is what
@@ -232,38 +232,15 @@ def test_plain_form_carries_no_tags_and_no_escaping():
     assert "<code>" not in replies.quiet_line(_quiet(), markup=False)
 
 
-def test_the_report_block_uses_the_shared_renderers_escaped():
-    summary = SimpleNamespace(
-        income={},
-        expense={},
-        by_category=[],
-        biggest=[],
-        interactions=0,
-        people_seen=[],
-        new_debts=[],
-        new_promises=[],
+def test_the_recap_uses_the_shared_renderers_escaped():
+    act = recap_helpers.activity(
+        NOW.date(),
+        questions_open=[_question(person=_person("Akmal <GZ>"), follow_ups=1)],
     )
-    completed = SimpleNamespace(settled_debts=[], done_promises=[], done_tasks=[])
-    data = reports.ReportData(
-        day=NOW.date(),
-        summary=summary,
-        completed=completed,
-        due={},
-        plan="—",
-        questions=[_question(person=_person("Akmal <GZ>"), follow_ups=1)],
-        quiet=[_quiet()],
-    )
-    block = reports.render_data_block(data)
-    assert (
-        "- Akmal &lt;GZ&gt;, 6 soat javobsiz: «konteyner qachon keladi?» (+1 xabar)"
-        in block
-    )
-    assert "- Sardor: 40 kun jim — $1200 (qarzingiz)" in block
-    # Counterparty text is escaped; the only markup is the section headings.
-    assert "Akmal &lt;GZ&gt;" in block and "<GZ>" not in block
-    rendered = [h for h in reports.HEADINGS if h in block]
-    assert block.count("<b>") == len(rendered)
-    assert "<code>" not in block
+    text = recap_helpers.render(act)
+    [section] = [b for b in text.split("\n\n") if b.startswith(recap_text.RECAP_OPEN)]
+    assert "Akmal &lt;GZ&gt;" in section and "konteyner qachon keladi?" in section
+    assert "<GZ>" not in text
 
 
 def test_a_long_question_is_cut_the_same_way_in_both_forms():

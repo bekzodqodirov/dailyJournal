@@ -20,6 +20,7 @@ from miya.bot.formatting import (
     full_date,
     missed_line,
     money,
+    new_record_lines,
     question_line,
     queue_line,
     quiet_line,
@@ -93,7 +94,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
 /yuk &lt;YW26-004715 yoki GS367&gt; — yuk xati yoki kod qayerda tilga olingan
 /qidir &lt;so'z&gt; — xotiradan qidirish
-/hisobot — kunlik hisobot
+/hisobot — bugun nima bo'ldi (hozirgacha)
 /ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
@@ -130,7 +131,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("tekshir", "Qayta ishlanmagan yozuvlar"),
     ("qayta", "Ularni qaytadan ajratish"),
     ("qidir", "Xotiradan qidirish"),
-    ("hisobot", "Kunlik hisobot"),
+    ("hisobot", "Bugun nima bo'ldi"),
     ("ertalab", "Ertalabki xulosa"),
     ("reja", "Ertangi reja"),
     ("chats", "Qaysi chatlar o'qilishi"),
@@ -603,24 +604,7 @@ def day_report(summary: DaySummary) -> str:
     if summary.new_debts or summary.new_promises:
         # Listed by ref, not counted: the day's fresh rows are the ones most
         # likely to need /tuzat, and the owner needs a handle to name them.
-        new_lines = [
-            debt_line(
-                escape(debt.person.display_name),
-                debt.direction,
-                debt.amount,
-                debt.currency,
-                debt.due_date,
-            )
-            + tag("debt", debt.id)
-            for debt in summary.new_debts
-        ]
-        new_lines += [
-            ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
-            + f"{escape(p.person.display_name)} — {escape(p.description)}"
-            + (f" · {relative_day(p.due_date)}" if p.due_date else "")
-            + tag("promise", p.id)
-            for p in summary.new_promises
-        ]
+        new_lines = new_record_lines(summary.new_debts, summary.new_promises)
         parts.append(
             "🧾 <b>Yangi qarz va va'dalar</b>\n" + bullet_list(new_lines, empty="—")
         )

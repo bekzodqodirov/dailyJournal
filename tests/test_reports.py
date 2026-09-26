@@ -39,6 +39,9 @@ class _StubClient:
         self.error = error
         self.calls: list[dict] = []
 
+    def with_options(self, **kwargs):
+        return self
+
     async def create(self, **kwargs):
         self.calls.append(kwargs)
         if self.error is not None:
@@ -115,28 +118,26 @@ async def test_planner_uses_the_model_when_available(session, monkeypatch):
 
 
 def _no_model(*_a, **_k):
-    raise AssertionError("the daily report must never call a model")
+    raise AssertionError("the planner must not be called by the recap")
 
 
-async def test_generate_report_makes_no_model_call(session, monkeypatch):
-    """Money reaches the owner from SQL only: the report is rendered, never
-    rewritten, so a model cannot mis-copy a figure on the evening surface."""
+async def test_generate_report_figures_come_from_sql(session, monkeypatch):
+    """Money reaches the owner from SQL only: the recap's figures are
+    rendered, and the model — down here — only ever writes prose."""
+    from miya.services import recaps
+
     day = await _seed_day(session)
     monkeypatch.setattr(planner, "get_client", _no_model)
-    from miya.services import extraction
-
-    monkeypatch.setattr(extraction, "get_client", _no_model)
+    monkeypatch.setattr(recaps, "get_client", lambda: _StubClient(error=_api_error()))
 
     content = await reports.generate_report(session, day)
     await session.commit()
 
-    assert content.startswith(reports.H_MONEY)
-    assert f"chiqim: {format_money(Decimal('1200000'), Currency.UZS)}" in content
+    assert content.startswith("🌆 <b>Bugun nima bo'ldi</b>")
+    assert f"Chiqim: {format_money(Decimal('1200000'), Currency.UZS)}" in content
     row = await session.scalar(sa.select(m.DailyReport))
     assert row.report_date == day and row.content == content
     assert row.stats["expense"] == {"UZS": "1200000.00"}
-    assert row.stats["model"] is False
-    assert row.stats["interactions"] >= 1
     operations = set(await session.scalars(sa.select(m.UsageLog.operation)))
     assert not operations & {"report", "planner"}
 
@@ -147,9 +148,9 @@ async def test_report_ertaga_is_the_sql_listing(session, monkeypatch):
 
     content = await reports.generate_report(session, day)
 
-    tomorrow = content[content.index(reports.H_TOMORROW) :]
+    [tomorrow] = [b for b in content.split("\n\n") if b.startswith("📅 <b>Ertaga</b>")]
     assert "Bojxona uchrashuvi" in tomorrow and "15:00" in tomorrow
-    assert "REJA KUNI" not in tomorrow
+    assert "/reja" in tomorrow
 
 
 async def test_generate_report_upserts_on_the_same_day(session):

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import sqlalchemy as sa
 
-from miya.bot import handlers, keyboards, replies
+from miya.bot import handlers, keyboards, recap_text, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import (
@@ -30,11 +30,12 @@ from miya.db.enums import (
     EventStatus,
     WindowStatus,
 )
-from miya.services import batch, brief, chats, nudges, reports, windows
+from miya.services import batch, brief, chats, nudges, queries, recaps, windows
 from miya.services import extraction as ex
 from miya.tools import backfill as backfill_tool
 from miya.userbot import main as userbot
 from miya.worker import main as worker
+from tests import recap_helpers
 from tests.test_close_and_correct import (
     _Callback,
     _Message,
@@ -311,31 +312,21 @@ def test_the_brief_is_in_help_and_scheduled_at_the_owners_time():
 # --- 2. the evening report ---------------------------------------------------
 
 
-async def test_the_report_gains_the_two_sections_with_ages(session):
+async def test_the_recap_lists_what_waits_for_an_answer(session):
     seed = await _seed_loops(session)
 
-    data = await reports.gather(session, _now().date())
-    block = reports.render_data_block(data)
-
-    unanswered = block[block.index(reports.H_QUESTIONS) : block.index(reports.H_QUIET)]
-    assert "Akmal, 6 soat javobsiz: «konteyner qachon keladi?»" in unanswered
-    quiet = block[block.index(reports.H_QUIET) : block.index(reports.H_TOMORROW)]
-    assert "Sardor: 40 kun jim — $1200 (qarzingiz)" in quiet
-    assert [q.interaction_id for q in data.questions] == [seed.asked.id]
-    assert reports._stats_json(data)["unanswered"] == 1
-    assert reports._stats_json(data)["quiet"] == 1
+    text = await recap_helpers.recap_of(session, _now().date(), now=_now())
+    [section] = [b for b in text.split("\n\n") if b.startswith(recap_text.RECAP_OPEN)]
+    assert "Akmal" in section and "konteyner qachon keladi?" in section
+    start, end = queries.day_bounds(_now().date())
+    activity = await recaps.gather_activity(session, start, end, now=_now())
+    assert [q.interaction_id for q in activity.questions_open] == [seed.asked.id]
 
 
-async def test_the_report_sections_say_none_in_the_fixed_order(session):
-    data = await reports.gather(session, _now().date())
-    block = reports.render_data_block(data)
-    assert f"{reports.H_QUESTIONS}\n- yo'q" in block
-    assert f"{reports.H_QUIET}\n- yo'q" in block
-    assert reports._stats_json(data)["unanswered"] == 0
-    shown = [h for h in reports.HEADINGS if h in block]
-    assert shown == sorted(shown, key=block.index)
-    assert block.index(reports.H_TO_ME) < block.index(reports.H_QUESTIONS)
-    assert block.index(reports.H_QUIET) < block.index(reports.H_TOMORROW)
+async def test_a_quiet_day_has_no_open_section(session):
+    text = await recap_helpers.recap_of(session, _now().date(), now=_now())
+    assert recap_text.RECAP_OPEN not in text
+    assert text.startswith("🌆 <b>Bugun nima bo'ldi</b>")
 
 
 # --- 3. nudges ------------------------------------------------------------------
@@ -395,8 +386,9 @@ async def test_javob_berdim_is_final_and_the_next_question_surfaces(session):
     assert [q.interaction_id for q in (await brief.gather(session)).loops.questions] == [
         second.id
     ]
-    data = await reports.gather(session, _now().date())
-    assert [q.interaction_id for q in data.questions] == [second.id]
+    start, end = queries.day_bounds(_now().date())
+    activity = await recaps.gather_activity(session, start, end, now=_now())
+    assert [q.interaction_id for q in activity.questions_open] == [second.id]
     assert [q.interaction_id for q in await nudges.collect(session)] == [second.id]
 
 

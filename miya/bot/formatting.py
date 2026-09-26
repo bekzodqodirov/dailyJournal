@@ -672,3 +672,38 @@ def queue_line(queue, *, markup: bool = True) -> str | None:
             f"({queue.money} tasi pul bo'yicha) — /savollar"
         )
     return f"❓ Yana {queue.waiting} ta savol navbatda — /savollar"
+
+
+# --- shared by /bugun and the recap (WP-53) ------------------------------------------
+
+
+def new_record_lines(new_debts, new_promises) -> list[str]:
+    """Each new debt and promise as one line with its ref."""
+    lines = [
+        debt_line(
+            escape(debt.person.display_name),
+            debt.direction,
+            debt.amount,
+            debt.currency,
+            debt.due_date,
+        )
+        + tag("debt", debt.id)
+        for debt in new_debts
+    ]
+    lines += [
+        ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
+        + f"{escape(p.person.display_name)} — {escape(p.description)}"
+        + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+        + tag("promise", p.id)
+        for p in new_promises
+    ]
+    return lines
+
+
+def minutes_label(seconds: int) -> str:
+    """'' / '1 daqiqadan kam' / '7 daqiqa'."""
+    if not seconds:
+        return ""
+    if seconds < 60:
+        return "1 daqiqadan kam"
+    return f"{round(seconds / 60)} daqiqa"

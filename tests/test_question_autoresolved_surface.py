@@ -7,11 +7,12 @@ from datetime import datetime, timedelta
 import pytest
 import sqlalchemy as sa
 
-from miya.bot import handlers, keyboards, replies
+from miya.bot import handlers, keyboards, recap_text, replies
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import ChatType
-from miya.services import approvals, chats, claims, reports
+from miya.services import approvals, chats, claims
+from tests import recap_helpers
 from tests.test_claims_autoresolve import _claim as _debt_claim
 from tests.test_claims_bank_evidence import NOW, _claimed, _sms, _txn_claim
 from tests.test_close_and_correct import (  # noqa: F401
@@ -53,10 +54,8 @@ async def test_undo_is_refused_for_a_claim_the_owner_answered(session):
 
 async def test_evening_report_counts_todays_auto_resolutions(session):
     await _bank_closed(session)
-    today = datetime.now(settings.tz).date()
-    data = await reports.gather(session, today)
-    assert data.auto_resolved == 1
-    assert reports.AUTO_RESOLVED_LINE.format(n=1) in reports.render_data_block(data)
+    text = await recap_helpers.recap_of(session)
+    assert recap_text.AUTO_LINE.format(n=1) in text
 
 
 async def test_savollar_hal_lists_bank_duplicate_own_channel_ignored_and_expired(

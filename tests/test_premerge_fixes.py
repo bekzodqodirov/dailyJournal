@@ -387,7 +387,7 @@ def test_an_empty_api_key_raises_a_type_every_caller_already_handles(monkeypatch
 
 
 async def test_the_daily_report_still_arrives_without_an_api_key(session, monkeypatch):
-    """No key means the deterministic data block *is* the report — never nothing."""
+    """No key: the recap arrives from SQL alone — never nothing."""
     from miya.services import extraction, reports
 
     monkeypatch.setattr(settings, "anthropic_api_key", "")
@@ -396,7 +396,7 @@ async def test_the_daily_report_still_arrives_without_an_api_key(session, monkey
     content = await reports.generate_report(session)
     await session.flush()
 
-    assert reports.H_MONEY in content
+    assert content.startswith("🌆 <b>Bugun nima bo'ldi</b>")
     stored = await session.scalar(
         sa.select(m.DailyReport.content).where(
             m.DailyReport.report_date == datetime.now(TZ).date()

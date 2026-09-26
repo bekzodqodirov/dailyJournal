@@ -154,10 +154,10 @@ async def test_holat_line(session, monkeypatch):
     assert f"savollar 2 (/savollar) · bugun 0/{settings.question_budget_per_day}" in text
 
 
-def test_queue_line_is_importable_from_reports_without_replies():
-    import miya.services.reports as reports
+def test_queue_line_is_importable_from_the_recap_without_replies():
+    import miya.bot.recap_text as recap_text
 
-    assert "replies" not in reports.__dict__
-    assert reports.queue_line(SimpleNamespace(waiting=2, money=0)) == (
+    assert "replies" not in recap_text.__dict__
+    assert recap_text.queue_line(SimpleNamespace(waiting=2, money=0)) == (
         "❓ Yana 2 ta savol navbatda — /savollar"
     )

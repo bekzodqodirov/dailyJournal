@@ -53,9 +53,9 @@ from miya.services import (
     queries,
     questions,
     rag,
+    recaps,
     records,
     reminders,
-    reports,
 )
 from miya.services import codes as client_codes
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -401,11 +401,12 @@ async def cmd_search(message: Message, command: CommandObject) -> None:
 @router.message(Command("hisobot"))
 async def cmd_report(message: Message) -> None:
     await _typing(message)
-    day = datetime.now(settings.tz).date()
+    now = datetime.now(settings.tz)
     async with session_scope() as session:
-        # A look, not the evening report: stored nowhere (WP-49).
-        content = await reports.generate_report(session, day, store=False)
-    for part in reports.report_parts(day, content):
+        # A look, not the evening report: stored nowhere (WP-49), and it
+        # says until when (WP-53).
+        result = await recaps.build_evening(session, now.date(), now=now, store=False)
+    for part in result.parts:
         await _safe_answer(message, part)
 
 
