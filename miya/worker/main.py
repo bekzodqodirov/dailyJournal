@@ -661,6 +661,9 @@ async def backup_job(bot: Bot) -> None:
     """
     result = await backup.create_backup()
     if result.error == "no_recipient":
+        # The health job tells the owner (backup_unconfigured); the log says
+        # why tonight's run did nothing.
+        log.warning("backup skipped: BACKUP_AGE_RECIPIENT is empty")
         return
     # Pieces left by an upload the container died in the middle of: nothing
     # prunes them otherwise, and they are only ever a copy of the file.

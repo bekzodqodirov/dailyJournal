@@ -428,6 +428,7 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         "worker_silent": _status(components=_with("worker", _silent("worker"))),
         "userbot_silent": _status(components=_with("userbot", _silent("userbot"))),
         "api_silent": _status(components=_with("api", _silent("api"))),
+        "backup_unconfigured": _status(backup=_backup_info(configured=False)),
         "backup_stale": _status(backup=_backup_info(stale=True)),
         "backup_failed": _status(
             backup=_backup_info(sent_to_telegram=False, send_failed=True, send_error="x")
@@ -625,3 +626,31 @@ def test_the_contract_names_are_fixed():
     }
     with pytest.raises(TypeError):
         health.Problem()  # key, severity and text are required
+
+
+# --- an unconfigured backup (WP-04) ------------------------------------------
+
+
+def test_an_unconfigured_backup_is_a_warning_not_silence():
+    status = _status(backup=_backup_info(configured=False, stale=False, created_at=None))
+    [problem] = health.problems(status)
+    assert problem.key == "backup_unconfigured"
+    assert problem.severity == "warning"
+    assert "make backup-key" in problem.text
+    assert "backup_stale" not in _keys(status)
+
+
+def test_a_configured_backup_is_never_reported_unconfigured():
+    for info in (
+        _backup_info(),
+        _backup_info(stale=True),
+        _backup_info(send_failed=True),
+    ):
+        assert "backup_unconfigured" not in _keys(_status(backup=info))
+
+
+def test_the_unconfigured_backup_has_a_recovery_line():
+    assert (
+        health.recovery_text("backup_unconfigured")
+        == "✅ Zaxira nusxa sozlandi — tiklandi"
+    )

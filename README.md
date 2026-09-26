@@ -66,9 +66,12 @@ make bot                  # tail the assistant bot's logs
 ```
 
 Before `make up`, fill in at least `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`,
-`ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` and `API_BEARER_TOKEN`. The bot and
-worker refuse to start without a bot token and owner id rather than run
-unrestricted.
+`ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID`, `API_BEARER_TOKEN` (at least 32
+characters: `openssl rand -hex 32`) and `BACKUP_AGE_RECIPIENT` (`make
+backup-key` prints the line). The bot and worker refuse to start without a bot
+token and owner id rather than run unrestricted, and every service refuses a
+blank or short API token. Without a backup key no backup is written, and MIYA
+warns you about it until you set one.
 
 `make help` lists every target.
 
@@ -84,6 +87,8 @@ unrestricted.
 | `make userbot-login` | One-time Telethon login (prints `TELETHON_SESSION`) |
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
+| `make backup-key` | Create the backup key and print the `.env` line |
+| `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
 | `make test` / `make lint` / `make fmt` | Local dev loop |
 
@@ -428,9 +433,13 @@ Telegram can never report different balances.
 not this server — a password manager entry, a USB stick in a drawer, both:
 
 ```bash
-age-keygen -o secrets/backup-key.txt   # prints the public key: put it in .env
-make backup                            # write one now, do not wait for 03:30
+make backup-key        # creates secrets/backup-key.txt, prints BACKUP_AGE_RECIPIENT=… for .env
+make backup-key-show   # prints the secret key: store it off this server
+make backup            # write one now, do not wait for 03:30
 ```
+
+`make backup-key` refuses to overwrite an existing key, because a new key
+cannot open the old backups.
 
 **Losing the key means losing every backup.** Nobody — not Telegram, not
 the person who wrote this — can open a `.dump.age` file without it. The

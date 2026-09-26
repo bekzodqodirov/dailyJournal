@@ -647,3 +647,40 @@ async def test_the_media_loop_beats_every_pass(session, monkeypatch):
 
     rows = await _rows(session)
     assert rows["userbot"].detail == {"enabled": True, "connected": False, "user": 7}
+
+
+# --- an unconfigured backup (WP-04) ------------------------------------------
+
+
+async def test_backup_job_without_a_recipient_logs_and_sends_nothing(
+    session, monkeypatch, caplog
+):
+    monkeypatch.setattr(settings, "backup_age_recipient", "")
+    bot = _Bot()
+    with caplog.at_level("WARNING"):
+        await worker.backup_job(bot)
+    assert "BACKUP_AGE_RECIPIENT" in caplog.text
+    assert bot.sent == [] and bot.documents == []
+
+
+async def test_a_backup_key_set_later_is_announced_as_recovered(session):
+    unconfigured = health.problems(
+        _status(
+            backup=health.BackupInfo(
+                path=None,
+                created_at=None,
+                size=None,
+                sent_to_telegram=False,
+                sent_at=None,
+                stale=False,
+                configured=False,
+            )
+        )
+    )
+    assert [p.key for p in unconfigured] == ["backup_unconfigured"]
+    due, recovered = await health.alerts_due(session, unconfigured, now=NOW)
+    assert [p.key for p in due] == ["backup_unconfigured"]
+    health.mark_alerted(session, ["backup_unconfigured"], now=NOW)
+    await session.flush()
+    due, recovered = await health.alerts_due(session, [], now=NOW + timedelta(minutes=5))
+    assert due == [] and recovered == ["backup_unconfigured"]

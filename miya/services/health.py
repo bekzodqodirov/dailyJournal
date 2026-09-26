@@ -69,6 +69,7 @@ PROBLEM_KEYS = (
     "worker_silent",
     "userbot_silent",
     "api_silent",
+    "backup_unconfigured",
     "backup_stale",
     "backup_failed",
     "anthropic_failing",
@@ -531,7 +532,21 @@ def problems(status: Status) -> list[Problem]:
         )
 
     info = status.backup
-    if info.stale:
+    if not info.configured:
+        # Without a key no backup is ever written: silence here would let the
+        # owner run for a year believing the ledger is safe.
+        found.append(
+            Problem(
+                "backup_unconfigured",
+                "warning",
+                "⚠️ Zaxira nusxa sozlanmagan — hech qanday zaxira yozilmayapti. "
+                "Server diski buzilsa, hamma qarz va yozuvlar yo'qoladi. Serverda: "
+                "<code>make backup-key</code>, chiqqan qatorni .env'ga yoz, keyin "
+                "<code>docker compose up -d --force-recreate worker bot</code> va "
+                "<code>make backup</code>.",
+            )
+        )
+    elif info.stale:
         if info.created_at is None:
             what = "⚠️ Zaxira nusxa umuman yo'q."
         else:
@@ -679,6 +694,7 @@ _RECOVERY = {
     "api_silent": "✅ API qayta javob beryapti — tiklandi",
     "db_down": "✅ Baza qayta javob beryapti — tiklandi",
     "disk_low": "✅ Diskda yana joy bor — tiklandi",
+    "backup_unconfigured": "✅ Zaxira nusxa sozlandi — tiklandi",
     "backup_stale": "✅ Zaxira nusxa yana yangi — tiklandi",
     "backup_failed": "✅ Zaxira nusxa yana Telegramga yetib bordi — tiklandi",
     "anthropic_failing": "✅ Anthropic qayta ishlayapti — tiklandi",
