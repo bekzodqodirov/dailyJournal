@@ -24,7 +24,7 @@ from miya import __version__
 from miya.api.deps import require_token
 from miya.api.middleware import RequestGuard
 from miya.api.uploads import PartInfo, RecordingUploadReader
-from miya.config import settings
+from miya.config import API_TOKEN_MIN_LENGTH, settings
 from miya.db.enums import (
     Currency,
     DebtDirection,
@@ -48,6 +48,32 @@ from miya.services.embeddings import EmbeddingError, get_local_embedder
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
 log = logging.getLogger(__name__)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=settings.log_level.upper(),
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+    )
+
+
+def assert_startup_config() -> None:
+    """Refuse to serve with a guessable owner token.
+
+    Called by ``python -m miya.api`` before uvicorn starts, never from the
+    lifespan: Starlette turns an exception there into a full traceback and
+    "Application startup failed", which is exactly what the owner must not
+    have to read. ``require_token`` keeps its own 503 as defence in depth.
+    """
+    problem = settings.api_token_problem()
+    if problem:
+        raise SystemExit(problem)
+    owner = settings.api_bearer_token.strip()
+    for name, token in settings.upload_tokens_parsed.items():
+        if len(token) < API_TOKEN_MIN_LENGTH:
+            log.warning("UPLOAD_TOKENS: %s's token is shorter than 32 characters", name)
+        if token == owner:
+            log.warning("UPLOAD_TOKENS: %s's token equals API_BEARER_TOKEN", name)
 
 
 @asynccontextmanager

@@ -41,6 +41,16 @@ def pytest_unconfigure(config) -> None:
         timetravel.stop()
 
 
+@pytest.fixture(autouse=True)
+def _strong_api_token(monkeypatch):
+    """The bot and worker refuse to start with a short API token; tests that
+    drive their run() must not trip on the laptop's blank .env."""
+    from miya.config import API_TOKEN_MIN_LENGTH, settings
+
+    if len(settings.api_bearer_token.strip()) < API_TOKEN_MIN_LENGTH:
+        monkeypatch.setattr(settings, "api_bearer_token", "a" * 64)
+
+
 async def database_available() -> bool:
     try:
         async with engine.connect() as conn:

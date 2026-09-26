@@ -8,8 +8,31 @@ from pathlib import Path
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
-from pydantic import BeforeValidator, Field, field_validator, model_validator
+from pydantic import (
+    BeforeValidator,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The internal API token must be at least this long: a short or blank one is a
+# password anyone reading the public .env.example could guess.
+API_TOKEN_MIN_LENGTH = 32
+
+COMMENT_VALUE_ERROR = (
+    "{key} qiymati izohga o'xshaydi ('#…'): .env faylida izohni kalitdan "
+    "yuqoridagi alohida qatorga o'tkaz."
+)
+API_TOKEN_ERROR = (
+    "API_BEARER_TOKEN bo'sh yoki juda qisqa (kamida 32 belgi kerak). Yarat: "
+    "openssl rand -hex 32 — natijani .env'dagi API_BEARER_TOKEN= ga yoz, keyin make up."
+)
+BACKUP_RECIPIENT_ERROR = (
+    "BACKUP_AGE_RECIPIENT «age1…» bilan boshlanishi kerak. "
+    "Kalitni yarat: make backup-key."
+)
 
 
 def _parse_hhmm(value: str) -> time:
@@ -204,6 +227,25 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     debug: bool = Field(default=False)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _no_comment_values(cls, data: object) -> object:
+        """Docker Compose and python-dotenv both read ``KEY=   # note`` as the
+        value "# note"; refuse it with a message that says how to fix .env."""
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, str) and value.lstrip().startswith("#"):
+                    raise ValueError(COMMENT_VALUE_ERROR.format(key=str(key).upper()))
+        return data
+
+    @field_validator("backup_age_recipient")
+    @classmethod
+    def _validate_backup_recipient(cls, v: str) -> str:
+        v = v.strip()
+        if v and not v.startswith(("age1", "ssh-")):
+            raise ValueError(BACKUP_RECIPIENT_ERROR)
+        return v
+
     @field_validator("report_time", "backup_time", "morning_brief_time")
     @classmethod
     def _validate_report_time(cls, v: str) -> str:
@@ -278,10 +320,30 @@ class Settings(BaseSettings):
         start, end = self.quiet_hours.split("-")
         return _parse_hhmm(start), _parse_hhmm(end)
 
+    def api_token_problem(self) -> str | None:
+        """The owner-facing reason the API token is unusable, or None."""
+        if len(self.api_bearer_token.strip()) < API_TOKEN_MIN_LENGTH:
+            return API_TOKEN_ERROR
+        return None
+
+
+def _config_error_text(exc: ValidationError) -> str:
+    """One Uzbek line per problem, without pydantic's framing."""
+    lines = []
+    for error in exc.errors():
+        message = str(error.get("msg", ""))
+        lines.append(message.removeprefix("Value error, "))
+    return "\n".join(lines)
+
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    # Built at import time by every service: a bad .env must end the process
+    # with the one-line reason, not a pydantic traceback.
+    try:
+        return Settings()
+    except ValidationError as exc:
+        raise SystemExit(_config_error_text(exc)) from None
 
 
 settings = get_settings()

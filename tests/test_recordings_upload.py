@@ -33,7 +33,7 @@ from miya.services import ingest, purge
 from miya.services.transcription import Transcript
 
 TZ = settings.tz
-TOKEN = "test-token"
+TOKEN = "test-token-" + "x" * 53
 
 AUDIO = b"RIFFfakeaudio-one-ten-second-test-call"
 SHA = hashlib.sha256(AUDIO).hexdigest()

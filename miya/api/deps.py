@@ -49,6 +49,10 @@ def check_authorization(authorization: str | None, *, path: str) -> None:
     upload routes (recordings, call-log events, SMS) — so a stolen phone (or
     an APK someone unzipped) can push data but cannot read a single debt,
     transcript or contact back out.
+
+    A blank or short API_BEARER_TOKEN is refused before the server starts
+    (``python -m miya.api`` → ``assert_startup_config``); the 503 below stays
+    as defence in depth for a process started some other way.
     """
     upload_tokens = settings.upload_tokens_parsed
     if not settings.api_bearer_token and not upload_tokens:

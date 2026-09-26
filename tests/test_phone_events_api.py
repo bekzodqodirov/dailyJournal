@@ -34,7 +34,7 @@ from tests.test_close_and_correct import _Callback, _Message
 from tests.test_step2_render import NOW, _question, _stale
 
 TZ = settings.tz
-TOKEN = "test-token"
+TOKEN = "test-token-" + "x" * 53
 DEVICE = "b7f1c2e0-0000-4000-8000-000000000002"
 
 

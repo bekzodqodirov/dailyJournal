@@ -172,6 +172,10 @@ async def run() -> None:
         raise SystemExit(
             "OWNER_TELEGRAM_ID is not set — refusing to start an unrestricted bot"
         )
+    # The bot embeds through the api with this token; a blank or short one
+    # would only surface later as a mystery 401/503.
+    if problem := settings.api_token_problem():
+        raise SystemExit(problem)
     # Not fatal — extraction falls back to needs_review and reports fall back
     # to their data block — but the owner deserves one loud line, not a
     # mystery three jobs deep.

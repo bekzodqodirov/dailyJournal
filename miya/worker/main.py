@@ -982,6 +982,9 @@ async def run() -> None:
         raise SystemExit(
             "ASSISTANT_BOT_TOKEN and OWNER_TELEGRAM_ID must be set for the worker"
         )
+    # The worker embeds through the api with this token.
+    if problem := settings.api_token_problem():
+        raise SystemExit(problem)
     if not settings.anthropic_api_key:
         log.warning("ANTHROPIC_API_KEY is empty — extraction and reports degrade")
     if not settings.elevenlabs_api_key:

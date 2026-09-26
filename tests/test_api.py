@@ -76,3 +76,48 @@ def test_embed_endpoint_requires_auth_and_texts(client, monkeypatch):
         "/v1/embed", headers={"Authorization": "Bearer s3cret"}, json={"texts": []}
     )
     assert resp.status_code == 422
+
+
+# --- the startup check (WP-03) ----------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["", "s3cret"])
+def test_startup_refuses_a_blank_or_short_token(monkeypatch, token):
+    from miya.api.main import assert_startup_config
+
+    monkeypatch.setattr(settings, "api_bearer_token", token)
+    with pytest.raises(SystemExit) as caught:
+        assert_startup_config()
+    assert "API_BEARER_TOKEN" in str(caught.value)
+
+
+def test_startup_accepts_a_strong_token(monkeypatch):
+    from miya.api.main import assert_startup_config
+
+    monkeypatch.setattr(settings, "api_bearer_token", "ab" * 32)
+    assert assert_startup_config() is None
+
+
+def test_lifespan_does_not_check_the_token(monkeypatch):
+    """The check lives in `python -m miya.api`, not the lifespan, so the app
+    still starts (and answers 503) when served some other way."""
+    monkeypatch.setattr(settings, "api_bearer_token", "")
+    monkeypatch.setattr(settings, "upload_tokens", "")
+    with TestClient(app) as c:
+        assert c.get("/v1/config").status_code == 503
+
+
+def test_api_main_module_exits_before_uvicorn(monkeypatch):
+    import runpy
+    import sys
+
+    import uvicorn
+
+    calls = []
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(settings, "api_bearer_token", "short")
+    monkeypatch.delitem(sys.modules, "miya.api.__main__", raising=False)
+    with pytest.raises(SystemExit) as caught:
+        runpy.run_module("miya.api", run_name="__main__")
+    assert "API_BEARER_TOKEN" in str(caught.value)
+    assert calls == []

@@ -20,7 +20,7 @@ from miya.db.enums import Currency, DebtDirection, DebtStatus, InteractionSource
 from miya.db.session import SessionLocal
 
 TZ = settings.tz
-TOKEN = "test-token"
+TOKEN = "test-token-" + "x" * 53
 
 
 @pytest.fixture
