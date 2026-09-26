@@ -141,6 +141,18 @@ async def notify(bot: Bot, text: str, *, reply_markup=None, silent: bool = False
     return ok
 
 
+async def notify_parts(bot: Bot, parts: list[str], *, reply_markup=None) -> int:
+    """Send a split message in order, the keyboard on the last part; stop at
+    the first failure. Returns how many parts went out (WP-50)."""
+    sent = 0
+    for index, part in enumerate(parts):
+        markup = reply_markup if index == len(parts) - 1 else None
+        if not await notify(bot, part, reply_markup=markup):
+            break
+        sent += 1
+    return sent
+
+
 async def reminder_job(bot: Bot) -> None:
     """Ping the owner about anything due. Silent during quiet hours.
 
@@ -395,10 +407,11 @@ async def brief_job(bot: Bot, *, now: datetime | None = None) -> bool:
         data.queue = questions.summarise(
             await questions.collect(session, now=now, for_push=False), picked
         )
-        body = replies.morning_brief(data)
-        due, _ = replies.morning_brief_refs(data)
+        parts = replies.morning_brief_parts(data)
+        due, _ = replies.morning_brief_refs(data, parts)
         keyboard = keyboards.brief_actions(due)
-    sent = await notify(bot, body, reply_markup=keyboard)
+    # Logged only when the last part — the one with the buttons — went out.
+    sent = await notify_parts(bot, parts, reply_markup=keyboard) == len(parts)
     if sent:
         async with session_scope() as session:
             session.add(ReminderLog(kind=BRIEF_KIND, ref=data.day.isoformat()))

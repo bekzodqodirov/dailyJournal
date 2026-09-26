@@ -266,6 +266,8 @@ class Settings(BaseSettings):
     # WP-42: an owner-typed payment and a bank record of the same amount on
     # the same day within this many hours are one payment (0 disables).
     money_typed_match_hours: int = Field(default=6, ge=0, le=24)
+    # WP-50: a long evening report goes out in at most this many messages.
+    recap_max_parts: int = Field(default=4, ge=1, le=8)
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

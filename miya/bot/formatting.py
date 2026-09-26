@@ -260,6 +260,85 @@ def bullet_list(lines: list[str], *, empty: str) -> str:
 TELEGRAM_LIMIT = 3900
 
 
+def tg_len(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units (an emoji is two)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _cut_line(line: str, room: int) -> str:
+    """One line that alone overflows: cut at a space, with an ellipsis."""
+    while tg_len(line) + 1 > room and " " in line:
+        line = line.rsplit(" ", 1)[0]
+    while tg_len(line) + 1 > room:
+        line = line[:-1]
+    return line + "…"
+
+
+def split_message(
+    text: str,
+    *,
+    limit: int = TELEGRAM_LIMIT,
+    max_parts: int = 4,
+    continued: str = "",
+    overflow: str = "",
+) -> list[str]:
+    """A long message as several, cut between sections, then between lines
+    — never inside one, so no tag is ever split (all markup is single-line).
+
+    Parts after the first start with ``continued`` ("… (davomi 2/3)"); past
+    ``max_parts`` the last part ends with ``overflow``, which names where the
+    rest can be read.
+    """
+    if tg_len(text) <= limit:
+        return [text]
+    header_room = tg_len(continued.format(i=99, n=99)) + 2 if continued else 0
+
+    def room(index: int) -> int:
+        return limit - (header_room if index > 0 else 0)
+
+    pieces: list[str] = []
+    for block in text.split("\n\n"):
+        if tg_len(block) <= room(1):
+            pieces.append(block)
+            continue
+        lines = [
+            line if tg_len(line) <= room(1) else _cut_line(line, room(1))
+            for line in block.split("\n")
+        ]
+        # A block too big for one part goes line by line; the lines of one
+        # block stay joined by single newlines where they share a part.
+        pieces.extend(["\x00" + line for line in lines])
+
+    parts: list[str] = []
+    current = ""
+    for piece in pieces:
+        joiner = "\n" if piece.startswith("\x00") and current else "\n\n"
+        body = piece.removeprefix("\x00")
+        candidate = f"{current}{joiner}{body}" if current else body
+        if tg_len(candidate) <= room(len(parts)):
+            current = candidate
+        else:
+            parts.append(current)
+            current = body
+    if current:
+        parts.append(current)
+
+    if len(parts) > max_parts:
+        parts = parts[:max_parts]
+        last = parts[-1]
+        tail = "\n" + overflow
+        while last and tg_len(last) + tg_len(tail) > room(len(parts) - 1):
+            last = last.rsplit("\n", 1)[0] if "\n" in last else ""
+        parts[-1] = (last + tail).lstrip("\n")
+    total = len(parts)
+    return [
+        part
+        if index == 0 or not continued
+        else continued.format(i=index + 1, n=total) + "\n\n" + part
+        for index, part in enumerate(parts)
+    ]
+
+
 def clip(text: str, *, limit: int = TELEGRAM_LIMIT) -> str:
     """Hard-cap a message body so one oversized reply can never fail to send.
 

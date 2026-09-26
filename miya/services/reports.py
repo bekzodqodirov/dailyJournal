@@ -25,6 +25,7 @@ from miya.bot.formatting import (
     queue_line,
     quiet_line,
     ref,
+    split_message,
 )
 from miya.bot.formatting import money as format_money
 from miya.config import settings
@@ -305,6 +306,18 @@ async def gather(session: AsyncSession, day: date) -> ReportData:
 
 
 EVENING = "evening"
+REPORT_CONTINUED = "📊 <b>Kunlik hisobot</b> (davomi {i}/{n})"
+REPORT_OVERFLOW = "<i>… qolgani sig'madi — /hisobot</i>"
+
+
+def report_parts(day: date, content: str) -> list[str]:
+    """The report as Telegram messages, split between sections (WP-50)."""
+    return split_message(
+        f"{report_header(day)}\n\n{content}",
+        max_parts=settings.recap_max_parts,
+        continued=REPORT_CONTINUED,
+        overflow=REPORT_OVERFLOW,
+    )
 
 
 async def generate_report(
@@ -341,7 +354,7 @@ async def generate_report(
     values = {
         "content": content,
         "stats": _stats_json(data),
-        "parts": [f"{report_header(day)}\n\n{content}"],
+        "parts": report_parts(day, content),
         "window_start": start,
         "window_end": now,
         "prose_status": "none",

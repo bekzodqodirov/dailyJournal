@@ -405,7 +405,8 @@ async def cmd_report(message: Message) -> None:
     async with session_scope() as session:
         # A look, not the evening report: stored nowhere (WP-49).
         content = await reports.generate_report(session, day, store=False)
-    await _safe_answer(message, clip(f"{reports.report_header(day)}\n\n{content}"))
+    for part in reports.report_parts(day, content):
+        await _safe_answer(message, part)
 
 
 @router.message(Command("ertalab"))
@@ -417,10 +418,12 @@ async def cmd_brief(message: Message) -> None:
         data.queue = questions.summarise(
             await questions.collect(session, for_push=False), []
         )
-        body = replies.morning_brief(data)
-        due, _ = replies.morning_brief_refs(data)
+        parts = replies.morning_brief_parts(data)
+        due, _ = replies.morning_brief_refs(data, parts)
         keyboard = keyboards.brief_actions(due)
-    await _safe_answer(message, body, reply_markup=keyboard)
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        await _safe_answer(message, part, reply_markup=keyboard if last else None)
 
 
 # --- /savollar: everything waiting for a tap, paged (WP-19) -------------------

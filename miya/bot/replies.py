@@ -27,12 +27,14 @@ from miya.bot.formatting import (
     record_line,
     relative_day,
     short_date,
+    split_message,
     stale_line,
     tag,
     tags,
     timeline_line,
     usd,
 )
+from miya.bot.formatting import ref as _ref_handle
 from miya.config import settings
 from miya.db.enums import ChatType, Currency, DebtDirection, PromiseMadeBy
 from miya.services import claims, health, reports
@@ -1594,7 +1596,36 @@ BRIEF_STALE = "📌 <b>Muddatsiz, turib qolganlar</b>"
 BRIEF_QUIET = "🤫 <b>Jim bo'lib qolganlar</b>"
 
 
+BRIEF_CONTINUED = "🌅 <b>Ertalabki xulosa</b> (davomi {i}/{n})"
+BRIEF_OVERFLOW = "<i>… qolgani sig'madi — to'liq ro'yxat: /ertalab</i>"
+BRIEF_MAX_PARTS = 3
+
+
 def morning_brief(brief: MorningBrief) -> str:
+    """The morning message as one text (the parts joined)."""
+    return "\n\n".join(morning_brief_parts(brief))
+
+
+def morning_brief_parts(
+    brief: MorningBrief, *, max_parts: int = BRIEF_MAX_PARTS
+) -> list[str]:
+    """The morning brief as Telegram messages: split between sections,
+    never clipped (WP-50)."""
+    return split_message(
+        _morning_brief_text(brief),
+        max_parts=max_parts,
+        continued=BRIEF_CONTINUED,
+        overflow=BRIEF_OVERFLOW,
+    )
+
+
+def visible_refs(parts: list[str], refs: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Only the refs whose handle the owner can actually see."""
+    shown = "\n\n".join(parts)
+    return [(kind, i) for kind, i in refs if _ref_handle(kind, i) in shown]
+
+
+def _morning_brief_text(brief: MorningBrief) -> str:
     """The one morning message. Deterministic — SQL and the loops engine."""
     parts = [f"{BRIEF_HEADER} · {full_date(brief.day)}"]
     if brief.is_empty():
@@ -1651,11 +1682,11 @@ def morning_brief(brief: MorningBrief) -> str:
     if line:
         parts.append(line)
 
-    return clip("\n\n".join(parts))
+    return "\n\n".join(parts)
 
 
 def morning_brief_refs(
-    brief: MorningBrief,
+    brief: MorningBrief, parts: list[str] | None = None
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     """``(due, stale)`` — the rows the brief's buttons act on, in line order."""
     due: list[tuple[str, int]] = []
@@ -1668,6 +1699,8 @@ def morning_brief_refs(
         if brief.loops is not None
         else []
     )
+    if parts is not None:
+        due, stale = visible_refs(parts, due), visible_refs(parts, stale)
     return due, stale
 
 
