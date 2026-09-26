@@ -95,7 +95,8 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /yuk &lt;YW26-004715 yoki GS367&gt; — yuk xati yoki kod qayerda tilga olingan
 /qidir &lt;so'z&gt; — xotiradan qidirish
 /hisobot — bugun nima bo'ldi (hozirgacha)
-/ertalab — ertalabki xulosa: bugungi ishlar va ochiq qolganlar
+/kecha — kecha nima bo'ldi (qisqa xulosa)
+/ertalab — kechagi xulosa va bugungi ishlar, ochiq qolganlar
 /reja — ertangi reja
 /chats — qaysi Telegram chatlar o'qilishi
 /process — javob yozilgan media'ni qayta ishlash
@@ -132,6 +133,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("qayta", "Ularni qaytadan ajratish"),
     ("qidir", "Xotiradan qidirish"),
     ("hisobot", "Bugun nima bo'ldi"),
+    ("kecha", "Kecha nima bo'ldi"),
     ("ertalab", "Ertalabki xulosa"),
     ("reja", "Ertangi reja"),
     ("chats", "Qaysi chatlar o'qilishi"),

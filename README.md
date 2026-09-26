@@ -164,6 +164,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
 | `RECAP_PROSE_ENABLED`, `RECAP_MODEL`, `RECAP_MAX_PEOPLE`, `RECAP_MAX_GROUPS`, `RECAP_SUBJECT_INPUT_CHARS`, `RECAP_INPUT_MAX_CHARS`, `RECAP_MAX_OUTPUT_TOKENS`, `RECAP_MODEL_TIMEOUT_SECONDS` | `true` / blank (= `REASON_MODEL`) / 8 / 5 / 1200 / 12000 / 1200 / 60 — one capped call per recap writes a sentence or two per person and group; prose with any digit or currency word is dropped, and the recap falls back to its SQL lines when the model is down |
+| `RECAP_MORNING_TOP_PEOPLE` | 5 — the morning "🌙 Kecha" recalls this many of yesterday's main conversations, with the evening's own prose |
 | `EXTRACT_MODEL_PRICE`, `REASON_MODEL_PRICE` | Blank — "input,output" USD per million tokens for the two model roles; set them when you change a model, then `make reprice SINCE=…` |
 | `SPEND_ALERT_DAILY_USD`, `SPEND_ALERT_MONTHLY_USD` | 5 / 60 — a Telegram warning when MIYA's own API spend passes either (0 = off); the hard cap is the Anthropic Console limit |
 | `QUESTION_BUDGET_PER_DAY`, `QUESTION_BRIEF_SLOTS`, `QUESTION_EVENING_SLOTS` | 10 / 5 / 3 — how many taps a day MIYA may ask for, and how many ride the brief and the evening report (`0` = never push) |
@@ -332,6 +333,15 @@ when the model is down. It is stored in `daily_reports`, split into at most
 `RECAP_MAX_PARTS` messages and delivered part by part. `/hisobot` shows the
 same recap up to now without storing it; `/reja` is the model-written plan for
 tomorrow.
+
+**Morning recap.** At `MORNING_BRIEF_TIME` the owner first gets "🌙 Kecha":
+yesterday's money per currency, repayments and phone-booked counts, the new
+and closed records, the main conversations recalled with the evening's own
+prose (no new model call), and a block for everything since the evening
+cutoff — so nothing between 19:00 and 09:00 goes untold. When the evening
+recap never reached the owner, the whole of yesterday is told here instead.
+Then the brief with its buttons, then at most the brief's questions.
+`/kecha` shows the morning recap on demand; `/ertalab` shows both.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
 Google Cloud Console, save it to `secrets/google_oauth.json`, then

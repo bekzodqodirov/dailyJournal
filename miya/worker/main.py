@@ -84,6 +84,7 @@ from miya.services import (
     money_notices,
     profiles,
     questions,
+    recaps,
     reminders,
     reports,
     windows,
@@ -390,6 +391,16 @@ async def brief_job(bot: Bot, *, now: datetime | None = None) -> bool:
     questions (WP-19), and one line counts what else waits in /savollar.
     """
     now = now or datetime.now(settings.tz)
+    # First "🌙 Kecha" — yesterday and the night (WP-54). Whatever happens to
+    # it, the brief still goes out.
+    try:
+        async with session_scope() as session:
+            morning = await recaps.build_morning(session, now=now, store=True)
+            await session.commit()
+        if morning.parts:
+            await deliver_report(bot, now.astimezone(settings.tz).date(), recaps.MORNING)
+    except Exception:
+        log.exception("the morning recap failed; the brief goes out regardless")
     async with session_scope() as session:
         data = await brief.gather(session, now=now)
         await questions.auto_resolve(session, now=now)
@@ -1080,10 +1091,8 @@ async def _evening_to_resume(now: datetime) -> date | None:
         )
     if delivered is not None:
         return None
-    today = now.astimezone(settings.tz).date()
-    if today == day:
-        return day
-    if today == day + timedelta(days=1):  # temporary; WP-54 removes it
+    # Only today's: a missed evening is told by the next morning's "Kecha".
+    if now.astimezone(settings.tz).date() == day:
         return day
     return None
 

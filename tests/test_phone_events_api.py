@@ -529,7 +529,7 @@ async def test_the_brief_and_the_ma_button_close_the_loop(bound):
 
     message = _Message()
     await handlers.cmd_brief(message)
-    [(body, _)] = message.sent
+    (body, _) = message.sent[-1]  # "🌙 Kecha" may come first (WP-54)
     assert replies.BRIEF_MISSED in body
     assert "&lt;b&gt;Yovuz&lt;/b&gt;" in body and "(2 marta)" in body
     # /ertalab tells; the buttons come with the question batch (WP-19).

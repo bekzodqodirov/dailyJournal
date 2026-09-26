@@ -351,3 +351,126 @@ def evening_parts(
         continued=EVENING_CONTINUED,
         overflow=EVENING_OVERFLOW,
     )
+
+
+# --- the morning "🌙 Kecha" (WP-54) --------------------------------------------------
+
+KECHA_HEADER = "🌙 <b>Kecha</b> · {full_date}"
+KECHA_CONTINUED = "🌙 <b>Kecha</b> (davomi {i}/{n})"
+KECHA_OVERFLOW = "<i>… qolgani sig'madi — /kecha</i>"
+KECHA_TOP = "👥 <b>Asosiy suhbatlar</b>"
+KECHA_LATE = "🌃 <b>Kechqurun va tunda</b> ({time} dan keyin)"
+KECHA_FULL = "👥 <b>Kecha kim bilan nima bo'ldi</b>"
+KECHA_FULL_NOTE = "<i>Kechki xulosa yetib bormagan edi — kun shu yerda to'liq.</i>"
+KECHA_NONE = "🌙 Kecha yozib qo'yadigan narsa bo'lmadi."
+KECHA_REFS_MAX = 6
+
+
+def _kecha_money(money_day) -> list[str]:
+    lines = [f"💰 Kirim: {money(t, c)}" for c, t in money_day.income.items()]
+    lines += [f"💰 Chiqim: {money(t, c)}" for c, t in money_day.expense.items()]
+    if money_day.repayments:
+        refs = ", ".join(
+            dict.fromkeys(ref("debt", r.debt_id) for r in money_day.repayments)
+        )
+        lines.append(
+            f"↩️ Qaytgan qarzlar: {len(money_day.repayments)} ta (<code>{refs}</code>)"
+        )
+    if money_day.from_phone or money_day.review_pending:
+        lines.append(
+            f"📱 Telefondan yozilgan: {money_day.from_phone} ta · tekshiruvda: "
+            f"{money_day.review_pending} ta (/tekshir)"
+        )
+    return lines
+
+
+def _kecha_records(new_debts, new_promises, completed) -> str | None:
+    done = 0
+    if completed is not None:
+        done = (
+            len(completed.settled_debts)
+            + len(completed.done_promises)
+            + len(completed.done_tasks)
+        )
+    if not (new_debts or new_promises or done):
+        return None
+    line = (
+        f"🧾 Yangi: {len(new_debts)} ta qarz, {len(new_promises)} ta va'da"
+        f" · ✅ Yopildi: {done} ta"
+    )
+    refs = [ref("debt", d.id) for d in new_debts] + [
+        ref("promise", p.id) for p in new_promises
+    ]
+    if refs and len(refs) <= KECHA_REFS_MAX:
+        line += f" (<code>{', '.join(refs)}</code>)"
+    return line
+
+
+def kecha_parts(
+    *,
+    yesterday,
+    money_day,
+    new_debts,
+    new_promises,
+    completed,
+    top,
+    late,
+    late_start,
+    prose: dict[str, str],
+    full: bool,
+    tz,
+    codes: dict | None = None,
+    prose_status: str = "none",
+    max_people: int = 8,
+    max_groups: int = 5,
+    max_parts: int = 2,
+) -> list[str]:
+    """The morning recap of yesterday and the night; [] when nothing happened.
+
+    ``top`` is [(name, prose)] reused from the evening recap; ``late`` is the
+    DayActivity since ``late_start`` (all of yesterday when ``full``)."""
+    codes = codes or {}
+    sections = [KECHA_HEADER.format(full_date=full_date(yesterday))]
+    body: list[str] = []
+    money_lines = _kecha_money(money_day)
+    if money_lines:
+        body.append("\n".join(money_lines))
+    records = _kecha_records(new_debts, new_promises, completed)
+    if records:
+        body.append(records)
+    any_prose = False
+    if top:
+        lines = [
+            f"<b>{escape(name)}</b> — 🤖 <i>{escape(text)}</i>" for name, text in top
+        ]
+        body.append(KECHA_TOP + "\n" + "\n".join(lines))
+        any_prose = True
+    blocks = []
+    if late is not None:
+        for person_day in late.people[:max_people]:
+            block, shown = _person_block(person_day, prose, codes)
+            any_prose = any_prose or shown
+            blocks.append(block)
+        for group in late.groups[:max_groups]:
+            block, shown = _group_block(group, prose)
+            any_prose = any_prose or shown
+            blocks.append(block)
+    if blocks:
+        if full:
+            head = KECHA_FULL + "\n" + KECHA_FULL_NOTE
+        else:
+            head = KECHA_LATE.format(time=late_start.astimezone(tz).strftime("%H:%M"))
+        body.append(head + "\n" + "\n\n".join(blocks))
+    if not body:
+        return []
+    sections += body
+    if any_prose:
+        sections.append(PROSE_LABEL)
+    elif prose_status == "fallback":
+        sections.append(PROSE_DOWN)
+    return split_message(
+        "\n\n".join(sections),
+        max_parts=max_parts,
+        continued=KECHA_CONTINUED,
+        overflow=KECHA_OVERFLOW,
+    )

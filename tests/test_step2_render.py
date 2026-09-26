@@ -328,7 +328,7 @@ def test_the_brief_all_clear_and_the_nudge_strings():
         "⏰ Ertaga 09:00 dagi ertalabki xulosada yana eslataman."
     )
     assert "to'liq ro'yxat: /ertalab" in replies.nudge_overflow(3)
-    assert "/ertalab — ertalabki xulosa" in replies.HELP
+    assert "/ertalab — kechagi xulosa va bugungi ishlar" in replies.HELP
 
 
 def test_the_nudge_counts_follow_ups_in_plain_words():

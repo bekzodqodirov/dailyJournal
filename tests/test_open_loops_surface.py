@@ -240,7 +240,9 @@ async def test_the_brief_job_sends_one_message_without_a_model_even_at_dawn(
 
     await worker.brief_job(bot)
 
-    (text, markup), (batch, batch_markup) = bot.sent
+    # "🌙 Kecha" may come first (WP-54); then the brief, then the batch.
+    *_, (text, markup), (batch, batch_markup) = bot.sent
+    assert all(m is None for _, m in bot.sent[:-2])
     assert replies.BRIEF_HEADER in text
     assert "Javobsiz qolganlar" in text
     assert markup is not None and _buttons(markup)
@@ -253,7 +255,8 @@ async def test_ertalab_is_the_brief_on_demand(bound):  # noqa: F811
 
     await handlers.cmd_brief(message)
 
-    [(text, markup)] = message.sent
+    # "🌙 Kecha" first when anything happened, the brief last (WP-54).
+    (text, markup) = message.sent[-1]
     assert replies.BRIEF_HEADER in text and "Jim bo'lib qolganlar" in text
     assert markup is not None
 

@@ -915,3 +915,137 @@ async def build_evening(
         window_start=start,
         window_end=end,
     )
+
+
+# --- the morning "🌙 Kecha" (WP-54) --------------------------------------------------
+
+MORNING = "morning"
+
+
+async def _top_from_evening(session: AsyncSession, evening: DailyReport, yesterday):
+    """The evening's own prose for its first subjects — no model call."""
+    keys = list((evening.stats or {}).get("subjects") or [])[
+        : settings.recap_morning_top_people
+    ]
+    if not keys:
+        return []
+    digests = {
+        d.subject_key: d.prose
+        for d in await session.scalars(
+            sa.select(RecapDigest).where(
+                RecapDigest.digest_date == yesterday,
+                RecapDigest.window_end == evening.window_end,
+                RecapDigest.subject_key.in_(keys),
+            )
+        )
+    }
+    person_ids = [int(k[2:]) for k in keys if k.startswith("p:") and k in digests]
+    names = {
+        f"p:{p.id}": p.display_name
+        for p in await session.scalars(sa.select(Person).where(Person.id.in_(person_ids)))
+    }
+    chat_ids = [int(k[2:]) for k in keys if k.startswith("g:") and k in digests]
+    names |= {
+        f"g:{m.tg_chat_id}": m.title or str(m.tg_chat_id)
+        for m in await session.scalars(
+            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id.in_(chat_ids))
+        )
+    }
+    return [(names[k], digests[k]) for k in keys if k in digests and k in names]
+
+
+async def build_morning(
+    session: AsyncSession, *, now: datetime, store: bool
+) -> RecapResult:
+    """Yesterday in one look and everything since the evening cutoff.
+
+    When yesterday's evening recap reached the owner it is only recalled
+    (its own prose, no new model call) and the night is added; when it did
+    not, the whole of yesterday is told here instead."""
+    from miya.bot import recap_text
+    from miya.services import codes as client_codes
+
+    today = now.astimezone(settings.tz).date()
+    yesterday = today - timedelta(days=1)
+    y_start, y_end = queries.day_bounds(yesterday)
+    evening = await session.scalar(
+        sa.select(DailyReport).where(
+            DailyReport.report_date == yesterday,
+            DailyReport.kind == EVENING,
+            DailyReport.delivered_at.is_not(None),
+        )
+    )
+    full = evening is None
+    late_start = y_start if full else (evening.window_end or y_end)
+    money_day = await queries.money_between(session, y_start, y_end)
+    new_debts = list(
+        await session.scalars(
+            sa.select(Debt).where(Debt.created_at >= y_start, Debt.created_at < y_end)
+        )
+    )
+    new_promises = list(
+        await session.scalars(
+            sa.select(Promise).where(
+                Promise.created_at >= y_start, Promise.created_at < y_end
+            )
+        )
+    )
+    completed = await queries.completed_between(session, y_start, y_end)
+    top = [] if full else await _top_from_evening(session, evening, yesterday)
+    late = await gather_activity(session, late_start, now, now=now)
+    subjects = [
+        *late.people[: settings.recap_max_people],
+        *late.groups[: settings.recap_max_groups],
+    ]
+    prose = await write_prose(
+        session, subjects, digest_date=today, window_start=late_start, window_end=now
+    )
+    held = await client_codes.codes_of_many(
+        session, [p.person.id for p in late.people[: settings.recap_max_people]]
+    )
+    parts = recap_text.kecha_parts(
+        yesterday=yesterday,
+        money_day=money_day,
+        new_debts=new_debts,
+        new_promises=new_promises,
+        completed=completed,
+        top=top,
+        late=late,
+        late_start=late_start,
+        prose=prose.prose,
+        full=full,
+        tz=settings.tz,
+        codes=held,
+        prose_status=prose.status,
+        max_people=settings.recap_max_people,
+        max_groups=settings.recap_max_groups,
+    )
+    stats = {
+        "mode": "full" if full else "reminder",
+        "subjects": [s.key for s in late.people] + [g.key for g in late.groups],
+        "prose_status": prose.status,
+        "parts": len(parts),
+    }
+    if store and parts:
+        values = {
+            "content": "\n\n".join(parts),
+            "stats": stats,
+            "parts": parts,
+            "window_start": late_start,
+            "window_end": now,
+            "prose_status": prose.status,
+            "updated_at": now,
+        }
+        await session.execute(
+            insert(DailyReport)
+            .values(report_date=today, kind=MORNING, **values)
+            .on_conflict_do_update(constraint="uq_daily_reports_date_kind", set_=values)
+        )
+        await session.flush()
+    return RecapResult(
+        parts=parts,
+        stats=stats,
+        prose_status=prose.status,
+        window_start=late_start,
+        window_end=now,
+    )

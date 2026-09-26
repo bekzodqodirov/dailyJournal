@@ -268,18 +268,15 @@ def test_a_shared_audio_file_keeps_its_real_extension():
 # --- worker catch-up: a startup path that can never kill the worker ----------
 
 
-async def test_catch_up_recovers_a_report_missed_across_midnight(session, monkeypatch):
-    """The headline case: the VPS is down from 18:00 to the next morning.
-
-    Yesterday's 19:00 report never went out, and checking only "today" would
-    never notice — the owner simply loses that day. (Temporary until WP-54.)
-    """
+async def test_a_missed_evening_is_not_resent_the_next_morning(session, monkeypatch):
+    """The VPS is down from 18:00 to the next morning: yesterday's recap is
+    not sent late as its own message — the morning "Kecha" tells the whole
+    day instead (WP-54)."""
     from miya.worker import main as worker
 
     morning = datetime.now(TZ).replace(hour=8, minute=0, second=0, microsecond=0)
-    yesterday = (morning - timedelta(days=1)).date()
 
-    assert await worker._evening_to_resume(morning) == yesterday
+    assert await worker._evening_to_resume(morning) is None
 
 
 async def test_a_delivered_evening_report_is_never_resumed(session, monkeypatch):

@@ -28,7 +28,7 @@ from aiogram.types import (
     Message,
 )
 
-from miya.bot import keyboards, replies
+from miya.bot import keyboards, recap_text, replies
 from miya.bot.formatting import clip, escape, parse_ref, ref_of, short_date
 from miya.bot.keyboards import FIELD_CODES, PAGE_SIZE, ChatsPage, chats_keyboard
 from miya.config import settings
@@ -410,10 +410,28 @@ async def cmd_report(message: Message) -> None:
         await _safe_answer(message, part)
 
 
+@router.message(Command("kecha"))
+async def cmd_yesterday(message: Message) -> None:
+    """`/kecha` — yesterday in one look and everything since the evening."""
+    now = datetime.now(settings.tz)
+    async with session_scope() as session:
+        morning = await recaps.build_morning(session, now=now, store=False)
+    if not morning.parts:
+        await _safe_answer(message, recap_text.KECHA_NONE)
+        return
+    for part in morning.parts:
+        await _safe_answer(message, part)
+
+
 @router.message(Command("ertalab"))
 async def cmd_brief(message: Message) -> None:
-    """The morning brief on demand — the same message the worker sends at
-    MORNING_BRIEF_TIME, with the same buttons. No model call: it is SQL."""
+    """The morning on demand: "🌙 Kecha" (whose prose may ask the model
+    once, cached) and then the brief — SQL — with the same buttons."""
+    now = datetime.now(settings.tz)
+    async with session_scope() as session:
+        morning = await recaps.build_morning(session, now=now, store=False)
+    for part in morning.parts:
+        await _safe_answer(message, part)
     async with session_scope() as session:
         data = await brief.gather(session)
         data.queue = questions.summarise(
