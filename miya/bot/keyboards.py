@@ -926,3 +926,18 @@ def save_as_note(interaction_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def merge_confirm(source_id: int, target_id: int) -> InlineKeyboardMarkup:
+    """/birlashtir: the plan is re-derived when Ha is pressed (WP-77)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Ha, birlashtir",
+                    callback_data=f"birl:{source_id}:{target_id}",
+                ),
+                InlineKeyboardButton(text="Bekor", callback_data="birl:no"),
+            ]
+        ]
+    )

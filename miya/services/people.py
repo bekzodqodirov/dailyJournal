@@ -499,6 +499,21 @@ async def resolve_person(
                 )
                 return held
         elif not rest:
+            if settings.code_placeholders and create:
+                # The owner's choice (WP-77): a person to hold the code until
+                # a name is known; `/kod <name> <code>` folds it in later.
+                placeholder = Person(display_name=q_codes[0], aliases=[])
+                session.add(placeholder)
+                await session.flush()
+                await codes.attach(
+                    session,
+                    placeholder,
+                    q_codes[0],
+                    source=source or "placeholder",
+                    by="placeholder",
+                    interaction_id=source_interaction_id,
+                )
+                return placeholder
             if strict:
                 raise UnknownCode(q_codes[0])
             return None
@@ -622,3 +637,123 @@ async def find_by_phone(session: AsyncSession, phone: str) -> Person | None:
         )
         .limit(1)
     )
+
+
+# --- merging two people (WP-77) ----------------------------------------------------
+
+
+class MergeRefused(Exception):
+    """Two people who cannot be one: each has their own Telegram account."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _fk_columns():
+    from miya.db import models as m
+
+    return (
+        ("debts", m.Debt, m.Debt.person_id),
+        ("promises", m.Promise, m.Promise.person_id),
+        ("transactions", m.Transaction, m.Transaction.counterparty_person_id),
+        ("interactions", m.Interaction, m.Interaction.person_id),
+        ("windows", m.ConversationWindow, m.ConversationWindow.person_id),
+        ("memories", m.Memory, m.Memory.person_id),
+        ("claims", m.Claim, m.Claim.person_id),
+        ("codes", m.ClientCode, m.ClientCode.person_id),
+        ("passages", m.Passage, m.Passage.speaker_person_id),
+        ("passages_chat", m.Passage, m.Passage.chat_person_id),
+    )
+
+
+async def merge_plan(session: AsyncSession, source: Person, target: Person) -> dict:
+    """What moving ``source`` into ``target`` would carry over, by kind."""
+    counts: dict[str, int] = {}
+    for key, model, column in _fk_columns():
+        n = await session.scalar(
+            sa.select(sa.func.count()).select_from(model).where(column == source.id)
+        )
+        counts[key] = counts.get(key, 0) + int(n or 0)
+    counts["passages"] += counts.pop("passages_chat")
+    return counts
+
+
+def is_placeholder(person: Person, code: str | None = None) -> bool:
+    """A person made only to hold a code (CODE_PLACEHOLDERS): named after the
+    code and known by nothing else."""
+    name = (person.display_name or "").strip()
+    held = codes.canonical_client_code(name)
+    return (
+        held is not None
+        and (code is None or held == code)
+        and person.telegram_id is None
+        and not person.phone
+    )
+
+
+async def merge_into(
+    session: AsyncSession, source: Person, target: Person, *, by: str
+) -> Person:
+    """Move every row of ``source`` onto ``target`` and delete ``source``.
+    Refused when both have a different Telegram account."""
+    from miya.db import models as m
+
+    if source.id == target.id:
+        return target
+    if (
+        source.telegram_id is not None
+        and target.telegram_id is not None
+        and source.telegram_id != target.telegram_id
+    ):
+        raise MergeRefused("telegram")
+
+    # A code the target already has: the source's row for it goes, so the
+    # (code, person) pair stays unique.
+    target_codes = set(
+        await session.scalars(
+            sa.select(m.ClientCode.code).where(m.ClientCode.person_id == target.id)
+        )
+    )
+    if target_codes:
+        await session.execute(
+            sa.delete(m.ClientCode).where(
+                m.ClientCode.person_id == source.id, m.ClientCode.code.in_(target_codes)
+            )
+        )
+    for _key, model, column in _fk_columns():
+        await session.execute(
+            sa.update(model).where(column == source.id).values({column.key: target.id})
+        )
+
+    # Identity fields only where the target has none; the source's unique
+    # telegram_id is cleared first.
+    carried = {
+        "telegram_id": source.telegram_id,
+        "telegram_username": source.telegram_username,
+        "phone": source.phone,
+        "relationship_": source.relationship_,
+    }
+    source.telegram_id = None
+    await session.flush()
+    for attr, value in carried.items():
+        if value and not getattr(target, attr):
+            setattr(target, attr, value)
+
+    seen = {normalise(a) for a in [target.display_name, *(target.aliases or [])]}
+    aliases = list(target.aliases or [])
+    for alias in [source.display_name, *(source.aliases or [])]:
+        if not alias or codes.find_client_codes(alias):
+            continue
+        key = normalise(alias)
+        if key and key not in seen:
+            seen.add(key)
+            aliases.append(alias)
+    target.aliases = aliases
+    target.profile_updated_at = None  # rewritten with the merged history
+
+    await session.delete(source)
+    await session.flush()
+    log.warning("merged person %s into %s (by %s)", source.id, target.id, by)
+    await session.refresh(target)
+    return target

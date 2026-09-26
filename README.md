@@ -163,6 +163,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
 | `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
 | `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
+| `CODE_PLACEHOLDERS` | `false` — when `true`, a client code nobody holds yet becomes a placeholder person named after it; `/kod Akmal GS367` later folds it into Akmal |
 | `PAYMENT_OWN_CARDS` | empty — extra last-4 digits of your own cards (cards seen with a balance count already); an expense on one and an income of the same amount on another within the dedupe window is a transfer, left out of the totals (`/tuzat x12 tashqi` undoes it) |
 | `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |

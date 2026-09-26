@@ -261,6 +261,10 @@ class Settings(BaseSettings):
     money_receipts_fold_at: int = Field(default=4, ge=2)
     # Older events (a first import, a backlog) are only summarised.
     money_receipt_max_age_hours: int = Field(default=12, ge=1)
+    # WP-77: a code nobody holds, named with no person, creates a placeholder
+    # person called by the code (merged into the real one by /kod). Off:
+    # such a code is only reported, never made into a person.
+    code_placeholders: bool = False
     # WP-69: extra last-4 digits of the owner's own cards (comma list), on top
     # of the cards seen with a balance; a transfer between two of them is
     # kept out of the income and expense totals.

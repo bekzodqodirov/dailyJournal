@@ -89,6 +89,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /bugun — bugungi holat
 /kim &lt;ism yoki GS kod&gt; — odam haqida hamma narsa: profil, qarz, va'da, tarix
 /kod &lt;ism&gt; &lt;GS kod&gt; — mijoz kodini biriktirish
+/birlashtir &lt;kim&gt; &gt; &lt;kimga&gt; — ikki yozuvni bitta odamga qo'shish
 /kodlar — xabarlardan topilgan kod takliflari
 /tarix &lt;ism&gt; [N] — odam bilan to'liq aloqa tarixi (oxirgi N ta)
 /eslab &lt;ism&gt;: &lt;matn&gt; — odam haqida biror narsani eslab qolish
@@ -156,6 +157,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("tarix", "Odam bilan aloqa tarixi"),
     ("eslab", "Odam haqida eslab qolish"),
     ("kod", "Mijoz kodini biriktirish"),
+    ("birlashtir", "Ikki odamni birlashtirish"),
     ("kodlar", "Kod takliflari"),
     ("yuk", "Yuk xati yoki kod qayerda tilga olingan"),
     ("pul", "bugungi to'lovlar ro'yxati"),
@@ -315,6 +317,46 @@ def chat_digest_report(digests: list) -> str:
             # conversation legitimately has nothing summarised yet.
             lines.append("<i>• hali umumlashtirilmadi</i>")
     return "\n".join(lines)
+
+
+# --- /birlashtir (WP-77) ----------------------------------------------------------
+
+MERGE_USAGE = (
+    "Birlashtirish: <code>/birlashtir Акмал &gt; Akmal</code> — birinchisi "
+    "ikkinchisiga qo'shiladi."
+)
+MERGE_REFUSED = (
+    "⚠️ Ikkalasining ham alohida Telegram hisobi bor — bular ikki xil odam. "
+    "Birlashtirmadim."
+)
+MERGE_SAME = "Bu bitta odamning o'zi — birlashtiradigan narsa yo'q."
+MERGE_STALE = "Bu savol eskirgan — <code>/birlashtir</code> ni qaytadan yozing."
+MERGE_CANCELLED = "Bekor qilindi — hech narsa o'zgarmadi."
+
+
+def merge_preview(source, target, counts: dict) -> str:
+    return (
+        f"🔗 <b>{escape(source.display_name)}</b> → <b>{escape(target.display_name)}</b> "
+        "ga qo'shiladi:\n"
+        f"• qarzlar: {counts.get('debts', 0)}\n"
+        f"• va'dalar: {counts.get('promises', 0)}\n"
+        f"• xarajat/kirim: {counts.get('transactions', 0)}\n"
+        f"• xabar va qo'ng'iroqlar: {counts.get('interactions', 0)}\n"
+        f"• eslab qolinganlar: {counts.get('memories', 0)}\n"
+        f"• kodlar: {counts.get('codes', 0)}\n"
+        "Birlashtiraymi?"
+    )
+
+
+def merge_done(target) -> str:
+    return f"✅ Birlashtirildi: endi hammasi <b>{escape(target.display_name)}</b> nomida."
+
+
+def placeholder_merged(code: str, name: str) -> str:
+    return (
+        f"🏷 <b>{escape(code)}</b> → <b>{escape(name)}</b>. «{escape(code)}» nomli "
+        f"vaqtinchalik yozuv {escape(name)} ga qo'shildi."
+    )
 
 
 def person_not_found(name: str) -> str:

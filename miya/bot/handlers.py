@@ -54,6 +54,7 @@ from miya.services import (
     memories,
     money_events,
     nudges,
+    people,
     persistence,
     planner,
     purge,
@@ -1779,6 +1780,74 @@ def _code_args(args: str) -> tuple[list[str], str]:
     return found, " ".join(rest.split())
 
 
+_MERGE_SPLIT = re.compile(r"\s*(?:>|→|->)\s*")
+
+
+async def _merge_side(session, name: str):
+    """(person, None) or (None, reply) for one side of /birlashtir."""
+    match = await find_person(session, name)
+    if match.person is None:
+        if match.unknown_code:
+            return None, replies.code_unknown(match.unknown_code)
+        return None, replies.person_not_found(name)
+    if match.ambiguous:
+        held = await client_codes.codes_of_many(
+            session, [p.id for p in (match.person, match.runner_up) if p is not None]
+        )
+        return None, replies.person_ambiguous(match, command="birlashtir", codes=held)
+    return match.person, None
+
+
+@router.message(Command("birlashtir"))
+async def cmd_merge(message: Message, command: CommandObject) -> None:
+    """`/birlashtir Акмал > Akmal` — the first joins the second (WP-77)."""
+    sides = _MERGE_SPLIT.split((command.args or "").strip(), maxsplit=1)
+    if len(sides) != 2 or not all(side.strip() for side in sides):
+        await _safe_answer(message, replies.MERGE_USAGE)
+        return
+    keyboard = None
+    async with session_scope() as session:
+        source, body = await _merge_side(session, sides[0].strip())
+        if source is not None:
+            target, body = await _merge_side(session, sides[1].strip())
+            if target is not None:
+                if source.id == target.id:
+                    body = replies.MERGE_SAME
+                elif (
+                    source.telegram_id
+                    and target.telegram_id
+                    and source.telegram_id != target.telegram_id
+                ):
+                    body = replies.MERGE_REFUSED
+                else:
+                    counts = await people.merge_plan(session, source, target)
+                    body = replies.merge_preview(source, target, counts)
+                    keyboard = keyboards.merge_confirm(source.id, target.id)
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("birl:"))
+async def on_merge_button(callback: CallbackQuery) -> None:
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
+        await _edit_callback(callback, replies.MERGE_CANCELLED)
+        return
+    async with session_scope() as session:
+        source = await session.get(Person, int(parts[1]))
+        target = await session.get(Person, int(parts[2]))
+        if source is None or target is None or source.id == target.id:
+            body = replies.MERGE_STALE
+        else:
+            try:
+                merged = await people.merge_into(
+                    session, source, target, by=records.BY_BUTTON
+                )
+                body = replies.merge_done(merged)
+            except people.MergeRefused:
+                body = replies.MERGE_REFUSED
+    await _edit_callback(callback, body)
+
+
 @router.message(Command("kod"))
 async def cmd_code(message: Message, command: CommandObject) -> None:
     """`/kod Akmal GS367` — say in one line which client a code is."""
@@ -1825,6 +1894,26 @@ async def cmd_code(message: Message, command: CommandObject) -> None:
 
 
 async def _code_to_person(session, code: str, name: str, holder: Person | None):
+    if holder is not None and people.is_placeholder(holder, code):
+        # The owner names the placeholder's client (WP-77): folded in, or
+        # renamed when the name is new. The owner's assertion; nothing asked.
+        match = await find_person(session, name)
+        if match.person is not None and match.person.id != holder.id:
+            if match.ambiguous:
+                held = await client_codes.codes_of_many(
+                    session,
+                    [p.id for p in (match.person, match.runner_up) if p is not None],
+                )
+                return replies.person_ambiguous(match, command="kod", codes=held), None
+            try:
+                target = await people.merge_into(
+                    session, holder, match.person, by=records.BY_COMMAND
+                )
+            except people.MergeRefused:
+                return replies.MERGE_REFUSED, None
+            return replies.placeholder_merged(code, target.display_name), None
+        holder.display_name = name.strip()
+        return replies.placeholder_merged(code, holder.display_name), None
     match = await find_person(session, name)
     if match.person is None:
         return replies.code_person_not_found(name, code), None
