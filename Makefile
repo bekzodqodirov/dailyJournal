@@ -2,7 +2,7 @@
 COMPOSE := docker compose
 .PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
-        backfill import-history backup backup-key backup-key-show restore doctor update
+        backfill import-history payments-corpus backup backup-key backup-key-show restore doctor update
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -90,6 +90,10 @@ import-history: ## Archive allowed private chats for search only: make import-hi
 	@test -n "$(DAYS)" || (echo "usage: make import-history DAYS=30 [TRANSCRIBE=1]" && exit 1)
 	$(COMPOSE) run --rm userbot python -m miya.tools.backfill --archive --all-private \
 		--days $(DAYS) $(if $(TRANSCRIBE),--transcribe,)
+
+payments-corpus: ## Export labelled payment texts (anonymised, server-only): make payments-corpus [ALL=1]
+	$(COMPOSE) run --rm worker python -m miya.tools.payments_corpus \
+		--out /data/exports/payments.jsonl $(if $(ALL),--all,)
 
 reprice: ## Recompute Anthropic costs from stored tokens: make reprice SINCE=2026-09-01 [DRY=1]
 	$(COMPOSE) run --rm worker python -m miya.tools.reprice_usage "$(SINCE)" $(if $(DRY),--dry,)

@@ -39,7 +39,15 @@ from miya.db.enums import (
     TaskStatus,
     TransactionType,
 )
-from miya.db.models import Debt, DebtPayment, Person, Promise, Task, Transaction
+from miya.db.models import (
+    Debt,
+    DebtPayment,
+    Interaction,
+    Person,
+    Promise,
+    Task,
+    Transaction,
+)
 from miya.services import codes as client_codes
 from miya.services import people
 from miya.services.people import resolve_person
@@ -455,6 +463,16 @@ async def void(
     old, new = _note(txn, "status", "active", "void", by, now, **extra)
     txn.voided_at = now
     txn.void_reason = reason
+    if txn.channel is not None and txn.source_interaction_id is not None:
+        # The owner's word on what the phone read (WP-82): a label for the
+        # parser's regression corpus.
+        source = await session.get(Interaction, txn.source_interaction_id)
+        media = (source.media or {}) if source is not None else {}
+        if isinstance(media.get("money"), dict):
+            source.media = {
+                **media,
+                "money": {**media["money"], "owner_label": "voided"},
+            }
     await session.flush()
     return Change("transaction", txn, person_of(txn), "status", old, new)
 
