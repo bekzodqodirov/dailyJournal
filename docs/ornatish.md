@@ -41,6 +41,15 @@
 10b) Tashqi kuzatuvchi: healthchecks.io'da «MIYA» tekshiruvini yarat (davr 5 daqiqa, kutish 15 daqiqa), Telegram integratsiyasini ulab, ping manzilini .env'dagi DEADMAN_PING_URL= ga yoz, keyin docker compose up -d --force-recreate worker.
 11) Telefon ilovasi: faqat Telegramga kelgan yangi imzoli APK'ni, serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda).
 
+## Ishlab turgan serverni yangilash
+
+1) Serverda: cd miya && git status → o'zgarish yo'q; git branch → * master.
+2) make update → zaxira oladi, kodni tortadi, bot/worker/userbot'ni to'xtatib migratsiyalarni qo'llaydi va hammasini qayta yoqadi.
+3) make doctor → ❌ qolmasin. Yangi sozlamalar .env'ga yozilmasa ham standart qiymat bilan ishlaydi; ro'yxati .env.example'da.
+4) Botda /holat → hamma qator ✅. /ertalab → ertalabki xulosa chiqsin.
+5) Standartda o'chiq, xohlasang .env'da yoq: CODE_PLACEHOLDERS, TRANSCRIBE_DIARIZE_CALLS, MEDIA_RETENTION_DAYS, VIDEO_RETENTION_DAYS.
+6) Birinchi yakshanba 05:00 dan keyin /holat'da tiklash mashqi natijasi ✅ bo'lsin (kalit /app/secrets/backup-key.txt'da bo'lishi kerak).
+
 ## Telefon ilovasi: yangi kalitga bir martalik o'tish
 
 Yangi APK boshqa kalit bilan imzolangan, shuning uchun eski ilova ustidan o'rnatilmaydi — eski ilovani bir marta o'chirish kerak.
