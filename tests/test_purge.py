@@ -233,3 +233,113 @@ def test_range_parsing_accepts_both_forms():
 def test_a_name_is_not_mistaken_for_a_date():
     assert purge.parse_range("Akmal") is None
     assert purge.parse_range("chat GZ") is None
+
+
+# --- recaps and digests (WP-72) --------------------------------------------------
+
+
+def _report(day: date, content: str, kind: str = "evening") -> m.DailyReport:
+    return m.DailyReport(report_date=day, content=content, kind=kind, parts=[content])
+
+
+def _digest(day: date, prose: str, *, person=None, chat=None, ids=()) -> m.RecapDigest:
+    moment = datetime.combine(day, datetime.min.time(), tzinfo=TZ)
+    return m.RecapDigest(
+        digest_date=day,
+        subject_key=f"k{len(prose)}{prose[:8]}",
+        person_id=person.id if person else None,
+        tg_chat_id=chat,
+        window_start=moment,
+        window_end=moment + timedelta(hours=20),
+        input_hash="0" * 64,
+        source_interaction_ids=list(ids),
+        prose=prose,
+        model="test",
+    )
+
+
+async def test_unut_person_removes_their_digests_and_the_recaps_of_those_days(session):
+    person, interaction = await _full_person(session)
+    day = interaction.occurred_at.astimezone(TZ).date()
+    other_day = day - timedelta(days=5)
+    session.add_all(
+        [
+            _report(day, "Akmal 5 mln qarz oldi"),
+            _report(day + timedelta(days=1), "Kecha: Akmal …", kind="morning"),
+            _report(other_day, "boshqa kun"),
+            _digest(day, "Akmal bilan gaplashildi", person=person),
+            _digest(other_day, "Akmal eslatildi", ids=[interaction.id]),
+        ]
+    )
+    await session.flush()
+
+    plan = await purge.plan_person(session, person)
+    await purge.execute(session, plan)
+
+    reports = list(await session.scalars(sa.select(m.DailyReport)))
+    assert [r.content for r in reports] == ["boshqa kun"]
+    assert await session.scalar(sa.select(sa.func.count(m.RecapDigest.id))) == 0
+
+
+async def test_unut_range_removes_the_days_recaps(session):
+    day = date(2026, 3, 10)
+    session.add_all(
+        [
+            _report(day, "10-mart"),
+            _report(date(2026, 3, 12), "12-mart"),
+            _digest(day, "10-mart xulosa"),
+        ]
+    )
+    await session.flush()
+
+    plan = await purge.plan_range(session, day, day)
+    assert plan.is_empty() is False
+    await purge.execute(session, plan)
+
+    reports = [r.content for r in await session.scalars(sa.select(m.DailyReport))]
+    assert reports == ["12-mart"]
+    assert await session.scalar(sa.select(sa.func.count(m.RecapDigest.id))) == 0
+
+
+async def test_unut_chat_removes_group_digests(session):
+    await _interaction(session, chat=-500)
+    session.add_all(
+        [
+            _digest(purge.today(), "guruh", chat=-500),
+            _digest(purge.today(), "boshqa", chat=-501),
+        ]
+    )
+    await session.flush()
+
+    plan = await purge.plan_chat(session, -500)
+    await purge.execute(session, plan)
+
+    left = [d.prose for d in await session.scalars(sa.select(m.RecapDigest))]
+    assert left == ["boshqa"]
+
+
+async def test_preview_counts_reports_and_digests(session):
+    from miya.bot import replies
+
+    person, interaction = await _full_person(session)
+    day = interaction.occurred_at.astimezone(TZ).date()
+    session.add_all([_report(day, "x"), _digest(day, "y", person=person)])
+    await session.flush()
+
+    text = replies.purge_preview(await purge.plan_person(session, person))
+
+    assert "kunlik xulosa: 1 ta" in text and "AI xulosa: 1 ta" in text
+    assert replies.PURGE_REPORTS_NOTE in text
+
+
+async def test_recap_rows_of_untouched_days_survive(session):
+    person, interaction = await _full_person(session)
+    day = interaction.occurred_at.astimezone(TZ).date()
+    session.add(_report(day - timedelta(days=3), "tinch kun"))
+    await session.flush()
+
+    await purge.execute(session, await purge.plan_person(session, person))
+
+    assert [r.content for r in await session.scalars(sa.select(m.DailyReport))] == [
+        "tinch kun"
+    ]

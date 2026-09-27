@@ -78,16 +78,18 @@ def _state_matches(*states: str):
 
 
 async def awaiting_question(
-    session: AsyncSession, *, limit: int = 20
+    session: AsyncSession, *, limit: int = 20, pushable_only: bool = True
 ) -> list[Interaction]:
-    """Media the owner has not been asked about yet, oldest first."""
-    return list(
-        await session.scalars(
-            sa.select(Interaction)
-            .where(_state_matches(PENDING))
-            .order_by(Interaction.occurred_at)
-            .limit(limit)
+    """Media the owner has not been asked about yet, oldest first. A push
+    takes only pushable files (a row from before WP-46 counts as one); a
+    pull from /savollar takes every file."""
+    query = sa.select(Interaction).where(_state_matches(PENDING))
+    if pushable_only:
+        query = query.where(
+            Interaction.media["approval"]["pushable"].astext.is_distinct_from("false")
         )
+    return list(
+        await session.scalars(query.order_by(Interaction.occurred_at).limit(limit))
     )
 
 
@@ -113,14 +115,52 @@ async def expire_stale(session: AsyncSession, *, now: datetime | None = None) ->
     file whose context is long gone.
     """
     now = now or datetime.now(settings.tz)
-    cutoff = now - timedelta(hours=settings.media_ask_expiry_hours)
-    stale = list(
+    asked_cutoff = now - timedelta(hours=settings.media_ask_expiry_hours)
+    unseen_cutoff = now - timedelta(days=settings.media_unasked_expiry_days)
+    rows = list(
         await session.scalars(
             sa.select(Interaction)
             .where(_state_matches(PENDING, ASKED))
-            .where(Interaction.occurred_at < cutoff)
+            .where(Interaction.occurred_at < asked_cutoff)
         )
     )
-    for interaction in stale:
-        set_state(interaction, EXPIRED)
-    return len(stale)
+    expired = 0
+    for interaction in rows:
+        approval = (interaction.media or {}).get("approval") or {}
+        if approval.get("state") == ASKED:
+            # 48 h after the owner saw the question, not after the message:
+            # the budget may have held it back for days.
+            shown = _when(approval.get("shown_at")) or interaction.occurred_at
+            stale = shown < asked_cutoff
+        else:
+            # Never shown: a week, so a busy day cannot retire it unseen.
+            stale = interaction.occurred_at < unseen_cutoff
+        if stale:
+            set_state(interaction, EXPIRED, expired_at=now.isoformat())
+            expired += 1
+    return expired
+
+
+def _when(value) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def expired_since(session: AsyncSession, since: datetime) -> int:
+    """Files whose question expired since ``since`` — the brief's count."""
+    expired_at = sa.cast(
+        Interaction.media["approval"]["expired_at"].astext, sa.DateTime(timezone=True)
+    )
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(_state_matches(EXPIRED))
+            .where(Interaction.media["approval"]["expired_at"].astext.isnot(None))
+            .where(expired_at >= since)
+        )
+        or 0
+    )

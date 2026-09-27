@@ -111,3 +111,34 @@ async def test_search_with_a_blank_query_is_a_noop(session):
     embedder = FakeEmbedder()
     assert await memories.search(session, embedder, "   ") == []
     assert embedder.calls == 0
+
+
+def test_the_embedder_bounds_its_memory(monkeypatch):
+    """WP-26: max_seq_length and batch_size come from the settings."""
+    import sys
+    import types
+
+    from miya.config import settings
+    from miya.services.embeddings import LocalEmbedder
+
+    seen: dict = {}
+
+    class _Model:
+        max_seq_length = 8192
+
+        def __init__(self, name, device=None):
+            seen["model"] = self
+
+        def encode(self, texts, **kwargs):
+            seen["kwargs"] = kwargs
+            return [types.SimpleNamespace(tolist=lambda: [0.0]) for _ in texts]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=_Model),
+    )
+    embedder = LocalEmbedder("stub")
+    embedder._encode(["salom"])
+    assert seen["model"].max_seq_length == settings.embed_max_seq_length
+    assert seen["kwargs"]["batch_size"] == settings.embed_batch_size

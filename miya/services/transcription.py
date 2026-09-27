@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
@@ -27,6 +27,45 @@ class Transcript:
     text: str
     language: str | None
     duration: float  # seconds
+    # (speaker number, words) per turn when diarised (WP-85); else empty.
+    segments: list[tuple[int, str]] = field(default_factory=list)
+
+
+SPEAKER_LABEL = "[{n}-ovoz]"
+
+
+def segments_from_payload(payload: dict) -> list[tuple[int, str]]:
+    """Consecutive words of one speaker as one turn; speakers numbered 1, 2…
+    in the order they first speak. Empty when the payload names no speaker."""
+    numbers: dict[str, int] = {}
+    turns: list[tuple[int, list[str]]] = []
+    for word in payload.get("words") or []:
+        if not isinstance(word, dict):
+            continue
+        text = word.get("text") or ""
+        speaker = word.get("speaker_id")
+        if speaker is None:
+            if word.get("type") == "word":
+                return []  # a word without a speaker: not a diarised payload
+            if turns:
+                turns[-1][1].append(text)
+            continue
+        number = numbers.setdefault(str(speaker), len(numbers) + 1)
+        if turns and turns[-1][0] == number:
+            turns[-1][1].append(text)
+        else:
+            turns.append((number, [text]))
+    out = []
+    for number, parts in turns:
+        words = " ".join("".join(parts).split())
+        if words:
+            out.append((number, words))
+    return out
+
+
+def render_segments(segments: list[tuple[int, str]]) -> str:
+    """'[1-ovoz] …' lines, one per turn."""
+    return "\n".join(f"{SPEAKER_LABEL.format(n=n)} {text}" for n, text in segments)
 
 
 class TranscriptionError(RuntimeError):
@@ -39,7 +78,7 @@ class Transcriber(ABC):
 
     @abstractmethod
     async def transcribe(
-        self, path: str | Path, *, language_hint: str | None = None
+        self, path: str | Path, *, language_hint: str | None = None, **options
     ) -> Transcript: ...
 
 
@@ -52,7 +91,11 @@ class ElevenLabsScribe(Transcriber):
         self._timeout = timeout
 
     async def transcribe(
-        self, path: str | Path, *, language_hint: str | None = None
+        self,
+        path: str | Path,
+        *,
+        language_hint: str | None = None,
+        diarize: bool = False,
     ) -> Transcript:
         if not self._api_key:
             raise TranscriptionError("ELEVENLABS_API_KEY is not configured")
@@ -64,6 +107,9 @@ class ElevenLabsScribe(Transcriber):
         data = {"model_id": SCRIBE_MODEL}
         if language_hint:
             data["language_code"] = language_hint
+        if diarize:
+            # Who spoke when (WP-85); calls only, and only when switched on.
+            data["diarize"] = "true"
 
         try:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
@@ -88,10 +134,13 @@ class ElevenLabsScribe(Transcriber):
         # same file on every sweep.
         try:
             payload = response.json()
+            segments = segments_from_payload(payload) if diarize else []
+            text = (payload.get("text") or "").strip()
             return Transcript(
-                text=(payload.get("text") or "").strip(),
+                text=render_segments(segments) if segments else text,
                 language=payload.get("language_code"),
                 duration=_duration_from_payload(payload),
+                segments=segments,
             )
         except (ValueError, AttributeError, TypeError) as exc:
             raise TranscriptionError(

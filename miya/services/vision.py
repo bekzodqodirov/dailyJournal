@@ -1,4 +1,4 @@
-"""Photo triage with Haiku vision (spec §6).
+"""Photo triage with the extraction model's vision (spec §6).
 
 Receipts sent to the assistant bot are always processed — that is what they are
 for. In monitored Telegram chats the image itself is only looked at when the

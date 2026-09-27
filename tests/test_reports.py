@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import anthropic
 import httpx
 import sqlalchemy as sa
 
+from miya.bot.formatting import money as format_money
 from miya.config import settings
 from miya.db import models as m
 from miya.db.enums import Currency, EventSource, EventStatus, TransactionType
@@ -35,6 +38,9 @@ class _StubClient:
         self.text = text
         self.error = error
         self.calls: list[dict] = []
+
+    def with_options(self, **kwargs):
+        return self
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
@@ -111,47 +117,87 @@ async def test_planner_uses_the_model_when_available(session, monkeypatch):
 # --- daily report ------------------------------------------------------------
 
 
-async def test_generate_report_stores_content_and_stats(session, monkeypatch):
+def _no_model(*_a, **_k):
+    raise AssertionError("the planner must not be called by the recap")
+
+
+async def test_generate_report_figures_come_from_sql(session, monkeypatch):
+    """Money reaches the owner from SQL only: the recap's figures are
+    rendered, and the model — down here — only ever writes prose."""
+    from miya.services import recaps
+
     day = await _seed_day(session)
-    monkeypatch.setattr(reports, "get_client", lambda: _StubClient(text="HISOBOT"))
-    monkeypatch.setattr(planner, "get_client", lambda: _StubClient(text="REJA"))
+    monkeypatch.setattr(planner, "get_client", _no_model)
+    monkeypatch.setattr(recaps, "get_client", lambda: _StubClient(error=_api_error()))
 
     content = await reports.generate_report(session, day)
     await session.commit()
 
-    assert content == "HISOBOT"
+    assert content.startswith("🌆 <b>Bugun nima bo'ldi</b>")
+    assert f"Chiqim: {format_money(Decimal('1200000'), Currency.UZS)}" in content
     row = await session.scalar(sa.select(m.DailyReport))
-    assert row.report_date == day
-    assert row.content == "HISOBOT"
+    assert row.report_date == day and row.content == content
     assert row.stats["expense"] == {"UZS": "1200000.00"}
-    assert row.stats["interactions"] >= 1
+    operations = set(await session.scalars(sa.select(m.UsageLog.operation)))
+    assert not operations & {"report", "planner"}
 
 
-async def test_generate_report_upserts_on_the_same_day(session, monkeypatch):
+async def test_report_ertaga_is_the_sql_listing(session, monkeypatch):
     day = await _seed_day(session)
-    monkeypatch.setattr(planner, "get_client", lambda: _StubClient(text="REJA"))
+    monkeypatch.setattr(planner, "get_client", _no_model)
 
-    monkeypatch.setattr(reports, "get_client", lambda: _StubClient(text="ERTALABKI"))
-    await reports.generate_report(session, day)
-    monkeypatch.setattr(reports, "get_client", lambda: _StubClient(text="KECHKI"))
-    await reports.generate_report(session, day)
+    content = await reports.generate_report(session, day)
+
+    [tomorrow] = [b for b in content.split("\n\n") if b.startswith("📅 <b>Ertaga</b>")]
+    assert "Bojxona uchrashuvi" in tomorrow and "15:00" in tomorrow
+    assert "/reja" in tomorrow
+
+
+async def test_generate_report_upserts_on_the_same_day(session):
+    day = await _seed_day(session)
+    first = await reports.generate_report(session, day)
+    interaction = await _interaction(session, text="kechqurun")
+    session.add(
+        m.Transaction(
+            type=TransactionType.expense,
+            amount=300_000,
+            currency=Currency.UZS,
+            category="ovqat",
+            occurred_at=datetime.now(TZ),
+            source_interaction_id=interaction.id,
+        )
+    )
+    await session.flush()
+    second = await reports.generate_report(session, day)
     await session.commit()
 
     rows = list(await session.scalars(sa.select(m.DailyReport)))
     assert len(rows) == 1
-    assert rows[0].content == "KECHKI"
+    assert rows[0].content == second != first
+    assert "ovqat" in rows[0].content
 
 
-async def test_generate_report_survives_api_failure(session, monkeypatch):
+async def test_planner_model_input_carries_no_amounts(session, monkeypatch):
     day = await _seed_day(session)
-    failing = _StubClient(error=_api_error())
-    monkeypatch.setattr(reports, "get_client", lambda: failing)
-    monkeypatch.setattr(planner, "get_client", lambda: failing)
+    stub = _StubClient(text="<b>09:00</b> — Akmal")
+    monkeypatch.setattr(planner, "get_client", lambda: stub)
 
-    content = await reports.generate_report(session, day)
+    await planner.plan_for(session, day + timedelta(days=1))
 
-    # The deterministic data block is stored and sent instead of nothing.
-    assert content.startswith("HISOBOT KUNI:")
-    assert "transport" in content and "1.2 mln" in content
-    row = await session.scalar(sa.select(m.DailyReport))
-    assert row is not None and row.content == content
+    sent = stub.calls[0]["messages"][0]["content"]
+    debts = sent[sent.index("QARZLAR") :]
+    assert "Akmal: qarz (sizdan qarzi" in debts
+    assert not any(ch.isdigit() for ch in debts.split("muddat:")[0])
+    assert "5000000" not in sent and "5 mln" not in sent
+    assert re.search(r"\[d\d+\]", debts)
+    assert "Never write any amount" in planner.PLANNER_SYSTEM_PROMPT
+
+
+async def test_planner_fallback_formats_money(session, monkeypatch):
+    day = await _seed_day(session)
+    monkeypatch.setattr(planner, "get_client", lambda: _StubClient(error=_api_error()))
+
+    plan = await planner.plan_for(session, day + timedelta(days=1))
+
+    assert format_money(Decimal("5000000"), Currency.UZS) in plan
+    assert "<code>d" in plan

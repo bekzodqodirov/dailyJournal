@@ -6,6 +6,7 @@ person matching, retention and the database rows are all real.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from datetime import datetime
@@ -211,6 +212,82 @@ async def test_a_renamed_copy_is_still_deduped_by_hash(
 
     results = await cr.scan_directory(session)
     assert results == []
+
+
+async def test_a_deduped_copy_stops_being_invisible_to_everything(
+    session, recordings_dir, stub_scribe, stub_extract, monkeypatch
+):
+    """A copy no interaction claims is a copy nothing can manage.
+
+    It would be re-hashed on every 60-second sweep for as long as it exists —
+    the unbounded disk I/O the known-paths short-circuit was added to stop —
+    and retention would refuse to delete it, because retention only touches
+    files the database has a row for. Noting it against the interaction that
+    already holds the conversation puts it back under both.
+    """
+    original = _write_audio(recordings_dir, "Call recording Akmal_250817_143025.m4a")
+    stub_scribe()
+    stub_extract()
+    await cr.scan_directory(session)
+    await session.commit()
+
+    copy = recordings_dir / "Call recording Akmal_250817_143025.sync-conflict.m4a"
+    copy.write_bytes(original.read_bytes())
+    old = time.time() - 120
+    os.utime(copy, (old, old))
+    assert await cr.scan_directory(session) == []
+    await session.commit()
+
+    interaction = await session.scalar(sa.select(m.Interaction))
+    assert interaction.media["duplicate_paths"] == [str(copy)]
+
+    # Never hashed again …
+    hashed: list[Path] = []
+    real = cr.file_sha256
+    monkeypatch.setattr(cr, "file_sha256", lambda p, **kw: hashed.append(p) or real(p))
+    assert await cr.scan_directory(session) == []
+    assert hashed == []
+
+    # … and retention can finally reach it.
+    monkeypatch.setattr(cr, "file_sha256", real)
+    stamp = time.time() - 200 * 86400
+    for path in (original, copy):
+        os.utime(path, (stamp, stamp))
+    assert await cr.purge_old_audio(session) == 2
+    assert list(recordings_dir.iterdir()) == []
+
+
+async def test_a_sidecar_duration_that_cannot_be_true_is_not_billed(
+    recordings_dir,
+):
+    """Sidecars written by an older server never saw the edge's bound."""
+    audio = _write_audio(recordings_dir, "20260906-143025-abcdef012345.m4a")
+    cr.sidecar_path(audio).write_text(
+        json.dumps(
+            {
+                "counterparty_name": "Akmal aka",
+                "duration_seconds": 999_999_999,
+                "started_at": "2026-09-06T14:30:25+05:00",
+            }
+        )
+    )
+
+    parsed = cr.read_sidecar(audio)
+
+    assert parsed is not None
+    assert parsed.counterparty == "Akmal aka"
+    assert parsed.duration_seconds is None
+
+
+async def test_an_unreadable_sidecar_is_reported_not_swallowed(recordings_dir, caplog):
+    """Silent fallback would feed the extractor a hash for a person's name."""
+    audio = _write_audio(recordings_dir, "20260906-143025-abcdef012345.m4a")
+    cr.sidecar_path(audio).write_text('{"counterparty_name": "Akmal a')
+
+    with caplog.at_level("WARNING"):
+        assert cr.read_sidecar(audio) is None
+
+    assert any("unreadable sidecar" in r.message for r in caplog.records)
 
 
 async def test_a_known_phone_number_links_the_call_to_the_person(

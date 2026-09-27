@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MIYA Companion</string>
+    <string name="share_target_label">Send to MIYA</string>
+    <string name="channel_service_name">Sync activity</string>
+    <string name="channel_service_desc">Shown while MIYA is scanning for or uploading a recording.</string>
+    <string name="channel_alerts_name">Problems</string>
+    <string name="channel_alerts_desc">Shown when MIYA has stopped being able to upload recordings.</string>
+    <!-- WP-64: payment-app notifications. Owner-facing, Uzbek. -->
+    <string name="notification_listener_label">MIYA — to\'lov xabarlari</string>
+    <string name="payment_apps_onboarding_title">Payme va boshqa to\'lov ilovalari (ixtiyoriy)</string>
+    <string name="payment_apps_onboarding_body">Payme ilovasi yuboradigan to\'lov xabarlarini o\'qib, har bir to\'lovni o\'zingizning serveringizga yozadi. Faqat siz belgilagan ilovalar o\'qiladi — Telegram, SMS va boshqa ilovalarning xabarlari o\'qilmaydi va hech qayerga yuborilmaydi.</string>
+    <string name="payment_apps_grant">Ruxsat berish</string>
+    <string name="payment_apps_health_title">To\'lov ilovasi xabarlari</string>
+    <string name="payment_apps_not_granted">Ruxsat berilmagan. «Ruxsat berish»ni bosing va ro\'yxatda MIYA\'ni yoqing.</string>
+    <string name="restricted_settings_hint">Tugma kulrang bo\'lsa: «Ilova haqida» → ⋮ → «Cheklangan sozlamalarga ruxsat berish», keyin qaytadan urinib ko\'ring.</string>
+    <string name="app_info_action">Ilova haqida</string>
+    <string name="payment_apps_none_chosen">Ruxsat bor, lekin to\'lov ilovasi tanlanmagan: Sozlamalar → To\'lov ilovalari.</string>
+    <string name="payment_apps_choose">Tanlash</string>
+    <string name="payment_apps_ok">Yoqilgan: %1$s. Oxirgi to\'lov xabari: %2$s.</string>
+    <string name="payment_apps_disconnected">Tizim MIYA\'ni o\'chirib qo\'ydi — telefonni qayta yoqing yoki ruxsatni o\'chirib-yoqing.</string>
+    <string name="payment_apps_settings_title">To\'lov ilovalari</string>
+    <string name="payment_apps_settings_hint">Payme\'dan bitta to\'lov xabari kelgach, u shu ro\'yxatda paydo bo\'ladi. Faqat belgilanganlarning matni o\'qiladi.</string>
+    <string name="payment_apps_settings_empty">Hali hech qaysi ilova xabar yubormadi.</string>
+    <string name="payme_auto_ticked">Payme avtomatik tanlandi — kerak bo\'lmasa belgini olib tashlang.</string>
+    <string name="sms_restricted_hint">SMS ruxsati berilmasa: «Ilova haqida» → ⋮ → «Cheklangan sozlamalarga ruxsat berish». Baribir bo\'lmasa — Payme xabarlari bildirishnoma orqali keladi, SMS rejimini «O\'chiq» qiling.</string>
+    <!-- WP-65: the first SMS import window. -->
+    <string name="sms_backfill_title">Eski SMS\'lar: birinchi ulanishda oxirgi %1$d kunlik to\'lov SMS\'lari yuklanadi</string>
+    <string name="sms_backfill_none">Yuklamaslik</string>
+    <string name="sms_backfill_days">%1$d kun</string>
+    <string name="sms_backfill_year">1 yil</string>
+    <!-- WP-66 -->
+    <string name="last_heartbeat">Serverga oxirgi xabar: %1$s</string>
+</resources>

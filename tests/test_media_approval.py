@@ -11,6 +11,7 @@ So the tests exercise the state, not the transport.
 
 from __future__ import annotations
 
+import itertools
 from datetime import datetime, timedelta
 
 import pytest
@@ -22,6 +23,8 @@ from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Interaction
 from miya.services import approvals
 from miya.services.media_policy import MediaKind, forced_plan, plan_for
+
+_MESSAGE_IDS = itertools.count(77)
 
 
 def plan(kind, *, vision=True, docs=True, size=None, filename=None):
@@ -49,7 +52,7 @@ async def _pending(session, *, kind="video", size=90_000_000, occurred_at=None):
             "processed": False,
             "approval": {"state": approvals.PENDING, "reason": kind},
         },
-        meta={"tg_message_id": 77},
+        meta={"tg_message_id": next(_MESSAGE_IDS)},
     )
     session.add(interaction)
     await session.flush()
@@ -157,11 +160,12 @@ async def test_state_changes_survive_the_orm(session):
 
 
 async def test_an_unanswered_question_expires(session):
+    """A question never shown lives MEDIA_UNASKED_EXPIRY_DAYS (WP-46)."""
     fresh = await _pending(session)
     old = await _pending(
         session,
         occurred_at=datetime.now(settings.tz)
-        - timedelta(hours=settings.media_ask_expiry_hours + 1),
+        - timedelta(days=settings.media_unasked_expiry_days, hours=1),
     )
     await session.flush()
 
@@ -226,3 +230,17 @@ def test_the_question_escapes_a_caption_the_sender_controls():
     )
     assert "<script>" not in body
     assert "&lt;script&gt;" in body
+
+
+# --- the worker asks only what Telegram accepted (WP-09) ---------------------
+
+
+class _Bot:
+    def __init__(self, *, reachable: bool = True) -> None:
+        self.reachable = reachable
+        self.sent: list[str] = []
+
+    async def send_message(self, chat_id, text, **kwargs) -> None:
+        if not self.reachable:
+            raise RuntimeError("telegram is down")
+        self.sent.append(text)

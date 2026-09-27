@@ -56,25 +56,46 @@ reasoning model only phrases a query result in Uzbek.
 
 ## Quick start
 
-Requires Docker with Compose v2.
+The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md).
+
+### Server requirements
+
+- **At least 8 GB RAM** plus 2–4 GB swap; 2 vCPU (4 is better); 80 GB SSD;
+  Ubuntu 24.04 LTS; Docker Engine with Compose v2.
+- Outbound HTTPS to the Anthropic API, ElevenLabs, api.telegram.org,
+  huggingface.co (on first start) and GitHub.
+- Why 8 GB: the api holds the bge-m3 search model, about 2.2 GB of weights
+  plus the torch runtime. Below 8 GB it is OOM-killed in a loop.
 
 ```bash
-cp .env.example .env      # then fill it in — see "Configuration" below
-make up                   # builds, starts everything, applies migrations
+cp .env.example .env      # then fill it in — see below
+make backup-key           # prints BACKUP_AGE_RECIPIENT=… for .env
+make doctor               # checks .env and the server; fix every ❌
+make up                   # runs doctor again, builds, starts, applies migrations
 make health               # {"status":"ok", ...}
 make bot                  # tail the assistant bot's logs
 ```
 
-Before `make up`, fill in at least `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY`,
-`ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` and `API_BEARER_TOKEN`. The bot and
-worker refuse to start without a bot token and owner id rather than run
-unrestricted.
+Before `make up`, fill in: `POSTGRES_PASSWORD` (and the same password inside
+`DATABASE_URL`, before the first start), `ANTHROPIC_API_KEY`,
+`ELEVENLABS_API_KEY`, `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID`,
+`TELETHON_API_ID` and `TELETHON_API_HASH` (unless `USERBOT_ENABLED=false`),
+`OWNER_ALIASES`, `API_BEARER_TOKEN` (at least 32 characters: `openssl rand -hex
+32`), `UPLOAD_TOKENS` for the phone, and `BACKUP_AGE_RECIPIENT` (`make
+backup-key` prints the line). `make doctor` checks all of them, the RAM, the
+swap and the disk; `make up` refuses to start while it reports an error
+(`SKIP_DOCTOR=1` skips it, at your own risk). The bot and worker refuse to
+start without a bot token and owner id rather than run unrestricted, and
+every service refuses a blank or short API token.
 
 `make help` lists every target.
 
 | Target | What it does |
 |---|---|
 | `make up` | Build and start db, api, bot, worker and userbot, then migrate |
+| `make import-history DAYS=30 [TRANSCRIBE=1]` | Import allowed private chats' older history for search only — never extracted, never an open question; voice is left untranscribed unless `TRANSCRIBE=1`; safe to re-run |
+| `make payments-corpus [ALL=1]` | Export the payment texts you labelled (booked, «not money», voided) to `/data/exports/payments.jsonl` for parser regression tests; card digits and phone numbers are masked, merchants and names are not — the file stays on the server and is never committed |
+| `make update` | Back up, `git pull --ff-only`, stop bot/worker/userbot, `make up`, restart Syncthing if it was running, prune old images |
 | `make down` | Stop everything (the database volume is kept) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
@@ -84,12 +105,23 @@ unrestricted.
 | `make userbot-login` | One-time Telethon login (prints `TELETHON_SESSION`) |
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
+| `make import-clients FILE=… [APPLY=1]` | Import the client-code list (CSV/.xlsx); a dry run unless APPLY=1 |
+| `make doctor` | Check `.env` and the server before `make up` |
+| `make backup-key` | Create the backup key and print the `.env` line |
+| `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
 | `make test` / `make lint` / `make fmt` | Local dev loop |
 
 On first start the api container downloads the bge-m3 embedding model (~2 GB,
 cached in a volume). Until it finishes, `/qidir` and semantic search politely
 report that search is not ready yet; everything else works immediately.
+
+Two `/holat` alerts watch the server itself: **API restarting** (three or
+more api starts within an hour — almost always too little RAM; the api is
+capped at `API_MEM_LIMIT`, 4 GB by default, so the kernel kills it rather than
+PostgreSQL) and **search down** (a memory waiting more than
+`EMBED_STALE_MINUTES` for its vector — the first start downloads the ~2 GB
+model, so give it half an hour).
 
 ### Local development without Docker
 
@@ -114,16 +146,46 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `DATABASE_URL` | Must match `POSTGRES_*`; driver is `postgresql+psycopg` |
 | `ANTHROPIC_API_KEY` | Required — extraction, reports and answers all use it |
 | `EXTRACT_MODEL` | `claude-haiku-4-5` — the extraction engine |
-| `REASON_MODEL` | `claude-sonnet-5` — daily report, planner, RAG answers |
+| `REASON_MODEL` | `claude-sonnet-5` — `/reja` planner, RAG answers |
 | `ELEVENLABS_API_KEY` | Scribe transcription (uz/ru) |
 | `TRANSCRIBER` | `elevenlabs`; a local Whisper backend can be swapped in later |
 | `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` | The bot rejects every other user |
 | `USERBOT_ENABLED` | One-flag kill switch for the passive Telegram reader |
+| `TRANSCRIBE_DIARIZE_CALLS` | `false` — ask Scribe for speaker turns on call recordings, so transcripts read `[1-ovoz] …` / `[2-ovoz] …` and search cites the turn; unverified on Uzbek phone audio, and the price must be checked first |
+| `RESTORE_DRILL_ENABLED`, `RESTORE_DRILL_DAY` | `true` / `sun` — every week at 05:00 the newest backup is restored into a scratch database, its row counts compared with those at dump time, and the database dropped; a failure is a /holat problem |
+| `PHONE_SILENT_HOURS` | 4 — warn when the phone app has not contacted the server for this many awake hours (quiet hours not counted); it also warns when a permission it once had is revoked; 0 = off |
+| `OWNER_ALIAS_NAMESAKE_DAYS` | 90 — in a group where another member with the owner's first name spoke this recently, a bare first name is only "maybe to you" |
+| `USERBOT_CATCHUP_MINUTES`, `USERBOT_CATCHUP_MAX_PER_CHAT`, `USERBOT_CATCHUP_MAX_CHATS` | 30 / 500 / 20 — after downtime the userbot re-reads allowed chats past the last message it saw, never before a chat was switched on |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
 | `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
 | `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
 | `GCAL_CALENDAR_ID`, `GCAL_PULL_MINUTES`, `GCAL_DAYS_AHEAD` | Which calendar, how often, how far ahead |
+| `PAYMENT_SMS_SENDERS` | Extra bank/payment SMS senders on top of the built-in list |
+| `PAYMENT_APP_PACKAGES` | Blank — package ids of the payment apps whose pushes may book money; blank trusts the phone's allow-list |
+| `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
+| `MONEY_AUTOBOOK` | `true` — the emergency brake: `false` sends every completed payment to `/tekshir` instead of booking it |
+| `PAYMENT_DEDUPE_WINDOW_MINUTES`, `PAYMENT_REPEAT_SECONDS` | 10 min / 120 s — one payment seen by SMS and app push is booked once; a re-posted text is not a second payment |
+| `CODE_PLACEHOLDERS` | `false` — when `true`, a client code nobody holds yet becomes a placeholder person named after it; `/kod Akmal GS367` later folds it into Akmal |
+| `PAYMENT_OWN_CARDS` | empty — extra last-4 digits of your own cards (cards seen with a balance count already); an expense on one and an income of the same amount on another within the dedupe window is a transfer, left out of the totals (`/tuzat x12 tashqi` undoes it) |
+| `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
+| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
+| `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
+| `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
+| `RECAP_PHONE_STALE_HOURS` | 24 — the evening recap names a phone app silent this long, an unconfigured or stale backup, and any open problem (`/holat`) |
+| `RECAP_PROSE_ENABLED`, `RECAP_MODEL`, `RECAP_MAX_PEOPLE`, `RECAP_MAX_GROUPS`, `RECAP_SUBJECT_INPUT_CHARS`, `RECAP_INPUT_MAX_CHARS`, `RECAP_MAX_OUTPUT_TOKENS`, `RECAP_MODEL_TIMEOUT_SECONDS` | `true` / blank (= `REASON_MODEL`) / 8 / 5 / 1200 / 12000 / 1200 / 60 — one capped call per recap writes a sentence or two per person and group; prose with any digit or currency word is dropped, and the recap falls back to its SQL lines when the model is down |
+| `RECAP_MORNING_TOP_PEOPLE` | 5 — the morning "🌙 Kecha" recalls this many of yesterday's main conversations, with the evening's own prose |
+| `PASSAGE_CHUNK_CHARS`, `PASSAGE_CHUNK_OVERLAP`, `PASSAGE_EMBED_MIN_CHARS`, `PASSAGE_INDEX_BATCH`, `PASSAGE_EMBED_BATCH` | 1200 / 200 / 12 / 500 / 128 — every message, transcript, document and note is indexed verbatim for search; long ones are chunked with overlap, short ones are matched by words only; the embed batch stays ≤ 256 |
+| `RAG_FOLLOWUP_MINUTES`, `RAG_FOLLOWUP_PAIRS` | 30 / 2 — a question soon after an answer (or a reply to one) carries the earlier question/answer pairs, so «keyin nima bo'ldi?» works |
+| `RECALL_TOP_K`, `RECALL_CANDIDATES`, `RECALL_MIN_SIMILARITY`, `RECALL_RECENCY_HALFLIFE_DAYS`, `RECALL_RECENCY_WEIGHT`, `RECALL_CONTEXT_LINES` | 12 / 40 / 0.45 / 45 / 0.3 / 3 — hybrid recall: word, typo and meaning matches fused with recency, each hit shown with the lines around it |
+| `EXTRACT_MODEL_PRICE`, `REASON_MODEL_PRICE` | Blank — "input,output" USD per million tokens for the two model roles; set them when you change a model, then `make reprice SINCE=…` |
+| `SPEND_ALERT_DAILY_USD`, `SPEND_ALERT_MONTHLY_USD` | 5 / 60 — a Telegram warning when MIYA's own API spend passes either (0 = off); the hard cap is the Anthropic Console limit |
+| `QUESTION_BUDGET_PER_DAY`, `QUESTION_BRIEF_SLOTS`, `QUESTION_EVENING_SLOTS` | 10 / 5 / 3 — how many taps a day MIYA may ask for, and how many ride the brief and the evening report (`0` = never push) |
+| `QUESTION_BATCH_MAX`, `QUESTION_PUSH_GAP_MINUTES`, `QUESTION_URGENT_MIN_UZS` | 5 / 120 / 5 mln — questions per pushed message, the gap between pushes, the stake that moves a question up |
+| `QUESTION_GROUP_DIGEST_SIZE`, `QUESTION_GROUP_MAX_SHOWS`, `QUESTION_GROUP_MIN_MESSAGES`, `QUESTION_ASK_CHANNELS` | 3 / 2 / 1 / `false` — the new-groups digest |
+| `CLAIM_ASK_AFTER_MINUTES`, `CLAIM_DUPLICATE_DAYS`, `CLAIM_BANK_MATCH_HOURS` | 10 / 14 / 48 — when an unshown claim is queued, when a repeat folds into the first, how far a bank payment can settle a claim |
+| `CLAIM_BANK_AUTOCLOSE_TRANSACTIONS`, `CLAIM_BANK_AUTOACCEPT_SETTLEMENTS` | `true` / `false` — what bank evidence may settle without asking |
+| `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.
@@ -144,15 +206,25 @@ it recorded:
 | `/qarz` | Open balances, split into who owes you and who you owe |
 | `/vada` | Open promises, split into yours and theirs |
 | `/bugun` | Today: money in and out, people spoken to, new debts and promises |
-| `/kim <ism>` | One person: balances, promises, last contact |
+| `/pul [kecha\|YYYY-MM-DD]` | One day's money rows by ref (`x12`), each with ✏️ Tuzat and 🗑 O'chir; voided rows marked 🗑 |
+| `/ochir x12` | Void one wrong money row: it leaves every total, stays in the history, and ↩️ Qaytar (or `/qaytar x12`) restores it |
+| `/tuzat x12 …` | Correct a money row: amount, currency, `kirim`/`chiqim`/`teskari`, `kim <ism>`, `sana kecha`, `izoh …`, `turkum …` |
+| `/kim <ism yoki GS kod>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
+| `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
+| `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
+| `/kod <ism> <GS kod>` | Attach, show (`/kod GS367`), move or detach (`/kod GS367 o'chir`) a client code |
+| `/kodlar` | Code suggestions learned from chats; send a CSV/.xlsx captioned `/kodlar` to import the client list |
+| `/yuk <YW26-004715 yoki GS367>` | Every message, call and note that mentions a waybill or client code, oldest first; a bare code or waybill sent as a message does the same |
 | `/qidir <so'z>` | Semantic search over long-term memory (bge-m3 → pgvector) |
-| `/hisobot` | Generate and send today's report right now |
+| `/hisobot` | Today's recap so far ("🌆 Bugun nima bo'ldi", up to now) |
 | `/reja` | Tomorrow's time-blocked plan |
 | `/chats` | Which Telegram chats the userbot reads, with per-chat toggles |
 | `/process` | Reply to a video/document/voice to process it on demand |
 | `/xarajat` | What MIYA's own API calls cost this month |
 | `/unut` | Delete a person, a chat or a date range — asks first |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
+| `/savollar` | Every question waiting for the owner's tap (claims, money texts, missed calls, groups, files), ranked money first and paged; answering here spends none of the day's 5–10 asked questions |
+| `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
@@ -211,7 +283,9 @@ end-to-end encrypted sync; no cloud in between.
 
 **One-time pairing:**
 
-1. `make up` starts the `syncthing` container. Open its UI over an SSH tunnel:
+1. Start the `syncthing` container — it sits behind a Compose profile, so
+   `make up` and a bare `docker compose up -d` leave it off:
+   `docker compose --profile syncthing up -d syncthing`. Open its UI over an SSH tunnel:
    `ssh -L 8384:127.0.0.1:8384 vps` → http://127.0.0.1:8384. Set a UI password
    immediately (Actions → Settings → GUI).
 2. Install Syncthing on the phone and add the VPS as a remote device
@@ -243,8 +317,20 @@ row, so a broken file is not retried (and re-billed) every minute. The nightly
 retention job (04:15) deletes audio older than `AUDIO_RETENTION_DAYS` from both
 the recordings share and the bot-media folder — interactions and transcripts
 outlive the audio.
+With `MEDIA_RETENTION_DAYS` / `VIDEO_RETENTION_DAYS` above 0 (both default to 0,
+keep forever) the same job also deletes photos, documents and videos — a video
+note's `.mp4` included — that many days after they were read; the extracted
+text always stays, and the row is stamped `media.purged_at`.
 
 ---
+
+### Phone: first import and reinstall
+
+The companion app's first SMS harvest reaches back only as far as its
+«Eski SMS'lar» setting (default 30 days, «Yuklamaslik» = from now); a
+reinstall re-sends nothing new, because the server answers `duplicates`; and
+a backfill arrives as one folded Telegram summary. Details in
+`android/README.md` («First SMS import and reinstalling»).
 
 ## Memory, reports and calendar
 
@@ -262,12 +348,27 @@ the only source of financial figures; `search_memories` covers contextual
 questions. If the model or a tool fails, the owner gets an honest "try again
 later" instead of a guess.
 
-**Daily report.** At `REPORT_TIME` the worker gathers the day from SQL,
-renders a deterministic data block, and asks Sonnet to phrase it in Uzbek; the
-result is stored in `daily_reports` (upsert per date) and sent to the owner.
-If the Sonnet call fails, the deterministic block itself is stored and sent —
-a report day is never lost. `/hisobot` runs the same path on demand, and
-`/reja` produces the tomorrow plan that also closes the report.
+**Evening recap.** At `REPORT_TIME` the worker sends "🌆 Bugun nima bo'ldi":
+the day's money per currency, repayments and what the phone booked (with
+`x` refs to check), new and closed records, then a block per person — messages,
+calls, what they asked and whether it was answered, claims and refs — and per
+group, the calls, what was aimed at the owner in groups, what is still open,
+and tomorrow. Every figure comes from SQL (`services/recaps.py`); one capped
+model call adds at most a labelled sentence or two per person and group, with
+any digit or currency word refused, and the recap arrives complete without it
+when the model is down. It is stored in `daily_reports`, split into at most
+`RECAP_MAX_PARTS` messages and delivered part by part. `/hisobot` shows the
+same recap up to now without storing it; `/reja` is the model-written plan for
+tomorrow.
+
+**Morning recap.** At `MORNING_BRIEF_TIME` the owner first gets "🌙 Kecha":
+yesterday's money per currency, repayments and phone-booked counts, the new
+and closed records, the main conversations recalled with the evening's own
+prose (no new model call), and a block for everything since the evening
+cutoff — so nothing between 19:00 and 09:00 goes untold. When the evening
+recap never reached the owner, the whole of yesterday is told here instead.
+Then the brief with its buttons, then at most the brief's questions.
+`/kecha` shows the morning recap on demand; `/ertalab` shows both.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
 Google Cloud Console, save it to `secrets/google_oauth.json`, then
@@ -297,6 +398,10 @@ re-typing them. It is passive by construction:
 * It downloads no history. Only messages that arrive after it starts are read;
   the dialog list is used for chat titles only.
 * `USERBOT_ENABLED=false` turns the whole thing off in one flag.
+* In a group that is switched off and not yet decided, it keeps only a
+  message counter and two timestamps (when the owner last wrote there, when
+  someone addressed him) — never the text, the sender or any media — so the
+  daily "Yangi guruhlar" digest can offer the active groups first.
 * The Telethon session string is a **full credential** for the account. Keep it
   in `.env`, and revoke it from Telegram → Settings → Devices if it leaks.
 
@@ -383,7 +488,7 @@ Telegram can never report different balances.
 | `GET /v1/transactions` | Income/expense totals over `date_from`…`date_to` |
 | `GET /v1/people/{id}/summary` | One person's balances, promises and contact |
 | `POST /v1/ask` | RAG answer (same SQL-first path as the bot) |
-| `POST /v1/report/today` | Generate and store today's report |
+| `POST /v1/report/today` | Generate today's report (not stored) |
 | `GET /v1/plan/tomorrow` | Tomorrow's plan |
 | `GET /v1/usage` | API spend over a range |
 | `POST /v1/embed` | Embedding service for the bot and worker |
@@ -402,33 +507,83 @@ Telegram can never report different balances.
 * **The Telethon session string is a credential** — it grants full access to the
   owner's Telegram account. Keep it in `.env` or an encrypted file, never in the
   repository.
-* **Nightly backups are encrypted before they touch the disk.** `pg_dump` is
-  piped straight into `age`; the plaintext exists only inside that pipe. With
-  `BACKUP_AGE_RECIPIENT` unset the job writes nothing at all — an unencrypted
-  dump of every debt and transcript is not an acceptable fallback. Backups are
-  kept for `BACKUP_RETENTION_DAYS` (14) and a failing backup pings the owner.
-
-  ```bash
-  age-keygen -o secrets/backup-key.txt   # keep the private key OFF the VPS
-  # put the printed public key in BACKUP_AGE_RECIPIENT
-  make backup                            # run one now
-  age -d -i secrets/backup-key.txt data/backups/miya-….sql.age | psql …
-  ```
+* **Nightly backups are encrypted before they touch the disk.** `pg_dump -Fc`
+  (compressed custom format) is piped straight into `age`; the plaintext
+  exists only inside that pipe. With `BACKUP_AGE_RECIPIENT` unset the job
+  writes nothing at all — an unencrypted dump of every debt and transcript is
+  not an acceptable fallback. Backups are kept for `BACKUP_RETENTION_DAYS`
+  (14), the nightly file is also sent to the owner's Telegram as a document
+  (`BACKUP_TO_TELEGRAM`, in ≤ 45 MB pieces when large — still ciphertext),
+  and a failing or unsent backup pings the owner. See *Backups and restore*
+  below.
 
 * **`/unut` really deletes.** It shows exactly what would go — interactions,
   debts, promises, transactions, events, tasks, memories and media files — and
   only acts after the owner confirms. Cascades do the work, so nothing is left
   orphaned, and the audio and photos are unlinked from disk in the same pass.
 
+### Backups and restore
+
+**The key.** Backups are locked with an `age` key pair. The *public* key is
+`BACKUP_AGE_RECIPIENT` in `.env`; the *private* key is one line in
+`secrets/backup-key.txt`. Make it once and copy that file somewhere that is
+not this server — a password manager entry, a USB stick in a drawer, both:
+
+```bash
+make backup-key        # creates secrets/backup-key.txt, prints BACKUP_AGE_RECIPIENT=… for .env
+make backup-key-show   # prints the secret key: store it off this server
+make backup            # write one now, do not wait for 03:30
+```
+
+`make backup-key` refuses to overwrite an existing key, because a new key
+cannot open the old backups.
+
+**Losing the key means losing every backup.** Nobody — not Telegram, not
+the person who wrote this — can open a `.dump.age` file without it. The
+files in Telegram and in `data/backups/` are only as safe as that one line.
+
+**What you have.** Every night at `BACKUP_TIME` the worker writes
+`data/backups/miya-<date>-<time>.dump.age` and sends the same file to your
+Telegram (as pieces `….dump.age.part01`, `.part02`, … when it is over 45 MB).
+`/holat` shows the newest one and whether it reached Telegram. Files from
+before this format, `….sql.age`, still open with
+`age -d -i secrets/backup-key.txt miya-….sql.age | psql "$DATABASE_URL"`.
+
+**Restoring, the three commands.** On a fresh server: clone the repo, copy
+`.env` and `secrets/backup-key.txt` back into place, put the backup file
+(or all of its pieces, from Telegram) into `data/backups/`, then:
+
+```bash
+docker compose up -d db                                               # 1. the database only
+make restore FILE=/data/backups/miya-20260915-033000.dump.age DRY=1   # 2. look inside first
+make restore FILE=/data/backups/miya-20260915-033000.dump.age         # 3. load it
+make up                                                               # 4. migrate forward, start everything
+```
+
+Only the database runs while the backup loads: the bot, worker and userbot
+would otherwise hold locks on the tables being replaced and write rows of
+their own. On a server that is already running, `docker compose stop bot
+worker userbot api` first and `make up` afterwards. For a split backup name
+any one piece, e.g. `….dump.age.part01`; the others are found next to it.
+The restore refuses a database that already holds people or debts; add
+`FORCE=1` to replace what is there. `make up` at the end brings an older
+backup up to the current schema.
+The decrypted dump exists only in a temporary file that is deleted when the
+command ends, success or not.
+
 ### Documented egress
 
-Three external services receive data. Nothing else leaves the VPS.
+Four external services receive data, plus one optional bare ping. Nothing
+else leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
-| **Anthropic API** | Message text, call transcripts, document text, receipt images | Extraction, daily report, planner, RAG answers |
+| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names); when the owner asks a question, verbatim quotes of the stored messages found for it | Extraction, the recap's prose, planner, RAG answers |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
+| **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
+
+| **`DEADMAN_PING_URL`** (optional) | A bare GET every `DEADMAN_PING_MINUTES`, no data | An outside watcher notices a dead server |
 
 Embeddings run locally on the VPS CPU (`BAAI/bge-m3`) — no egress.
 
@@ -471,19 +626,25 @@ FastAPI, SQLAlchemy, Alembic, psycopg, pgvector and APScheduler; Phase 1 added
 
 ## Cost target
 
-~$25–45/month at the expected volume (~50 calls/day plus Telegram): ~$7
-transcription, ~$10–20 Haiku extraction (Batch API at −50% for the userbot
-stream, prompt caching on the static system prompt), ~$5–15 Sonnet reasoning,
-$0 embeddings. Every API call is logged to `usage_log` so the real figure is
-measured, not assumed.
+Every API call is logged to `usage_log`, so the real figure is measured, not
+assumed: `/xarajat` shows this month's spend per operation. The largest item
+used to be the person profiles; they are now written by `PROFILE_MODEL`
+(blank = `EXTRACT_MODEL`), at most once per `PROFILE_MIN_AGE_HOURS` per
+person and at most `PROFILE_DAILY_CAP` a day, and appear in `/xarajat` as
+«odam haqida profil». The evening recap makes one capped call to
+`RECAP_MODEL` (blank = `REASON_MODEL`) for its prose, cached per input so a
+repeated `/hisobot` with nothing new costs nothing; it appears as «kunlik
+xulosa (AI)». Extraction uses prompt caching on the static system
+prompt and the Batch API for the userbot stream; embeddings run locally.
 
 ---
 
 ## Verification
 
-315 tests against PostgreSQL 16.14 with pgvector 0.6.0. The Anthropic,
-ElevenLabs, Google and Telegram clients are stubbed throughout (the embedder
-too), so the suite is free and offline.
+The suite runs against PostgreSQL 16 with pgvector and pg_trgm, in CI on every
+push (see `.github/workflows/`). The Anthropic, ElevenLabs, Google and
+Telegram clients are stubbed throughout (the embedder too), so the suite is
+free and offline.
 
 **Schema and migrations**
 * `upgrade head` → `downgrade base` → `upgrade head` round-trips cleanly, and
@@ -538,8 +699,8 @@ too), so the suite is free and offline.
   back as an error the model can phrase, never a crash.
 * Question routing: `?` or a leading interrogative goes to RAG; question words
   mid-sentence stay log entries.
-* The daily report upserts by date, and an Anthropic outage stores and sends
-  the deterministic data block instead of losing the day.
+* The daily report upserts by date and makes no model call, so an Anthropic
+  outage cannot cost the owner the day's report.
 
 **Google Calendar (Phase 3)**
 * Pulls upsert by `gcal_event_id` — re-pulls change nothing, edits update the

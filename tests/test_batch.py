@@ -195,6 +195,11 @@ async def test_a_finished_batch_lands_rows_and_costs(session, monkeypatch):
     debt = await session.scalar(sa.select(m.Debt))
     assert debt.amount == 5_000_000
     assert debt.direction is DebtDirection.they_owe_me
+    # What landed comes back per window, not as a bare count — the owner is
+    # told about it from this.
+    [landed] = outcome.windows
+    assert landed.window is window
+    assert landed.applied.debts == [debt]
 
     # The debt hangs off a synthetic window interaction, and the member message
     # it came from is marked processed.

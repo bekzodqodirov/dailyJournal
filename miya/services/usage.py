@@ -12,6 +12,7 @@ from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from miya.config import parse_price, settings
 from miya.db.models import UsageLog
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,20 @@ SCRIBE_USD_PER_HOUR = Decimal("0.22")
 _MILLION = Decimal(1_000_000)
 
 
+def price_for(model: str) -> tuple[Decimal, Decimal] | None:
+    """The configured price of a model's role first (WP-25), then the table.
+    None means unpriced: recorded as NULL and shown as such, never as $0."""
+    for role_model, configured in (
+        (settings.extract_model, settings.extract_model_price),
+        (settings.reason_model, settings.reason_model_price),
+    ):
+        if model == role_model and configured:
+            price = parse_price(configured)
+            if price is not None:
+                return price
+    return MODEL_PRICES.get(model)
+
+
 def anthropic_cost_usd(
     model: str,
     *,
@@ -40,7 +55,7 @@ def anthropic_cost_usd(
     cache_write_tokens: int = 0,
     batch: bool = False,
 ) -> Decimal | None:
-    price = MODEL_PRICES.get(model)
+    price = price_for(model)
     if price is None:
         return None
     in_price, out_price = price

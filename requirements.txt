@@ -1,6 +1,10 @@
 # --- Core -------------------------------------------------------------------
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
+# FastAPI checks for this when a multipart route is *registered*, not when it
+# is called, so without it POST /v1/recordings takes down the whole app at
+# import — /health and every other route with it.
+python-multipart==0.0.20
 pydantic==2.10.4
 pydantic-settings==2.7.1
 
