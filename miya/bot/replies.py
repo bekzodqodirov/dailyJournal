@@ -1392,6 +1392,8 @@ def claim_value_refused(view: claims.ClaimView) -> str:
     return f"Bu qiymat to'g'ri kelmadi.\n{claim_tuzat_hint(view)}"
 
 
+QUESTION_REPLY_DONE = "✅ Javoblar qabul qilindi: {list}"
+QUESTION_REPLY_PARTIAL = "⚠️ {n}-savolni tushunmadim — tugma bilan javob ber."
 MANBA_USAGE = "Qaysi yozuv? Masalan: <code>/manba m1234</code>"
 MANBA_NOT_FOUND = "Bunday yozuv topilmadi — o'chirilgan bo'lishi mumkin."
 QIDIR_USAGE = "Nima qidiray? <code>/qidir bojxona</code>"

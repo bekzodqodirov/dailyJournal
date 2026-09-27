@@ -39,7 +39,7 @@ from miya.db.enums import (
     InteractionSource,
     TransactionType,
 )
-from miya.db.models import ChatMonitor, ClientCode, Interaction, Person
+from miya.db.models import ChatMonitor, ClientCode, Interaction, Person, QuestionLog
 from miya.db.session import session_scope
 from miya.services import (
     approvals,
@@ -59,6 +59,7 @@ from miya.services import (
     planner,
     purge,
     queries,
+    question_replies,
     questions,
     rag,
     recall,
@@ -2344,6 +2345,116 @@ async def _answer_suggestion(session, row_id: int, *, accept: bool) -> str:
 # --- content ----------------------------------------------------------------
 
 
+class _Collector:
+    """Stands in for the message a button sat on: keeps what the button's
+    handler would have said, so one typed reply gets one answer (WP-84)."""
+
+    def __init__(self) -> None:
+        self.texts: list[str] = []
+        self.reply_markup = None
+
+    async def answer(self, text, **kwargs):
+        self.texts.append(text)
+
+    async def edit_text(self, text, **kwargs):
+        self.texts.append(text)
+
+    async def edit_reply_markup(self, **kwargs):
+        return None
+
+
+class _TypedTap:
+    """A button press, typed."""
+
+    def __init__(self, data: str, message: _Collector) -> None:
+        self.data = data
+        self.message = message
+        self.from_user = None
+
+    async def answer(self, *args, **kwargs):
+        return None
+
+
+def _button_handlers():
+    return {
+        "cl": on_claim_button,
+        "rec": on_record_button,
+        "md": on_media_button,
+        keyboards.REVIEW_PREFIX: on_review_button,
+    }
+
+
+async def _batch_reply(message: Message) -> bool:
+    """A reply to a question batch — "1 ha 2 yo'q" — answered exactly as the
+    taps would have been. False when the text is not one."""
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None) if reply is not None else None
+    if not isinstance(reply_id, int):
+        return False
+    async with session_scope() as session:
+        logged = list(
+            await session.scalars(
+                sa.select(QuestionLog)
+                .where(QuestionLog.tg_message_id == reply_id)
+                .order_by(QuestionLog.id)
+            )
+        )
+        if not logged:
+            return False
+        answers = question_replies.parse(message.text or "", len(logged))
+        if answers is None:
+            return False
+        waiting = {
+            (p.kind, p.ref): p for p in await questions.collect(session, for_push=False)
+        }
+    done: list[str] = []
+    missed: list[int] = []
+    outcomes: list[str] = []
+    for answer in answers:
+        row = logged[answer.number - 1]
+        item = waiting.get((row.kind, row.ref))
+        if item is None:
+            missed.append(answer.number)
+            continue
+        buttons = keyboards.question_item_row(item, answer.number)
+        button = question_replies.button_for(buttons, answer.verb)
+        if button is None:
+            missed.append(answer.number)
+            continue
+        if answer.amount_text:
+            edit = records.parse_edit(answer.amount_text)
+            is_amount = edit is not None and edit.field == "amount"
+            if item.kind != questions.KIND_CLAIM or not is_amount:
+                missed.append(answer.number)
+                continue
+            async with session_scope() as session:
+                try:
+                    await claims.edit(
+                        session, item.subject.id, edit, by=claims.BY_COMMAND
+                    )
+                except (ValueError, claims.AlreadyAnswered):
+                    missed.append(answer.number)
+                    continue
+        prefix = (button.callback_data or "").split(":")[0]
+        handler = _button_handlers().get(prefix)
+        if handler is None:
+            missed.append(answer.number)
+            continue
+        sink = _Collector()
+        await handler(_TypedTap(button.callback_data, sink))
+        outcomes.extend(sink.texts)
+        done.append(f"{answer.number} {answer.verb}")
+    lines = []
+    if done:
+        lines.append(replies.QUESTION_REPLY_DONE.format(list=", ".join(done)))
+    lines += [replies.QUESTION_REPLY_PARTIAL.format(n=n) for n in missed]
+    body = "\n".join(lines)
+    if outcomes:
+        body += "\n\n" + "\n\n".join(outcomes)
+    await _safe_answer(message, clip(body))
+    return True
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     await _typing(message)
@@ -2365,6 +2476,8 @@ async def on_text(message: Message) -> None:
             interaction.processed = True
             reply = await _code_lookup_reply(session, *lookup)
         await _safe_answer(message, reply)
+        return
+    if await _batch_reply(message):
         return
     async with session_scope() as session:
         history, replied = await _followup_history(session, message)
