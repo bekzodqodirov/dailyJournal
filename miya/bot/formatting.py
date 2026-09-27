@@ -382,6 +382,12 @@ def _name(value: str, markup: bool) -> str:
     return f"<b>{escape(value)}</b>" if markup else value
 
 
+def person_label(person) -> str:
+    """The name a money list shows (WP-78): with the code when a namesake
+    could be confused, else the display name."""
+    return getattr(person, "miya_label", None) or person.display_name
+
+
 def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
     """How one debt / promise / task reads on its own, ref first.
 
@@ -393,7 +399,7 @@ def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
     if record.id is not None:
         handle = ref(kind, record.id)
         handle = f"<code>{handle}</code> " if markup else f"{handle} "
-    name = _text(person.display_name, markup) if person is not None else "?"
+    name = _text(person_label(person), markup) if person is not None else "?"
     if kind == "debt":
         body = debt_line(
             name, record.direction, record.amount, record.currency, record.due_date
@@ -419,7 +425,7 @@ def transaction_line(txn, person=None, *, handle: str = "", markup: bool = True)
     income = txn.type.value == "income"
     what = txn.description or txn.category or "—"
     card = f" · karta *{txn.card_last4}" if txn.card_last4 else ""
-    who = f" · 👤 {_text(person.display_name, markup)}" if person is not None else ""
+    who = f" · 👤 {_text(person_label(person), markup)}" if person is not None else ""
     void = " · 🗑 o'chirilgan" if txn.voided_at is not None else ""
     return (
         f"{'📈' if income else '📉'} {handle}{'Kirim' if income else 'Chiqim'}: "
@@ -697,7 +703,7 @@ def new_record_lines(new_debts, new_promises) -> list[str]:
     """Each new debt and promise as one line with its ref."""
     lines = [
         debt_line(
-            escape(debt.person.display_name),
+            escape(person_label(debt.person)),
             debt.direction,
             debt.amount,
             debt.currency,
@@ -708,7 +714,7 @@ def new_record_lines(new_debts, new_promises) -> list[str]:
     ]
     lines += [
         ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
-        + f"{escape(p.person.display_name)} — {escape(p.description)}"
+        + f"{escape(person_label(p.person))} — {escape(p.description)}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
         + tag("promise", p.id)
         for p in new_promises

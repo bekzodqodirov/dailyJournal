@@ -21,6 +21,7 @@ from miya.bot.formatting import (
     missed_line,
     money,
     new_record_lines,
+    person_label,
     question_line,
     queue_line,
     quiet_line,
@@ -591,7 +592,7 @@ def debts_report(balances: list[DebtBalance]) -> str:
 
 def _balance_line(b: DebtBalance) -> str:
     return (
-        f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)}"
+        f"{escape(person_label(b.person))}: {money(b.outstanding, b.currency)}"
         + (f" · {relative_day(b.earliest_due)}" if b.earliest_due else "")
         + tags("debt", b.ids)
     )
@@ -602,14 +603,14 @@ def promises_report(items) -> str:
         return "✅ Ochiq va'da yo'q."
 
     mine = [
-        f"{escape(p.description)} — {escape(person.display_name)}"
+        f"{escape(p.description)} — {escape(person_label(person))}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
         + tag("promise", p.id)
         for p, person in items
         if p.made_by is PromiseMadeBy.me
     ]
     theirs = [
-        f"{escape(person.display_name)}: {escape(p.description)}"
+        f"{escape(person_label(person))}: {escape(p.description)}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
         + tag("promise", p.id)
         for p, person in items
@@ -717,7 +718,7 @@ def person_report(summary: PersonSummary) -> str:
     if summary.balances:
         lines = [
             debt_line(
-                escape(b.person.display_name),
+                escape(person_label(b.person)),
                 b.direction,
                 b.outstanding,
                 b.currency,
@@ -849,7 +850,7 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
             "debt",
             "💰 <b>Qarz muddati</b>",
             [
-                f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
+                f"{escape(person_label(b.person))}: {money(b.outstanding, b.currency)} · "
                 f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
                 for b in debts
             ],
@@ -858,7 +859,7 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
             "promise",
             "🤝 <b>Va'da muddati</b>",
             [
-                f"{escape(person.display_name)}: {escape(p.description)} · "
+                f"{escape(person_label(person))}: {escape(p.description)} · "
                 f"{relative_day(p.due_date)}" + tag("promise", p.id)
                 for p, person in promises
             ],
@@ -1819,12 +1820,12 @@ def _morning_brief_text(brief: MorningBrief) -> str:
         parts.append(f"{BRIEF_EVENTS}\n" + bullet_list(lines, empty="—"))
 
     due_lines = [
-        f"{escape(b.person.display_name)}: {money(b.outstanding, b.currency)} · "
+        f"{escape(person_label(b.person))}: {money(b.outstanding, b.currency)} · "
         f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
         for b in brief.due.get("debts", [])
     ]
     due_lines += [
-        f"{escape(person.display_name)}: {escape(p.description)} · "
+        f"{escape(person_label(person))}: {escape(p.description)} · "
         f"{relative_day(p.due_date)}" + tag("promise", p.id)
         for p, person in brief.due.get("promises", [])
     ]

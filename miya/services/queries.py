@@ -154,7 +154,7 @@ async def open_debts(
     if person_id is not None:
         stmt = stmt.where(Debt.person_id == person_id)
 
-    return [
+    balances = [
         DebtBalance(
             person=row[0],
             direction=row[1],
@@ -166,6 +166,11 @@ async def open_debts(
         )
         for row in (await session.execute(stmt)).all()
     ]
+    # Two "Akmal" lines with different balances must be told apart (WP-78);
+    # one person's own list has no namesake to tell apart.
+    if person_id is None:
+        await codes.apply_labels(session, [b.person for b in balances])
+    return balances
 
 
 async def open_promises(
@@ -192,7 +197,10 @@ async def promises_by_status(
     )
     if person_id is not None:
         stmt = stmt.where(Promise.person_id == person_id)
-    return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+    rows = [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
+    if person_id is None:
+        await codes.apply_labels(session, [person for _, person in rows])
+    return rows
 
 
 async def _top_expenses(
@@ -685,6 +693,10 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
             .where(Task.due_date.isnot(None), Task.due_date <= limit)
             .order_by(Task.due_date)
         )
+    )
+    # One list in the brief: namesakes across debts and promises differ.
+    await codes.apply_labels(
+        session, [b.person for b in debts] + [person for _, person in promises]
     )
     return {"debts": debts, "promises": promises, "tasks": tasks}
 

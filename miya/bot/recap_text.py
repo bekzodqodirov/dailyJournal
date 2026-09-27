@@ -19,6 +19,7 @@ from miya.bot.formatting import (
     missed_line,
     money,
     new_record_lines,
+    person_label,
     question_line,
     queue_line,
     quote,
@@ -252,12 +253,12 @@ def _tomorrow_lines(tomorrow) -> list[str]:
     for b in tomorrow.debts:
         side = "sizdan qarzi" if b.direction.value == "they_owe_me" else "qarzingiz"
         lines.append(
-            f"{escape(b.person.display_name)}: "
+            f"{escape(person_label(b.person))}: "
             f"{money(b.outstanding, b.currency)} ({side})"
             + "".join(tag("debt", i) for i in b.ids[:1])
         )
     lines += [
-        f"{escape(person.display_name)}: {escape(p.description)}{tag('promise', p.id)}"
+        f"{escape(person_label(person))}: {escape(p.description)}{tag('promise', p.id)}"
         for p, person in tomorrow.promises
     ]
     lines += [f"{escape(t.description)}{tag('task', t.id)}" for t in tomorrow.tasks]

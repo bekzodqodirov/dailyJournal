@@ -669,3 +669,44 @@ async def mentions(
             )
         )
     return lines
+
+
+# --- labels for money lists (WP-78) -------------------------------------------------
+
+LABEL_ATTR = "miya_label"
+
+
+async def labels(session: AsyncSession, people) -> dict[int, str]:
+    """A name that tells two namesakes apart, for one list: "Akmal · GS367",
+    "Akmal · GS367+1", or "Akmal (#12)" when a shared name has no code."""
+    from miya.services.people import normalise
+
+    unique = {p.id: p for p in people if p is not None}
+    if not unique:
+        return {}
+    held = await codes_of_many(session, list(unique))
+    by_name: dict[str, int] = {}
+    for person in unique.values():
+        key = normalise(person.display_name or "")
+        by_name[key] = by_name.get(key, 0) + 1
+    out = {}
+    for pid, person in unique.items():
+        name = person.display_name or ""
+        own = held.get(pid) or []
+        if len(own) == 1:
+            out[pid] = f"{name} · {own[0]}"
+        elif own:
+            out[pid] = f"{name} · {own[0]}+{len(own) - 1}"
+        elif by_name[normalise(name)] > 1:
+            out[pid] = f"{name} (#{pid})"
+        else:
+            out[pid] = name
+    return out
+
+
+async def apply_labels(session: AsyncSession, people) -> None:
+    """Set each person's list label (a plain attribute, never stored)."""
+    found = await labels(session, people)
+    for person in people:
+        if person is not None and person.id in found:
+            setattr(person, LABEL_ATTR, found[person.id])
