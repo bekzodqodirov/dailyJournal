@@ -154,6 +154,7 @@ async def test_the_scheduler_registers_the_monitoring_jobs_and_the_listener(
     """run() wires heartbeat, health and the listener; the scheduler is
     stubbed so nothing actually ticks."""
     registered: list[str] = []
+    triggers: dict = {}
     listeners: list[tuple] = []
 
     class _Scheduler:
@@ -162,6 +163,7 @@ async def test_the_scheduler_registers_the_monitoring_jobs_and_the_listener(
 
         def add_job(self, func, trigger, *, id, **kwargs):
             registered.append(id)
+            triggers[id] = trigger
 
         def add_listener(self, callback, mask):
             listeners.append((callback, mask))
@@ -217,6 +219,9 @@ async def test_the_scheduler_registers_the_monitoring_jobs_and_the_listener(
     assert "heartbeat" in registered
     assert "health" in registered
     assert "code_index" in registered
+    # The weekly restore drill (WP-81): Sundays at 05:00.
+    drill = str(triggers["restore_drill"])
+    assert "day_of_week='sun'" in drill and "hour='5'" in drill
     [(callback, mask)] = listeners
     assert mask == worker.EVENT_JOB_EXECUTED | worker.EVENT_JOB_ERROR
     # One beat before the catch-up, carrying the job count.

@@ -386,3 +386,121 @@ async def test_a_real_backup_restores_whole_and_in_pieces(
     code = restore.main([str(parts[-1]), "--identity", str(key), "--to", dsn, "--force"])
     assert code == 0, capsys.readouterr().err
     backup.remove_parts(parts)
+
+
+# --- the weekly restore drill (WP-81) --------------------------------------------
+
+
+def _drill_ready():
+    for binary in ("age", "age-keygen", "pg_dump", "pg_restore"):
+        if not shutil.which(binary):
+            pytest.skip(f"{binary} is needed for the drill test")
+    import psycopg
+
+    dsn = settings.database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(dsn) as conn:
+        row = conn.execute(
+            "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user"
+        ).fetchone()
+    if not row or not row[0]:
+        pytest.skip("the database user may not create the drill database")
+
+
+def _key(tmp_path):
+    key = tmp_path / "key.txt"
+    subprocess.run(["age-keygen", "-o", str(key)], check=True, capture_output=True)
+    recipient = next(
+        line.split(": ")[1].strip()
+        for line in key.read_text().splitlines()
+        if line.startswith("# public key:")
+    )
+    return key, recipient
+
+
+def _drill_databases() -> list[str]:
+    import psycopg
+
+    from miya.services import restore_drill
+
+    dsn = settings.database_url.replace("postgresql+psycopg://", "postgresql://")
+    with psycopg.connect(dsn) as conn:
+        rows = conn.execute(
+            "SELECT datname FROM pg_database WHERE datname = %s",
+            (restore_drill.DRILL_DATABASE,),
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+async def test_a_drill_restores_the_newest_backup_and_leaves_nothing(
+    session, monkeypatch, tmp_path
+):
+    from miya.services import restore_drill
+
+    _drill_ready()
+    key, recipient = _key(tmp_path)
+    monkeypatch.setattr(settings, "backup_age_recipient", recipient)
+    monkeypatch.setattr(settings, "backup_dir", str(tmp_path / "backups"))
+    await session.commit()
+    result = await backup.create_backup()
+    assert result.ok, result.error
+    expected = restore_drill.count_rows(settings.database_url)
+
+    drill = await restore_drill.run(identity=key, expected=expected)
+
+    assert drill.ok, drill.error
+    assert drill.counts == expected
+    assert _drill_databases() == []
+
+
+async def test_a_corrupted_backup_fails_the_drill_and_raises_the_problem(
+    monkeypatch, tmp_path
+):
+    from miya.services import health, restore_drill
+
+    _drill_ready()
+    key, _ = _key(tmp_path)
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    monkeypatch.setattr(settings, "backup_dir", str(folder))
+    (folder / f"miya-20260920-033000{backup.BACKUP_SUFFIX}").write_bytes(b"not age")
+
+    drill = await restore_drill.run(identity=key)
+
+    assert drill.ok is False and drill.error
+    assert _drill_databases() == []
+    from tests.test_health import _status
+
+    beat = health.Component(
+        "restore_drill", None, None, drill.detail(), stale=False, disabled=False
+    )
+    keys = [p.key for p in health.problems(_status(restore_drill=beat))]
+    assert "restore_drill_failed" in keys
+
+
+async def test_a_missing_key_skips_the_drill(tmp_path):
+    from miya.services import restore_drill
+
+    drill = await restore_drill.run(identity=tmp_path / "absent.txt")
+
+    assert drill.ok and drill.skipped == "no_key"
+
+
+def test_holat_shows_the_drill_line():
+    from datetime import datetime
+
+    from miya.bot import replies
+    from miya.services import health
+    from tests.test_health import _status
+
+    beat = health.Component(
+        "restore_drill",
+        datetime(2026, 9, 20, 5, 1, tzinfo=settings.tz),
+        None,
+        {"ok": True, "counts": {"debts": 12, "transactions": 340}},
+        stale=False,
+        disabled=False,
+    )
+    line = replies._drill_line(_status(restore_drill=beat))
+    assert line == (
+        "✅ Tiklash sinovi — 20-sen: zaxira ochildi, 12 ta qarz, 340 ta tranzaksiya"
+    )

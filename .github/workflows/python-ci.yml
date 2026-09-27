@@ -55,6 +55,8 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+      - name: Backup tools for the restore drill tests (WP-81)
+        run: sudo apt-get update -q && sudo apt-get install -y -q age postgresql-client-16
       - name: Install (CPU torch first)
         run: |
           pip install --index-url https://download.pytorch.org/whl/cpu torch

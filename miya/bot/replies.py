@@ -2198,6 +2198,25 @@ def _search_line(status: health.Status) -> str:
     )
 
 
+def _drill_line(status: health.Status) -> str | None:
+    """The last weekly restore drill (WP-81); nothing before the first."""
+    drill = getattr(status, "restore_drill", None)
+    if drill is None or drill.last_seen_at is None:
+        return None
+    detail = drill.detail or {}
+    day = short_date(drill.last_seen_at.astimezone(settings.tz).date())
+    if detail.get("skipped"):
+        why = escape(str(detail["skipped"]))
+        return f"⏸ Tiklash sinovi — {day}: o'tkazib yuborildi ({why})"
+    if detail.get("ok") is False:
+        return f"❌ Tiklash sinovi — {day}: muvaffaqiyatsiz"
+    counts = detail.get("counts") or {}
+    return (
+        f"✅ Tiklash sinovi — {day}: zaxira ochildi, {counts.get('debts', 0)} ta qarz, "
+        f"{counts.get('transactions', 0)} ta tranzaksiya"
+    )
+
+
 def _phone_line(status: health.Status) -> str | None:
     """The phone app: last contact, last new event, and any stream it wants
     but cannot use (WP-66).
@@ -2255,6 +2274,7 @@ def status_report(
         _anthropic_line(status),
         _search_line(status),
         *([line] if (line := _phone_line(status)) else []),
+        *([line] if (line := _drill_line(status)) else []),
         "<b>Navbatda</b>: "
         f"kutayotgan suhbatlar {status.windows_pending} · "
         f"batch'da {status.windows_submitted} · "

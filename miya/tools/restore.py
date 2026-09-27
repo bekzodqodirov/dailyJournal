@@ -291,6 +291,17 @@ def restore(
     return EXIT_OK
 
 
+def restore_into(database_url: str, file: Path, identity: Path) -> int:
+    """Load ``file`` into ``database_url`` with no questions asked — for a
+    scratch database such as the weekly drill's (WP-81). Returns an exit
+    code, like the CLI."""
+    try:
+        return restore(file, identity, to=database_url, force=True)
+    except RestoreError as exc:
+        print(str(exc), file=sys.stderr)
+        return exc.code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m miya.tools.restore",

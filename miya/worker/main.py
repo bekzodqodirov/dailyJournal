@@ -89,6 +89,7 @@ from miya.services import (
     recaps,
     reminders,
     reports,
+    restore_drill,
     windows,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -874,6 +875,43 @@ async def backup_job(bot: Bot) -> None:
         return
     if settings.backup_to_telegram:
         await send_backup_to_telegram(bot, result.path, result.size)
+    # What the weekly drill must get back from this file (WP-81).
+    try:
+        counts = await asyncio.to_thread(restore_drill.count_rows, settings.database_url)
+        async with session_scope() as session:
+            await health.beat(
+                session,
+                restore_drill.COUNTS_COMPONENT,
+                detail={"path": str(result.path), "counts": counts},
+            )
+    except Exception:
+        log.exception("could not record the backup's row counts")
+
+
+async def restore_drill_job() -> None:
+    """Weekly: restore the newest backup into a scratch database (WP-81)."""
+    if not settings.restore_drill_enabled:
+        return
+    newest = await backup.newest_backup()
+    expected = None
+    async with session_scope() as session:
+        rows = await health.beats(session)
+        counted = rows.get(restore_drill.COUNTS_COMPONENT)
+        detail = dict(counted.detail or {}) if counted is not None else {}
+        if newest is not None and detail.get("path") == str(newest):
+            expected = detail.get("counts")
+    result = await restore_drill.run(expected=expected)
+    if result.skipped == "no_backup":
+        return
+    async with session_scope() as session:
+        await health.beat(session, restore_drill.COMPONENT, detail=result.detail())
+    log.info(
+        "restore drill: ok=%s skipped=%s %.1fs %s",
+        result.ok,
+        result.skipped,
+        result.seconds,
+        result.error or "",
+    )
 
 
 def _backup_caption(path: Path, size: int, index: int, total: int) -> str:
@@ -1290,6 +1328,19 @@ async def run() -> None:
         retention_job,
         CronTrigger(hour=4, minute=15, timezone=settings.timezone),
         id="retention",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        restore_drill_job,
+        CronTrigger(
+            day_of_week=settings.restore_drill_day,
+            hour=5,
+            minute=0,
+            timezone=settings.timezone,
+        ),
+        id="restore_drill",
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,

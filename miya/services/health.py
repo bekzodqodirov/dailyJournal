@@ -81,6 +81,7 @@ PROBLEM_KEYS = (
     "search_down",
     "phone_silent",
     "phone_stream_off",
+    "restore_drill_failed",
 )
 # The phone app's streams (WP-66), as the heartbeat names them.
 KNOWN_STREAMS = ("call_log", "sms", "recordings", "notifications")
@@ -252,6 +253,8 @@ class Status:
     # hourly heartbeat with what it wants and what it is allowed.
     phone_seen: Component | None = None
     phone_app: Component | None = None
+    # WP-81: the last weekly restore drill.
+    restore_drill: Component | None = None
     # Money texts waiting in /tekshir's money block (WP-14): shown, never
     # counted into the backlog alarm — they are the owner's call, not a fault.
     money_review: int = 0
@@ -495,6 +498,11 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         phone_app=(
             component_of("phone_app", rows["phone_app"], now=now)
             if "phone_app" in rows
+            else None
+        ),
+        restore_drill=(
+            component_of("restore_drill", rows["restore_drill"], now=now)
+            if "restore_drill" in rows
             else None
         ),
         jobs={
@@ -822,6 +830,19 @@ def problems(status: Status) -> list[Problem]:
                 "o'shani tuzat (batareya cheklovi, avtostart, internet yoki Tailscale).",
             )
         )
+    drill = status.restore_drill
+    if drill is not None and (drill.detail or {}).get("ok") is False:
+        error = str((drill.detail or {}).get("error") or "?")[:200]
+        found.append(
+            Problem(
+                "restore_drill_failed",
+                "warning",
+                "⚠️ Haftalik tiklash sinovi muvaffaqiyatsiz: "
+                f"<code>{escape(error)}</code>. "
+                "Zaxira nusxani ochib bo'lmasligi mumkin — serverda "
+                "<code>make restore FILE=… DRY=1</code> bilan tekshir.",
+            )
+        )
     revoked, _never = phone_streams(status)
     if revoked:
         names = ", ".join(STREAM_LABEL[key] for key in revoked)
@@ -932,6 +953,7 @@ _RECOVERY = {
     "search_down": "✅ Qidiruv yana ishlayapti — tiklandi",
     "phone_silent": "✅ Telefon ilovasi yana aloqada — tiklandi",
     "phone_stream_off": "✅ Telefondagi ruxsatlar yana joyida — tiklandi",
+    "restore_drill_failed": "✅ Tiklash sinovi yana muvaffaqiyatli — tiklandi",
     "spend_high": "✅ API xarajati yana chegara ichida — tiklandi",
     "worker_silent": "✅ Rejalashtiruvchi (worker) qayta ishlayapti — tiklandi",
     "userbot_silent": "✅ Telegram o'quvchi qayta ulandi — tiklandi",

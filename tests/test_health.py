@@ -439,6 +439,11 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         "api_restarting": _status(api_starts_last_hour=3),
         "search_down": _status(embed_backlog=1, embed_oldest_at=NOW - timedelta(hours=2)),
         "phone_silent": _status(phone_seen=_phone("phone_seen", hours=5)),
+        "restore_drill_failed": _status(
+            restore_drill=health.Component(
+                "restore_drill", NOW, None, {"ok": False, "error": "x"}, False, False
+            )
+        ),
         "phone_stream_off": _status(
             phone_app=_phone(
                 "phone_app",

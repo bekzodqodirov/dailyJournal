@@ -350,6 +350,11 @@ class Settings(BaseSettings):
     # than writing an unencrypted dump of every debt and transcript to disk.
     backup_age_recipient: str = ""
     backup_time: str = "03:30"
+    # WP-81: every week the newest backup is restored into a scratch
+    # database and its row counts compared; the key must be on the server.
+    restore_drill_enabled: bool = True
+    restore_drill_day: str = "sun"
+    backup_identity_path: str = "/app/secrets/backup-key.txt"
     # The nightly file also goes to the owner's Telegram (his decision, build
     # step 5) — the VPS disk is not the only copy. It is still age-encrypted;
     # Telegram only ever sees ciphertext.
