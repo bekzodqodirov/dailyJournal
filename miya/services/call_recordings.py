@@ -50,6 +50,7 @@ from miya.services.people import find_by_phone, resolve_person
 log = logging.getLogger(__name__)
 
 AUDIO_SUFFIXES = {".m4a", ".mp3", ".amr", ".wav", ".3ga", ".ogg", ".aac", ".opus"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm", ".mkv"}
 
 # Syncthing writes into hidden temp files before renaming; never touch them.
 _SYNC_TEMP_MARKERS = ("~syncthing~", ".syncthing.", ".tmp", ".part")
@@ -578,7 +579,11 @@ def _duplicate_paths_stmt() -> sa.Select:
 
 
 async def _ingested_audio_paths(session: AsyncSession) -> set[str]:
-    """Every audio path the database has a row for (any source)."""
+    return await _ingested_media_paths(session)
+
+
+async def _ingested_media_paths(session: AsyncSession) -> set[str]:
+    """Every media path the database has a row for (any source)."""
     rows = await session.execute(
         sa.select(
             Interaction.media["path"].astext,
@@ -633,3 +638,60 @@ async def purge_old_audio(session: AsyncSession, *, now: datetime | None = None)
             settings.audio_retention_days,
         )
     return deleted
+
+
+async def purge_old_media(session: AsyncSession, *, now: datetime | None = None) -> int:
+    """Delete photos, documents and videos past MEDIA_/VIDEO_RETENTION_DAYS
+    from the bot and userbot media folder (WP-79); 0 keeps a class forever.
+
+    Files only: the interaction's text, transcript and description stay,
+    and the row is stamped media.purged_at. Audio is purge_old_audio's;
+    a file never ingested, or still the only copy of unreviewed input,
+    and anything half-written are left alone."""
+    media_days = settings.media_retention_days
+    video_days = settings.video_retention_days
+    if media_days <= 0 and video_days <= 0:
+        return 0
+    now = now or datetime.now(settings.tz)
+    now_ts = now.timestamp()
+    protected = await protected_audio_paths(session)
+    ingested = await _ingested_media_paths(session)
+    recordings = Path(settings.call_recordings_dir).resolve()
+    root = settings.media_dir
+    if not root.is_dir():
+        return 0
+    gone: list[str] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if recordings in path.resolve().parents:
+            continue
+        suffix = path.suffix.lower()
+        if suffix in AUDIO_SUFFIXES or any(m in path.name for m in _SYNC_TEMP_MARKERS):
+            continue
+        days = video_days if suffix in VIDEO_SUFFIXES else media_days
+        if days <= 0:
+            continue
+        if str(path) in protected or str(path) not in ingested:
+            continue
+        try:
+            if path.stat().st_mtime < now_ts - days * 86400:
+                path.unlink()
+                gone.append(str(path))
+        except OSError:
+            log.warning("could not delete expired media %s", path)
+    if gone:
+        stamp = now.isoformat()
+        rows = await session.scalars(
+            sa.select(Interaction).where(
+                sa.or_(
+                    Interaction.media["path"].astext.in_(gone),
+                    Interaction.media["audio_path"].astext.in_(gone),
+                )
+            )
+        )
+        for row in rows:
+            row.media = {**(row.media or {}), "purged_at": stamp}
+        await session.flush()
+        log.info("retention: deleted %d photo/document/video file(s)", len(gone))
+    return len(gone)

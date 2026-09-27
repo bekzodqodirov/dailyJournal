@@ -92,6 +92,11 @@ STREAM_LABEL = {
 }
 # reminder_log kind the api writes once per start (WP-26).
 API_START_KIND = "api_start"
+# WP-79: a full disk points at the switch that would free it.
+DISK_RETENTION_HINT = (
+    " Eski videolarni avtomatik o'chirish uchun .env'da VIDEO_RETENTION_DAYS=30 "
+    "(va xohlasangiz MEDIA_RETENTION_DAYS=365) qo'ying — matnlar baribir saqlanadi."
+)
 # Flagged inputs pile up quietly; past this many the pile is itself a fault.
 REVIEW_BACKLOG_THRESHOLD = 20
 # No successful Anthropic call for this long while windows wait = failing.
@@ -644,7 +649,13 @@ def problems(status: Status) -> list[Problem]:
                 f"❌ Diskda joy kam: {escape(size_label(status.disk_free_bytes))} bo'sh "
                 f"(chegara {settings.disk_min_free_gb:g} GB). To'lsa hamma narsa "
                 "to'xtaydi. Serverda: <code>docker system prune</code>, eski "
-                "zaxiralarni va <code>/data/call_recordings</code>'ni tekshir.",
+                "zaxiralarni va <code>/data/call_recordings</code>'ni tekshir."
+                + (
+                    DISK_RETENTION_HINT
+                    if not settings.media_retention_days
+                    and not settings.video_retention_days
+                    else ""
+                ),
             )
         )
     if not status.db_ok:

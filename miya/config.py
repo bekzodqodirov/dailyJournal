@@ -228,6 +228,11 @@ class Settings(BaseSettings):
     # --- Call recordings ----------------------------------------------------
     call_recordings_dir: str = "/data/call_recordings"
     audio_retention_days: int = 90
+    # WP-79: photos and documents (MEDIA) and videos, including a video
+    # note's .mp4 (VIDEO), are deleted after this many days once ingested;
+    # 0 keeps them forever (the default — the owner decides). Text is kept.
+    media_retention_days: int = Field(default=0, ge=0)
+    video_retention_days: int = Field(default=0, ge=0)
 
     # --- Phone events (call log, SMS) ---------------------------------------
     # A missed call becomes an open loop only after this many minutes — a

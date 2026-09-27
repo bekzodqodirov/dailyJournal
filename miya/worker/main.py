@@ -221,7 +221,9 @@ async def call_scan_job(bot: Bot) -> None:
 
 async def retention_job() -> None:
     async with session_scope() as session:
-        await call_recordings.purge_old_audio(session)
+        audio = await call_recordings.purge_old_audio(session)
+        media = await call_recordings.purge_old_media(session)
+    log.info("retention: %d audio, %d other media file(s) deleted", audio, media)
 
 
 EMBED_JOB_SECONDS = 20

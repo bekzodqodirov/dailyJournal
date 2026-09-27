@@ -314,6 +314,10 @@ row, so a broken file is not retried (and re-billed) every minute. The nightly
 retention job (04:15) deletes audio older than `AUDIO_RETENTION_DAYS` from both
 the recordings share and the bot-media folder — interactions and transcripts
 outlive the audio.
+With `MEDIA_RETENTION_DAYS` / `VIDEO_RETENTION_DAYS` above 0 (both default to 0,
+keep forever) the same job also deletes photos, documents and videos — a video
+note's `.mp4` included — that many days after they were read; the extracted
+text always stays, and the row is stamped `media.purged_at`.
 
 ---
 
