@@ -736,3 +736,83 @@ async def test_a_failed_db_beat_sends_no_ping(monkeypatch):
     with pytest.raises(RuntimeError):
         await worker.heartbeat_job(None)
     assert pinged == []
+
+
+# --- one message per sweep (WP-80) ---------------------------------------------
+
+
+def _three_warnings() -> health.Status:
+    components = _healthy_components()
+    components["worker"] = health.component_of("worker", None, now=NOW)
+    return _status(
+        components=components,
+        needs_review=health.REVIEW_BACKLOG_THRESHOLD,
+        api_starts_last_hour=3,
+    )
+
+
+async def test_three_warnings_are_one_message_and_three_ledger_rows(session, monkeypatch):
+    _serve(monkeypatch, _three_warnings())
+    _quiet(monkeypatch, False)
+    bot = _Bot()
+
+    await worker.health_job(bot)
+
+    [text] = bot.sent
+    assert text.startswith(health.BUNDLE_HEADER.format(n=3))
+    assert "Rejalashtiruvchi" in text
+    for key in ("worker_silent", "review_backlog", "api_restarting"):
+        assert len(await _ledger(session, f"alert:{key}")) == 1
+
+
+async def test_a_critical_problem_goes_alone_beside_the_bundle(session, monkeypatch):
+    components = _healthy_components()
+    components["worker"] = health.component_of("worker", None, now=NOW)
+    _serve(
+        monkeypatch,
+        _status(components=components, disk_low=True, api_starts_last_hour=3),
+    )
+    _quiet(monkeypatch, False)
+    bot = _Bot()
+
+    await worker.health_job(bot)
+
+    assert len(bot.sent) == 2
+    assert "Diskda joy kam" in bot.sent[0]
+    assert bot.sent[1].startswith(health.BUNDLE_HEADER.format(n=2))
+
+
+async def test_a_failed_bundle_marks_nothing(session, monkeypatch):
+    _serve(monkeypatch, _three_warnings())
+    _quiet(monkeypatch, False)
+
+    await worker.health_job(_Bot(reachable=False))
+
+    for key in ("worker_silent", "review_backlog", "api_restarting"):
+        assert await _ledger(session, f"alert:{key}") == []
+
+
+async def test_two_recoveries_are_one_message(session, monkeypatch):
+    _quiet(monkeypatch, False)
+    bot = _Bot()
+    components = _healthy_components()
+    components["worker"] = health.component_of("worker", None, now=NOW)
+    _serve(monkeypatch, _status(components=components, api_starts_last_hour=3))
+    await worker.health_job(bot)
+
+    _serve(monkeypatch, _status())
+    await worker.health_job(bot)
+
+    assert len(bot.sent) == 2
+    assert bot.sent[1].count("tiklandi") == 2
+
+
+def test_the_brief_carries_the_system_line():
+    from miya.bot import replies
+    from miya.services.brief import MorningBrief
+
+    ok = replies.morning_brief_parts(MorningBrief(now=NOW, system_problems=0))
+    bad = replies.morning_brief_parts(MorningBrief(now=NOW, system_problems=2))
+
+    assert health.BRIEF_OK in ok[-1]
+    assert health.BRIEF_PROBLEMS.format(n=2) in bad[-1]

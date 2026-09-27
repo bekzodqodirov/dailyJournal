@@ -13,6 +13,7 @@ Rendering is replies.morning_brief; this module only gathers.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -26,6 +27,8 @@ from miya.services.loops import OpenLoops
 
 # The reminder_log kind the morning brief is logged under, one row per day.
 BRIEF_KIND = "brief"
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -46,6 +49,8 @@ class MorningBrief:
     code_suggestions: int = 0
     # File questions that expired in the last 24 h (WP-46): a count line.
     media_expired: int = 0
+    # Open /holat problems (WP-80): one "🩺 Tizim" line; None when unknown.
+    system_problems: int | None = None
 
     @property
     def day(self) -> date:
@@ -72,4 +77,17 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         money_review=await queries.money_review_count(session),
         code_suggestions=await codes.pending_suggestion_count(session),
         media_expired=await approvals.expired_since(session, now - timedelta(hours=24)),
+        system_problems=await _system_problems(session, now),
     )
+
+
+async def _system_problems(session: AsyncSession, now: datetime) -> int | None:
+    """How many /holat problems are open; None when the check itself fails,
+    so the brief is never lost to it."""
+    from miya.services import health
+
+    try:
+        return len(health.problems(await health.gather(session, now=now)))
+    except Exception:
+        log.warning("the brief's system line failed", exc_info=True)
+        return None

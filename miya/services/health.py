@@ -92,6 +92,10 @@ STREAM_LABEL = {
 }
 # reminder_log kind the api writes once per start (WP-26).
 API_START_KIND = "api_start"
+# WP-80: the non-critical problems of one sweep go out as one message.
+BUNDLE_HEADER = "🩺 <b>MIYA holati</b> — {n} ta muammo:"
+BRIEF_OK = "🩺 Tizim: hammasi joyida"
+BRIEF_PROBLEMS = "🩺 Tizim: {n} ta muammo — /holat"
 # WP-79: a full disk points at the switch that would free it.
 DISK_RETENTION_HINT = (
     " Eski videolarni avtomatik o'chirish uchun .env'da VIDEO_RETENTION_DAYS=30 "

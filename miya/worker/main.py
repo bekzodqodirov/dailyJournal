@@ -1069,21 +1069,38 @@ async def _alert_from_ledger(
 ) -> None:
     quiet = reminders.in_quiet_hours(now)
     due, recovered = await health.alerts_due(session, found, now=now)
+    # Critical problems stand alone; everything else of one sweep is one
+    # message (WP-80) — a bad night is one ping, not six.
+    bundle = []
     for problem in due:
-        if problem.severity != "critical" and quiet:
-            continue
-        if await notify(bot, problem.text):
-            health.mark_alerted(session, [problem.key], now=now)
-            # Committed one by one: a crash mid-sweep repeats at most one.
+        if problem.severity == "critical":
+            if await notify(bot, problem.text):
+                health.mark_alerted(session, [problem.key], now=now)
+                # Committed one by one: a crash mid-sweep repeats at most one.
+                await session.commit()
+        elif not quiet:
+            bundle.append(problem)
+    if bundle:
+        text = (
+            bundle[0].text
+            if len(bundle) == 1
+            else clip(
+                health.BUNDLE_HEADER.format(n=len(bundle))
+                + "\n\n"
+                + "\n\n".join(p.text for p in bundle)
+            )
+        )
+        if await notify(bot, text):
+            health.mark_alerted(session, [p.key for p in bundle], now=now)
             await session.commit()
-    if quiet:
+    if quiet or not recovered:
         return
-    for key in recovered:
-        # Includes worker_silent, raised by the bot's watchdog: this job
-        # running again is the proof, so the worker alone announces it.
-        if await notify(bot, health.recovery_text(key)):
-            health.mark_recovered(session, [key], now=now)
-            await session.commit()
+    # Includes worker_silent, raised by the bot's watchdog: this job running
+    # again is the proof, so the worker alone announces it.
+    text = "\n".join(health.recovery_text(key) for key in recovered)
+    if await notify(bot, text):
+        health.mark_recovered(session, list(recovered), now=now)
+        await session.commit()
 
 
 async def _alert_without_ledger(

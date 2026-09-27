@@ -1808,8 +1808,9 @@ def visible_refs(parts: list[str], refs: list[tuple[str, int]]) -> list[tuple[st
 def _morning_brief_text(brief: MorningBrief) -> str:
     """The one morning message. Deterministic — SQL and the loops engine."""
     parts = [f"{BRIEF_HEADER} · {full_date(brief.day)}"]
+    system = _brief_system_line(brief)
     if brief.is_empty():
-        return "\n\n".join([*parts, BRIEF_ALL_CLEAR])
+        return "\n\n".join([*parts, BRIEF_ALL_CLEAR, *([system] if system else [])])
 
     if brief.events:
         lines = [
@@ -1861,8 +1862,18 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     line = queue_line(getattr(brief, "queue", None))
     if line:
         parts.append(line)
+    if system:
+        parts.append(system)
 
     return "\n\n".join(parts)
+
+
+def _brief_system_line(brief: MorningBrief) -> str | None:
+    """One line on MIYA itself (WP-80); the evening footer names the rest."""
+    count = getattr(brief, "system_problems", None)
+    if count is None:
+        return None
+    return health.BRIEF_PROBLEMS.format(n=count) if count else health.BRIEF_OK
 
 
 def morning_brief_refs(
