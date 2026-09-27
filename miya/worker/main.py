@@ -581,6 +581,7 @@ async def question_job(bot: Bot, *, now: datetime | None = None) -> None:
         await session.commit()
         if any(resolved.values()):
             log.info("questions resolved without asking: %s", resolved)
+        await refresh_question_messages(bot, session, now=now)
         pending = await questions.collect(session, now=now, for_push=True)
         if not pending:
             return
@@ -603,6 +604,27 @@ async def question_job(bot: Bot, *, now: datetime | None = None) -> None:
             now=now,
         )
     log.info("asked %d question(s), %d waiting", shown, len(pending) - len(picked))
+
+
+async def refresh_question_messages(bot: Bot, session, *, now: datetime) -> int:
+    """Take the buttons of answered or auto-resolved items off today's
+    earlier batches (WP-83). A message that cannot be edited is skipped."""
+    since = datetime.combine(now.date(), time.min, tzinfo=settings.tz)
+    edited = 0
+    for sent in await questions.batches_to_refresh(session, since=since, now=now):
+        markup = keyboards.question_batch_rows(sent.rows)
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=settings.owner_telegram_id,
+                message_id=sent.tg_message_id,
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            if "not modified" not in str(exc).lower():
+                log.info("could not refresh batch %s: %s", sent.tg_message_id, exc)
+        questions.mark_refreshed(sent)
+        edited += 1
+    return edited
 
 
 async def _prune_job_heartbeats(session, registered: list[str]) -> int:

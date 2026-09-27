@@ -486,3 +486,62 @@ async def auto_resolved_since(session: AsyncSession, since: datetime) -> AutoRes
         )
     )
     return AutoResolved(claims=closed, groups=groups, media=media)
+
+
+# --- keeping sent batches current (WP-83) -----------------------------------------
+
+# What each batch message was last refreshed to, in this process: an edit is
+# sent only when the still-open set changes (a restart costs one extra edit).
+_REFRESHED: dict[int, tuple[str, ...]] = {}
+
+
+@dataclass(slots=True)
+class BatchRefresh:
+    tg_message_id: int
+    # (original number, still-open item) — numbers never shift.
+    rows: list[tuple[int, Pending]]
+
+
+async def batches_to_refresh(
+    session: AsyncSession, *, since: datetime, now: datetime | None = None
+) -> list[BatchRefresh]:
+    """Pushed batches since ``since`` whose items were answered or resolved
+    elsewhere: each with the rows that are still open, under their numbers."""
+    logged = list(
+        await session.scalars(
+            sa.select(QuestionLog)
+            .where(
+                QuestionLog.sent_at >= since,
+                QuestionLog.tg_message_id.is_not(None),
+                QuestionLog.kind != KIND_GROUPS,
+            )
+            .order_by(QuestionLog.tg_message_id, QuestionLog.id)
+        )
+    )
+    if not logged:
+        return []
+    open_now = {
+        (p.kind, p.ref): p for p in await collect(session, now=now, for_push=False)
+    }
+    by_message: dict[int, list[QuestionLog]] = {}
+    for row in logged:
+        by_message.setdefault(row.tg_message_id, []).append(row)
+    out = []
+    for message_id, rows in by_message.items():
+        kept = [
+            (number, open_now[(row.kind, row.ref)])
+            for number, row in enumerate(rows, 1)
+            if (row.kind, row.ref) in open_now
+        ]
+        key = tuple(f"{p.kind}:{p.ref}" for _, p in kept)
+        previous = _REFRESHED.get(message_id)
+        if previous is None and len(kept) == len(rows):
+            continue  # nothing answered since it was sent
+        if previous == key:
+            continue  # already edited to this
+        out.append(BatchRefresh(tg_message_id=message_id, rows=kept))
+    return out
+
+
+def mark_refreshed(batch: BatchRefresh) -> None:
+    _REFRESHED[batch.tg_message_id] = tuple(f"{p.kind}:{p.ref}" for _, p in batch.rows)

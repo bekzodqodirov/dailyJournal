@@ -762,6 +762,13 @@ def question_item_row(item, number: int) -> list[InlineKeyboardButton]:
     return question_row(kind, record_id, labelled=False, number=number)
 
 
+def question_batch_rows(numbered) -> InlineKeyboardMarkup | None:
+    """A sent batch rebuilt with only what is still open (WP-83); every
+    row keeps the number it was sent with."""
+    rows = [question_item_row(item, number) for number, item in numbered][:MAX_ROWS]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
 def question_batch(items) -> InlineKeyboardMarkup | None:
     rows = [question_item_row(item, n) for n, item in enumerate(items, 1)]
     rows = rows[:MAX_ROWS]
