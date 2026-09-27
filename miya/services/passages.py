@@ -11,6 +11,7 @@ words changed.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
 
 import sqlalchemy as sa
@@ -110,6 +111,45 @@ def attribution(
     if source in OWNER_SOURCES:
         return None, None, True
     return None, interaction.person_id, False
+
+
+_TURN = re.compile(r"^\[(\d+)-ovoz\]\s*(.*)$")
+
+
+def _turns(text: str) -> list[tuple[int, str]] | None:
+    """A diarised call transcript as (speaker, words) turns (WP-85); None
+    when the text is not one."""
+    turns = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _TURN.match(line.strip())
+        if match is None:
+            return None
+        turns.append((int(match.group(1)), line.strip()))
+    return turns or None
+
+
+def _pieces(interaction: Interaction) -> list[tuple[str, int | None]]:
+    """Chunks to index, with the speaker a call turn belongs to: a diarised
+    call is chunked on its speaker turns, so a hit cites the very turn."""
+    text = full_text(interaction)
+    turns = (
+        _turns(interaction.transcript or "")
+        if interaction.source is InteractionSource.phone_call
+        else None
+    )
+    if not turns:
+        return [(body, None) for body in chunk(text)]
+    # The call's own context line ("qo'ng'iroq ← Akmal") stays searchable.
+    pieces: list[tuple[str, int | None]] = (
+        [(interaction.raw_text.strip(), None)]
+        if (interaction.raw_text or "").strip()
+        else []
+    )
+    for speaker, line in turns:
+        pieces.extend((body, speaker) for body in chunk(line))
+    return pieces
 
 
 def _line(who: str, text: str) -> str:
@@ -221,8 +261,9 @@ async def index_pending(session: AsyncSession, *, limit: int | None = None) -> i
         where = titles.get(interaction.tg_chat_id) or interaction.source.value
         who = _who(interaction, names)
         context = await _context(session, interaction, names)
-        for number, body in enumerate(chunk(full_text(interaction))):
-            embed_text = "\n".join([*context, f"{where}: {who}: {body}"])
+        for number, (body, voice) in enumerate(_pieces(interaction)):
+            label = f"qo'ng'iroq · {voice}-ovoz" if voice else who
+            embed_text = "\n".join([*context, f"{where}: {label}: {body}"])
             session.add(
                 Passage(
                     interaction_id=interaction.id,

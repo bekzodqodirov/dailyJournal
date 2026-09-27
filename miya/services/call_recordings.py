@@ -464,6 +464,7 @@ async def ingest_recording(
         path,
         language_hint=parsed.language,
         duration_hint=parsed.duration_seconds,
+        diarize=settings.transcribe_diarize_calls,
     )
     if text is None:
         # needs_review is already set; the hash row keeps the scan from

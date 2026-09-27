@@ -151,6 +151,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `TRANSCRIBER` | `elevenlabs`; a local Whisper backend can be swapped in later |
 | `ASSISTANT_BOT_TOKEN`, `OWNER_TELEGRAM_ID` | The bot rejects every other user |
 | `USERBOT_ENABLED` | One-flag kill switch for the passive Telegram reader |
+| `TRANSCRIBE_DIARIZE_CALLS` | `false` — ask Scribe for speaker turns on call recordings, so transcripts read `[1-ovoz] …` / `[2-ovoz] …` and search cites the turn; unverified on Uzbek phone audio, and the price must be checked first |
 | `RESTORE_DRILL_ENABLED`, `RESTORE_DRILL_DAY` | `true` / `sun` — every week at 05:00 the newest backup is restored into a scratch database, its row counts compared with those at dump time, and the database dropped; a failure is a /holat problem |
 | `PHONE_SILENT_HOURS` | 4 — warn when the phone app has not contacted the server for this many awake hours (quiet hours not counted); it also warns when a permission it once had is revoked; 0 = off |
 | `OWNER_ALIAS_NAMESAKE_DAYS` | 90 — in a group where another member with the owner's first name spoke this recently, a bare first name is only "maybe to you" |

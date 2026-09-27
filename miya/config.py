@@ -228,6 +228,9 @@ class Settings(BaseSettings):
     # --- Call recordings ----------------------------------------------------
     call_recordings_dir: str = "/data/call_recordings"
     audio_retention_days: int = 90
+    # WP-85: ask Scribe who spoke when, for call recordings only; transcripts
+    # then read "[1-ovoz] …" / "[2-ovoz] …". Check the price first.
+    transcribe_diarize_calls: bool = False
     # WP-79: photos and documents (MEDIA) and videos, including a video
     # note's .mp4 (VIDEO), are deleted after this many days once ingested;
     # 0 keeps them forever (the default — the owner decides). Text is kept.

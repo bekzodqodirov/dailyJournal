@@ -86,6 +86,7 @@ async def transcribe_into(
     *,
     language_hint: str | None = None,
     duration_hint: float | None = None,
+    diarize: bool = False,
 ) -> str | None:
     """Transcribe audio onto the interaction. Returns the text, or None on failure.
 
@@ -99,7 +100,12 @@ async def transcribe_into(
     """
     transcriber = get_transcriber()
     try:
-        transcript = await transcriber.transcribe(audio_path, language_hint=language_hint)
+        # Speaker turns only when asked (call recordings, WP-85); the option
+        # is not passed otherwise, so a transcriber without it still works.
+        options = {"diarize": True} if diarize else {}
+        transcript = await transcriber.transcribe(
+            audio_path, language_hint=language_hint, **options
+        )
     except TranscriptionError as exc:
         log.error("transcription failed for interaction %s: %s", interaction.id, exc)
         interaction.needs_review = True
