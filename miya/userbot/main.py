@@ -51,7 +51,7 @@ from miya.services import (
 )
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
-from miya.services.ingest import create_interaction
+from miya.services.ingest import apply_vision, create_interaction
 from miya.services.media_policy import (
     MediaKind,
     MediaPlan,
@@ -65,7 +65,7 @@ from miya.services.text import (  # noqa: F401 - transliterate is re-exported
     transliterate,
 )
 from miya.services.transcription import TranscriptionError, get_transcriber
-from miya.services.vision import describe_image
+from miya.services.vision import read_image
 
 log = logging.getLogger(__name__)
 
@@ -154,7 +154,7 @@ class MediaOutcome:
     path: Path | None = None
     audio_path: Path | None = None
     transcript: object | None = None  # Transcript
-    vision: object | None = None  # VisionResult
+    vision: object | None = None  # VisionReading
     document: object | None = None  # DocumentText
     skip_reason: str | None = None
     failed: bool = False  # download or conversion failed; needs the owner's eye
@@ -213,7 +213,15 @@ async def fetch_media(
         return outcome
 
     if plan.vision:
-        outcome.vision = await describe_image(path)
+        if not sniffed.readable:
+            # Not an image whatever its name says (JV-04): never sent to vision.
+            outcome.skip_reason = media_policy.SKIP_MISMATCH
+            outcome.failed = True
+            return outcome
+        sent_at = getattr(message, "date", None)
+        outcome.vision = await read_image(
+            path, now=sent_at.astimezone(settings.tz) if sent_at else None
+        )
         return outcome
 
     if plan.read_document:
@@ -332,22 +340,9 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
         await _recheck_to_me(session, interaction)
 
     if outcome.vision is not None:
-        if outcome.vision.usage is not None:
-            await usage_service.record_anthropic_usage(
-                session,
-                model=outcome.vision.model,
-                operation="vision",
-                usage=outcome.vision.usage,
-                source_interaction_id=interaction.id,
-            )
-        if outcome.vision.error:
-            log.warning("vision failed for message: %s", outcome.vision.error)
-            interaction.needs_review = True
-        else:
-            interaction.meta = {
-                **(interaction.meta or {}),
-                "vision": outcome.vision.text,
-            }
+        # The description for the extractor and, for a payment receipt, its
+        # receipts row; the card goes out from the worker (JV-04).
+        await apply_vision(session, interaction, outcome.vision, presume_receipt=False)
 
     if outcome.document is not None:
         interaction.transcript = outcome.document.text

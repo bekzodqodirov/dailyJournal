@@ -661,6 +661,7 @@ def _fk_columns():
         ("windows", m.ConversationWindow, m.ConversationWindow.person_id),
         ("memories", m.Memory, m.Memory.person_id),
         ("claims", m.Claim, m.Claim.person_id),
+        ("receipts", m.Receipt, m.Receipt.person_id),
         ("codes", m.ClientCode, m.ClientCode.person_id),
         ("passages", m.Passage, m.Passage.speaker_person_id),
         ("passages_chat", m.Passage, m.Passage.chat_person_id),

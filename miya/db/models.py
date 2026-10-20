@@ -980,6 +980,7 @@ __all__ = [
     "Promise",
     "QuestionLog",
     "RecapDigest",
+    "Receipt",
     "ReminderLog",
     "Task",
     "Transaction",
@@ -1129,4 +1130,147 @@ class RecapDigest(Base):
         ),
         sa.Index("ix_recap_digests_date_end", "digest_date", "window_end"),
         sa.Index("ix_recap_digests_person", "person_id"),
+    )
+
+
+# The values the receipts CHECKs allow (JV-04, 0023). The migration keeps its
+# own frozen copy; tests/test_receipts_read.py holds the two equal.
+RECEIPT_DIRECTIONS = ("in", "out", "unknown")
+RECEIPT_STATES = ("read", "needs_review", "rejected")
+RECEIPT_VERDICTS = (
+    "waiting",
+    "confirmed",
+    "unconfirmed",
+    "suspicious",
+    "owner_ok",
+    "owner_fake",
+)
+RECEIPT_REASONS = (
+    "duplicate_image",
+    "duplicate_reference",
+    "stale_date",
+    "future_date",
+    "own_card_no_bank",
+    "amount_near_miss",
+)
+
+
+def _sql_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+class Receipt(Base):
+    """A payment receipt read from an image (JV-04, 0023): a Payme or bank-app
+    screenshot, a terminal check, sent to the bot or into a chat.
+
+    What the image says, never the bank's record: nothing here books money.
+    ``reading`` is the model's structured answer kept for audit only; the
+    columns are the parsed, checked values. ``verdict`` is the bank
+    cross-check (JV-05), ``waiting`` until then.
+    """
+
+    __tablename__ = "receipts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    # Who sent it: the chat's counterparty; NULL for the owner's own photo.
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    # Money to the owner (in), from the owner (out), or not known (unknown).
+    direction: Mapped[str] = mapped_column(
+        sa.String(8), nullable=False, server_default="unknown"
+    )
+    amount: Mapped[Decimal | None] = money_column()
+    currency: Mapped[e.Currency | None] = mapped_column(CURRENCY)
+    # The date and time printed on the receipt, on the owner's clock.
+    paid_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    payer_name: Mapped[str | None] = mapped_column(sa.Text)
+    payee_name: Mapped[str | None] = mapped_column(sa.Text)
+    # The bank or the payment app that issued it.
+    issuer: Mapped[str | None] = mapped_column(sa.Text)
+    reference: Mapped[str | None] = mapped_column(sa.Text)
+    payer_card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    payee_card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    image_sha256: Mapped[str | None] = mapped_column(sa.CHAR(64))
+    reading: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    # read | needs_review | rejected
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    verdict: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="waiting"
+    )
+    verdict_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    # The bank row that confirms it (JV-05), and the claim it backs.
+    transaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("transactions.id", ondelete="SET NULL")
+    )
+    claim_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("claims.id", ondelete="SET NULL")
+    )
+    # The owner's receipt card: when it went out and which message it is.
+    notified_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    notice_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    verdict_notified_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"direction IN ({_sql_list(RECEIPT_DIRECTIONS)})",
+            name="ck_receipts_direction",
+        ),
+        sa.CheckConstraint("amount > 0", name="ck_receipts_amount_positive"),
+        sa.CheckConstraint(
+            "(amount IS NULL) = (currency IS NULL)", name="ck_receipts_amount_currency"
+        ),
+        sa.CheckConstraint(
+            "payer_card_last4 IS NULL OR payer_card_last4 ~ '^[0-9]{4}$'",
+            name="ck_receipts_payer_card_last4",
+        ),
+        sa.CheckConstraint(
+            "payee_card_last4 IS NULL OR payee_card_last4 ~ '^[0-9]{4}$'",
+            name="ck_receipts_payee_card_last4",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(RECEIPT_STATES)})", name="ck_receipts_state"
+        ),
+        sa.CheckConstraint(
+            f"verdict IN ({_sql_list(RECEIPT_VERDICTS)})", name="ck_receipts_verdict"
+        ),
+        sa.CheckConstraint(
+            f"verdict_reasons <@ ARRAY[{_sql_list(RECEIPT_REASONS)}]::text[]",
+            name="ck_receipts_verdict_reasons",
+        ),
+        sa.Index("ux_receipts_interaction", "interaction_id", unique=True),
+        sa.Index("ix_receipts_person", "person_id"),
+        sa.Index("ix_receipts_image_sha256", "image_sha256"),
+        sa.Index(
+            "ux_receipts_transaction",
+            "transaction_id",
+            unique=True,
+            postgresql_where=sa.text("transaction_id IS NOT NULL"),
+        ),
+        sa.Index("ix_receipts_claim", "claim_id"),
+        sa.Index(
+            "ix_receipts_waiting",
+            "created_at",
+            postgresql_where=sa.text("verdict = 'waiting'"),
+        ),
+        sa.Index(
+            "ix_receipts_reference",
+            "issuer",
+            "reference",
+            postgresql_where=sa.text("reference IS NOT NULL"),
+        ),
     )

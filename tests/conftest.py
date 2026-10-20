@@ -79,6 +79,8 @@ async def _truncate(session) -> None:
     # references the table, so it goes first, ahead of the ledger below.
     await session.execute(sa.delete(m.Heartbeat))
     for model in (
+        # Receipts reference interactions, people, transactions and claims.
+        m.Receipt,
         # Claims reference interactions and people, so they go before both.
         m.QuestionLog,
         m.Claim,

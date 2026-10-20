@@ -38,6 +38,7 @@ from miya.db.models import (
     Person,
     Promise,
     RecapDigest,
+    Receipt,
     Task,
     Transaction,
 )
@@ -85,6 +86,9 @@ class PurgePlan:
     # kept payments, and other people's profiles that mention them.
     memory_ids: list[int] = field(default_factory=list)
     claim_ids: list[int] = field(default_factory=list)
+    # Receipts read from their images or naming them (JV-04): the printed
+    # names and cards go, and the reading mirrored on a kept message too.
+    receipt_ids: list[int] = field(default_factory=list)
     rerender_window_ids: list[int] = field(default_factory=list)
     scrub_transaction_ids: list[int] = field(default_factory=list)
     profile_stale_person_ids: list[int] = field(default_factory=list)
@@ -140,6 +144,7 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
         "events": await _count(session, Event, Event.source_interaction_id, ids),
         "tasks": await _count(session, Task, Task.source_interaction_id, ids),
         "memories": await _count(session, Memory, Memory.source_interaction_id, ids),
+        "receipts": await _count(session, Receipt, Receipt.interaction_id, ids),
     }
 
     if ids:
@@ -285,6 +290,30 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
             claim_ids.append(claim.id)
     plan.claim_ids = sorted(claim_ids)
 
+    # (c2) receipts: from their messages, sent by them, or with their name
+    # printed on them as payer or payee.
+    receipt_ids = set(
+        await session.scalars(sa.select(Receipt.id).where(Receipt.person_id == person.id))
+    )
+    if ids:
+        receipt_ids |= set(
+            await session.scalars(
+                sa.select(Receipt.id).where(Receipt.interaction_id.in_(ids))
+            )
+        )
+    if pattern is not None:
+        for receipt_id, payer, payee in await session.execute(
+            sa.select(Receipt.id, Receipt.payer_name, Receipt.payee_name).where(
+                sa.or_(Receipt.payer_name.isnot(None), Receipt.payee_name.isnot(None))
+            )
+        ):
+            if any(
+                pattern.search(normalise_for_search(name or ""))
+                for name in (payer, payee)
+            ):
+                receipt_ids.add(receipt_id)
+    plan.receipt_ids = sorted(receipt_ids)
+
     # (d) windows: a window of their own goes; a group window loses their
     # lines and is re-rendered from the rest.
     person_windows = set(
@@ -358,6 +387,7 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
 
     plan.counts["memories"] = len(plan.memory_ids)
     plan.counts["claims"] = len(plan.claim_ids)
+    plan.counts["receipts"] = len(plan.receipt_ids)
     plan.counts["group_lines"] = group_lines
     # Debts and promises hang off the person too, not only off an interaction.
     plan.counts["debts"] = (
@@ -497,6 +527,8 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         )
     if plan.claim_ids:
         await session.execute(sa.delete(Claim).where(Claim.id.in_(plan.claim_ids)))
+    if plan.receipt_ids:
+        await _forget_receipts(session, plan)
     if plan.memory_ids:
         await session.execute(sa.delete(Memory).where(Memory.id.in_(plan.memory_ids)))
     if plan.interaction_ids:
@@ -544,6 +576,26 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         result.files_deleted,
     )
     return result
+
+
+async def _forget_receipts(session: AsyncSession, plan: PurgePlan) -> None:
+    """Receipts go, and so does the reading mirrored on a message that stays
+    (``meta.receipt``): it carries the same printed names and cards."""
+    kept = sorted(
+        set(
+            await session.scalars(
+                sa.select(Receipt.interaction_id).where(Receipt.id.in_(plan.receipt_ids))
+            )
+        )
+        - set(plan.interaction_ids)
+    )
+    await session.execute(sa.delete(Receipt).where(Receipt.id.in_(plan.receipt_ids)))
+    for interaction in await session.scalars(
+        sa.select(Interaction).where(Interaction.id.in_(kept))
+    ):
+        meta = dict(interaction.meta or {})
+        if meta.pop("receipt", None) is not None:
+            interaction.meta = meta
 
 
 def _redact(pattern, text: str | None) -> str | None:

@@ -50,7 +50,7 @@ from miya.db.models import (
     Transaction,
 )
 from miya.services import codes as client_codes
-from miya.services import people, persistence, records
+from miya.services import people, persistence, receipts, records
 from miya.services.extraction import (
     ExtractedDebt,
     ExtractedFulfilment,
@@ -181,12 +181,49 @@ async def create(
         claim.created_at = now
     session.add(claim)
     await session.flush()
+    await _attach_receipt(session, interaction, claim, item)
     primary = await _primary_for(session, claim, now or datetime.now(settings.tz))
     if primary is not None:
         # The same thing said again: linked to the first, never asked twice.
         claim.duplicate_of = primary.id
         await session.flush()
     return claim
+
+
+RECEIPT_AT_KEY = "receipt_at"
+
+
+async def _attach_receipt(
+    session: AsyncSession, interaction: Interaction, claim: Claim, item: BaseModel
+) -> None:
+    """A counterparty's money backed by a receipt they sent (JV-04): the
+    claim carries the receipt's printed time, which the bank match anchors
+    on instead of the message's, and the receipt names the claim."""
+    if claim.kind not in BANK_KINDS:
+        return
+    receipt = await receipts.backing(session, interaction, item)
+    if receipt is None or receipt.paid_at is None:
+        return
+    claim.payload = {
+        **claim.payload,
+        RECEIPT_AT_KEY: receipt.paid_at.astimezone(settings.tz).isoformat(),
+        "receipt_id": receipt.id,
+    }
+    if receipt.claim_id is None:
+        receipt.claim_id = claim.id
+    await session.flush()
+
+
+def receipt_at(claim: Claim) -> datetime | None:
+    """The printed time of the receipt behind a claim, if it has one."""
+    value = (claim.payload or {}).get(RECEIPT_AT_KEY)
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=settings.tz)
 
 
 # --- claims that answer themselves (WP-43) -------------------------------------
@@ -1039,6 +1076,11 @@ def _bank_key(claim: Claim):
 
 
 async def _anchor(session: AsyncSession, claim: Claim) -> datetime | None:
+    """When the money moved: the receipt's printed time when the claim has
+    one (JV-04), else when the words were said."""
+    printed = receipt_at(claim)
+    if printed is not None:
+        return printed
     return await session.scalar(
         sa.select(Interaction.occurred_at).where(Interaction.id == claim.interaction_id)
     )
@@ -1082,7 +1124,7 @@ async def _open_bank_claims(session: AsyncSession) -> list[tuple[Claim, datetime
         )
         .order_by(Claim.id)
     )
-    return [(c, anchor) for c, anchor in rows.all() if _is_automatic(c)]
+    return [(c, receipt_at(c) or anchor) for c, anchor in rows.all() if _is_automatic(c)]
 
 
 async def match_bank_evidence(

@@ -12,16 +12,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
 from miya.db.enums import Direction, InteractionSource
 from miya.db.models import Interaction
+from miya.services import receipts
 from miya.services import usage as usage_service
 from miya.services.extraction import extract
 from miya.services.persistence import Applied, apply_extraction
 from miya.services.transcription import TranscriptionError, get_transcriber
-from miya.services.vision import describe_image
+from miya.services.vision import VisionReading, read_image
 
 log = logging.getLogger(__name__)
 
@@ -127,25 +129,79 @@ async def transcribe_into(
     return transcript.text
 
 
-async def describe_into(
-    session: AsyncSession, interaction: Interaction, image_path: str | Path
+# usage_log operations of the one vision call: an image that turned out to be
+# a payment receipt is billed as receipt reading (§5.9), anything else as
+# plain vision.
+OPERATION_VISION = "vision"
+OPERATION_RECEIPT = "receipt_vision"
+
+
+def vision_operation(reading: VisionReading) -> str:
+    return OPERATION_RECEIPT if reading.is_receipt else OPERATION_VISION
+
+
+async def apply_vision(
+    session: AsyncSession,
+    interaction: Interaction,
+    reading: VisionReading,
+    *,
+    presume_receipt: bool,
 ) -> str | None:
-    """Run vision triage and append the description to the interaction's metadata."""
-    result = await describe_image(image_path)
-    if result.usage is not None:
+    """Record one image reading on its interaction (JV-04).
+
+    The bill, ``meta.vision`` (the description the extractor reads, as it
+    always has) and, for a receipt, the ``receipts`` row. Returns the
+    description, or None when the read failed (the interaction is then
+    flagged for review).
+    """
+    if reading.usage is not None:
         await usage_service.record_anthropic_usage(
             session,
-            model=result.model,
-            operation="vision",
-            usage=result.usage,
+            model=reading.model,
+            operation=vision_operation(reading),
+            usage=reading.usage,
             source_interaction_id=interaction.id,
         )
-    if result.error:
-        log.warning("vision triage failed for %s: %s", interaction.id, result.error)
+    try:
+        # A savepoint: a reading the receipts table refuses must not take the
+        # interaction (and the bill above) down with it.
+        async with session.begin_nested():
+            await receipts.record(
+                session, interaction, reading, presume_receipt=presume_receipt
+            )
+    except sa.exc.SQLAlchemyError as exc:
+        log.error(
+            "receipt not stored for interaction %s: %s",
+            interaction.id,
+            type(exc).__name__,
+            extra={"interaction_id": interaction.id},
+        )
+        interaction.needs_review = True
+    if reading.error:
+        log.warning(
+            "vision failed for interaction %s: %s",
+            interaction.id,
+            reading.error,
+            extra={"interaction_id": interaction.id},
+        )
         interaction.needs_review = True
         return None
-    interaction.meta = {**(interaction.meta or {}), "vision": result.text}
-    return result.text
+    interaction.meta = {**(interaction.meta or {}), "vision": reading.description}
+    return reading.description
+
+
+async def describe_into(
+    session: AsyncSession,
+    interaction: Interaction,
+    image_path: str | Path,
+    *,
+    presume_receipt: bool = False,
+) -> str | None:
+    """Read the image and record it on the interaction (see `apply_vision`)."""
+    reading = await read_image(image_path, now=interaction.occurred_at)
+    return await apply_vision(
+        session, interaction, reading, presume_receipt=presume_receipt
+    )
 
 
 def text_for_extraction(interaction: Interaction) -> str:

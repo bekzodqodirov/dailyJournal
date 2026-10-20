@@ -420,7 +420,8 @@ source of the day, so the ~40 existing readers keep working.
   `('waiting','confirmed','unconfirmed','suspicious','owner_ok','owner_fake')`.
 - `verdict_reasons text[] '{}'` CHECK `<@ ARRAY['duplicate_image','duplicate_reference',
   'stale_date','future_date','own_card_no_bank','amount_near_miss']`.
-- `transaction_id` FK transactions SET NULL, indexed, plus `ux_receipts_transaction WHERE NOT NULL`.
+- `transaction_id` FK transactions SET NULL, indexed by `ux_receipts_transaction (transaction_id)
+  WHERE transaction_id IS NOT NULL`.
 - `claim_id` FK claims SET NULL, indexed.
 - `notified_at`, `notice_tg_message_id BIGINT`, `verdict_notified_at`, `history`.
 - `ix_receipts_waiting (created_at) WHERE verdict='waiting'`;

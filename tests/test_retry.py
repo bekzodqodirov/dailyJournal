@@ -228,26 +228,63 @@ def test_model_client_max_retries_explicit(monkeypatch):
     assert client.max_retries == 3
 
 
+def _callee(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return None
+
+
+# Exceptions a module may retry with with_backoff next to a model call: its
+# own markers for an answer that came back unusable (JV-04's vision read),
+# never the client's transport or API failures, which the client retries.
+_RETRYABLE_BESIDE_A_MODEL_CALL = frozenset({"_Unusable"})
+
+
+def _retries_only_unusable_answers(node: ast.Call) -> bool:
+    retry_on = next((k.value for k in node.keywords if k.arg == "retry_on"), None)
+    return (
+        isinstance(retry_on, ast.Tuple)
+        and bool(retry_on.elts)
+        and all(
+            isinstance(e, ast.Name) and e.id in _RETRYABLE_BESIDE_A_MODEL_CALL
+            for e in retry_on.elts
+        )
+    )
+
+
 def test_model_call_sites_are_not_wrapped_again():
-    """A module that calls the model client never adds with_backoff on top."""
+    """A module that calls the model client never retries its failures with
+    with_backoff on top: only an unusable answer may be asked again."""
     offenders = []
     for path in sorted(PACKAGE.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        calls = {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        names = {
-            node.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-        }
-        if "get_client" in calls | names and "with_backoff" in calls | names:
-            offenders.append(path.relative_to(PACKAGE).as_posix())
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        if not any(_callee(node) == "get_client" for node in calls):
+            continue
+        for node in calls:
+            if _callee(node) == "with_backoff" and not _retries_only_unusable_answers(
+                node
+            ):
+                offenders.append(path.relative_to(PACKAGE).as_posix())
     assert offenders == []
+
+
+def test_the_guard_still_catches_a_wrapped_model_call():
+    source = (
+        "async def f():\n"
+        "    client = get_client()\n"
+        "    await with_backoff(g, attempts=2, base=1, cap=1, retry_on=API_FAILURES)\n"
+    )
+    [node] = [
+        n
+        for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.Call) and _callee(n) == "with_backoff"
+    ]
+    assert _retries_only_unusable_answers(node) is False
 
 
 # --- the plain-HTTP calls ------------------------------------------------------

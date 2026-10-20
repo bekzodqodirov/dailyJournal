@@ -35,6 +35,10 @@ Jobs:
                    sent into a chat, one note per macro document read as
                    text (JV-01); silent in quiet hours, never counted in the
                    question budget
+  * receipt_notices — every minute; the receipt card for each payment
+                   receipt someone sent into a chat, once (notified_at;
+                   JV-04); held in quiet hours unless receipts are set to
+                   arrive silently, never counted in the question budget
   * code_index   — every 2 min; GS codes and waybills of every stored text
                    into code_mentions for exact lookup (WP-39)
   * profile_refresh — every 60 min; rewrites the written profile of up to
@@ -81,6 +85,7 @@ from miya.db.models import (
     DailyReport,
     Interaction,
     Person,
+    Receipt,
     ReminderLog,
     Transaction,
 )
@@ -103,6 +108,7 @@ from miya.services import (
     profiles,
     questions,
     recaps,
+    receipts,
     reminders,
     reports,
     restore_drill,
@@ -1042,6 +1048,74 @@ async def safety_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
         log.info("sent %d safety notice(s)", sent)
 
 
+async def receipt_notice_text(session, receipt: Receipt, interaction: Interaction) -> str:
+    """The owner's card for a receipt someone sent into a chat (JV-04)."""
+    person = (
+        await session.get(Person, receipt.person_id or interaction.person_id)
+        if (receipt.person_id or interaction.person_id)
+        else None
+    )
+    monitor = (
+        await session.scalar(
+            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == interaction.tg_chat_id)
+        )
+        if interaction.tg_chat_id is not None
+        else None
+    )
+    if monitor is None or monitor.chat_type is ChatType.private or not monitor.title:
+        channel = replies.PRIVATE_CHAT_LABEL
+    else:
+        channel = monitor.title
+    sender = person.display_name if person else (monitor.title if monitor else None)
+    return replies.receipt_card(
+        receipt, sender=safety.display_name(sender or "—"), channel=channel
+    )
+
+
+async def receipt_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The receipt card for each payment receipt someone sent into a chat,
+    within the minute, once (JV-04).
+
+    Deduped on ``notified_at``, stamped only after the card went out, one
+    commit per card, with the message id kept so the bank verdict can edit
+    it in place. In quiet hours the cards wait, or arrive silently when
+    receipts are set to (MONEY_RECEIPTS_SILENT_AT_NIGHT). A card that cannot
+    be rendered is logged and skipped, never a stop for the rest. Not a
+    question: nothing here touches the question budget.
+    """
+    now = now or datetime.now(settings.tz)
+    silent = False
+    if reminders.in_quiet_hours(now):
+        if not settings.money_receipts_silent_at_night:
+            return
+        silent = True
+    sent = 0
+    async with session_scope() as session:
+        for receipt, interaction in await receipts.pending_notices(session, now=now):
+            try:
+                text = await receipt_notice_text(session, receipt, interaction)
+            except Exception as exc:
+                log.error(
+                    "receipt card for receipt %s failed to render: %s",
+                    receipt.id,
+                    type(exc).__name__,
+                )
+                continue
+            message = await notify_message(bot, text, silent=silent)
+            if message is None:
+                return  # unreachable: the rest stay queued for the next sweep
+            message_id = getattr(message, "message_id", None)
+            receipts.mark_notified(
+                receipt,
+                now=now,
+                message_id=message_id if isinstance(message_id, int) else None,
+            )
+            await session.commit()
+            sent += 1
+    if sent:
+        log.info("sent %d receipt card(s)", sent)
+
+
 async def backup_job(bot: Bot) -> None:
     """Nightly encrypted pg_dump (spec §10), then a copy to Telegram.
 
@@ -1640,6 +1714,14 @@ async def run() -> None:
         IntervalTrigger(minutes=1),
         args=[bot],
         id="safety_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        receipt_notice_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="receipt_notices",
         max_instances=1,
         coalesce=True,
     )

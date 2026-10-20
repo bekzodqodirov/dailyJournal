@@ -957,8 +957,9 @@ def test_the_claims_table_is_wiped_before_what_it_references():
         for line in py_inspect.getsource(conftest._truncate).splitlines()
         if line.strip().startswith("m.")
     ]
-    # The question log references nothing, so it may go first (WP-16).
-    assert order[:2] == ["m.QuestionLog,", "m.Claim,"]
+    # The question log references nothing, so it may go first (WP-16);
+    # receipts reference claims, so they go before them (JV-04).
+    assert order[:3] == ["m.Receipt,", "m.QuestionLog,", "m.Claim,"]
     assert order.index("m.Claim,") < order.index("m.Interaction,")
     assert order.index("m.Claim,") < order.index("m.Person,")
 

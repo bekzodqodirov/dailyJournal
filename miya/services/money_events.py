@@ -83,7 +83,15 @@ def _label(interaction: Interaction, channel: str) -> str:
 # --- hooks filled in by later packages ------------------------------------------
 
 
-TYPED_SOURCES = (InteractionSource.assistant_bot, InteractionSource.manual)
+# What the owner told MIYA themselves, by typing, speaking or sending a photo
+# of a receipt to the bot: a bank record that arrives later is that row's
+# evidence, never a second row. The receipt photo joined in JV-04, so a
+# photo sent before its SMS no longer books the payment twice.
+TYPED_SOURCES = (
+    InteractionSource.assistant_bot,
+    InteractionSource.manual,
+    InteractionSource.receipt_photo,
+)
 
 
 def _local_day(column):

@@ -39,7 +39,14 @@ from miya.db.enums import (
     InteractionSource,
     TransactionType,
 )
-from miya.db.models import ChatMonitor, ClientCode, Interaction, Person, QuestionLog
+from miya.db.models import (
+    ChatMonitor,
+    ClientCode,
+    Interaction,
+    Person,
+    QuestionLog,
+    Receipt,
+)
 from miya.db.session import session_scope
 from miya.services import (
     approvals,
@@ -64,14 +71,17 @@ from miya.services import (
     rag,
     recall,
     recaps,
+    receipts,
     records,
     reminders,
     safety,
+    vision,
 )
 from miya.services import codes as client_codes
 from miya.services.embeddings import get_embedder
 from miya.services.extraction import ExtractedTransaction
 from miya.services.ingest import (
+    apply_vision,
     create_interaction,
     describe_into,
     process_interaction,
@@ -222,6 +232,96 @@ def _with_risk(media: dict, verdict: safety.Verdict | None, name: str | None) ->
     if verdict is not None and verdict.kind == safety.MACRO:
         return {**media, "risk": verdict.as_risk(name)}
     return media
+
+
+# --- images and receipts (JV-04) ----------------------------------------------
+
+
+def _booked_money(applied) -> bool:
+    """Did the owner's own words in this message already write money?"""
+    return applied is not None and bool(
+        applied.transactions
+        or applied.matched_transactions
+        or applied.settlements
+        or applied.debts
+    )
+
+
+def _with_receipt_card(receipt: Receipt | None, reply: str, applied) -> str:
+    """The receipt card on top of the bot's reply, stamped as delivered: the
+    owner gets it right here, never again from the worker."""
+    if receipt is None:
+        return reply
+    card = replies.receipt_card(
+        receipt,
+        sender=replies.RECEIPT_FROM_OWNER,
+        channel=replies.RECEIPT_BOT_CHANNEL,
+        footer=not _booked_money(applied),
+    )
+    receipts.mark_notified(receipt, now=datetime.now(settings.tz))
+    return f"{card}\n\n{reply}" if reply else card
+
+
+async def _read_image(
+    session, interaction: Interaction, path: Path, *, readable: bool = True
+) -> tuple[str, InlineKeyboardMarkup | None, int | None]:
+    """An image the owner sent the bot — a photo, or a .jpg/.png/.webp sent
+    as a file — read once by vision; a receipt gets its card in the reply.
+
+    ``readable`` is False when the file's bytes are not an image
+    (safety.sniff_magic): the model never sees it, and the receipt the owner
+    meant it to be waits in /tekshir. Returns (reply, keyboard, receipt id).
+    """
+    if readable:
+        described = await describe_into(session, interaction, path, presume_receipt=True)
+    else:
+        described = await apply_vision(
+            session,
+            interaction,
+            vision.VisionReading(
+                description="", model=settings.extract_model, error="not an image"
+            ),
+            presume_receipt=True,
+        )
+    receipt = await receipts.for_interaction(session, interaction.id)
+    keyboard = None
+    applied = None
+    if described is None and not interaction.raw_text:
+        reply = "" if receipt is not None else replies.PHOTO_FAILED_HINT
+    else:
+        interaction.media = {**(interaction.media or {}), "processed": True}
+        result = await process_interaction(session, interaction)
+        reply, keyboard = _receipt(result)
+        applied = result.applied if result.ok else None
+        if result.ok and described is None:
+            # The caption was extracted, but the image itself was not read —
+            # the owner must not be told everything succeeded.
+            reply = reply + "\n" + replies.VISION_PARTIAL_HINT
+    reply = _with_receipt_card(receipt, reply, applied)
+    return reply, keyboard, receipt.id if receipt is not None else None
+
+
+async def _stamp_receipt_card(receipt_id: int | None, sent) -> None:
+    """Which message the card is, so the bank verdict can edit it in place
+    later. Best-effort: the receipt itself is already committed."""
+    message_id = getattr(sent, "message_id", None)
+    if receipt_id is None or not isinstance(message_id, int):
+        return
+    try:
+        async with session_scope() as session:
+            receipt = await session.get(Receipt, receipt_id)
+            if receipt is not None:
+                receipts.mark_notified(
+                    receipt,
+                    now=receipt.notified_at or datetime.now(settings.tz),
+                    message_id=message_id,
+                )
+    except Exception as exc:
+        log.error(
+            "could not record the receipt card message for receipt %s: %s",
+            receipt_id,
+            type(exc).__name__,
+        )
 
 
 # --- commands ---------------------------------------------------------------
@@ -1739,11 +1839,19 @@ async def cmd_process(message: Message, bot: Bot) -> None:
         return
     if await _refuse_dangerous(message, media):
         return
+    if target.document and vision.is_heic(
+        getattr(media, "file_name", None), getattr(media, "mime_type", None)
+    ):
+        await _safe_answer(message, replies.RECEIPT_HEIC_HINT)
+        return
 
     await _typing(message)
     is_video = bool(target.video or target.video_note)
     is_audio = bool(target.voice or target.audio)
-    is_photo = bool(target.photo)
+    # An image sent as a file goes to vision like a photo (JV-04).
+    is_photo = bool(target.photo) or bool(
+        target.document and vision.is_image_document(getattr(media, "file_name", None))
+    )
     suffix = Path(getattr(media, "file_name", "") or "").suffix
     if not suffix:
         suffix = (
@@ -1758,6 +1866,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
     if sniffed.dangerous:
         await _safe_answer(message, _refusal(name))
         return
+    image_readable = sniffed.readable
     if is_video or is_audio or is_photo:
         sniffed = None  # only a document's bytes decide whether it is parsed
 
@@ -1781,7 +1890,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             ),
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
-        reply, keyboard = await _process_on_demand(
+        reply, keyboard, receipt_id = await _process_on_demand(
             session,
             interaction,
             path,
@@ -1789,8 +1898,10 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             is_audio=is_audio,
             is_photo=is_photo,
             sniffed=sniffed,
+            image_readable=image_readable,
         )
-    await _safe_answer(message, reply, reply_markup=keyboard)
+    sent = await _safe_answer(message, reply, reply_markup=keyboard)
+    await _stamp_receipt_card(receipt_id, sent)
 
 
 async def _process_on_demand(
@@ -1802,33 +1913,34 @@ async def _process_on_demand(
     is_audio: bool,
     is_photo: bool,
     sniffed: safety.Verdict | None = None,
-) -> tuple[str, InlineKeyboardMarkup | None]:
+    image_readable: bool = True,
+) -> tuple[str, InlineKeyboardMarkup | None, int | None]:
     """Run the right pipeline for one explicitly requested media file.
 
     A document is parsed only when its bytes matched its name (`sniffed`);
-    a macro document is read as text and the owner told so (JV-01)."""
+    a macro document is read as text and the owner told so (JV-01). An
+    image, photo or file, is read by vision and a receipt gets its card
+    (JV-04). Returns (reply, keyboard, the receipt's id or None)."""
     macro_read = False
     if is_video:
         audio_path = path.with_suffix(".mp3")
         if not await audio.extract_audio(path, audio_path):
             interaction.needs_review = True
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
         interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
         if await transcribe_into(session, interaction, audio_path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
     elif is_audio:
         if await transcribe_into(session, interaction, path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
     elif is_photo:
-        described = await describe_into(session, interaction, path)
-        if described is None and not interaction.raw_text:
-            return replies.PHOTO_FAILED_HINT, None
+        return await _read_image(session, interaction, path, readable=image_readable)
     else:
         readable = sniffed is None or sniffed.readable
         parsed = await documents.read_document_async(path) if readable else None
         if parsed is None and not interaction.raw_text:
             interaction.needs_review = True
-            return replies.DOCUMENT_FAILED_HINT, None
+            return replies.DOCUMENT_FAILED_HINT, None, None
         if parsed is not None:
             interaction.transcript = parsed.text
             macro_read = sniffed is not None and sniffed.kind == safety.MACRO
@@ -1839,7 +1951,7 @@ async def _process_on_demand(
     if macro_read:
         name = (interaction.media or {}).get("filename")
         reply = reply + "\n" + replies.macro_document_note(name)
-    return reply, keyboard
+    return reply, keyboard, None
 
 
 # --- client codes by hand (WP-33) ---------------------------------------------
@@ -2680,6 +2792,12 @@ async def on_photo(message: Message, bot: Bot) -> None:
     path = _media_path(".jpg")
     if not await _download(bot, message, photo, path):
         return
+    # Telegram re-encodes a photo as JPEG; its bytes are still checked
+    # before the vision model sees them (JV-01, JV-04).
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(None))
+        return
 
     async with session_scope() as session:
         interaction = await create_interaction(
@@ -2697,19 +2815,11 @@ async def on_photo(message: Message, bot: Bot) -> None:
             },
         )
         # Photos sent straight to the bot are always vision-processed (spec §6).
-        described = await describe_into(session, interaction, path)
-        keyboard = None
-        if described is None and not message.caption:
-            reply = replies.PHOTO_FAILED_HINT
-        else:
-            interaction.media = {**(interaction.media or {}), "processed": True}
-            result = await process_interaction(session, interaction)
-            reply, keyboard = _receipt(result)
-            if result.ok and described is None:
-                # The caption was extracted, but the image itself was not read —
-                # the owner must not be told everything succeeded.
-                reply = reply + "\n" + replies.VISION_PARTIAL_HINT
-    await _safe_answer(message, reply, reply_markup=keyboard)
+        reply, keyboard, receipt_id = await _read_image(
+            session, interaction, path, readable=sniffed.readable
+        )
+    sent = await _safe_answer(message, reply, reply_markup=keyboard)
+    await _stamp_receipt_card(receipt_id, sent)
 
 
 @router.message(F.document)
@@ -2720,6 +2830,10 @@ async def on_document(message: Message, bot: Bot) -> None:
     document = message.document
     if await _refuse_dangerous(message, document):
         return
+    if vision.is_heic(document.file_name, document.mime_type):
+        # Vision cannot read the iPhone's own format; nothing is fetched.
+        await _safe_answer(message, replies.RECEIPT_HEIC_HINT)
+        return
     await _typing(message)
     suffix = Path(document.file_name or "").suffix or ".bin"
     path = _media_path(suffix)
@@ -2728,6 +2842,9 @@ async def on_document(message: Message, bot: Bot) -> None:
     sniffed = _sniff_download(path)
     if sniffed.dangerous:
         await _safe_answer(message, _refusal(document.file_name))
+        return
+    if vision.is_image_document(document.file_name):
+        await _on_image_document(message, document, path, sniffed)
         return
 
     async with session_scope() as session:
@@ -2772,6 +2889,35 @@ async def on_document(message: Message, bot: Bot) -> None:
             if parsed is not None and sniffed.kind == safety.MACRO:
                 reply = reply + "\n" + replies.macro_document_note(document.file_name)
     await _safe_answer(message, reply, reply_markup=keyboard)
+
+
+async def _on_image_document(
+    message: Message, document, path: Path, sniffed: safety.Verdict
+) -> None:
+    """A .jpg/.png/.webp sent as a file, uncompressed, is a photo to vision
+    (JV-04) once its bytes passed the shield."""
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.receipt_photo,
+            direction=Direction.in_,
+            text=message.caption,
+            occurred_at=message.date.astimezone(settings.tz),
+            media={
+                "type": "document",
+                "path": str(path),
+                "filename": document.file_name,
+                "mime": document.mime_type,
+                "size": document.file_size,
+                "caption": message.caption,
+                "processed": False,
+            },
+        )
+        reply, keyboard, receipt_id = await _read_image(
+            session, interaction, path, readable=sniffed.readable
+        )
+    sent = await _safe_answer(message, reply, reply_markup=keyboard)
+    await _stamp_receipt_card(receipt_id, sent)
 
 
 @router.message(F.video_note)

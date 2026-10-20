@@ -323,6 +323,9 @@ OFFICE_ZIP_SUFFIXES = _OOXML_ZIP | _ODF_ZIP
 # The only ZIP containers MIYA parses (documents.SUPPORTED_SUFFIXES).
 OOXML_SUFFIXES = frozenset({".docx", ".xlsx", ".xlsm"})
 _TEXT_SUFFIXES = frozenset({".txt", ".csv", ".md"})
+# Images, as a photo or as a file sent uncompressed (JV-04): the bytes must be
+# an image, whichever of these formats the name claims.
+IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp", ".gif"})
 
 # ZIP central-directory limits: a decompression bomb is refused unopened.
 ZIP_MAX_UNCOMPRESSED = 100 * 1024 * 1024
@@ -544,6 +547,8 @@ def sniff_magic(path: Path | str, claimed_suffix: str | None = None) -> Verdict:
     mismatch, kept but never parsed); a VBA project makes it a macro
     document. Executables (MZ, ELF, dex, Mach-O) are refused whatever the
     name says; an OLE file posing as OOXML is a mismatch and is never parsed.
+    A name claiming an image (.jpg, .png, .webp, .gif) must hold JPEG, PNG,
+    GIF or WebP bytes, or it is a mismatch the vision model never sees.
     """
     path = Path(path)
     claimed = (claimed_suffix or path.suffix or "").casefold()
@@ -567,6 +572,8 @@ def sniff_magic(path: Path | str, claimed_suffix: str | None = None) -> Verdict:
         # Legacy Office, or a password-protected OOXML: not what was claimed.
         return Verdict(MISMATCH, "ole_container")
 
+    if claimed in IMAGE_SUFFIXES and image_media_type(head) is None:
+        return Verdict(MISMATCH, "not_image")
     if claimed in OOXML_SUFFIXES:
         return Verdict(MISMATCH, "not_zip")
     if claimed == ".pdf" and b"%PDF-" not in head[:1024]:
@@ -574,6 +581,20 @@ def sniff_magic(path: Path | str, claimed_suffix: str | None = None) -> Verdict:
     if claimed in _TEXT_SUFFIXES and b"\x00" in head and not _utf16(head):
         return Verdict(MISMATCH, "binary_text")
     return SAFE
+
+
+def image_media_type(head: bytes) -> str | None:
+    """The media type of an image's first bytes: JPEG, PNG, GIF or WebP, else
+    None. The vision call is sent what the bytes are, not what the name says."""
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _windows_program(head: bytes) -> bool:

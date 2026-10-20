@@ -10,6 +10,7 @@ do what the returned plan says.
 | voice / video note   | download → (ffmpeg) → Scribe transcript. Always.        |
 | photo                | caption always; the image only if `vision_enabled`.     |
 | document             | if `docs_enabled` and readable and ≤ DOC_MAX_BYTES.     |
+| image file           | a .jpg/.png/.webp sent as a file: like a photo (JV-04). |
 | video                | ask the owner; `/process` still forces one directly.    |
 | oversized audio/doc  | ask the owner, up to MEDIA_ASK_MAX_BYTES.               |
 | sticker / gif        | ignored entirely — no interaction row.                  |
@@ -33,7 +34,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from miya.config import settings
-from miya.services import documents, safety
+from miya.services import documents, safety, vision
 
 Channel = Literal["telegram", "whatsapp", "gmail"]
 CHANNELS: tuple[Channel, ...] = ("telegram", "whatsapp", "gmail")
@@ -43,6 +44,9 @@ SKIP_DANGEROUS = "dangerous_file"
 SKIP_HTML = "html_file"
 # Downloaded, but the bytes are not what the name claims: never parsed.
 SKIP_MISMATCH = "mismatched_type"
+# An image sent as a file that vision cannot take (JV-04).
+SKIP_HEIC = "heic_image"
+SKIP_IMAGE_TOO_LARGE = "image_too_large"
 
 
 class MediaKind(str, enum.Enum):
@@ -138,6 +142,8 @@ def _forced(kind: MediaKind, filename: str | None) -> MediaPlan:
     if kind is MediaKind.photo:
         return MediaPlan(kind=kind, download=True, vision=True)
     if kind is MediaKind.document:
+        if vision.is_image_document(filename):
+            return MediaPlan(kind=kind, download=True, vision=True)
         if not filename or not documents.is_supported(Path(filename)):
             return MediaPlan(kind=kind, skip_reason="unsupported_type")
         return MediaPlan(kind=kind, download=True, read_document=True)
@@ -181,6 +187,7 @@ def plan_for(
         docs_enabled=docs_enabled,
         filename=filename,
         size=size,
+        mime=mime,
     )
     plan.risk = risk
     plan.channel = channel
@@ -194,6 +201,7 @@ def _plan(
     docs_enabled: bool,
     filename: str | None,
     size: int | None,
+    mime: str | None = None,
 ) -> MediaPlan:
     if kind in (MediaKind.text, MediaKind.other):
         return MediaPlan(kind=kind)
@@ -231,7 +239,17 @@ def _plan(
         # `/process` still forces one directly.
         return _ask_or_skip(kind, size, "video")
 
-    # Documents.
+    # Documents. An image sent as a file, uncompressed, is a photo to vision
+    # (JV-04): the same `vision_enabled` gate, its bytes checked by
+    # safety.sniff_magic after the download and before the model sees them.
+    if vision.is_image_document(filename):
+        if not vision_enabled:
+            return MediaPlan(kind=kind, skip_reason="vision_disabled")
+        if size is not None and size > vision.MAX_IMAGE_BYTES:
+            return MediaPlan(kind=kind, skip_reason=SKIP_IMAGE_TOO_LARGE)
+        return MediaPlan(kind=kind, download=True, vision=True)
+    if vision.is_heic(filename, mime):
+        return MediaPlan(kind=kind, skip_reason=SKIP_HEIC)
     if not docs_enabled:
         return MediaPlan(kind=kind, skip_reason="docs_disabled")
     if size is not None and size > settings.doc_max_bytes:

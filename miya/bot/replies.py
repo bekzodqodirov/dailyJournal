@@ -264,6 +264,61 @@ def macro_document_note(filename: str | None) -> str:
     )
 
 
+# --- receipts read from images (JV-04) -----------------------------------------
+
+RECEIPT_FOOTER = (
+    "Summa rasmdan o'qildi; hisobga faqat bank SMS yoki Payme tasdig'i bilan " "yoziladi."
+)
+RECEIPT_UNREADABLE = "🧾 Chek o'qilmadi — rasm aniq emas. /tekshir ro'yxatiga qo'ydim."
+RECEIPT_HEIC_HINT = "Bu rasm formati (HEIC) o'qilmaydi — JPG qilib yuboring."
+RECEIPT_BANK_WAITING = "Bank tasdig'i: ⏳ kutilmoqda"
+# Who sent it and where, for a photo the owner sent the bot themselves.
+RECEIPT_FROM_OWNER = "siz"
+RECEIPT_BOT_CHANNEL = "MIYA bot"
+_MISSING = "—"
+
+
+def _or_missing(value: str | None) -> str:
+    return _shown(value) if value else _MISSING
+
+
+def receipt_card(receipt, *, sender: str, channel: str, footer: bool = True) -> str:
+    """The owner's receipt card: what the image says, never the bank's word.
+
+    A receipt that could not be read is the one line saying so. ``footer``
+    is dropped only where the owner's own words already booked the payment
+    (a photo sent to the bot), so the card never claims otherwise.
+    """
+    if receipt.state != "read":
+        return RECEIPT_UNREADABLE
+    amount = (
+        money(receipt.amount, receipt.currency)
+        if receipt.amount is not None and receipt.currency is not None
+        else _MISSING
+    )
+    when = (
+        f"{day_label(receipt.paid_at)} {clock(receipt.paid_at)}"
+        if receipt.paid_at is not None
+        else _MISSING
+    )
+    card = f" ****{receipt.payee_card_last4}" if receipt.payee_card_last4 else ""
+    lines = [
+        f"🧾 Chek · {_shown(sender)} · {_shown(channel)}",
+        f"Chekda: {amount} · {when}",
+        f"To'lovchi: {_or_missing(receipt.payer_name)} → "
+        f"{_or_missing(receipt.payee_name)}{card}",
+    ]
+    issued = [_shown(receipt.issuer)] if receipt.issuer else []
+    if receipt.reference:
+        issued.append(f"№ {_shown(receipt.reference)}")
+    if issued:
+        lines.append(" · ".join(issued))
+    lines.append(RECEIPT_BANK_WAITING)
+    if footer:
+        lines.append(RECEIPT_FOOTER)
+    return "\n".join(lines)
+
+
 RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."
 
 
@@ -1625,6 +1680,7 @@ OPERATION_LABEL = {
     "extract_window_fallback": "telegram suhbatlari (qayta)",
     "transcribe": "ovozni matnga o'girish",
     "vision": "rasmlarni o'qish",
+    "receipt_vision": "cheklarni o'qish",
     "report": "kunlik hisobot",
     "planner": "reja tuzish",
     "rag": "savollarga javob",
@@ -1693,6 +1749,7 @@ _COUNT_LABEL = {
     "tasks": "vazifa",
     "memories": "xotira",
     "claims": "da'vo",
+    "receipts": "chek",
     "group_lines": "guruhlardagi xabari",
     "person_card": "odam kartasi (ism, telefon, taxalluslar)",
     "reports": "kunlik xulosa",

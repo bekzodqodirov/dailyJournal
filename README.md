@@ -171,7 +171,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `CODE_PLACEHOLDERS` | `false` — when `true`, a client code nobody holds yet becomes a placeholder person named after it; `/kod Akmal GS367` later folds it into Akmal |
 | `PAYMENT_OWN_CARDS` | empty — extra last-4 digits of your own cards (cards seen with a balance count already); an expense on one and an income of the same amount on another within the dedupe window is a transfer, left out of the totals (`/tuzat x12 tashqi` undoes it) |
 | `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
-| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
+| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours; the receipt cards read from images (JV-04) follow the same night rule |
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
 | `RECAP_PHONE_STALE_HOURS` | 24 — the evening recap names a phone app silent this long, an unconfigured or stale backup, and any open problem (`/holat`) |
@@ -198,7 +198,13 @@ Credentials in `.env.example` are intentionally blank; blank integer keys
 ## Using the bot
 
 Send the bot a note, a voice message or a receipt photo and it replies with what
-it recorded:
+it recorded. A payment receipt — a Payme or bank-app screenshot, a terminal
+check, as a photo or as a `.jpg`/`.png`/`.webp` file — also gets a receipt card:
+the amount, the printed date and time, payer → payee with the card's last four
+digits, the bank or app and the receipt number. The card is what the image says,
+not the bank's record; a receipt a client sends into a chat gets the same card
+within the minute, and money they claim is still asked before it is written.
+HEIC photos cannot be read: send them as JPG.
 
 > **you:** Akmal akaga 5 mln so'm berdim, 25-avgustgacha qaytaradi
 > **MIYA:** 💰 Qarz: → senga 5 mln so'm, muddat: 25-avg
