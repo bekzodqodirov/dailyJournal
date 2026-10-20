@@ -31,7 +31,8 @@ Rules:
   against CURRENT_DATE. Output ISO. Unknown → null.
 - Conversation windows are transcripts with exactly one message per line:
     [YYYY-MM-DD HH:MM] [SPEAKER] "text"
-  SPEAKER is ME (the owner), THEM (name) (the other person), or bare THEM when
+  SPEAKER is ME (the owner), MIYA (an automatic reply the owner's assistant
+  sent in the owner's name), THEM (name) (the other person), or bare THEM when
   that person's name is not known. A speaker label ending in " → ME" —
   "[THEM (name) → ME]" or "[THEM → ME]" — means that message was addressed to
   the owner directly (a mention or a reply to him) — in a group, treat only
@@ -40,6 +41,11 @@ Rules:
   sent: newlines appear as \n, quotes as \". Media sent without text appears
   inside the quotes as a bracketed placeholder such as [ovozli xabar], [rasm]
   or [hujjat: name].
+- A [MIYA] line is an automatic reply, never the owner's own words or
+  assertion. Use it only as context for the other lines: never extract a debt,
+  settlement, promise, fulfilment, transaction, task, event or fact from what a
+  [MIYA] line says, never read it as the owner agreeing to, confirming or
+  promising anything, and never let it make anything asserted_by "me".
 - A call transcript may be split into speaker turns, one per line:
     [1-ovoz] text
     [2-ovoz] text

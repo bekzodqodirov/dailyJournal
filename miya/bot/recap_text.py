@@ -55,6 +55,8 @@ PROSE_DOWN = (
     "Raqamlar va ro'yxatlar to'liq.</i>"
 )
 AUTO_LINE = "🤖 Bugun {n} ta savolni o'zim hal qildim — /savollar hal"
+# JV-10: replies MIYA sent itself, counted apart from the owner's own messages.
+MIYA_REPLIES = "MIYA: {n} ta avtomatik javob"
 # MIYA's own blind spots (WP-73), after the queue line, evening only.
 PHONE_SILENT_LINE = (
     "📱 Telefon ilovasidan {age} beri ma'lumot kelmadi — qo'ng'iroq va SMS'lar "
@@ -181,6 +183,8 @@ def _person_header(day, codes: dict) -> str:
     messages = day.messages_in + day.messages_out
     if messages:
         bits.append(f"💬 {messages} xabar")
+    if day.messages_ai:
+        bits.append(MIYA_REPLIES.format(n=day.messages_ai))
     if day.calls:
         minutes = minutes_label(day.call_seconds)
         bits.append(f"📞 {day.calls} qo'ng'iroq" + (f" ({minutes})" if minutes else ""))

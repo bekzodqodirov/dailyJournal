@@ -72,7 +72,7 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import phone_events, queries
+from miya.services import authorship, phone_events, queries
 from miya.services.queries import DebtBalance
 from miya.services.text import fold_apostrophes
 
@@ -423,13 +423,15 @@ def _last_outgoing_per_chat(floor: datetime):
 
     An outgoing message older than the floor cannot matter: every incoming
     candidate is newer than the floor, so it is newer than that reply too.
+    Only the owner's own words count (JV-10): an automatic reply MIYA sent,
+    a stall above all, answers nothing, so an escalated chat stays open.
     """
     return (
         sa.select(
             Interaction.tg_chat_id.label("tg_chat_id"),
             sa.func.max(Interaction.occurred_at).label("at"),
         )
-        .where(*_is_message(), Interaction.direction == Direction.out)
+        .where(*_is_message(), authorship.owner_words_clause())
         .where(Interaction.occurred_at >= floor)
         .group_by(Interaction.tg_chat_id)
         .subquery("last_out")

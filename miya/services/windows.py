@@ -41,8 +41,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
+from miya.db.enums import ChatType, InteractionSource, WindowStatus
 from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
+from miya.services import authorship
 from miya.services.ingest import text_for_extraction
 
 log = logging.getLogger(__name__)
@@ -110,8 +111,12 @@ def render_line(interaction: Interaction, speaker: str) -> str:
 
 
 def _speaker(interaction: Interaction, names: dict[int, str]) -> str:
-    if interaction.direction is Direction.out:
-        return "ME"
+    # JV-10: an outgoing line is [ME] only when it is the owner's own words
+    # (typed, or dictated and approved through MIYA); MIYA's automatic
+    # replies are [MIYA], which the prompt says is never the owner speaking.
+    own = authorship.speaker_label(interaction)
+    if own is not None:
+        return own
     name = _label_name(names.get(interaction.person_id or -1) or "")
     speaker = f"THEM ({name})" if name else "THEM"
     # In a busy group most messages are between other people. Marking the ones

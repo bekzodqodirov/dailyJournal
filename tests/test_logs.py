@@ -476,6 +476,7 @@ def pick(x):
 STRICT_MODULES = (
     "miya/jarvis",
     "miya/logs.py",
+    "miya/services/authorship.py",
     "miya/services/retry.py",
     "miya/services/safety.py",
     "miya/services/when.py",

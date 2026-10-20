@@ -18,8 +18,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource
+from miya.db.enums import ChatType, InteractionSource
 from miya.db.models import ChatMonitor, Interaction, Memory, Passage, Person
+from miya.services import authorship
 from miya.services.embeddings import Embedder
 from miya.services.ingest import text_for_extraction
 from miya.services.text import normalise_for_search
@@ -95,10 +96,17 @@ def chunk(text: str) -> list[str]:
 def attribution(
     interaction: Interaction, chat_type: ChatType | None
 ) -> tuple[int | None, int | None, bool]:
-    """(speaker_person_id, chat_person_id, from_owner)."""
+    """(speaker_person_id, chat_person_id, from_owner).
+
+    An automatic reply MIYA sent (JV-10) is nobody's words: not the owner's,
+    and not the counterparty's either. It keeps the chat it was sent in.
+    """
     source = interaction.source
-    out = interaction.direction is Direction.out
+    out = authorship.is_owner_words(interaction)
     if source is InteractionSource.telegram_userbot:
+        if authorship.is_ai_reply(interaction):
+            private = chat_type is ChatType.private
+            return None, interaction.person_id if private else None, False
         if chat_type is ChatType.private:
             if out:
                 return None, interaction.person_id, True
@@ -183,8 +191,11 @@ async def _context(session: AsyncSession, interaction: Interaction, names) -> li
 
 
 def _who(interaction: Interaction, names: dict[int, str]) -> str:
-    if interaction.direction is Direction.out or interaction.source in OWNER_SOURCES:
-        return "ME"
+    own = authorship.speaker_label(interaction)
+    if own is not None:
+        return own
+    if interaction.source in OWNER_SOURCES:
+        return authorship.SPEAKER_OWNER
     return names.get(interaction.person_id or 0, "THEM")
 
 

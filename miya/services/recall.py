@@ -20,7 +20,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.enums import ChatType, Direction, InteractionSource
+from miya.db.enums import ChatType, InteractionSource
 from miya.db.models import (
     ChatMonitor,
     ConversationWindow,
@@ -29,8 +29,8 @@ from miya.db.models import (
     Passage,
     Person,
 )
+from miya.services import authorship, queries
 from miya.services import people as people_mod
-from miya.services import queries
 from miya.services.embeddings import Embedder, EmbeddingError
 from miya.services.text import (
     UZ_SUFFIXES,
@@ -618,8 +618,14 @@ def where_label(interaction: Interaction, monitors, names) -> str:
     return label
 
 
+# JV-10: a cited line MIYA sent itself says so, never "Siz".
+MIYA_WHO = "🤖 MIYA nomidan (avtomatik)"
+
+
 def _who(interaction: Interaction, names) -> str:
-    if interaction.direction is Direction.out or interaction.source in (
+    if authorship.is_ai_reply(interaction):
+        return MIYA_WHO
+    if authorship.is_owner_words(interaction) or interaction.source in (
         InteractionSource.assistant_bot,
         InteractionSource.manual,
     ):

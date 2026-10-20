@@ -33,6 +33,7 @@ warn_unreachable = true
 files = [
     "miya/jarvis",
     "miya/logs.py",
+    "miya/services/authorship.py",
     "miya/services/retry.py",
     "miya/services/safety.py",
 ]

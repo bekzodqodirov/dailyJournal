@@ -41,7 +41,7 @@ from miya.db.models import (
     TransactionEvidence,
     UsageLog,
 )
-from miya.services import codes, memories
+from miya.services import authorship, codes, memories
 
 
 @dataclass(slots=True)
@@ -521,14 +521,16 @@ def timeline_filter(direction: Direction | None = None):
     raw userbot member lines stay out. With one: the member lines *are* the
     point — "what did I say to him" is the owner's own DM lines (direction
     out), "what did he say" his — so only userbot rows with that direction
-    count. The owner's own notes to the bot are stored as direction ``in``
-    too, and a call transcript holds both voices; neither is "his lines".
-    The window row itself has direction ``na`` and drops out on its own.
+    count. A reply MIYA wrote itself is outgoing but not the owner's line, so
+    the side's words come from ``authorship.said_by_clause``. The owner's own
+    notes to the bot are stored as direction ``in`` too, and a call
+    transcript holds both voices; neither is "his lines". The window row
+    itself has direction ``na`` and drops out on its own.
     """
     if direction is not None:
         return sa.and_(
             Interaction.source == InteractionSource.telegram_userbot,
-            Interaction.direction == direction,
+            authorship.said_by_clause(direction),
         )
     return sa.or_(_is_window_row(), Interaction.source.in_(TIMELINE_SOURCES))
 

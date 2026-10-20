@@ -40,6 +40,7 @@ from miya.logs import setup_logging
 from miya.services import (
     approvals,
     audio,
+    authorship,
     chats,
     documents,
     health,
@@ -614,6 +615,16 @@ async def ingest_message(
             sender=person,
             aliases=_owner_aliases(),
         )
+        if message.out:
+            # JV-10: an outgoing message MIYA sent from the outbox is tagged as
+            # such, whichever path stores it first (live, catch-up, backfill).
+            echo = await authorship.find_echo(
+                session,
+                channel=authorship.CHANNEL_TELEGRAM,
+                external_id=authorship.telegram_external_id(message.chat_id, message.id),
+            )
+            if echo is not None:
+                meta = authorship.tagged(meta, echo)
         if plan.risk is not None and plan.risk.dangerous:
             meta = safety.with_file_verdict(
                 meta,
