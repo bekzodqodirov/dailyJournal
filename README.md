@@ -159,6 +159,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `USERBOT_CATCHUP_MINUTES`, `USERBOT_CATCHUP_MAX_PER_CHAT`, `USERBOT_CATCHUP_MAX_CHATS` | 30 / 500 / 20 — after downtime the userbot re-reads allowed chats past the last message it saw, never before a chat was switched on |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
 | `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
+| `PROMISE_REMIND_LEAD_MINUTES` | 60 (5–720, the timed sweep runs every five minutes) — a promise or task deadline with a time of day («ertaga 14:00 gacha») is reminded this long before it, never inside quiet hours (a lead that falls there moves to the end of the quiet hours, or before they begin when the deadline is inside them); date-only deadlines keep the morning ping |
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
 | `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
 | `GCAL_CALENDAR_ID`, `GCAL_PULL_MINUTES`, `GCAL_DAYS_AHEAD` | Which calendar, how often, how far ahead |
@@ -211,6 +212,7 @@ it recorded:
 | `/pul [kecha\|YYYY-MM-DD]` | One day's money rows by ref (`x12`), each with ✏️ Tuzat and 🗑 O'chir; voided rows marked 🗑 |
 | `/ochir x12` | Void one wrong money row: it leaves every total, stays in the history, and ↩️ Qaytar (or `/qaytar x12`) restores it |
 | `/tuzat x12 …` | Correct a money row: amount, currency, `kirim`/`chiqim`/`teskari`, `kim <ism>`, `sana kecha`, `izoh …`, `turkum …` |
+| `/tuzat p12 ertaga 14:00` | Move a promise's or task's deadline; a time of day after the day (`14:00`, `soat 3`, `kechki 6`) is kept, shown («ertaga 14:00») and reminded `PROMISE_REMIND_LEAD_MINUTES` before it; `muddatsiz` clears both |
 | `/kim <ism yoki GS kod>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
 | `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
 | `/eslab <ism>: <matn>` | Remember a fact about a person by hand |

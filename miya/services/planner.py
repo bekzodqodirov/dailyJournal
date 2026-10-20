@@ -57,6 +57,12 @@ async def plan_inputs(session: AsyncSession, day: date) -> PlanInputs:
     )
 
 
+def _due_text(record) -> str:
+    """'2026-10-21', or '2026-10-21 14:00' when the deadline has a time."""
+    at = getattr(record, "due_time", None)
+    return f"{record.due_date} {at:%H:%M}" if at is not None else f"{record.due_date}"
+
+
 def render_inputs(
     inputs: PlanInputs, *, header: bool = True, amounts: bool = True
 ) -> str:
@@ -85,7 +91,7 @@ def render_inputs(
     tasks = inputs.due.get("tasks", [])
     if tasks:
         for t in tasks:
-            lines.append(f"- {escape(t.description)} (muddat: {t.due_date})")
+            lines.append(f"- {escape(t.description)} (muddat: {_due_text(t)})")
     else:
         lines.append("- yo'q")
 
@@ -95,7 +101,7 @@ def render_inputs(
         for p, person in promises:
             lines.append(
                 f"- {escape(person.display_name)}: {escape(p.description)} "
-                f"(muddat: {p.due_date})"
+                f"(muddat: {_due_text(p)})"
             )
     else:
         lines.append("- yo'q")

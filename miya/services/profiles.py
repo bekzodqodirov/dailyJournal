@@ -97,6 +97,12 @@ def _day(value: datetime) -> str:
     return value.astimezone(settings.tz).strftime("%Y-%m-%d")
 
 
+def _at(promise) -> str:
+    """' 14:00' after the date of a timed deadline (JV-03), else nothing."""
+    at = getattr(promise, "due_time", None)
+    return f" {at:%H:%M}" if at is not None else ""
+
+
 def render_inputs(summary: PersonSummary) -> str:
     """The deterministic data block the model writes the profile from.
 
@@ -139,7 +145,7 @@ def render_inputs(summary: PersonSummary) -> str:
     if summary.open_promises:
         for p in summary.open_promises:
             who = "sen" if p.made_by is PromiseMadeBy.me else "u"
-            due = f" (muddat {p.due_date.isoformat()})" if p.due_date else ""
+            due = f" (muddat {p.due_date.isoformat()}{_at(p)})" if p.due_date else ""
             lines.append(f"- {who}: {p.description}{due}")
     else:
         lines.append("- yo'q")

@@ -361,6 +361,9 @@ async def list_promises(
                 "made_by": promise.made_by.value,
                 "description": promise.description,
                 "due_date": promise.due_date.isoformat() if promise.due_date else None,
+                "due_time": (
+                    promise.due_time.strftime("%H:%M") if promise.due_time else None
+                ),
             }
             for promise, person in items
         ]

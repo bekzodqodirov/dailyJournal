@@ -16,7 +16,7 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any
@@ -404,6 +404,12 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def _hhmm(value: time | None) -> str | None:
+    """A deadline's time of day as the owner says it, '14:00', or None for a
+    date-only one (JV-03)."""
+    return value.strftime("%H:%M") if value is not None else None
+
+
 def _jsonable(value: Any) -> Any:
     """SQLAlchemy rows / dataclasses / Decimals → plain JSON data."""
     if isinstance(value, Decimal):
@@ -652,6 +658,7 @@ async def _run_tool(
                         "made_by": p.made_by.value,
                         "description": p.description,
                         "due_date": _jsonable(p.due_date),
+                        "due_time": _hhmm(p.due_time),
                     }
                     for p in summary.open_promises
                 ],
@@ -776,6 +783,7 @@ async def _run_tool(
                         "made_by": p.made_by.value,
                         "description": p.description,
                         "due_date": _jsonable(p.due_date),
+                        "due_time": _hhmm(p.due_time),
                     }
                     for p, person in items["promises"]
                 ],
@@ -783,6 +791,7 @@ async def _run_tool(
                     {
                         "description": t.description,
                         "due_date": _jsonable(t.due_date),
+                        "due_time": _hhmm(t.due_time),
                         "priority": t.priority.value,
                     }
                     for t in items["tasks"]

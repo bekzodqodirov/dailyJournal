@@ -400,6 +400,12 @@ class Settings(BaseSettings):
     timezone: str = "Asia/Tashkent"
     report_time: str = "19:00"
     quiet_hours: str = "23:30-07:30"
+    # A promise or task deadline with a time of day ("ertaga 14:00") is
+    # reminded this many minutes before it, never inside QUIET_HOURS (JV-03).
+    # Date-only deadlines keep the morning-of-the-day ping. At least 5: the
+    # timed sweep runs every five minutes, and a shorter lead would fall
+    # between two runs and never be sent before the deadline.
+    promise_remind_lead_minutes: int = Field(default=60, ge=5, le=720)
     batch_flush_hours: int = 3
 
     # --- Misc ---------------------------------------------------------------

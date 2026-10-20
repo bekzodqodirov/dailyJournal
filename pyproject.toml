@@ -36,6 +36,7 @@ files = [
     "miya/services/authorship.py",
     "miya/services/retry.py",
     "miya/services/safety.py",
+    "miya/services/when.py",
 ]
 
 [tool.pytest.ini_options]

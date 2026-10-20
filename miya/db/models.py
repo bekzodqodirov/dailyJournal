@@ -9,13 +9,14 @@ Conventions:
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from miya.config import settings
@@ -37,6 +38,44 @@ EVENT_STATUS = pg_enum(e.EventStatus, e.EVENT_STATUS_ENUM)
 TASK_PRIORITY = pg_enum(e.TaskPriority, e.TASK_PRIORITY_ENUM)
 TASK_STATUS = pg_enum(e.TaskStatus, e.TASK_STATUS_ENUM)
 WINDOW_STATUS = pg_enum(e.WindowStatus, e.WINDOW_STATUS_ENUM)
+
+
+def local_due_at(due_date: date | None, due_time: time | None) -> datetime | None:
+    """The deadline moment of a dated, timed row, in the owner's timezone."""
+    if due_date is None or due_time is None:
+        return None
+    return datetime.combine(due_date, due_time, tzinfo=settings.tz)
+
+
+def due_at_expr(model: type[Promise] | type[Task]) -> sa.ColumnElement[datetime]:
+    """The same moment in SQL: ``due_date + due_time`` read as local time.
+    NULL for a date-only or undated row, like the Python side."""
+    return sa.func.timezone(
+        settings.timezone, model.due_date + model.due_time, type_=sa.DateTime(True)
+    )
+
+
+class _TimedDue:
+    """A deadline that may carry a time of day (JV-03).
+
+    ``due_date`` stays the single source of the day, so every reader that
+    only knows the date keeps working; ``due_time`` is NULL for a date-only
+    deadline and a CHECK keeps it NULL when there is no date. ``due_at`` is
+    the moment the two make, None unless both are set.
+    """
+
+    if TYPE_CHECKING:  # the columns themselves are declared on each model
+        due_date: Mapped[date | None]
+        due_time: Mapped[time | None]
+
+    @hybrid_property
+    def due_at(self) -> datetime | None:
+        return local_due_at(self.due_date, self.due_time)
+
+    @due_at.inplace.expression
+    @classmethod
+    def _due_at_expression(cls) -> sa.ColumnElement[datetime]:
+        return due_at_expr(cls)  # type: ignore[arg-type]
 
 
 class Person(Base):
@@ -369,7 +408,7 @@ class DebtPayment(Base):
     )
 
 
-class Promise(Base):
+class Promise(_TimedDue, Base):
     __tablename__ = "promises"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -379,6 +418,8 @@ class Promise(Base):
     )
     description: Mapped[str] = mapped_column(sa.Text, nullable=False)
     due_date: Mapped[date | None] = mapped_column(sa.Date)
+    # The time of day the deadline names, when it names one (JV-03).
+    due_time: Mapped[time | None] = mapped_column(sa.Time)
     status: Mapped[e.PromiseStatus] = mapped_column(
         PROMISE_STATUS, nullable=False, server_default=e.PromiseStatus.open.value
     )
@@ -394,6 +435,9 @@ class Promise(Base):
     person: Mapped[Person] = relationship(lazy="raise")
 
     __table_args__ = (
+        sa.CheckConstraint(
+            "due_time IS NULL OR due_date IS NOT NULL", name="ck_promises_due_time"
+        ),
         sa.Index("ix_promises_status_due", "status", "due_date"),
         sa.Index("ix_promises_person", "person_id"),
         # Foreign keys that cascade or set null are indexed (WP-23, 0016).
@@ -517,12 +561,14 @@ class Event(Base):
     )
 
 
-class Task(Base):
+class Task(_TimedDue, Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     description: Mapped[str] = mapped_column(sa.Text, nullable=False)
     due_date: Mapped[date | None] = mapped_column(sa.Date)
+    # The time of day the deadline names, when it names one (JV-03).
+    due_time: Mapped[time | None] = mapped_column(sa.Time)
     priority: Mapped[e.TaskPriority] = mapped_column(
         TASK_PRIORITY, nullable=False, server_default=e.TaskPriority.med.value
     )
@@ -542,6 +588,9 @@ class Task(Base):
     )
 
     __table_args__ = (
+        sa.CheckConstraint(
+            "due_time IS NULL OR due_date IS NOT NULL", name="ck_tasks_due_time"
+        ),
         sa.Index("ix_tasks_status_due", "status", "due_date"),
         # Foreign keys that cascade or set null are indexed (WP-23, 0016).
         sa.Index("ix_tasks_source_interaction", "source_interaction_id"),

@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -57,6 +57,7 @@ from miya.services.extraction import (
     ExtractedPromise,
     ExtractedSettlement,
     ExtractedTransaction,
+    parse_iso_due,
 )
 
 log = logging.getLogger(__name__)
@@ -583,6 +584,8 @@ class ClaimView:
     origin: str | None = None
     code: str | None = None
     candidates: tuple[int, ...] = ()
+    # The time of day a promise's deadline names (JV-03).
+    due_time: time | None = None
 
 
 def _money(value: object) -> Decimal | None:
@@ -611,6 +614,13 @@ def _date(value: object) -> date | None:
         return None
 
 
+def _time(value: object) -> time | None:
+    """The time of day in a promise payload's ``due_date``, if it has one."""
+    if not isinstance(value, str) or _date(value) is None:
+        return None
+    return parse_iso_due(value)[1]
+
+
 def view(claim: Claim) -> ClaimView:
     """Plain fields for a question line. Tolerates a partial or broken payload."""
     payload: dict[str, Any] = claim.payload if isinstance(claim.payload, dict) else {}
@@ -635,6 +645,7 @@ def view(claim: Claim) -> ClaimView:
         ),
         description=text.strip() if isinstance(text, str) else "",
         due=_date(payload.get("due_date")) if kind in (KIND_DEBT, KIND_PROMISE) else None,
+        due_time=_time(payload.get("due_date")) if kind == KIND_PROMISE else None,
         made_by=(
             _enum(PromiseMadeBy, payload.get("made_by"))
             if kind in (KIND_PROMISE, KIND_FULFILMENT)
@@ -975,14 +986,19 @@ async def edit(
         value = change.value
         if value is not None and not isinstance(value, date):
             raise ValueError("a due date must be a date or empty")
-        _set(
-            claim,
-            "due_date",
-            value.isoformat() if value else None,
-            field=field,
-            by=by,
-            now=now,
-        )
+        if isinstance(value, datetime):
+            # «c12 ertaga 14:00»: the payload keeps the form the extractor
+            # writes, which the promise writer splits again (JV-03).
+            if claim.kind != KIND_PROMISE:
+                raise ValueError("only a promise deadline carries a time of day")
+            if value.time() == time.min:
+                # parse_iso_due reads T00:00 as a date-only value, so a stored
+                # midnight would be dropped on view and on accept without a word.
+                raise ValueError("a midnight deadline reads as date-only in a claim")
+            stored: str | None = value.strftime("%Y-%m-%dT%H:%M")
+        else:
+            stored = value.isoformat() if value else None
+        _set(claim, "due_date", stored, field=field, by=by, now=now)
 
     else:  # direction: a flip
         current = _enum(DebtDirection, (claim.payload or {}).get("direction"))

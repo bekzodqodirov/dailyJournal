@@ -40,6 +40,7 @@ from miya.db.models import (
     Transaction,
     TransactionEvidence,
     UsageLog,
+    due_at_expr,
 )
 from miya.services import authorship, codes, memories
 
@@ -192,7 +193,12 @@ async def promises_by_status(
         sa.select(Promise, Person)
         .join(Person, Person.id == Promise.person_id)
         .where(Promise.status == status)
-        .order_by(Promise.due_date.nulls_last(), Promise.created_at)
+        # A timed deadline before a date-only one of the same day (JV-03).
+        .order_by(
+            Promise.due_date.nulls_last(),
+            Promise.due_time.nulls_last(),
+            Promise.created_at,
+        )
         .limit(limit)
     )
     if person_id is not None:
@@ -693,7 +699,7 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
             sa.select(Task)
             .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
             .where(Task.due_date.isnot(None), Task.due_date <= limit)
-            .order_by(Task.due_date)
+            .order_by(Task.due_date, Task.due_time.nulls_last())
         )
     )
     # One list in the brief: namesakes across debts and promises differ.
@@ -701,6 +707,38 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
         session, [b.person for b in debts] + [person for _, person in promises]
     )
     return {"debts": debts, "promises": promises, "tasks": tasks}
+
+
+async def timed_due_items(
+    session: AsyncSession, *, after: datetime, until: datetime
+) -> dict[str, list]:
+    """Open promises and tasks whose deadline names a time of day, later than
+    ``after`` and at or before ``until``, soonest first — the timed
+    reminder's source (JV-03)."""
+    promises = [
+        (row[0], row[1])
+        for row in (
+            await session.execute(
+                sa.select(Promise, Person)
+                .join(Person, Person.id == Promise.person_id)
+                .where(Promise.status == PromiseStatus.open)
+                .where(Promise.due_time.isnot(None))
+                .where(due_at_expr(Promise) > after, due_at_expr(Promise) <= until)
+                .order_by(due_at_expr(Promise), Promise.id)
+            )
+        ).all()
+    ]
+    tasks = list(
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
+            .where(Task.due_time.isnot(None))
+            .where(due_at_expr(Task) > after, due_at_expr(Task) <= until)
+            .order_by(due_at_expr(Task), Task.id)
+        )
+    )
+    await codes.apply_labels(session, [person for _, person in promises])
+    return {"promises": promises, "tasks": tasks}
 
 
 async def upcoming_events(

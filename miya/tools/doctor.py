@@ -170,6 +170,7 @@ EXPECTED_ENV_KEYS: tuple[str, ...] = (
     "TIMEZONE",
     "REPORT_TIME",
     "QUIET_HOURS",
+    "PROMISE_REMIND_LEAD_MINUTES",
     "BATCH_FLUSH_HOURS",
     "LOG_LEVEL",
     "LOG_FORMAT",

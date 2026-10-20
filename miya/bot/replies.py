@@ -26,7 +26,9 @@ from miya.bot.formatting import (
     queue_line,
     quiet_line,
     quote,
+    record_due,
     record_line,
+    record_short_due,
     relative_day,
     short_date,
     split_message,
@@ -547,7 +549,7 @@ def confirmation(applied: Applied) -> str:
 
     for promise in applied.promises:
         who = "Men" if promise.made_by is PromiseMadeBy.me else "U"
-        tail = f" ({short_date(promise.due_date)})" if promise.due_date else ""
+        tail = f" ({record_short_due(promise)})" if promise.due_date else ""
         lines.append(
             f"🤝 Va'da: {who} — {escape(promise.description)}{tail}"
             + tag("promise", promise.id)
@@ -592,7 +594,7 @@ def confirmation(applied: Applied) -> str:
         )
 
     for task in applied.tasks:
-        tail = f" ({short_date(task.due_date)})" if task.due_date else ""
+        tail = f" ({record_short_due(task)})" if task.due_date else ""
         priority = (
             f" [{PRIORITY_LABEL[task.priority]}]" if task.priority.value == "high" else ""
         )
@@ -657,14 +659,18 @@ def promises_report(items) -> str:
         return "✅ Ochiq va'da yo'q."
 
     mine = [
-        f"{escape(p.description)} — {escape(person_label(person))}"
+        timed_promise_line(p, person)
+        if getattr(p, "due_time", None) is not None
+        else f"{escape(p.description)} — {escape(person_label(person))}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
         + tag("promise", p.id)
         for p, person in items
         if p.made_by is PromiseMadeBy.me
     ]
     theirs = [
-        f"{escape(person_label(person))}: {escape(p.description)}"
+        timed_promise_line(p, person)
+        if getattr(p, "due_time", None) is not None
+        else f"{escape(person_label(person))}: {escape(p.description)}"
         + (f" · {relative_day(p.due_date)}" if p.due_date else "")
         + tag("promise", p.id)
         for p, person in items
@@ -789,7 +795,7 @@ def person_report(summary: PersonSummary) -> str:
         lines = [
             ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
             + escape(p.description)
-            + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+            + (f" · {record_due(p)}" if p.due_date else "")
             + tag("promise", p.id)
             for p in summary.open_promises
         ]
@@ -882,6 +888,79 @@ def reminder(debts, promises, tasks, events) -> str:
     return body
 
 
+# --- timed deadlines (JV-03) ------------------------------------------------
+
+# A promise whose deadline names a time of day, in a list.
+TIMED_PROMISE_LINE = "⏰ {muddat} — {ism}: {matn}"
+# The ping PROMISE_REMIND_LEAD_MINUTES before a timed deadline: the owner's
+# own promise, the other side's, and a task.
+TIMED_REMINDER_MINE = "⏰ {vaqt} da muddat: {ism}ga va'da — {matn}"
+TIMED_REMINDER_THEIRS = "⏰ {vaqt} da muddat: {ism}ning va'dasi — {matn}"
+TIMED_REMINDER_TASK = "⏰ {vaqt} da muddat: {matn}"
+
+
+def timed_promise_line(promise, person) -> str:
+    """'⏰ ertaga 14:00 — Akmal: hisob-kitob p12'."""
+    return TIMED_PROMISE_LINE.format(
+        muddat=record_due(promise),
+        ism=escape(person_label(person)),
+        matn=escape(promise.description),
+    ) + tag("promise", promise.id)
+
+
+def _due_promise_line(promise, person) -> str:
+    """A promise in the reminder and the brief: timed ones lead with ⏰ and
+    the time, date-only ones read as they always have."""
+    if getattr(promise, "due_time", None) is not None:
+        return timed_promise_line(promise, person)
+    return (
+        f"{escape(person_label(person))}: {escape(promise.description)} · "
+        f"{relative_day(promise.due_date)}" + tag("promise", promise.id)
+    )
+
+
+def timed_reminder_line(kind: str, record, person=None) -> str:
+    """One ping before a timed deadline, ref last for the buttons."""
+    vaqt = record_due(record)
+    matn = escape(record.description)
+    if kind == "task":
+        return TIMED_REMINDER_TASK.format(vaqt=vaqt, matn=matn) + tag("task", record.id)
+    template = (
+        TIMED_REMINDER_MINE
+        if record.made_by is PromiseMadeBy.me
+        else TIMED_REMINDER_THEIRS
+    )
+    name = escape(person_label(person)) if person is not None else "?"
+    return template.format(vaqt=vaqt, ism=name, matn=matn) + tag("promise", record.id)
+
+
+def timed_reminder_with_counts(promises, tasks) -> tuple[str, dict[str, int]]:
+    """The before-the-deadline pings in one message, plus how many of each
+    kind fit — only what is shown may be marked as sent, as for the hourly
+    reminder."""
+    entries = [
+        ("promise", timed_reminder_line("promise", p, person)) for p, person in promises
+    ]
+    entries += [("task", timed_reminder_line("task", t)) for t in tasks]
+    counts = {"promise": 0, "task": 0}
+    lines: list[str] = []
+    for kind, line in entries:
+        if len("\n".join([*lines, line])) > TELEGRAM_LIMIT - 60:
+            break
+        lines.append(line)
+        counts[kind] += 1
+    return "\n".join(lines), counts
+
+
+def timed_reminder_refs(
+    promises, tasks, rendered: dict[str, int]
+) -> list[tuple[str, int]]:
+    """The rows the shown pings' buttons act on, in line order."""
+    refs = [("promise", p.id) for p, _ in promises][: rendered.get("promise", 0)]
+    refs += [("task", t.id) for t in tasks][: rendered.get("task", 0)]
+    return refs
+
+
 def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str, int]]:
     """The ping body, plus how many of each kind actually fit in it.
 
@@ -912,18 +991,13 @@ def reminder_with_counts(debts, promises, tasks, events) -> tuple[str, dict[str,
         (
             "promise",
             "🤝 <b>Va'da muddati</b>",
-            [
-                f"{escape(person_label(person))}: {escape(p.description)} · "
-                f"{relative_day(p.due_date)}" + tag("promise", p.id)
-                for p, person in promises
-            ],
+            [_due_promise_line(p, person) for p, person in promises],
         ),
         (
             "task",
             "✔️ <b>Vazifalar</b>",
             [
-                f"{escape(t.description)} · {relative_day(t.due_date)}"
-                + tag("task", t.id)
+                f"{escape(t.description)} · {record_due(t)}" + tag("task", t.id)
                 for t in tasks
             ],
         ),
@@ -1039,6 +1113,7 @@ TUZAT_USAGE = (
     "<code>/tuzat d12 teskari</code> — kim kimga qarz (aksincha)\n"
     "<code>/tuzat d12 Sardor</code> — boshqa odam\n"
     "<code>/tuzat p7 ertaga</code> — muddat (sana, ertaga, juma, 3 kun, muddatsiz)\n"
+    "<code>/tuzat p7 ertaga 14:00</code> — muddat va vaqt (va'da, vazifa)\n"
     "<code>/tuzat c12 summa 4 mln</code> — tasdiqlanmagan da'voni, javobdan oldin\n\n"
     "<i>Aniq bo'lmasa: «kim Sardor», «summa 5 mln», «muddat juma».</i>"
 )
@@ -1048,8 +1123,8 @@ TUZAT_USAGE = (
 # that row (records.EDITABLE), so the hint never teaches a refused edit.
 _TUZAT_EXAMPLES = {
     "debt": ("6 mln", "300 $", "teskari", "Sardor", "ertaga"),
-    "promise": ("Sardor", "ertaga"),
-    "task": ("ertaga",),
+    "promise": ("Sardor", "ertaga", "ertaga 14:00"),
+    "task": ("ertaga", "ertaga 14:00"),
     "transaction": (
         "250 ming",
         "valyuta $",
@@ -1882,12 +1957,10 @@ def _morning_brief_text(brief: MorningBrief) -> str:
         for b in brief.due.get("debts", [])
     ]
     due_lines += [
-        f"{escape(person_label(person))}: {escape(p.description)} · "
-        f"{relative_day(p.due_date)}" + tag("promise", p.id)
-        for p, person in brief.due.get("promises", [])
+        _due_promise_line(p, person) for p, person in brief.due.get("promises", [])
     ]
     due_lines += [
-        f"{escape(t.description)} · {relative_day(t.due_date)}" + tag("task", t.id)
+        f"{escape(t.description)} · {record_due(t)}" + tag("task", t.id)
         for t in brief.due.get("tasks", [])
     ]
     if due_lines:

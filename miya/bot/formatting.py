@@ -7,7 +7,7 @@ place that decides how money, dates and names are rendered.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -161,6 +161,47 @@ def relative_day(value: date, *, today: date | None = None) -> str:
     if delta <= 7:
         return f"{delta} kundan keyin"
     return short_date(value)
+
+
+def due_label(day: date, at: time | None = None, *, today: date | None = None) -> str:
+    """A deadline: `relative_day` for a date-only one, and with its time for
+    a timed one (JV-03) — 'bugun 14:00', 'ertaga 14:00', 'dushanba 10:00'.
+
+    A timed deadline later this week is named by its weekday, one more than a
+    week away by its date; one more than a day overdue is just overdue, the
+    hour no longer matters.
+    """
+    if at is None:
+        return relative_day(day, today=today)
+    today = today or datetime.now(settings.tz).date()
+    delta = (day - today).days
+    hhmm = at.strftime("%H:%M")
+    if delta < -1:
+        return relative_day(day, today=today)
+    if -1 <= delta <= 2:
+        return f"{relative_day(day, today=today)} {hhmm}"
+    if delta <= 6:
+        return f"{WEEKDAYS_UZ[day.weekday()]} {hhmm}"
+    return f"{short_date(day)} {hhmm}"
+
+
+def record_due(record, *, today: date | None = None) -> str:
+    """A promise's or task's deadline as `due_label` reads it; the caller
+    checks that there is a due date at all."""
+    return due_label(record.due_date, getattr(record, "due_time", None), today=today)
+
+
+def short_due(day: date | None, at: time | None = None) -> str:
+    """The deadline in a confirmation: '21-okt' as always for a date-only one,
+    'ertaga 15:00' for a timed one, so the owner sees the time was heard."""
+    if day is None or at is None:
+        return short_date(day)
+    return due_label(day, at)
+
+
+def record_short_due(record) -> str:
+    """`short_due` of a promise or task row."""
+    return short_due(record.due_date, getattr(record, "due_time", None))
 
 
 def age_label(delta: timedelta) -> str:
@@ -409,12 +450,12 @@ def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
         return transaction_line(record, person, handle=handle, markup=markup)
     if kind == "promise":
         who = "Men" if record.made_by is PromiseMadeBy.me else "U"
-        due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+        due = f" · {record_due(record)}" if record.due_date else " · muddatsiz"
         return (
             f"🤝 {handle}{who} — {name}: {_text(record.description, markup)}{due}"
             f"{_PROMISE_STATUS.get(record.status, '')}"
         )
-    due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+    due = f" · {record_due(record)}" if record.due_date else " · muddatsiz"
     status = _TASK_STATUS.get(record.status, "")
     return f"✔️ {handle}{_text(record.description, markup)}{due}{status}"
 
@@ -562,7 +603,8 @@ def _claim_body(view: ClaimView, markup: bool) -> str:
         label = _TXN_LABEL.get(getattr(view, "txn_type", None) or "", "pul harakati")
         return f"{_claim_money(view)} {label}{detail}"
     if kind == "promise":
-        due = f" ({short_date(view.due)})" if view.due else ""
+        at = getattr(view, "due_time", None)
+        due = f" ({short_due(view.due, at)})" if view.due else ""
         return f"sen va'da bergansan — {quote(view.description, markup=markup)}{due}"
     # fulfilment: the counterparty says he did what he had promised
     return quote(view.description, markup=markup)
@@ -715,7 +757,7 @@ def new_record_lines(new_debts, new_promises) -> list[str]:
     lines += [
         ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
         + f"{escape(person_label(p.person))} — {escape(p.description)}"
-        + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+        + (f" · {record_due(p)}" if p.due_date else "")
         + tag("promise", p.id)
         for p in new_promises
     ]

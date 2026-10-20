@@ -29,6 +29,8 @@ Rules:
 - Promises: "Men ... qilaman/beraman" → made_by=me. "U ... qiladi/va'da berdi" → them.
 - Dates: resolve relative dates ("ertaga", "завтра", "indinga", "next Monday")
   against CURRENT_DATE. Output ISO. Unknown → null.
+- A promise or task deadline with a time of day said ("soat 3 da", "14:00
+  gacha", "kechki 6", "завтра в 10"): due_date is YYYY-MM-DDTHH:MM, 24-hour.
 - Conversation windows are transcripts with exactly one message per line:
     [YYYY-MM-DD HH:MM] [SPEAKER] "text"
   SPEAKER is ME (the owner), MIYA (an automatic reply the owner's assistant

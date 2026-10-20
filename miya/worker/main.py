@@ -3,6 +3,9 @@
 Jobs:
   * reminders    — hourly, on the hour; quiet-hours aware; escalates and then
                    asks "Hali ochiqmi?" (see services/reminders.py)
+  * timed_reminders — every 5 min; the ping PROMISE_REMIND_LEAD_MINUTES
+                   before a promise or task deadline that has a time of day
+                   (quiet-hours aware; JV-03)
   * call_scan    — every minute; ingests new call recordings (Phase 2)
   * retention    — daily at 04:15; deletes audio past AUDIO_RETENTION_DAYS
   * embed        — every 2 min; backfills bge-m3 vectors for new memories
@@ -211,6 +214,76 @@ async def reminder_job(bot: Bot) -> None:
         len(bundle.promises),
         len(bundle.tasks),
         len(bundle.events),
+    )
+
+
+def _renderable_timed(bundle: reminders.DueBundle) -> reminders.DueBundle:
+    """The timed bundle without the items whose ping line cannot be rendered.
+
+    One bad row is logged and dropped, never a stop for the sweep; the keys
+    are rebuilt from what is left so mark_sent and the buttons stay aligned
+    with the lines actually shown.
+    """
+    kept = reminders.DueBundle()
+    for promise, person in bundle.promises:
+        try:
+            replies.timed_reminder_line("promise", promise, person)
+        except Exception as exc:
+            log.error(
+                "timed reminder for promise %s failed to render: %s",
+                promise.id,
+                type(exc).__name__,
+            )
+            continue
+        kept.promises.append((promise, person))
+        kept.keys.append(("promise", str(promise.id)))
+    for task in bundle.tasks:
+        try:
+            replies.timed_reminder_line("task", task)
+        except Exception as exc:
+            log.error(
+                "timed reminder for task %s failed to render: %s",
+                task.id,
+                type(exc).__name__,
+            )
+            continue
+        kept.tasks.append(task)
+        kept.keys.append(("task", str(task.id)))
+    return kept
+
+
+async def timed_reminder_job(bot: Bot) -> None:
+    """The ping before a deadline that names a time of day (JV-03).
+
+    Every five minutes, so «bugun 14:00» is reminded close to
+    PROMISE_REMIND_LEAD_MINUTES before 14:00 rather than at whichever hourly
+    sweep comes first. Only those first pings go out here; the later ones
+    and "Hali ochiqmi?" stay with the hourly sweep, which never sends them.
+    """
+    now = datetime.now(settings.tz)
+    if reminders.in_quiet_hours(now):
+        return
+
+    async with session_scope() as session:
+        bundle = _renderable_timed(await reminders.collect_timed(session, now=now))
+        if bundle.is_empty():
+            return
+        body, rendered = replies.timed_reminder_with_counts(bundle.promises, bundle.tasks)
+        if not body:
+            return
+        keyboard = keyboards.record_actions(
+            replies.timed_reminder_refs(bundle.promises, bundle.tasks, rendered)
+        )
+        if not await notify(bot, body, reply_markup=keyboard):
+            return
+        # As for the hourly pings: logged after the send, and only what fit.
+        await reminders.mark_sent(session, bundle, rendered=rendered)
+        await session.commit()
+
+    log.info(
+        "sent timed reminder: %d promises, %d tasks",
+        rendered["promise"],
+        rendered["task"],
     )
 
 
@@ -1437,6 +1510,15 @@ async def run() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        timed_reminder_job,
+        CronTrigger(minute="*/5", timezone=settings.timezone),
+        args=[bot],
+        id="timed_reminders",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
     scheduler.add_job(
         call_scan_job,
