@@ -176,3 +176,15 @@ async def test_lookup_code_tool(session):
 
 def test_lookup_code_is_a_tool():
     assert "lookup_code" in [tool["name"] for tool in rag.TOOLS]
+    # The tools whose results are the ledger, pinned (JV-06 adds the two
+    # one-day reads).
+    sql_tools = set(rag.SQL_TOOLS)
+    assert sql_tools == {
+        "open_debts",
+        "spending_summary",
+        "list_transactions",
+        "lookup_code",
+        "promises_made",
+        "who_wrote",
+    }
+    assert sql_tools <= {tool["name"] for tool in rag.TOOLS}

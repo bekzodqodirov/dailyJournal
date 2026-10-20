@@ -571,6 +571,8 @@ predicate is rebuilt with JSON and FK conditions (no `source = 'whatsapp'` liter
   its own, so the bank verdict edits it in place; a bot card without it (sent before JV-05, when
   the card shared its message with the reply and its buttons) is never edited, a fresh card is
   sent instead.
+- `interactions.meta.sql` (JV-06): `promises_made` | `who_wrote`, set on a bot question answered
+  straight from SQL with no model call.
 - Echoes of MIYA-sent messages: `meta.sent_by='miya'`, `meta.authored_by ('ai'|'owner')`,
   `meta.outbox_id`.
 
@@ -1172,9 +1174,12 @@ or voice.
 5. A deterministic fast path in `on_text` and `_spoken_mode` renders these two canonical questions
    with no model call. `rag.answer_full` wraps the model call in `with_backoff`.
 
-**Owner strings.** "📌 Bugun bergan va'dalaringiz ({n}):\n{i}. {ism} — {matn} · muddat: {muddat} ·
-{kanal}" · empty: "Bugun hech kimga va'da bermagansiz (yozuvlarda topilmadi)." · "📨 Kecha sizga
-yozganlar ({n}):\n{i}. {ism} — {soni} ta xabar, oxirgisi {vaqt} · {javob berilgan|javobsiz}".
+**Owner strings.** "📌 {kun} bergan va'dalaringiz ({n}):\n{i}. {ism} — {matn} · muddat: {muddat} ·
+{kanal}" · empty: "{kun} hech kimga va'da bermagansiz (yozuvlarda topilmadi)." · "📨 {kun} sizga
+yozganlar ({n}):\n{i}. {ism} — {soni} ta xabar, oxirgisi {vaqt} · {javob berilgan|javobsiz}" ·
+empty: "{kun} sizga hech kim yozmagan (yozuvlarda topilmadi)." · rows left out (by the query's
+limit or the message size): "<i>… va yana {k} ta</i>", with `{n}` always the full count. `{kun}`
+is Bugun, Kecha or "{Hafta kuni} kuni ({sana})".
 
 **Tests.** `test_promises_made_day_window_tashkent`, `test_who_wrote_private_and_addressed_only`,
 `test_fast_path_no_model_call`, `test_voice_routes_to_fast_path`, `test_rag_backoff_retries`.

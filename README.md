@@ -361,12 +361,21 @@ Only the api container loads the model — the bot and worker call its
 `POST /v1/embed` over the compose network (`EMBED_SERVICE_URL`), so the ~2 GB
 of weights sit in RAM once, not three times.
 
-**RAG chat.** A question to the bot goes to Sonnet with a fixed toolbox:
+**RAG chat.** A question to the bot goes to REASON_MODEL with a fixed toolbox:
 `open_debts`, `person_summary`, `spending_summary`, `due_items`,
-`upcoming_events`, `search_memories`, `recent_interactions`. The SQL tools are
+`promises_made`, `who_wrote`, `upcoming_events`, `search_memories`,
+`recent_interactions` and the rest of `rag.TOOLS`. The SQL tools are
 the only source of financial figures; `search_memories` covers contextual
 questions. If the model or a tool fails, the owner gets an honest "try again
-later" instead of a guess.
+later" instead of a guess; an answer that comes back empty is asked for once
+more.
+
+Two questions need no model at all: «Bugun kimga nima va'da bergandim?» and
+«Kecha kimlar yozdi?» (any of bugun, kecha, o'tgan kuni or a weekday; typed or
+spoken, with or without a question mark) are answered straight from SQL
+(`queries.promises_made`, `queries.who_wrote`) over the local Asia/Tashkent
+day. Only the owner's own words count: a reply MIYA sent by itself never
+makes a promise and never answers anyone.
 
 **Evening recap.** At `REPORT_TIME` the worker sends "🌆 Bugun nima bo'ldi":
 the day's money per currency, repayments and what the phone booked (with

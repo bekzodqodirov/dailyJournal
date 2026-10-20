@@ -694,7 +694,10 @@ SOURCE_WORD = {
 
 # A DM line shown on its own (``/tarix`` with a direction, the RAG tool)
 # needs to say who said it; a note the owner typed into the bot does not.
+# MIYA's own automatic reply is outgoing too, but never the owner's line
+# (JV-10): it is MIYA's.
 _SPEAKER = {Direction.out: "sen", Direction.in_: "u"}
+SPEAKER_MIYA = "MIYA"
 
 TIMELINE_TEXT_LIMIT = 200
 TIMELINE_NO_TEXT = "[matn yo'q]"
@@ -715,8 +718,11 @@ def timeline_line(entry: TimelineEntry, *, markup: bool = True) -> str:
     if not body:
         body = TIMELINE_NO_TEXT
     speaker = ""
-    if entry.source is InteractionSource.telegram_userbot and entry.direction in _SPEAKER:
-        speaker = f"{_SPEAKER[entry.direction]}: "
+    if entry.source is InteractionSource.telegram_userbot:
+        if entry.by_miya:
+            speaker = f"{SPEAKER_MIYA}: "
+        elif entry.direction in _SPEAKER:
+            speaker = f"{_SPEAKER[entry.direction]}: "
     return f"{day_label(entry.when)} · {emoji} {word} · {speaker}{_text(body, markup)}"
 
 

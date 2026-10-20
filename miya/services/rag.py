@@ -27,11 +27,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.bot import formatting
 from miya.bot.formatting import WEEKDAYS_UZ
 from miya.config import settings
-from miya.db.enums import DebtDirection, Direction, TransactionType
+from miya.db.enums import DebtDirection, Direction, PromiseMadeBy, TransactionType
 from miya.db.models import ChatMonitor, Interaction, Memory, Person
 from miya.services import codes as client_codes
 from miya.services import memories as memories_svc
-from miya.services import queries, recall
+from miya.services import queries, recall, retry
 from miya.services.amounts import guard_amounts
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
 from miya.services.extraction import API_FAILURES, get_client, to_money
@@ -184,6 +184,13 @@ person_summary fields. Optionally one line "<b>Taklif:</b> …". An amount
 inside a quote is what that person SAID: keep it inside «…» attributed to
 them. Balances, totals and who-owes-whom come only from SQL tools. Never
 add up quoted amounts. If the person is ambiguous, ask back in one line.
+
+One day's promises and writers — "Bugun kimga nima va'da bergandim?",
+"Kecha kimlar yozdi?": call promises_made or who_wrote with the date that
+the CURRENT_DATE lines at the top of the question give for the day word
+(bugun, kecha, o'tgan kuni, a weekday). Report the list as the tool
+returned it; never add or drop a line. When total is larger than the list,
+say how many more there are.
 
 Clients — the owner identifies clients by a GS code (GS367) or by name. A code
 is exact: pass it as the name to person_summary, person_timeline or open_debts,
@@ -349,6 +356,40 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "promises_made",
+        "description": (
+            "Promises made on one local day, from SQL: who to, what, the "
+            "deadline and the channel. Use for 'Bugun kimga nima va'da "
+            "bergandim?' (made_by 'me', the default) and 'Kecha kim menga "
+            "va'da berdi?' (made_by 'them'). MIYA's automatic replies never "
+            "count as the owner's promises."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "YYYY-MM-DD, local day"},
+                "made_by": {"type": "string", "enum": ["me", "them"]},
+            },
+            "required": ["date"],
+        },
+    },
+    {
+        "name": "who_wrote",
+        "description": (
+            "Who wrote to the owner on one local day, from SQL: private chats "
+            "plus group messages aimed at the owner, per person with the "
+            "message count, the last message time and whether the owner has "
+            "answered since. Use for 'Kecha kimlar yozdi?'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "YYYY-MM-DD, local day"},
+            },
+            "required": ["date"],
+        },
+    },
+    {
         "name": "due_items",
         "description": (
             "Overdue and soon-due debts, promises and tasks within a horizon "
@@ -429,12 +470,16 @@ def _jsonable(value: Any) -> Any:
         }
     if isinstance(value, TimelineEntry):
         # Before the generic dataclass branch: asdict would pull the ORM row in.
-        return {
+        entry = {
             "when": _jsonable(value.when),
             "source": _jsonable(value.source),
             "direction": _jsonable(value.direction),
             "text": value.text,
         }
+        if value.by_miya:
+            # MIYA's automatic reply: outgoing, but not the owner's words (JV-10).
+            entry["author"] = "miya"
+        return entry
     if isinstance(value, Interaction):
         return {
             "ref": f"m{value.id}",
@@ -734,6 +779,10 @@ async def _run_tool(
 
     if name == "list_transactions":
         return await _list_transactions(session, args)
+    if name == "promises_made":
+        return await _promises_made(session, args)
+    if name == "who_wrote":
+        return await _who_wrote(session, args)
     if name == "spending_summary":
         summary = await queries.spending_summary(
             session, _parse_date(args["date_from"]), _parse_date(args["date_to"])
@@ -880,14 +929,77 @@ async def _run_tool(
     return _dumps({"error": f"unknown tool: {name}"})
 
 
+async def _promises_made(session: AsyncSession, args: dict) -> str:
+    day = _parse_date(args["date"])
+    made_by = PromiseMadeBy(args.get("made_by") or PromiseMadeBy.me.value)
+    made, total = await queries.promises_made(
+        session, queries.day_bounds(day), made_by=made_by
+    )
+    return _dumps(
+        {
+            "date": day.isoformat(),
+            "made_by": made_by.value,
+            "note": UNTRUSTED_NOTE,
+            "total": total,
+            "promises": [
+                {
+                    "person": item.person.display_name,
+                    "description": item.promise.description,
+                    "due_date": _jsonable(item.promise.due_date),
+                    "due_time": _hhmm(item.promise.due_time),
+                    "status": item.promise.status.value,
+                    "made_at": _jsonable(item.made_at.astimezone(settings.tz)),
+                    "source": _jsonable(item.source),
+                    "chat": item.chat_title,
+                }
+                for item in made
+            ],
+        }
+    )
+
+
+async def _who_wrote(session: AsyncSession, args: dict) -> str:
+    day = _parse_date(args["date"])
+    wrote, total = await queries.who_wrote(session, queries.day_bounds(day))
+    return _dumps(
+        {
+            "date": day.isoformat(),
+            "note": UNTRUSTED_NOTE,
+            "total": total,
+            "people": [
+                {
+                    "person": (
+                        item.person.display_name if item.person else item.chat_title
+                    ),
+                    "messages": item.messages,
+                    "last_at": _jsonable(item.last_at.astimezone(settings.tz)),
+                    "answered": item.answered,
+                }
+                for item in wrote
+            ],
+        }
+    )
+
+
+def weekday_on_or_before(today: date, weekday: int) -> date:
+    """The latest date on or before ``today`` that falls on ``weekday``
+    (0 = dushanba): what a bare weekday name means in a question."""
+    return today - timedelta(days=(today.weekday() - weekday) % 7)
+
+
 def date_hints(now: datetime) -> str:
     """The calendar words resolved for this question, so the model never
-    does date arithmetic (WP-57)."""
+    does date arithmetic (WP-57). A date is one local day, [00:00, next
+    00:00), and each weekday name is its latest date up to today (JV-06)."""
     today = now.astimezone(settings.tz).date()
     monday = today - timedelta(days=today.weekday())
     last_monday = monday - timedelta(days=7)
     first = today.replace(day=1)
     last_month_end = first - timedelta(days=1)
+    weekdays = "; ".join(
+        f"{name}={weekday_on_or_before(today, index)}"
+        for index, name in enumerate(WEEKDAYS_UZ)
+    )
     return (
         f"CURRENT_DATE: {today.isoformat()} ({WEEKDAYS_UZ[today.weekday()]}), "
         f"{settings.timezone}\n"
@@ -896,8 +1008,125 @@ def date_hints(now: datetime) -> str:
         f"bu hafta={monday}..{today}; "
         f"o'tgan hafta={last_monday}..{last_monday + timedelta(days=6)}\n"
         f"bu oy={first}..{today}; "
-        f"o'tgan oy={last_month_end.replace(day=1)}..{last_month_end}"
+        f"o'tgan oy={last_month_end.replace(day=1)}..{last_month_end}\n"
+        f"day window: a date is [00:00, next day 00:00) {settings.timezone}\n"
+        f"{weekdays}"
     )
+
+
+# --- two questions answered straight from SQL (JV-06) ---------------------------------
+#
+# «Bugun kimga nima va'da bergandim?» and «Kecha kimlar yozdi?», typed or
+# spoken, need no model: the bot renders queries.promises_made / who_wrote.
+# The match is strict on purpose: every word of the folded question must be
+# one these questions use, so a note such as «Bugun Akmalga va'da berdim»
+# (a name in it) is never taken for one and still gets written down.
+
+OWNER_PROMISES = "promises_made"
+OWNER_WHO_WROTE = "who_wrote"
+
+
+@dataclass(frozen=True, slots=True)
+class OwnerQuestion:
+    """A canonical owner question and the local day it asks about."""
+
+    kind: str
+    day: date
+    days_ago: int
+    start: datetime
+    end: datetime
+
+
+_DAY_WORDS = {"bugun": 0, "bugungi": 0, "kecha": 1, "kechagi": 1}
+# «o'tgan kuni», «avvalgi kuni»: the day before yesterday.
+_TWO_DAYS_BACK = {"otgan", "avvalgi"}
+_WEEKDAY_WORDS = {name: index for index, name in enumerate(WEEKDAYS_UZ)}
+# Words either question may carry around its core.
+_FILLERS = frozenset(
+    {"kuni", "miya", "menga", "men", "man", "edi", "ekan", "chi", "ayt", "aytchi"}
+    | {"aytib", "ber", "korsat", "iltimos", "hammasi", "hamma"}
+)
+_PROMISE_NOUNS = frozenset({"vada", "vadalar", "vadani", "vadalarni"})
+_PROMISE_VERBS = frozenset(
+    {"berdim", "bergandim", "berganman", "bergan", "edim", "berdimmi"}
+    | {"bergandimmi", "berganmanmi", "kildim", "kilgandim", "kilganman"}
+)
+# The verb must be the owner's own (first person): «menga ... bergan edi» is
+# what someone promised the owner, which the model answers from made_by=them.
+_PROMISE_FIRST_PERSON = frozenset(
+    {"berdim", "bergandim", "berganman", "berdimmi", "bergandimmi", "berganmanmi"}
+    | {"kildim", "kilgandim", "kilganman"}
+)
+_PROMISE_ASKS = frozenset(
+    {"kimga", "kimlarga", "nima", "nimalar", "nimani", "kanday", "kanaka"}
+)
+_WROTE_ASKS = frozenset({"kim", "kimlar"})
+_WROTE_VERBS = frozenset(
+    {"yozdi", "yozgan", "yozgandi", "yozishdi", "yozishgan", "yozishgandi"}
+    | {"yozibdi", "yozishibdi", "yubordi", "yuborgan", "yuborishdi", "xabar"}
+)
+_PROMISE_WORDS = _FILLERS | _PROMISE_NOUNS | _PROMISE_VERBS | _PROMISE_ASKS
+_WROTE_WORDS = _FILLERS | _WROTE_ASKS | _WROTE_VERBS
+
+
+def _day_back(tokens: list[str], today: date) -> int | None:
+    """How many days before ``today`` the one day word names, or None when
+    there is none or more than one."""
+    found: list[int] = []
+    for index, token in enumerate(tokens):
+        if token in _DAY_WORDS:
+            found.append(_DAY_WORDS[token])
+        elif token in _WEEKDAY_WORDS:
+            day = weekday_on_or_before(today, _WEEKDAY_WORDS[token])
+            found.append((today - day).days)
+        elif token in _TWO_DAYS_BACK:
+            if tokens[index + 1 : index + 2] != ["kuni"]:
+                return None
+            found.append(2)
+    return found[0] if len(found) == 1 else None
+
+
+def _kind_of(words: set[str]) -> str | None:
+    if (
+        words <= _PROMISE_WORDS
+        and words & _PROMISE_NOUNS
+        and (words & _PROMISE_FIRST_PERSON or {"bergan", "edim"} <= words)
+        and words & _PROMISE_ASKS
+    ):
+        return OWNER_PROMISES
+    if (
+        words <= _WROTE_WORDS
+        and words & _WROTE_ASKS
+        and words & (_WROTE_VERBS - {"xabar"})
+    ):
+        return OWNER_WHO_WROTE
+    return None
+
+
+def owner_question(text: str, now: datetime) -> OwnerQuestion | None:
+    """The canonical question ``text`` asks, with its day window, or None.
+
+    The day comes from the one day word (bugun, kecha, o'tgan kuni, a
+    weekday) and is resolved against ``now``, the question's own moment.
+    """
+    today = now.astimezone(settings.tz).date()
+    tokens = normalise_for_search(text).split()
+    days_ago = _day_back(tokens, today)
+    if days_ago is None:
+        return None
+    words = {
+        token
+        for token in tokens
+        if token not in _DAY_WORDS
+        and token not in _WEEKDAY_WORDS
+        and token not in _TWO_DAYS_BACK
+    }
+    kind = _kind_of(words)
+    if kind is None:
+        return None
+    day = today - timedelta(days=days_ago)
+    start, end = queries.day_bounds(day)
+    return OwnerQuestion(kind=kind, day=day, days_ago=days_ago, start=start, end=end)
 
 
 async def _search_history(
@@ -1031,7 +1260,14 @@ FOLLOWUP_NOTE = (
     "if this question follows on from them; otherwise ignore them.)"
 )
 # Tools whose results are the ledger; the others carry people's words.
-SQL_TOOLS = {"open_debts", "spending_summary", "list_transactions", "lookup_code"}
+SQL_TOOLS = {
+    "open_debts",
+    "spending_summary",
+    "list_transactions",
+    "lookup_code",
+    "promises_made",
+    "who_wrote",
+}
 QUOTE_TOOLS = {"search_history", "search_memories", "recent_interactions"}
 REF_RE = re.compile(r"\b([mf]\d+(?:#\d+)?)\b")
 CITED_RE = re.compile(r"\[([mf]\d+(?:#\d+)?)\]")
@@ -1169,6 +1405,26 @@ def _refs_in(output: str) -> set[str]:
     return found
 
 
+# An answer with neither words nor a tool call is asked for once more, through
+# retry.with_backoff (JV-06); a transport failure is the client's to retry.
+ANSWER_ATTEMPTS = 2
+_RETRY_BASE_SECONDS = 0.5
+_RETRY_CAP_SECONDS = 2.0
+
+
+class _Unusable(Exception):
+    """The model answered, but with nothing to show or to run."""
+
+
+def _usable(response: Any) -> bool:
+    for block in response.content or ():
+        if block.type == "tool_use":
+            return True
+        if block.type == "text" and (block.text or "").strip():
+            return True
+    return False
+
+
 async def answer(
     session: AsyncSession,
     question: str,
@@ -1272,26 +1528,48 @@ async def answer_full(
 
     final_text = ""
     called = False
-    for _round in range(MAX_TOOL_ROUNDS):
-        try:
-            response = await client.messages.create(
-                model=settings.reason_model,
-                max_tokens=2048,
-                system=system,
-                messages=messages,
-                tools=TOOLS,
-            )
-        except API_FAILURES as exc:
-            log.warning("rag call failed: %s", exc)
-            break
-        called = True
 
+    async def _ask() -> Any:
+        # The client retries transport and API failures itself (JV-02); only
+        # an answer that came back empty is asked again here.
+        nonlocal called
+        response = await client.messages.create(
+            model=settings.reason_model,
+            max_tokens=2048,
+            system=system,
+            messages=messages,
+            tools=TOOLS,
+        )
+        called = True
         await record_anthropic_usage(
             session,
             model=settings.reason_model,
             operation=operation,
             usage=response.usage,
         )
+        if not _usable(response):
+            raise _Unusable()
+        return response
+
+    for _round in range(MAX_TOOL_ROUNDS):
+        try:
+            response = await retry.with_backoff(
+                _ask,
+                attempts=ANSWER_ATTEMPTS,
+                base=_RETRY_BASE_SECONDS,
+                cap=_RETRY_CAP_SECONDS,
+                retry_on=(_Unusable,),
+            )
+        except _Unusable:
+            log.warning(
+                "rag answer came back empty after %d attempt(s)",
+                ANSWER_ATTEMPTS,
+                extra={"attempt": ANSWER_ATTEMPTS, "error": "empty"},
+            )
+            break
+        except API_FAILURES as exc:
+            log.warning("rag call failed: %s", exc)
+            break
 
         text_parts = [b.text for b in response.content if b.type == "text"]
         if text_parts:

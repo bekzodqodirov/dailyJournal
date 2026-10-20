@@ -2230,7 +2230,10 @@ _SPOKEN_ASK = re.compile(r"(?<![a-z0-9])(?:nima|kim)(?![a-z0-9])")
 
 def _spoken_mode(text: str) -> str:
     """A transcript has no '?': the "-mi" particle marks the question too,
-    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi")."""
+    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi"). The
+    two questions SQL answers alone (JV-06) are questions however spoken."""
+    if rag.owner_question(text, datetime.now(settings.tz)) is not None:
+        return "question"
     mode = rag.classify(text)
     if mode != "note":
         return mode
@@ -2292,6 +2295,46 @@ async def _followup_history(session, message) -> tuple[tuple, bool]:
     return tuple(_turn(r) for r in reversed(rows)), False
 
 
+async def _sql_answer(
+    session, text: str, now: datetime, *, interaction_id: int | None = None
+) -> tuple[str, str] | None:
+    """(kind, reply) for «Bugun kimga nima va'da bergandim?» and «Kecha kimlar
+    yozdi?», rendered from SQL with no model call (JV-06). None for any other
+    text, and when the query fails: the model path answers it then."""
+    asked = rag.owner_question(text, now)
+    if asked is None:
+        return None
+    window = (asked.start, asked.end)
+    try:
+        async with session.begin_nested():
+            if asked.kind == rag.OWNER_PROMISES:
+                made, total = await queries.promises_made(session, window)
+                reply = replies.promises_made_report(
+                    made,
+                    day=asked.day,
+                    days_ago=asked.days_ago,
+                    today=now.astimezone(settings.tz).date(),
+                    total=total,
+                )
+            else:
+                wrote, total = await queries.who_wrote(session, window)
+                reply = replies.who_wrote_report(
+                    wrote, day=asked.day, days_ago=asked.days_ago, total=total
+                )
+    except Exception as exc:
+        log.warning(
+            "sql answer failed: %s",
+            type(exc).__name__,
+            extra={
+                "error": type(exc).__name__,
+                "kind": asked.kind,
+                "interaction_id": interaction_id,
+            },
+        )
+        return None
+    return asked.kind, reply
+
+
 async def _answer_into(
     session,
     interaction: Interaction,
@@ -2303,6 +2346,20 @@ async def _answer_into(
 ) -> str:
     """Answer ``text`` and keep the answer and what it cited on the row."""
     interaction.processed = True
+    fast = await _sql_answer(
+        session, text, interaction.occurred_at, interaction_id=interaction.id
+    )
+    if fast is not None:
+        kind, body = fast
+        reply = clip(f"{header}\n\n{body}" if header else body)
+        interaction.meta = {
+            **(interaction.meta or {}),
+            "mode": "question",
+            "sql": kind,
+            "answer": reply[:4000],
+            "refs": [],
+        }
+        return reply
     result = await rag.answer_full(session, text, mode=mode, history=history)
     reply = clip(f"{header}\n\n{result.text}" if header else result.text)
     interaction.meta = {
@@ -2784,6 +2841,11 @@ async def on_text(message: Message) -> None:
     mode = rag.classify(message.text or "")
     if replied and mode == "note":
         # A reply to MIYA's answer asks on, "?" or not (WP-75).
+        mode = "question"
+    if mode != "question" and rag.owner_question(
+        message.text or "", message.date.astimezone(settings.tz)
+    ):
+        # «Kecha kimlar yozdi» needs no '?': SQL answers it alone (JV-06).
         mode = "question"
     if mode != "note":
         await _answer_question(message, message.text, mode, history=history)

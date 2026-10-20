@@ -7,7 +7,9 @@ from decimal import Decimal
 
 from miya.bot.formatting import (
     PRIORITY_LABEL,
+    SOURCE_WORD,
     TELEGRAM_LIMIT,
+    WEEKDAYS_UZ,
     age_label,
     bullet_list,
     claim_line,
@@ -40,7 +42,13 @@ from miya.bot.formatting import (
 )
 from miya.bot.formatting import ref as _ref_handle
 from miya.config import settings
-from miya.db.enums import ChatType, Currency, DebtDirection, PromiseMadeBy
+from miya.db.enums import (
+    ChatType,
+    Currency,
+    DebtDirection,
+    InteractionSource,
+    PromiseMadeBy,
+)
 from miya.services import claims, health, reports, safety
 from miya.services.brief import MorningBrief
 from miya.services.loops import MissedCall, UnansweredQuestion
@@ -2958,3 +2966,130 @@ def voice_question_header(text: str) -> str:
     if len(heard) > VOICE_QUESTION_CHARS:
         heard = heard[: VOICE_QUESTION_CHARS - 1] + "…"
     return f"🎙 <i>Savolingiz:</i> «{escape(heard)}»"
+
+
+# --- one day's promises and writers, straight from SQL (JV-06) ---------------------
+
+PROMISES_MADE_HEADER = "📌 {kun} bergan va'dalaringiz ({n}):"
+PROMISES_MADE_LINE = "{i}. {ism} — {matn} · muddat: {muddat} · {kanal}"
+PROMISES_MADE_NONE = "{kun} hech kimga va'da bermagansiz (yozuvlarda topilmadi)."
+WHO_WROTE_HEADER = "📨 {kun} sizga yozganlar ({n}):"
+WHO_WROTE_LINE = "{i}. {ism} — {soni} ta xabar, oxirgisi {vaqt} · {javob}"
+WHO_WROTE_NONE = "{kun} sizga hech kim yozmagan (yozuvlarda topilmadi)."
+WHO_WROTE_ANSWERED = "javob berilgan"
+WHO_WROTE_UNANSWERED = "javobsiz"
+OWNER_DAY_MORE = "<i>… va yana {k} ta</i>"
+OWNER_DAY_TODAY = "Bugun"
+OWNER_DAY_YESTERDAY = "Kecha"
+OWNER_DAY_OTHER = "{hafta_kuni} kuni ({sana})"
+UNKNOWN_SENDER = "Nomaʼlum"
+
+
+def owner_day(day, days_ago: int) -> str:
+    """The day a question asked about, as the answer's first word."""
+    if days_ago == 0:
+        return OWNER_DAY_TODAY
+    if days_ago == 1:
+        return OWNER_DAY_YESTERDAY
+    return OWNER_DAY_OTHER.format(
+        hafta_kuni=WEEKDAYS_UZ[day.weekday()].capitalize(), sana=short_date(day)
+    )
+
+
+def _promise_channel(item) -> str:
+    """Where a promise was made: the group's title, «Telegram» for a private
+    chat, «MIYA bot» for a note to the bot, else the source's own word."""
+    if item.source is InteractionSource.telegram_userbot:
+        if item.chat_type is ChatType.group and item.chat_title:
+            return _shown(item.chat_title)
+        return PRIVATE_CHAT_LABEL
+    if item.source in (InteractionSource.assistant_bot, InteractionSource.manual):
+        return RECEIPT_BOT_CHANNEL
+    if item.source is None:
+        return _MISSING
+    return SOURCE_WORD.get(item.source, item.source.value)
+
+
+# Room a day report leaves under the Telegram limit for the «… va yana» tail
+# and the heard-question header a spoken question puts above it.
+_OWNER_DAY_ROOM = 400
+
+
+def _owner_day_report(header: str, lines: list[str], total: int, *, newest: bool) -> str:
+    """``header`` and the ``lines`` that fit, and a «… va yana {k} ta» line
+    for every row of ``total`` not shown: cut by the query's limit or by the
+    message size. ``newest`` keeps the latest lines when they do not all fit
+    and puts that line first (who wrote), else keeps the earliest and puts
+    it last (promises made)."""
+    budget = TELEGRAM_LIMIT - len(header) - _OWNER_DAY_ROOM
+    if newest:
+        shown = _fit_oldest_first(list(reversed(lines)), budget=budget)
+    else:
+        shown, used = [], 0
+        for line in lines:
+            used += len(line) + 1
+            if used > budget:
+                break
+            shown.append(line)
+    hidden = total - len(shown)
+    if hidden <= 0:
+        return clip("\n".join([header, *shown]))
+    more = OWNER_DAY_MORE.format(k=hidden)
+    # The tail sits where the left-out rows would be.
+    rows = [more, *shown] if newest else [*shown, more]
+    return clip("\n".join([header, *rows]))
+
+
+def promises_made_report(
+    items, *, day, days_ago: int, today=None, total: int | None = None
+) -> str:
+    """«Bugun kimga nima va'da bergandim?», answered from queries.promises_made.
+    ``total`` is how many promises there are in all (default: ``items``)."""
+    kun = owner_day(day, days_ago)
+    total = len(items) if total is None else total
+    if not items:
+        return PROMISES_MADE_NONE.format(kun=kun)
+    lines = []
+    for index, item in enumerate(items, start=1):
+        promise = item.promise
+        due = record_due(promise, today=today) if promise.due_date else short_date(None)
+        lines.append(
+            PROMISES_MADE_LINE.format(
+                i=index,
+                ism=_shown(person_label(item.person)),
+                matn=_shown(promise.description),
+                muddat=due,
+                kanal=_promise_channel(item),
+            )
+        )
+    header = PROMISES_MADE_HEADER.format(kun=kun, n=total)
+    return _owner_day_report(header, lines, total, newest=False)
+
+
+def _writer_name(item) -> str:
+    if item.person is not None:
+        return _shown(person_label(item.person))
+    return _shown(item.chat_title) if item.chat_title else UNKNOWN_SENDER
+
+
+def who_wrote_report(items, *, day, days_ago: int, total: int | None = None) -> str:
+    """«Kecha kimlar yozdi?», answered from queries.who_wrote. ``total`` is
+    how many people wrote in all (default: ``items``)."""
+    kun = owner_day(day, days_ago)
+    total = len(items) if total is None else total
+    if not items:
+        return WHO_WROTE_NONE.format(kun=kun)
+    lines = []
+    # The query keeps the latest writers: number them as in the whole day.
+    for index, item in enumerate(items, start=total - len(items) + 1):
+        lines.append(
+            WHO_WROTE_LINE.format(
+                i=index,
+                ism=_writer_name(item),
+                soni=item.messages,
+                vaqt=clock(item.last_at),
+                javob=WHO_WROTE_ANSWERED if item.answered else WHO_WROTE_UNANSWERED,
+            )
+        )
+    header = WHO_WROTE_HEADER.format(kun=kun, n=total)
+    return _owner_day_report(header, lines, total, newest=True)

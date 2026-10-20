@@ -15,7 +15,9 @@ Model calls are not wrapped here: the shared client retries by itself
 twice. Google API calls use ``execute(num_retries=N)`` for the same reason.
 A model *answer* that came back unusable (truncated, not a valid object) is
 another matter: ``vision.read_image`` asks once more through
-``with_backoff``, retrying only that, never a transport failure (JV-04).
+``with_backoff``, retrying only that, never a transport failure (JV-04), and
+``rag.answer_full`` does the same for an answer with neither text nor a tool
+call (JV-06).
 """
 
 from __future__ import annotations
