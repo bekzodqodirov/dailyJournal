@@ -19,6 +19,7 @@ ever rendered.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -30,8 +31,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.enums import Currency
 from miya.db.models import ChatMonitor, Claim, Interaction, QuestionLog, ReminderLog
-from miya.services import approvals, chats, claims, loops, nudges, queries, reminders
+from miya.services import (
+    approvals,
+    chats,
+    claims,
+    loops,
+    nudges,
+    queries,
+    receipts,
+    reminders,
+)
 from miya.services.brief import BRIEF_KIND
+
+log = logging.getLogger(__name__)
 
 KIND_CLAIM = "claim"
 KIND_MONEY = "money"
@@ -437,7 +449,20 @@ async def auto_resolve(session: AsyncSession, *, now: datetime) -> dict[str, int
         "claims_linked": await claims.collapse_duplicates(session, now=now),
         "claims_superseded": len(await claims.resolve_superseded(session, now=now)),
         "claims_bank": len(await claims.match_bank_evidence(session, now=now)),
+        "receipts_bank": await _receipts_bank(session, now=now),
     }
+
+
+async def _receipts_bank(session: AsyncSession, *, now: datetime) -> int:
+    """Receipts the bank confirmed (JV-05), in a savepoint: a receipt that
+    cannot be matched never costs the brief or the questions; the worker's
+    receipt_check sweep tries again."""
+    try:
+        async with session.begin_nested():
+            return len(await receipts.match_bank(session, now=now))
+    except Exception as exc:
+        log.error("receipts not matched in auto_resolve: %s", type(exc).__name__)
+        return 0
 
 
 # --- what resolved itself (WP-45) -------------------------------------------------

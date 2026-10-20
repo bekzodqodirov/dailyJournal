@@ -285,6 +285,15 @@ class Settings(BaseSettings):
     # WP-42: an owner-typed payment and a bank record of the same amount on
     # the same day within this many hours are one payment (0 disables).
     money_typed_match_hours: int = Field(default=6, ge=0, le=24)
+    # JV-05: a receipt read from an image is confirmed by a bank income of the
+    # same amount and currency within this many minutes of its printed time.
+    receipt_match_minutes: int = Field(default=30, ge=1, le=720)
+    # Only this many minutes after a receipt arrived does the missing bank
+    # record count: the receipt becomes unconfirmed, or suspicious.
+    receipt_bank_wait_minutes: int = Field(default=60, ge=1, le=1440)
+    # A printed time this many hours older than the message that carried the
+    # receipt is an old receipt sent again (stale_date).
+    receipt_stale_hours: int = Field(default=72, ge=1, le=8760)
     # WP-50: a long evening report goes out in at most this many messages.
     recap_max_parts: int = Field(default=4, ge=1, le=8)
     # The evening recap names a phone silent for longer than this (WP-73).

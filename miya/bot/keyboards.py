@@ -11,6 +11,7 @@ bytes, and a chat list page carries one payload per button.
     rec:ma|ms:m<interaction_id> a missed call: got in touch / snooze till morning
     ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
     cl:y|n|e:<claim_id>         a counterparty's claim: write it / drop it / correct it
+    rcp:ok|f:<receipt_id>       a receipt card: the money came / the receipt is fake
 """
 
 from __future__ import annotations
@@ -88,6 +89,31 @@ def chats_keyboard(page: ChatsPage) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# A receipt card's own verdict (JV-05). Never in handlers._button_handlers:
+# a typed batch answer can never judge a receipt.
+RECEIPT_PREFIX = "rcp"
+RECEIPT_OK = "ok"
+RECEIPT_FAKE = "f"
+
+
+def receipt_verdict(receipt_id: int) -> InlineKeyboardMarkup:
+    """✅ Pul keldi / 🚩 Soxta under a receipt card. Neither books money."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Pul keldi",
+                    callback_data=f"{RECEIPT_PREFIX}:{RECEIPT_OK}:{receipt_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🚩 Soxta",
+                    callback_data=f"{RECEIPT_PREFIX}:{RECEIPT_FAKE}:{receipt_id}",
+                ),
+            ]
+        ]
+    )
 
 
 def media_approval(interaction_id: int) -> InlineKeyboardMarkup:

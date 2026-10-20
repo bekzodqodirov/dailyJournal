@@ -565,6 +565,12 @@ predicate is rebuilt with JSON and FK conditions (no `source = 'whatsapp'` liter
 - `interactions.meta.safety` `{verdict, score, reasons}`; `safety_notice` / `safety_notified`.
 - `interactions.media.risk` `{kind: exec|archive|macro|html, name}`.
 - `interactions.meta.receipt` (the structured reading, mirrored into `receipts`).
+- `interactions.meta.receipt_booked` (JV-05): the owner's own words in this bot message booked
+  the payment, so the receipt card and every later edit of it leave out the bank-only footer.
+- `interactions.meta.receipt_card_alone` (JV-05): this bot message's receipt card is a message of
+  its own, so the bank verdict edits it in place; a bot card without it (sent before JV-05, when
+  the card shared its message with the reply and its buttons) is never edited, a fresh card is
+  sent instead.
 - Echoes of MIYA-sent messages: `meta.sent_by='miya'`, `meta.authored_by ('ai'|'owner')`,
   `meta.outbox_id`.
 
@@ -1078,8 +1084,8 @@ card, issuer and reference, and the owner sees a receipt card.
 4. A counterparty's money still goes through claims; the claim payload carries `receipt_at` and
    `claims._anchor` (`claims.py:1025`) prefers it. `receipt_photo` is added to
    `money_events.TYPED_SOURCES` (`money_events.py:86`), closing the photo-before-SMS double-book.
-5. Bot photos get the card in the reply. Chat receipts get it from the worker job
-   `receipt_notices` (1 min), deduped on `notified_at`.
+5. Bot photos get the card as its own message, sent before the reply (JV-05 edits it in place).
+   Chat receipts get it from the worker job `receipt_notices` (1 min), deduped on `notified_at`.
 6. `merge_into._fk_columns` and the purge planners cover `receipts`.
 
 **Owner strings.**
@@ -1120,7 +1126,12 @@ Payme; the card updates in place.
 2. Job `receipt_check` (1 min) for waiting receipts older than `RECEIPT_BANK_WAIT_MINUTES`:
    `suspicious` only when the payee card is one of `money_events.own_cards` **and** the phone
    heartbeat is fresh, or for a duplicate image hash or reference, or a `paid_at` older than
-   `RECEIPT_STALE_HOURS` or in the future. Otherwise `unconfirmed` — never "fake".
+   `RECEIPT_STALE_HOURS` or in the future. Otherwise `unconfirmed` — never "fake". A receipt of
+   the owner's own payment (`direction='out'`) is never matched (only income confirms) or
+   flagged (every reason and the suspicious line speak of money reaching the owner): it becomes
+   `unconfirmed`, and its card carries no buttons. Another read of the same receipt that the bank
+   already confirmed (the same image or issuer + reference, where either copy is the owner's own
+   bot image) confirms it too; the bank row stays linked to the first copy only.
 3. The card is edited in place via `notice_tg_message_id`. Buttons `rcp:ok:<id>` and `rcp:f:<id>`
    set owner verdicts under a row lock; neither books money; both write history.
 

@@ -39,6 +39,11 @@ Jobs:
                    receipt someone sent into a chat, once (notified_at;
                    JV-04); held in quiet hours unless receipts are set to
                    arrive silently, never counted in the question budget
+  * receipt_check — every minute; the bank cross-check of receipts read
+                   from images (JV-05): confirmed by a bank income near the
+                   printed time, else after RECEIPT_BANK_WAIT_MINUTES
+                   unconfirmed or suspicious; the card is edited in place.
+                   Never books money
   * code_index   — every 2 min; GS codes and waybills of every stored text
                    into code_mentions for exact lookup (WP-39)
   * profile_refresh — every 60 min; rewrites the written profile of up to
@@ -69,6 +74,7 @@ import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import FSInputFile, Message
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -1049,26 +1055,21 @@ async def safety_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
 
 
 async def receipt_notice_text(session, receipt: Receipt, interaction: Interaction) -> str:
-    """The owner's card for a receipt someone sent into a chat (JV-04)."""
-    person = (
-        await session.get(Person, receipt.person_id or interaction.person_id)
-        if (receipt.person_id or interaction.person_id)
-        else None
+    """The owner's card for a receipt someone sent into a chat (JV-04), with
+    the bank cross-check it has so far (JV-05)."""
+    return replies.receipt_card_for(
+        receipt,
+        await receipts.card_source(session, receipt, interaction),
+        await receipts.verdict_detail(session, receipt),
     )
-    monitor = (
-        await session.scalar(
-            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == interaction.tg_chat_id)
-        )
-        if interaction.tg_chat_id is not None
+
+
+def receipt_card_keyboard(receipt: Receipt):
+    """✅ Pul keldi / 🚩 Soxta while the owner's word could still decide."""
+    return (
+        keyboards.receipt_verdict(receipt.id)
+        if receipts.owner_can_judge(receipt)
         else None
-    )
-    if monitor is None or monitor.chat_type is ChatType.private or not monitor.title:
-        channel = replies.PRIVATE_CHAT_LABEL
-    else:
-        channel = monitor.title
-    sender = person.display_name if person else (monitor.title if monitor else None)
-    return replies.receipt_card(
-        receipt, sender=safety.display_name(sender or "—"), channel=channel
     )
 
 
@@ -1101,7 +1102,9 @@ async def receipt_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
                     type(exc).__name__,
                 )
                 continue
-            message = await notify_message(bot, text, silent=silent)
+            message = await notify_message(
+                bot, text, reply_markup=receipt_card_keyboard(receipt), silent=silent
+            )
             if message is None:
                 return  # unreachable: the rest stay queued for the next sweep
             message_id = getattr(message, "message_id", None)
@@ -1109,11 +1112,119 @@ async def receipt_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
                 receipt,
                 now=now,
                 message_id=message_id if isinstance(message_id, int) else None,
+                verdict=receipt.verdict,
             )
             await session.commit()
             sent += 1
     if sent:
         log.info("sent %d receipt card(s)", sent)
+
+
+async def receipt_check_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The bank cross-check of receipts read from images (JV-05).
+
+    Every minute: confirm receipts by the bank's own income records
+    (``receipts.match_bank``), give the ones still without one after
+    RECEIPT_BANK_WAIT_MINUTES their verdict (``receipts.check_waiting``:
+    unconfirmed, or suspicious for a reason), then bring each card that went
+    out up to date. No verdict books money.
+    """
+    now = now or datetime.now(settings.tz)
+    async with session_scope() as session:
+        confirmed: list[Receipt] = []
+        try:
+            async with session.begin_nested():
+                confirmed = await receipts.match_bank(session, now=now)
+        except Exception as exc:
+            # The verdicts and the cards still go ahead; the match is retried
+            # next minute.
+            log.error("receipts not matched: %s", type(exc).__name__)
+        decided = await receipts.check_waiting(session, now=now)
+        await session.commit()
+        edited = await refresh_receipt_cards(bot, session, now=now)
+    if confirmed or decided or edited:
+        log.info(
+            "receipts: %d confirmed, %d judged, %d card(s) updated",
+            len(confirmed),
+            len(decided),
+            edited,
+        )
+
+
+async def refresh_receipt_cards(bot: Bot, session, *, now: datetime) -> int:
+    """Edit each receipt card that shows an older verdict, in place
+    (``notice_tg_message_id``). An edit is silent, so it is made at any
+    hour; a card whose message id is unknown goes out again, under the
+    receipt cards' night rule. One commit per card; one that fails to render
+    or to edit is logged and left for the next sweep. Returns the count."""
+    silent = False
+    hold = False
+    if reminders.in_quiet_hours(now):
+        silent = True
+        hold = not settings.money_receipts_silent_at_night
+    updated = 0
+    for receipt in await receipts.cards_to_refresh(session):
+        receipt_id = receipt.id
+        try:
+            async with session.begin_nested():
+                # The row as it is now: another process (a button tap, an
+                # SMS) may have changed it since the batch was loaded.
+                await session.refresh(receipt)
+                interaction = await session.get(Interaction, receipt.interaction_id)
+                if receipt.verdict_notified_at is not None or interaction is None:
+                    continue
+                verdict = receipt.verdict
+                text = await receipt_notice_text(session, receipt, interaction)
+        except Exception as exc:
+            log.error(
+                "receipt card for receipt %s failed to render: %s",
+                receipt_id,
+                type(exc).__name__,
+                extra={"receipt_id": receipt_id},
+            )
+            continue
+        markup = receipt_card_keyboard(receipt)
+        message_id = receipt.notice_tg_message_id
+        editable = receipts.card_editable(interaction)
+        if not editable:
+            # A card from before JV-05 shares its message with the bot's
+            # reply and buttons: never overwritten, a fresh card goes out.
+            message_id = None
+        if message_id is None:
+            if hold:
+                continue
+            message = await notify_message(bot, text, reply_markup=markup, silent=silent)
+            if message is None:
+                return updated  # unreachable: the rest wait for the next sweep
+            sent_id = getattr(message, "message_id", None)
+            message_id = sent_id if isinstance(sent_id, int) else None
+            if not editable:
+                receipts.mark_card_alone(interaction)
+        else:
+            try:
+                await bot.edit_message_text(
+                    clip(text),
+                    chat_id=settings.owner_telegram_id,
+                    message_id=message_id,
+                    reply_markup=markup,
+                )
+            except TelegramBadRequest as exc:
+                # Not modified, deleted or too old to edit: nothing to retry.
+                log.info("receipt card %s not edited: %s", receipt_id, type(exc).__name__)
+            except Exception as exc:
+                log.warning(
+                    "receipt card %s could not be edited: %s",
+                    receipt_id,
+                    type(exc).__name__,
+                    extra={"receipt_id": receipt_id},
+                )
+                continue
+        await receipts.stamp_card(
+            session, receipt_id, now=now, verdict=verdict, message_id=message_id
+        )
+        await session.commit()
+        updated += 1
+    return updated
 
 
 async def backup_job(bot: Bot) -> None:
@@ -1722,6 +1833,14 @@ async def run() -> None:
         IntervalTrigger(minutes=1),
         args=[bot],
         id="receipt_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        receipt_check_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="receipt_check",
         max_instances=1,
         coalesce=True,
     )

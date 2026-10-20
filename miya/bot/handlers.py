@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -247,30 +248,53 @@ def _booked_money(applied) -> bool:
     )
 
 
-def _with_receipt_card(receipt: Receipt | None, reply: str, applied) -> str:
-    """The receipt card on top of the bot's reply, stamped as delivered: the
-    owner gets it right here, never again from the worker."""
+@dataclass(slots=True)
+class _ReceiptCard:
+    """The receipt card, its own message: the bank's verdict edits it in
+    place later (JV-05), so it never shares a message with the reply."""
+
+    receipt_id: int
+    text: str
+    keyboard: InlineKeyboardMarkup | None
+
+
+async def _receipt_card(session, receipt: Receipt | None, applied) -> _ReceiptCard | None:
+    """The card for an image the owner sent the bot, stamped as delivered:
+    the owner gets it right here, never again from the worker. When the
+    owner's own words in the message booked the payment, the card leaves
+    out the "booked only from the bank" footer — on every later edit too."""
     if receipt is None:
-        return reply
-    card = replies.receipt_card(
+        return None
+    interaction = await session.get(Interaction, receipt.interaction_id)
+    if interaction is not None:
+        receipts.mark_card_alone(interaction)
+        if _booked_money(applied):
+            interaction.meta = {**(interaction.meta or {}), receipts.BOOKED_KEY: True}
+    text = replies.receipt_card_for(
         receipt,
-        sender=replies.RECEIPT_FROM_OWNER,
-        channel=replies.RECEIPT_BOT_CHANNEL,
-        footer=not _booked_money(applied),
+        await receipts.card_source(session, receipt, interaction),
+        await receipts.verdict_detail(session, receipt),
     )
-    receipts.mark_notified(receipt, now=datetime.now(settings.tz))
-    return f"{card}\n\n{reply}" if reply else card
+    keyboard = (
+        keyboards.receipt_verdict(receipt.id)
+        if receipts.owner_can_judge(receipt)
+        else None
+    )
+    receipts.mark_notified(
+        receipt, now=datetime.now(settings.tz), verdict=receipt.verdict
+    )
+    return _ReceiptCard(receipt.id, text, keyboard)
 
 
 async def _read_image(
     session, interaction: Interaction, path: Path, *, readable: bool = True
-) -> tuple[str, InlineKeyboardMarkup | None, int | None]:
+) -> tuple[str, InlineKeyboardMarkup | None, _ReceiptCard | None]:
     """An image the owner sent the bot — a photo, or a .jpg/.png/.webp sent
-    as a file — read once by vision; a receipt gets its card in the reply.
+    as a file — read once by vision; a receipt gets its card.
 
     ``readable`` is False when the file's bytes are not an image
     (safety.sniff_magic): the model never sees it, and the receipt the owner
-    meant it to be waits in /tekshir. Returns (reply, keyboard, receipt id).
+    meant it to be waits in /tekshir. Returns (reply, keyboard, the card).
     """
     if readable:
         described = await describe_into(session, interaction, path, presume_receipt=True)
@@ -297,31 +321,105 @@ async def _read_image(
             # The caption was extracted, but the image itself was not read —
             # the owner must not be told everything succeeded.
             reply = reply + "\n" + replies.VISION_PARTIAL_HINT
-    reply = _with_receipt_card(receipt, reply, applied)
-    return reply, keyboard, receipt.id if receipt is not None else None
+    card = await _receipt_card(session, receipt, applied)
+    return reply, keyboard, card
 
 
-async def _stamp_receipt_card(receipt_id: int | None, sent) -> None:
+async def _answer_image(
+    message: Message,
+    reply: str,
+    keyboard: InlineKeyboardMarkup | None,
+    card: _ReceiptCard | None,
+) -> None:
+    """The receipt card first, then the bot's reply with its own buttons."""
+    if card is not None:
+        sent = await _safe_answer(message, card.text, reply_markup=card.keyboard)
+        await _stamp_receipt_card(card.receipt_id, sent)
+    await _safe_answer(message, reply, reply_markup=keyboard)
+
+
+async def _stamp_receipt_card(
+    receipt_id: int | None, sent, *, verdict: str | None = None
+) -> None:
     """Which message the card is, so the bank verdict can edit it in place
-    later. Best-effort: the receipt itself is already committed."""
+    later, and which verdict it now shows. Best-effort: the receipt itself is
+    already committed."""
     message_id = getattr(sent, "message_id", None)
     if receipt_id is None or not isinstance(message_id, int):
         return
     try:
         async with session_scope() as session:
-            receipt = await session.get(Receipt, receipt_id)
-            if receipt is not None:
-                receipts.mark_notified(
-                    receipt,
-                    now=receipt.notified_at or datetime.now(settings.tz),
-                    message_id=message_id,
-                )
+            await receipts.stamp_card(
+                session,
+                receipt_id,
+                now=datetime.now(settings.tz),
+                verdict=verdict,
+                message_id=message_id,
+            )
     except Exception as exc:
         log.error(
             "could not record the receipt card message for receipt %s: %s",
             receipt_id,
             type(exc).__name__,
         )
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.RECEIPT_PREFIX}:"))
+async def on_receipt_button(callback: CallbackQuery) -> None:
+    """✅ Pul keldi / 🚩 Soxta under a receipt card (JV-05).
+
+    Records the owner's verdict under a row lock and edits the card in
+    place. Neither books money nor voids any; the same tap twice changes
+    nothing. Not in ``_button_handlers``: a typed batch answer never
+    judges a receipt.
+    """
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[1] not in (keyboards.RECEIPT_OK, keyboards.RECEIPT_FAKE)
+        or not parts[2].isdigit()
+    ):
+        await callback.answer()
+        return
+    paid = parts[1] == keyboards.RECEIPT_OK
+    receipt_id = int(parts[2])
+    text = verdict = None
+    async with session_scope() as session:
+        receipt, _ = await receipts.set_owner_verdict(
+            session, receipt_id, paid=paid, by=receipts.BY_BUTTON
+        )
+        if receipt is not None:
+            verdict = receipt.verdict
+            text = replies.receipt_card_for(
+                receipt,
+                await receipts.card_source(session, receipt),
+                await receipts.verdict_detail(session, receipt),
+            )
+    if callback.message is not None:
+        edited = False
+        try:
+            if text is not None:
+                await callback.message.edit_text(text, reply_markup=None)
+            else:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            edited = True
+        except Exception as exc:
+            edited = "not modified" in str(exc).lower()
+            if not edited:
+                log.info(
+                    "could not edit receipt card %s: %s",
+                    receipt_id,
+                    type(exc).__name__,
+                    extra={"receipt_id": receipt_id},
+                )
+        if edited and text is not None:
+            # The card shows the owner's verdict; until it does, the
+            # worker's card refresh keeps trying.
+            await _stamp_receipt_card(receipt_id, callback.message, verdict=verdict)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
 
 
 # --- commands ---------------------------------------------------------------
@@ -1890,7 +1988,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             ),
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
-        reply, keyboard, receipt_id = await _process_on_demand(
+        reply, keyboard, card = await _process_on_demand(
             session,
             interaction,
             path,
@@ -1900,8 +1998,7 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             sniffed=sniffed,
             image_readable=image_readable,
         )
-    sent = await _safe_answer(message, reply, reply_markup=keyboard)
-    await _stamp_receipt_card(receipt_id, sent)
+    await _answer_image(message, reply, keyboard, card)
 
 
 async def _process_on_demand(
@@ -1914,13 +2011,13 @@ async def _process_on_demand(
     is_photo: bool,
     sniffed: safety.Verdict | None = None,
     image_readable: bool = True,
-) -> tuple[str, InlineKeyboardMarkup | None, int | None]:
+) -> tuple[str, InlineKeyboardMarkup | None, _ReceiptCard | None]:
     """Run the right pipeline for one explicitly requested media file.
 
     A document is parsed only when its bytes matched its name (`sniffed`);
     a macro document is read as text and the owner told so (JV-01). An
     image, photo or file, is read by vision and a receipt gets its card
-    (JV-04). Returns (reply, keyboard, the receipt's id or None)."""
+    (JV-04). Returns (reply, keyboard, the receipt card or None)."""
     macro_read = False
     if is_video:
         audio_path = path.with_suffix(".mp3")
@@ -2815,11 +2912,10 @@ async def on_photo(message: Message, bot: Bot) -> None:
             },
         )
         # Photos sent straight to the bot are always vision-processed (spec §6).
-        reply, keyboard, receipt_id = await _read_image(
+        reply, keyboard, card = await _read_image(
             session, interaction, path, readable=sniffed.readable
         )
-    sent = await _safe_answer(message, reply, reply_markup=keyboard)
-    await _stamp_receipt_card(receipt_id, sent)
+    await _answer_image(message, reply, keyboard, card)
 
 
 @router.message(F.document)
@@ -2913,11 +3009,10 @@ async def _on_image_document(
                 "processed": False,
             },
         )
-        reply, keyboard, receipt_id = await _read_image(
+        reply, keyboard, card = await _read_image(
             session, interaction, path, readable=sniffed.readable
         )
-    sent = await _safe_answer(message, reply, reply_markup=keyboard)
-    await _stamp_receipt_card(receipt_id, sent)
+    await _answer_image(message, reply, keyboard, card)
 
 
 @router.message(F.video_note)

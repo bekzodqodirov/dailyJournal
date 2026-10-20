@@ -552,7 +552,7 @@ async def test_image_document_goes_to_vision(
     interaction = await bound.get(m.Interaction, receipt.interaction_id)
     assert interaction.source is InteractionSource.receipt_photo
     assert interaction.media["filename"] == "Screenshot_2026.png"
-    [(text, _)] = message.sent
+    [(text, _), _reply] = message.sent
     assert text.startswith("🧾 Chek · siz · MIYA bot\nChekda: 1.25 mln so'm")
     assert bot_stubs.extracted == [interaction.id]
 
@@ -800,9 +800,18 @@ async def test_the_bot_card_does_not_contradict_what_was_booked(
     message = _PhotoMessage()
     await handlers.on_photo(message, bot=None)
 
-    [(text, _)] = message.sent
-    assert replies.RECEIPT_FOOTER not in text
-    assert text.endswith("Bank tasdig'i: ⏳ kutilmoqda\n\n✅ Yozildi")
+    # The card is its own message (JV-05 edits it in place), the reply follows.
+    [(card, buttons), (reply, _)] = message.sent
+    assert replies.RECEIPT_FOOTER not in card
+    assert card.endswith("Bank tasdig'i: ⏳ kutilmoqda")
+    assert reply == "✅ Yozildi"
+    assert buttons is not None
+    # Both the footer rule and "a card of its own" hold for every later edit.
+    [receipt] = await _receipts(bound)
+    photo = await bound.get(m.Interaction, receipt.interaction_id)
+    assert photo.meta[receipts.BOOKED_KEY] is True
+    assert photo.meta[receipts.CARD_ALONE_KEY] is True
+    assert receipts.card_editable(photo)
 
 
 # --- the owner's card ----------------------------------------------------------------

@@ -173,6 +173,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
 | `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours; the receipt cards read from images (JV-04) follow the same night rule |
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
+| `RECEIPT_MATCH_MINUTES`, `RECEIPT_BANK_WAIT_MINUTES`, `RECEIPT_STALE_HOURS` | 30 min / 60 min / 72 h — a receipt read from an image turns ✅ when a bank SMS or Payme push of the same amount and currency arrives within 30 min of the time printed on it (never the time it was sent); after 60 min without one it is ⏳ unconfirmed, or ⚠️ suspicious only when the image was sent before, its printed time is over 72 h old or in the future, or the payee card is yours (`PAYMENT_OWN_CARDS`) while the phone is reporting; ✅ Pul keldi / 🚩 Soxta on the card record your own verdict and never book money |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
 | `RECAP_PHONE_STALE_HOURS` | 24 — the evening recap names a phone app silent this long, an unconfigured or stale backup, and any open problem (`/holat`) |
 | `RECAP_PROSE_ENABLED`, `RECAP_MODEL`, `RECAP_MAX_PEOPLE`, `RECAP_MAX_GROUPS`, `RECAP_SUBJECT_INPUT_CHARS`, `RECAP_INPUT_MAX_CHARS`, `RECAP_MAX_OUTPUT_TOKENS`, `RECAP_MODEL_TIMEOUT_SECONDS` | `true` / blank (= `REASON_MODEL`) / 8 / 5 / 1200 / 12000 / 1200 / 60 — one capped call per recap writes a sentence or two per person and group; prose with any digit or currency word is dropped, and the recap falls back to its SQL lines when the model is down |
@@ -205,6 +206,15 @@ digits, the bank or app and the receipt number. The card is what the image says,
 not the bank's record; a receipt a client sends into a chat gets the same card
 within the minute, and money they claim is still asked before it is written.
 HEIC photos cannot be read: send them as JPG.
+
+The card's last line is the bank cross-check, edited in place: ✅ when a bank
+SMS or Payme push of the same amount and currency arrives near the time printed
+on the receipt; ⏳ when none came within `RECEIPT_BANK_WAIT_MINUTES` (some
+accounts never send an SMS); ⚠️ only for a reason it names — the same receipt was
+sent before, its date is old or in the future, or it was paid to one of your
+cards while the phone kept reporting and the bank said nothing. ✅ Pul keldi and
+🚩 Soxta under the card record your own verdict. None of this books money: the
+ledger only ever has the bank's own record and your own words.
 
 > **you:** Akmal akaga 5 mln so'm berdim, 25-avgustgacha qaytaradi
 > **MIYA:** 💰 Qarz: → senga 5 mln so'm, muddat: 25-avg

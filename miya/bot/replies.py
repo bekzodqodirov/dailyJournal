@@ -282,12 +282,76 @@ def _or_missing(value: str | None) -> str:
     return _shown(value) if value else _MISSING
 
 
-def receipt_card(receipt, *, sender: str, channel: str, footer: bool = True) -> str:
+# The bank cross-check (JV-05): the card's last line, edited in place.
+RECEIPT_CONFIRMED = "✅ Chek bankda tasdiqlandi: {kanal} {vaqt}."
+RECEIPT_UNCONFIRMED = (
+    "⏳ Bankdan tasdiq hali yo'q (SMS kelmaydigan hisob bo'lishi mumkin)."
+)
+RECEIPT_SUSPICIOUS = (
+    "⚠️ Chek shubhali: {sabab}. Pul kartangizga tushganini ilovadan tekshiring."
+)
+RECEIPT_REASON_RESENT = "bu chek avval ham yuborilgan ({sana})"
+RECEIPT_REASON_RESENT_UNDATED = "bu chek avval ham yuborilgan"
+RECEIPT_REASON_STALE = "chekdagi sana eski ({sana})"
+RECEIPT_REASON_FUTURE = "chekdagi sana kelajakda"
+RECEIPT_REASON_OWN_CARD = "karta sizniki, lekin bankdan xabar kelmadi"
+RECEIPT_OWNER_OK = "✅ Pul keldi — o'zingiz tasdiqladingiz."
+RECEIPT_OWNER_FAKE = "🚩 Soxta deb belgiladingiz."
+
+
+def _when(value: datetime | None) -> str:
+    return f"{day_label(value)} {clock(value)}" if value is not None else _MISSING
+
+
+def _suspicion(receipt, detail) -> str:
+    reasons = list(receipt.verdict_reasons or [])
+    parts: list[str] = []
+    if "duplicate_image" in reasons or "duplicate_reference" in reasons:
+        earlier = getattr(detail, "earlier_at", None)
+        parts.append(
+            RECEIPT_REASON_RESENT.format(sana=day_label(earlier))
+            if earlier is not None
+            else RECEIPT_REASON_RESENT_UNDATED
+        )
+    if "stale_date" in reasons:
+        parts.append(RECEIPT_REASON_STALE.format(sana=day_label(receipt.paid_at)))
+    if "future_date" in reasons:
+        parts.append(RECEIPT_REASON_FUTURE)
+    if "own_card_no_bank" in reasons:
+        parts.append(RECEIPT_REASON_OWN_CARD)
+    return RECEIPT_SUSPICIOUS.format(sabab=", ".join(parts) or _MISSING)
+
+
+def receipt_verdict_line(receipt, detail=None) -> str:
+    """The card's bank line for the receipt's verdict (JV-05)."""
+    verdict = getattr(receipt, "verdict", None)
+    if verdict == "confirmed":
+        label = getattr(detail, "bank_label", None)
+        return RECEIPT_CONFIRMED.format(
+            kanal=_shown(label) if label else _MISSING,
+            vaqt=_when(getattr(detail, "bank_at", None)),
+        )
+    if verdict == "unconfirmed":
+        return RECEIPT_UNCONFIRMED
+    if verdict == "suspicious":
+        return _suspicion(receipt, detail)
+    if verdict == "owner_ok":
+        return RECEIPT_OWNER_OK
+    if verdict == "owner_fake":
+        return RECEIPT_OWNER_FAKE
+    return RECEIPT_BANK_WAITING
+
+
+def receipt_card(
+    receipt, *, sender: str, channel: str, footer: bool = True, detail=None
+) -> str:
     """The owner's receipt card: what the image says, never the bank's word.
 
     A receipt that could not be read is the one line saying so. ``footer``
     is dropped only where the owner's own words already booked the payment
-    (a photo sent to the bot), so the card never claims otherwise.
+    (a photo sent to the bot), so the card never claims otherwise. The last
+    line is the bank cross-check (JV-05), ``detail`` the
+    ``receipts.VerdictDetail`` it names.
     """
     if receipt.state != "read":
         return RECEIPT_UNREADABLE
@@ -313,10 +377,24 @@ def receipt_card(receipt, *, sender: str, channel: str, footer: bool = True) -> 
         issued.append(f"№ {_shown(receipt.reference)}")
     if issued:
         lines.append(" · ".join(issued))
-    lines.append(RECEIPT_BANK_WAITING)
+    lines.append(receipt_verdict_line(receipt, detail))
     if footer:
         lines.append(RECEIPT_FOOTER)
     return "\n".join(lines)
+
+
+def receipt_card_for(receipt, source, detail=None) -> str:
+    """The card from ``receipts.CardSource``: the owner's own image says
+    «siz · MIYA bot», a chat receipt names its sender and the group (or
+    Telegram for a private chat)."""
+    if source.from_bot:
+        sender, channel = RECEIPT_FROM_OWNER, RECEIPT_BOT_CHANNEL
+    else:
+        sender = safety.display_name(source.sender or _MISSING)
+        channel = source.chat_title or PRIVATE_CHAT_LABEL
+    return receipt_card(
+        receipt, sender=sender, channel=channel, footer=source.footer, detail=detail
+    )
 
 
 RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."

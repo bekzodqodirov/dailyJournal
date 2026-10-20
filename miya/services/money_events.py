@@ -17,6 +17,7 @@ mixed — a candidate must match currency, direction and amount exactly.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -36,6 +37,8 @@ from miya.db.models import Debt, Interaction, Person, Transaction, TransactionEv
 from miya.services import codes, money_notices, sms_money
 from miya.services.extraction import ExtractedSettlement
 from miya.services.sms_money import ParsedPayment, Verdict
+
+log = logging.getLogger(__name__)
 
 MONEY_VERSION = 1
 BOOK_LOCK = "miya:money-book"
@@ -75,7 +78,8 @@ def _set_money(interaction: Interaction, **changes) -> None:
     }
 
 
-def _label(interaction: Interaction, channel: str) -> str:
+def channel_label(interaction: Interaction, channel: str) -> str:
+    """The sender or app a bank record came through, as the owner knows it."""
     media = interaction.media or {}
     return media.get("sender") or media.get("app_label") or channel.partition(":")[2]
 
@@ -353,6 +357,25 @@ async def _match_bank_evidence(session, *, now: datetime, txn: Transaction) -> N
     await claims.match_bank_evidence(session, now=now, txn=txn)
 
 
+async def _match_receipts(session, *, now: datetime, txn: Transaction) -> None:
+    """A fresh bank income may confirm a receipt read from an image (JV-05).
+    The receipt only points at this row; nothing more is booked. A savepoint:
+    a receipt that cannot be matched must never cost the booking itself —
+    the worker's receipt_check sweep tries again."""
+    from miya.services import receipts  # receipts → money_events (own_cards)
+
+    try:
+        async with session.begin_nested():
+            await receipts.match_bank(session, now=now, txn=txn)
+    except sa.exc.SQLAlchemyError as exc:
+        log.error(
+            "receipts not matched to bank row %s: %s",
+            txn.id,
+            type(exc).__name__,
+            extra={"transaction_id": txn.id},
+        )
+
+
 # --- booking ------------------------------------------------------------------------
 
 
@@ -460,7 +483,9 @@ async def book(
         amount=reading.amount,
         currency=reading.currency,
         category=sms_money.category_of(reading.merchant, raw),
-        description=f"{_label(interaction, channel)}: {reading.merchant or raw[:80]}",
+        description=(
+            f"{channel_label(interaction, channel)}: {reading.merchant or raw[:80]}"
+        ),
         occurred_at=moment,
         source_interaction_id=interaction.id,
         card_last4=card,
@@ -532,6 +557,7 @@ async def apply_reading(
         else:
             _set_money(interaction, transaction_id=txn.id, merged=merged)
             await _match_bank_evidence(session, now=now, txn=txn)
+            await _match_receipts(session, now=now, txn=txn)
     await session.flush()
     money_notices.note(interaction, verdict.value, txn=txn, merged=merged, now=now)
     return MoneyOutcome(
