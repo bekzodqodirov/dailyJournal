@@ -1623,7 +1623,7 @@ async def _backup_is_missing(now: datetime) -> bool:
 async def catch_up(bot: Bot, scheduler=None) -> None:
     """Run anything the scheduler missed while the worker was down.
 
-    The jobstore is in memory, so a deploy or a VPS reboot spanning 19:00
+    The jobstore is in memory, so a deploy or a VPS reboot spanning REPORT_TIME
     silently loses that day's report, one spanning 09:00 loses the morning
     brief, and one spanning BACKUP_TIME loses a nightly backup. All three
     are cheap to detect on startup and worth recovering: the report and the

@@ -2118,6 +2118,12 @@ BRIEF_HEADER = "🌅 <b>Ertalabki xulosa</b>"
 BRIEF_ALL_CLEAR = "✅ Hammasi joyida — bugun uchrashuv ham, ochiq qolgan narsa ham yo'q."
 
 BRIEF_EVENTS = "📅 <b>Bugungi uchrashuvlar</b>"
+# JV-08: today's deadlines that name a time of day, by that time, right after
+# the meetings; the due section below leaves them out.
+BRIEF_TIMED = "⏰ Bugungi muddatlar:"
+BRIEF_TIMED_LINE = "{vaqt} — {ism}: {matn}"
+# A task has no counterparty, so its line has no name.
+BRIEF_TIMED_TASK_LINE = "{vaqt} — {matn}"
 BRIEF_DUE = "⏰ <b>Muddati bugun va kechikkanlar</b>"
 BRIEF_QUESTIONS = "❓ <b>Javobsiz qolganlar</b>"
 # After the questions and before the claims: an unanswered ring outranks a
@@ -2171,17 +2177,25 @@ def _morning_brief_text(brief: MorningBrief) -> str:
         ]
         parts.append(f"{BRIEF_EVENTS}\n" + bullet_list(lines, empty="—"))
 
+    timed = _brief_timed(brief)
+    if timed:
+        parts.append("\n".join([BRIEF_TIMED, *(_timed_line(*item) for item in timed)]))
+    said = {(kind, record.id) for kind, record, _ in timed}
+
     due_lines = [
         f"{escape(person_label(b.person))}: {money(b.outstanding, b.currency)} · "
         f"{relative_day(b.earliest_due)}" + tags("debt", b.ids)
         for b in brief.due.get("debts", [])
     ]
     due_lines += [
-        _due_promise_line(p, person) for p, person in brief.due.get("promises", [])
+        _due_promise_line(p, person)
+        for p, person in brief.due.get("promises", [])
+        if ("promise", p.id) not in said
     ]
     due_lines += [
         f"{escape(t.description)} · {record_due(t)}" + tag("task", t.id)
         for t in brief.due.get("tasks", [])
+        if ("task", t.id) not in said
     ]
     if due_lines:
         parts.append(f"{BRIEF_DUE}\n" + bullet_list(due_lines, empty="—"))
@@ -2217,6 +2231,24 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     return "\n\n".join(parts)
 
 
+def _brief_timed(brief: MorningBrief) -> list:
+    """The brief's timed deadlines, read defensively like its other optional
+    fields: a brief built without them has none."""
+    return list(getattr(brief, "timed", None) or [])
+
+
+def _timed_line(kind: str, record, person) -> str:
+    """'14:00 — Akmal: hisob-kitob p12'. The name and the text come from a
+    counterparty's words, so both are escaped and stripped of bidi marks."""
+    vaqt = record.due_time.strftime("%H:%M")
+    matn = _shown(record.description or "")
+    if kind == "task" or person is None:
+        return BRIEF_TIMED_TASK_LINE.format(vaqt=vaqt, matn=matn) + tag(kind, record.id)
+    return BRIEF_TIMED_LINE.format(
+        vaqt=vaqt, ism=_shown(person_label(person)), matn=matn
+    ) + tag(kind, record.id)
+
+
 def _brief_system_line(brief: MorningBrief) -> str | None:
     """One line on MIYA itself (WP-80); the evening footer names the rest."""
     count = getattr(brief, "system_problems", None)
@@ -2229,11 +2261,18 @@ def morning_brief_refs(
     brief: MorningBrief, parts: list[str] | None = None
 ) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
     """``(due, stale)`` — the rows the brief's buttons act on, in line order."""
-    due: list[tuple[str, int]] = []
+    # Line order: today's timed deadlines come first, then the due section.
+    due: list[tuple[str, int]] = [(kind, r.id) for kind, r, _ in _brief_timed(brief)]
     for b in brief.due.get("debts", []):
         due += [("debt", i) for i in b.ids]
-    due += [("promise", p.id) for p, _ in brief.due.get("promises", [])]
-    due += [("task", t.id) for t in brief.due.get("tasks", [])]
+    due += [
+        ("promise", p.id)
+        for p, _ in brief.due.get("promises", [])
+        if ("promise", p.id) not in due
+    ]
+    due += [
+        ("task", t.id) for t in brief.due.get("tasks", []) if ("task", t.id) not in due
+    ]
     stale = (
         [(s.record_kind, s.record.id) for s in brief.loops.stale]
         if brief.loops is not None

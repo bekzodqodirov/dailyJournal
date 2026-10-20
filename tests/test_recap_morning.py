@@ -37,7 +37,7 @@ def _at(day, hour, minute=0) -> datetime:
 
 
 NINE = _at(TODAY, 9)
-CUTOFF = _at(YESTERDAY, 19)
+CUTOFF = _at(YESTERDAY, 20)
 
 
 def _boom():
@@ -142,7 +142,7 @@ async def test_late_section_covers_after_the_cutoff_only(session, monkeypatch):
     await _delivered_evening(session)
     text = "\n\n".join((await _morning(session)).parts)
     late = text[text.index("🌃") :]
-    assert "19:00 dan keyin" in late
+    assert "20:00 dan keyin" in late
     assert "Akmal" in late and "Vali" not in late
 
 

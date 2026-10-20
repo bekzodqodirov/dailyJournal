@@ -9,7 +9,7 @@ from miya.config import settings
 from miya.services import health, recaps
 from tests.recap_helpers import recap_of
 
-NOW = datetime.now(settings.tz).replace(hour=19, minute=0, second=0, microsecond=0)
+NOW = datetime.now(settings.tz).replace(hour=20, minute=0, second=0, microsecond=0)
 
 
 async def test_silent_phone_is_named(session, monkeypatch):

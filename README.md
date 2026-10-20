@@ -44,7 +44,7 @@ encrypted every night.
 └────────────────────────────┬────────────────────────────────────────┘
                              ▼
 ┌──────────── ACT (via the assistant bot) ────────────────────────────┐
-│ daily report (19:00 Tashkent) · tomorrow planner · RAG chat ·       │
+│ daily report (20:00 Tashkent) · tomorrow planner · RAG chat ·       │
 │ reminders for due debts, promises and tasks                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -158,7 +158,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `OWNER_ALIAS_NAMESAKE_DAYS` | 90 — in a group where another member with the owner's first name spoke this recently, a bare first name is only "maybe to you" |
 | `USERBOT_CATCHUP_MINUTES`, `USERBOT_CATCHUP_MAX_PER_CHAT`, `USERBOT_CATCHUP_MAX_CHATS` | 30 / 500 / 20 — after downtime the userbot re-reads allowed chats past the last message it saw, never before a chat was switched on |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
-| `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
+| `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 20:00 (the evening recap; outside the quiet hours and after `MORNING_BRIEF_TIME`), 23:30–07:30 |
 | `PROMISE_REMIND_LEAD_MINUTES` | 60 (5–720, the timed sweep runs every five minutes) — a promise or task deadline with a time of day («ertaga 14:00 gacha») is reminded this long before it, never inside quiet hours (a lead that falls there moves to the end of the quiet hours, or before they begin when the deadline is inside them); date-only deadlines keep the morning ping |
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
 | `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
@@ -256,7 +256,7 @@ not in a tool result.
 
 Reminders arrive on the hour for anything due today, tomorrow, or already
 overdue — once per item per 24 hours, and never inside `QUIET_HOURS`. The
-daily report lands at `REPORT_TIME` (19:00 Tashkent = 22:00 in China) with the
+daily report lands at `REPORT_TIME` (20:00 Tashkent = 23:00 in China) with the
 day's money, people, debts, completions and tomorrow's plan.
 
 ---
@@ -380,8 +380,9 @@ makes a promise and never answers anyone.
 
 **Evening recap.** At `REPORT_TIME` the worker sends "🌆 Bugun nima bo'ldi":
 the day's money per currency, repayments and what the phone booked (with
-`x` refs to check), new and closed records, then a block per person — messages,
-calls, what they asked and whether it was answered, claims and refs — and per
+`x` refs to check), the day's receipts by bank verdict (confirmed / waiting /
+suspicious, counted in SQL), new and closed records, then a block per person —
+messages, calls, what they asked and whether it was answered, claims and refs — and per
 group, the calls, what was aimed at the owner in groups, what is still open,
 and tomorrow. Every figure comes from SQL (`services/recaps.py`); one capped
 model call adds at most a labelled sentence or two per person and group, with
@@ -395,9 +396,11 @@ tomorrow.
 yesterday's money per currency, repayments and phone-booked counts, the new
 and closed records, the main conversations recalled with the evening's own
 prose (no new model call), and a block for everything since the evening
-cutoff — so nothing between 19:00 and 09:00 goes untold. When the evening
+cutoff — so nothing between 20:00 and 09:00 goes untold. When the evening
 recap never reached the owner, the whole of yesterday is told here instead.
-Then the brief with its buttons, then at most the brief's questions.
+Then the brief with its buttons — after the meetings it lists today's
+deadlines that name a time of day, by that time («⏰ Bugungi muddatlar») —
+then at most the brief's questions.
 `/kecha` shows the morning recap on demand; `/ertalab` shows both.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in

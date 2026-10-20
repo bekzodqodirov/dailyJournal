@@ -747,6 +747,35 @@ async def timed_due_items(
     return {"promises": promises, "tasks": tasks}
 
 
+async def timed_due_on(session: AsyncSession, day: date) -> dict[str, list]:
+    """Open promises and tasks due on ``day`` at a time of day, ordered by
+    ``due_at`` — the brief's «Bugungi muddatlar» (JV-08). Date-only deadlines
+    are not here: they stay in the due section as they always were. The
+    names are not labelled here: the brief labels this list together with
+    its due section (brief._label_brief), so namesakes across both read apart."""
+    promises = [
+        (row[0], row[1])
+        for row in (
+            await session.execute(
+                sa.select(Promise, Person)
+                .join(Person, Person.id == Promise.person_id)
+                .where(Promise.status == PromiseStatus.open)
+                .where(Promise.due_date == day, Promise.due_time.isnot(None))
+                .order_by(due_at_expr(Promise), Promise.id)
+            )
+        ).all()
+    ]
+    tasks = list(
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
+            .where(Task.due_date == day, Task.due_time.isnot(None))
+            .order_by(due_at_expr(Task), Task.id)
+        )
+    )
+    return {"promises": promises, "tasks": tasks}
+
+
 async def upcoming_events(
     session: AsyncSession, *, within_minutes: int = 60
 ) -> list[Event]:

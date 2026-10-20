@@ -91,6 +91,24 @@ def system_lines(
 
 
 REVIEW_LINE = "⚠️ Tekshirish kerak: {n} ta yozuv — /tekshir"
+# JV-08: the day's receipts by bank verdict, after the money, counted in SQL
+# (recaps.receipt_day). It lives here, not in replies.py, because this
+# renderer imports only formatting.
+RECEIPTS_LINE = (
+    "🧾 Bugun {n} ta chek: {k} tasi bankda tasdiqlandi, {m} tasi kutilmoqda, "
+    "{s} tasi shubhali."
+)
+
+
+def receipts_line(day) -> str | None:
+    """The receipts line, or None on a day without receipts (or when the
+    count failed)."""
+    if day is None or not day.total:
+        return None
+    return RECEIPTS_LINE.format(
+        n=day.total, k=day.confirmed, m=day.waiting, s=day.suspicious
+    )
+
 
 # Where a booked payment came from, in the owner's words.
 SOURCE_WORDS = (
@@ -285,9 +303,11 @@ def evening_parts(
     max_groups: int = 5,
     auto_resolved: int = 0,
     system: list[str] | None = None,
+    receipts=None,
 ) -> list[str]:
     """The recap as Telegram messages, sections in order, empty ones left out
-    (except 💰 Pul)."""
+    (except 💰 Pul). ``receipts`` is recaps.receipt_day's count, shown as one
+    line under the money."""
     codes = codes or {}
     header = EVENING_HEADER.format(full_date=full_date(day))
     if partial_until is not None:
@@ -305,7 +325,8 @@ def evening_parts(
 
     open_items = activity.questions_open or activity.missed_open
     tomorrow_lines = _tomorrow_lines(tomorrow)
-    if activity.is_empty() and not open_items and not tomorrow_lines:
+    receipt_line = receipts_line(receipts)
+    if activity.is_empty() and not open_items and not tomorrow_lines and not receipt_line:
         body = "\n\n".join(
             [header, EVENING_EMPTY, *(["\n".join(footer)] if footer else [])]
         )
@@ -320,6 +341,8 @@ def evening_parts(
     check = _check_section(activity.money, tz)
     if check:
         sections.append(check)
+    if receipt_line:
+        sections.append(receipt_line)
     new_lines = new_record_lines(activity.new_debts, activity.new_promises)
     if new_lines:
         sections.append(_section(RECAP_NEW, [f"• {x}" for x in new_lines]))

@@ -20,7 +20,7 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
@@ -34,9 +34,10 @@ from miya.db.models import (
     Person,
     Promise,
     RecapDigest,
+    Receipt,
     Transaction,
 )
-from miya.services import authorship, loops, queries, windows
+from miya.services import authorship, loops, queries, receipts, windows
 from miya.services.extraction import API_FAILURES, get_client
 from miya.services.profiles import UNTRUSTED_CLOSE, UNTRUSTED_OPEN
 from miya.services.queries import (
@@ -872,6 +873,93 @@ async def _system_lines(session: AsyncSession, now: datetime) -> list[str]:
         return []
 
 
+@dataclass(slots=True)
+class ReceiptDay:
+    """Receipts that came in during a recap window, by bank verdict (JV-08).
+
+    ``confirmed`` is the bank's match or the owner's ✅ Pul keldi, ``waiting``
+    has no bank word yet (``waiting`` or ``unconfirmed``), ``suspicious`` is a
+    flagged receipt or the owner's 🚩 Soxta. Only receipts that were read
+    count, and only money towards the owner: an unread one is in /tekshir
+    already, and the owner's own payment never gets a bank confirmation. A
+    client's receipt the owner forwards to the bot is that same receipt
+    (receipts.BOT_SOURCES), so the bot's copy of a chat receipt counts once.
+    """
+
+    total: int = 0
+    confirmed: int = 0
+    waiting: int = 0
+    suspicious: int = 0
+
+
+def _bot_copy_of_chat_receipt():
+    """True for a receipt the owner sent the bot that is a read chat receipt
+    too: the same image bytes, or the same issuer and printed reference —
+    the match receipts.linked_copy and receipts.earlier_copy use."""
+    twin = aliased(Receipt)
+    twin_message = aliased(Interaction)
+    same_reference = sa.and_(
+        sa.func.length(Receipt.reference) >= receipts.MIN_REFERENCE_CHARS,
+        twin.reference == Receipt.reference,
+        twin.issuer.is_not_distinct_from(Receipt.issuer),
+    )
+    return sa.and_(
+        Interaction.source.in_(receipts.BOT_SOURCES),
+        sa.exists()
+        .where(twin_message.id == twin.interaction_id)
+        .where(
+            twin.id != Receipt.id,
+            twin.state == receipts.STATE_READ,
+            twin_message.source.not_in(receipts.BOT_SOURCES),
+            sa.or_(twin.image_sha256 == Receipt.image_sha256, same_reference),
+        ),
+    )
+
+
+async def receipt_day(
+    session: AsyncSession, start: datetime, end: datetime
+) -> ReceiptDay | None:
+    """The day's receipts counted in SQL; None when the count fails, so the
+    recap goes out without the line rather than not at all."""
+
+    def among(*verdicts: str):
+        return sa.func.count(Receipt.id).filter(Receipt.verdict.in_(verdicts))
+
+    try:
+        async with session.begin_nested():
+            row = (
+                await session.execute(
+                    sa.select(
+                        sa.func.count(Receipt.id),
+                        among(receipts.VERDICT_CONFIRMED, receipts.VERDICT_OWNER_OK),
+                        among(receipts.VERDICT_WAITING, receipts.VERDICT_UNCONFIRMED),
+                        among(receipts.VERDICT_SUSPICIOUS, receipts.VERDICT_OWNER_FAKE),
+                    )
+                    .join(Interaction, Interaction.id == Receipt.interaction_id)
+                    .where(_window(Receipt.created_at, start, end))
+                    .where(Receipt.state == receipts.STATE_READ)
+                    .where(Receipt.direction != receipts.OUT)
+                    .where(~_bot_copy_of_chat_receipt())
+                )
+            ).one()
+    except Exception as exc:
+        log.warning(
+            "the recap's receipts line failed: %s",
+            type(exc).__name__,
+            extra={
+                "error": type(exc).__name__,
+                "window_start": start.isoformat(),
+                "window_end": end.isoformat(),
+            },
+            exc_info=True,
+        )
+        return None
+    total, confirmed, waiting, suspicious = (int(n or 0) for n in row)
+    return ReceiptDay(
+        total=total, confirmed=confirmed, waiting=waiting, suspicious=suspicious
+    )
+
+
 async def build_evening(
     session: AsyncSession, day, *, now: datetime, store: bool
 ) -> RecapResult:
@@ -930,6 +1018,7 @@ async def build_evening(
         max_groups=settings.recap_max_groups,
         auto_resolved=auto,
         system=await _system_lines(session, now),
+        receipts=await receipt_day(session, start, end),
     )
     stats = _stats(activity, prose, queue, parts)
     if store:

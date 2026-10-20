@@ -23,7 +23,7 @@
    OWNER_ALIASES=Bekzod, Bekzod aka, bekzodaka, Begi, Begika, Bega, GSR Logistics, @<sizning_username>
    API_BEARER_TOKEN=<openssl rand -hex 32>
    UPLOAD_TOKENS=phone:<yana bir openssl rand -hex 32>
-   Qolganlariga tegma: EXTRACT_MODEL, REASON_MODEL, TIMEZONE=Asia/Tashkent, QUIET_HOURS=23:30-07:30, MORNING_BRIEF_TIME=09:00, REPORT_TIME=19:00.
+   Qolganlariga tegma: EXTRACT_MODEL, REASON_MODEL, TIMEZONE=Asia/Tashkent, QUIET_HOURS=23:30-07:30, MORNING_BRIEF_TIME=09:00, REPORT_TIME=20:00.
 4) Zaxira kaliti: make backup-key → chiqqan BACKUP_AGE_RECIPIENT=age1… qatorini .env'ga yoz. make backup-key-show → chiqqan qatorlarni parol menejeriga saqla (server tashqarisida!).
 5) Tekshir: make doctor → ❌ qolmasin.
 6) Ishga tushir: make up (birinchi marta 10–20 daqiqa), keyin make health → "status":"ok".
@@ -34,7 +34,7 @@
    - Botga ovozli xabar yubor («sinov, bugun Akmal bilan gaplashdim») → javob kelsin.
    - 30 daqiqadan keyin /qidir Akmal → topsin (model ~2 GB birinchi marta yuklanadi).
    - Serverda docker stats --no-stream → api 4 GB dan kam; free -h → swap deyarli ishlatilmagan.
-   - 19:00 da kechki xulosa, ertasi 09:00 da ertalabki xulosa kelsin; 03:30 dan keyin Telegramda zaxira fayli bo'lsin.
+   - 20:00 da kechki xulosa, ertasi 09:00 da ertalabki xulosa kelsin; 03:30 dan keyin Telegramda zaxira fayli bo'lsin.
    - Birinchi 10 kun har kechqurun /bugun'dagi xarajat jamini o'zing hisoblagan bilan solishtir.
    - Haftasiga 2 marta /xarajat'ni Anthropic Console'dagi summa bilan solishtir.
    - Bir marta: make restore FILE=/data/backups/<oxirgi fayl> DRY=1 → ichidagi jadvallar ro'yxati chiqsin.
@@ -48,9 +48,10 @@
 1) Serverda: cd miya && git status → o'zgarish yo'q; git branch → * master.
 2) make update → zaxira oladi, kodni tortadi, bot/worker/userbot'ni to'xtatib migratsiyalarni qo'llaydi va hammasini qayta yoqadi.
 3) make doctor → ❌ qolmasin. Yangi sozlamalar .env'ga yozilmasa ham standart qiymat bilan ishlaydi; ro'yxati .env.example'da.
-4) Botda /holat → hamma qator ✅. /ertalab → ertalabki xulosa chiqsin.
-5) Standartda o'chiq, xohlasang .env'da yoq: CODE_PLACEHOLDERS, TRANSCRIBE_DIARIZE_CALLS, MEDIA_RETENTION_DAYS, VIDEO_RETENTION_DAYS.
-6) Birinchi yakshanba 05:00 dan keyin /holat'da tiklash mashqi natijasi ✅ bo'lsin (kalit /app/secrets/backup-key.txt'da bo'lishi kerak).
+4) .env'da REPORT_TIME=19:00 bo'lsa, REPORT_TIME=20:00 ga o'zgartir (yoki qatorni o'chir), keyin docker compose up -d --force-recreate worker → kechki xulosa 20:00 da keladi.
+5) Botda /holat → hamma qator ✅. /ertalab → ertalabki xulosa chiqsin.
+6) Standartda o'chiq, xohlasang .env'da yoq: CODE_PLACEHOLDERS, TRANSCRIBE_DIARIZE_CALLS, MEDIA_RETENTION_DAYS, VIDEO_RETENTION_DAYS.
+7) Birinchi yakshanba 05:00 dan keyin /holat'da tiklash mashqi natijasi ✅ bo'lsin (kalit /app/secrets/backup-key.txt'da bo'lishi kerak).
 
 ## Telefon ilovasi: yangi kalitga bir martalik o'tish
 

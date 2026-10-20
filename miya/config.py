@@ -420,7 +420,8 @@ class Settings(BaseSettings):
 
     # --- Scheduling ---------------------------------------------------------
     timezone: str = "Asia/Tashkent"
-    report_time: str = "19:00"
+    # The evening recap "Bugun nima bo'ldi" (JV-08: the spec's 20:00 summary).
+    report_time: str = "20:00"
     quiet_hours: str = "23:30-07:30"
     # A promise or task deadline with a time of day ("ertaga 14:00") is
     # reminded this many minutes before it, never inside QUIET_HOURS (JV-03).

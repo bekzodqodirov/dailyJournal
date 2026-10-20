@@ -1267,7 +1267,7 @@ in Tasks_Promises within a minute.
 **Priority** P1 · **Depends on** JV-03, JV-05 · **Migration** none
 
 **Goal.** The spec's 20:00 evening summary; the 09:00 brief shows today's timed deadlines and
-receipt status.
+the 20:00 recap shows the day's receipt status.
 
 **Files.** `miya/config.py`, `.env.example`, `README.md`, `miya/services/brief.py`,
 `miya/services/recaps.py`, `miya/bot/replies.py`, `tests/test_recap_morning.py`,
