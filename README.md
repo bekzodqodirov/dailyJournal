@@ -163,6 +163,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
 | `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
 | `GCAL_CALENDAR_ID`, `GCAL_PULL_MINUTES`, `GCAL_DAYS_AHEAD` | Which calendar, how often, how far ahead |
+| `SHEETS_ENABLED`, `SHEETS_SERVICE_ACCOUNT_JSON`, `SHEETS_SPREADSHEET_ID`, `SHEETS_SYNC_SECONDS` | `false` / `./secrets/sheets_service_account.json` / blank / 60 s (15–3600) — the one-way Google Sheets mirror (tabs `Tasks_Promises`, `Client_FollowUps`, `Receipts`): every 60 s what changed in SQL is written to your spreadsheet, never read back; a no-op until switched on with the service-account key file and the spreadsheet id in place, a `/holat` line and a problem when it keeps failing |
 | `PAYMENT_SMS_SENDERS` | Extra bank/payment SMS senders on top of the built-in list |
 | `PAYMENT_APP_PACKAGES` | Blank — package ids of the payment apps whose pushes may book money; blank trusts the phone's allow-list |
 | `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
@@ -414,6 +415,34 @@ marked `[MIYA]` in the description. Date-only events (midnight) stay local so
 the calendar isn't spammed with 00:00 entries. Without the token both jobs are
 quiet no-ops.
 
+**Google Sheets mirror.** A one-way copy of the ledger's lists in your own
+spreadsheet, at most a minute behind: `Tasks_Promises` (every promise and
+task, who to whom, deadline with its time, status, where and when it was
+said), `Client_FollowUps` (each client with an active code, an open promise or
+an unanswered question: last contact, open promises, next deadline) and
+`Receipts` (what each receipt image says, who sent it, and, in its own
+columns, the bank's cross-check and the bank's own record). Setup: in Google
+Cloud Console enable the Sheets API, create a service account, download its
+JSON key to `secrets/sheets_service_account.json`, share the spreadsheet with
+the account's e-mail address as **Editor**, then set `SHEETS_ENABLED=true` and
+`SHEETS_SPREADSHEET_ID` (the long id in the spreadsheet's address) and
+restart the worker. Missing tabs and their headers are created on the first
+sync.
+
+The database stays the truth: nothing typed into the sheet comes back, and a
+row you edit is overwritten when its record changes. Each record owns its row
+(the `ID` column is the bot's own ref: `p12`, `t7`, `r5`, `k3`), so sort and
+filter with a filter view or in another tab, never by moving the mirrored
+rows. Amounts are exact text with the currency in its own column and are
+never added up across currencies. Values are written as plain text, so
+nothing a client typed becomes a formula. After `/unut` the forgotten rows
+are blanked on the next sync. Google keeps the spreadsheet's version
+history, so what was mirrored before `/unut` can still be seen there (File →
+Version history); to remove it, make a fresh copy of the spreadsheet (a copy
+has no history), share it with the service account and point
+`SHEETS_SPREADSHEET_ID` at it, then delete the old one. While the mirror
+keeps failing (no access, a wrong id) `/holat` names the reason.
+
 ---
 
 ## The Telegram userbot
@@ -602,7 +631,7 @@ command ends, success or not.
 
 ### Documented egress
 
-Four external services receive data, plus one optional bare ping. Nothing
+Five external services receive data, plus one optional bare ping. Nothing
 else leaves the VPS.
 
 | Destination | What is sent | Why |
@@ -610,6 +639,7 @@ else leaves the VPS.
 | **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names); when the owner asks a question, verbatim quotes of the stored messages found for it | Extraction, the recap's prose, planner, RAG answers |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
+| **Google Sheets API** (only with `SHEETS_ENABLED=true`) | Promise and task texts, deadlines and statuses with the names of the people involved, the Telegram group's title and a context line of up to 300 characters (the conversation summary or, without one, the verbatim message text or call transcript); client names, codes, group titles and last-contact times; receipt figures, names, card last four digits, references, the bank cross-check verdict and the bank's own matching transaction (ref, amount, currency, time, bank) | The one-way mirror in the owner's own spreadsheet |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
 
 | **`DEADMAN_PING_URL`** (optional) | A bare GET every `DEADMAN_PING_MINUTES`, no data | An outside watcher notices a dead server |

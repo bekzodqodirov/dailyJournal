@@ -419,9 +419,26 @@ def test_a_healthy_status_has_no_problems():
     assert health.problems(_status()) == []
 
 
+def _sheets(
+    *, ok: bool = False, error: str = "http_403", failing_for: float = 15
+) -> health.Component:
+    detail = {
+        "ok": ok,
+        "error": None if ok else error,
+        "last_ok_at": (NOW - timedelta(hours=2)).isoformat(),
+        "failing_since": None
+        if ok
+        else (NOW - timedelta(minutes=failing_for)).isoformat(),
+    }
+    return health.Component(
+        health.SHEETS_COMPONENT, NOW, timedelta(0), detail, stale=False, disabled=False
+    )
+
+
 def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
     monkeypatch.setattr(settings, "heartbeat_stale_minutes", 10)
     monkeypatch.setattr(settings, "userbot_stale_minutes", 5)
+    monkeypatch.setattr(settings, "sheets_enabled", True)
     cases = {
         "db_down": _status(db_ok=False),
         "disk_low": _status(disk_low=True, disk_free_bytes=GB),
@@ -444,6 +461,7 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
                 "restore_drill", NOW, None, {"ok": False, "error": "x"}, False, False
             )
         ),
+        "sheets_failing": _status(sheets=_sheets()),
         "phone_stream_off": _status(
             phone_app=_phone(
                 "phone_app",
@@ -462,6 +480,37 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
         expected = "critical" if key in {"db_down", "disk_low"} else "warning"
         assert problem.severity == expected, key
         assert problem.text.strip(), key
+
+
+def test_sheets_failing_only_when_enabled_and_failing_for_a_while(monkeypatch):
+    monkeypatch.setattr(settings, "sheets_enabled", True)
+    [problem] = health.problems(_status(sheets=_sheets()))
+    assert problem.key == "sheets_failing" and problem.severity == "warning"
+    assert problem.text == (
+        "📊 Google Sheets yangilanmayapti: jadvalga ruxsat yo'q (403). Jadval xizmat "
+        "hisobiga «Muharrir» sifatida ulashilganini tekshiring."
+    )
+    # One failure a few minutes old is not worth the owner's attention yet.
+    assert _keys(_status(sheets=_sheets(failing_for=3))) == []
+    assert _keys(_status(sheets=_sheets(ok=True))) == []
+    assert _keys(_status(sheets=None)) == []
+    # An unknown code is shown escaped, as it is.
+    odd = health.problems(_status(sheets=_sheets(error="<Odd>")))[0]
+    assert "&lt;Odd&gt;" in odd.text
+    monkeypatch.setattr(settings, "sheets_enabled", False)
+    assert _keys(_status(sheets=_sheets())) == []
+    assert health.recovery_text("sheets_failing") == (
+        "✅ Google Sheets bilan sinxronlash tiklandi"
+    )
+
+
+async def test_gather_reads_the_sheets_beat(session):
+    await health.beat(
+        session, health.SHEETS_COMPONENT, detail={"ok": True, "last_ok_at": None}, now=NOW
+    )
+    status = await health.gather(session, now=NOW)
+    assert status.sheets is not None and status.sheets.detail["ok"] is True
+    assert health.SHEETS_COMPONENT not in status.jobs
 
 
 def test_problem_texts_name_the_remedy_in_uzbek():

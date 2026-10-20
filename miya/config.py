@@ -225,6 +225,19 @@ class Settings(BaseSettings):
     gcal_pull_minutes: int = 30
     gcal_days_ahead: int = 14
 
+    # --- Google Sheets mirror (JV-07) ---------------------------------------
+    # A one-way copy of promises, tasks, followed-up clients and receipts in
+    # the owner's spreadsheet; SQL stays the truth and nothing is read back.
+    # Off until switched on; a no-op while the key file or the spreadsheet id
+    # is missing.
+    sheets_enabled: bool = False
+    # The service account's JSON key; the spreadsheet is shared with that
+    # account as Editor.
+    sheets_service_account_json: str = "./secrets/sheets_service_account.json"
+    sheets_spreadsheet_id: str = ""
+    # How often the worker writes what changed.
+    sheets_sync_seconds: int = Field(default=60, ge=15, le=3600)
+
     # --- Call recordings ----------------------------------------------------
     call_recordings_dir: str = "/data/call_recordings"
     audio_retention_days: int = 90

@@ -82,6 +82,7 @@ PROBLEM_KEYS = (
     "phone_silent",
     "phone_stream_off",
     "restore_drill_failed",
+    "sheets_failing",
 )
 # The phone app's streams (WP-66), as the heartbeat names them.
 KNOWN_STREAMS = ("call_log", "sms", "recordings", "notifications")
@@ -90,6 +91,33 @@ STREAM_LABEL = {
     "sms": "SMS",
     "recordings": "qo'ng'iroq yozuvlari papkasi",
     "notifications": "bildirishnomalar (Payme)",
+}
+# The Google Sheets mirror's beat (JV-07), written by the sheets_sync job:
+# detail {"ok": bool, "error": code | None, "last_ok_at": iso | None,
+# "failing_since": iso | None, "written": n, "cleared": n, "waiting": n}.
+SHEETS_COMPONENT = "sheets"
+# A failing mirror is a problem only once it has failed for this long: one
+# timeout between two good minutes is not worth the owner's attention.
+SHEETS_FAILING_AFTER = timedelta(minutes=10)
+SHEETS_FAILING = (
+    "📊 Google Sheets yangilanmayapti: {sabab}. Jadval xizmat hisobiga «Muharrir» "
+    "sifatida ulashilganini tekshiring."
+)
+# {sabab} for the error codes services/sheets.py records; any other code is
+# shown as it is.
+SHEETS_REASONS = {
+    "key_file_missing": "xizmat hisobi kaliti topilmadi (SHEETS_SERVICE_ACCOUNT_JSON)",
+    "bad_key_file": "xizmat hisobi kaliti o'qilmadi (SHEETS_SERVICE_ACCOUNT_JSON)",
+    "no_spreadsheet_id": "SHEETS_SPREADSHEET_ID bo'sh",
+    "auth": "Google kalitni qabul qilmadi",
+    "http_400": "Google so'rovni rad etdi (400)",
+    "http_401": "Google kalitni qabul qilmadi (401)",
+    "http_403": "jadvalga ruxsat yo'q (403)",
+    "http_404": "jadval topilmadi (404) — SHEETS_SPREADSHEET_ID'ni tekshiring",
+    "http_429": "Google so'rovlar chegarasiga yetildi (429)",
+    "timeout": "Google javob bermadi",
+    "network": "Google bilan aloqa yo'q",
+    "plan_failed": "jadval qatorlarini tayyorlab bo'lmadi (make worker logini ko'ring)",
 }
 # reminder_log kind the api writes once per start (WP-26).
 API_START_KIND = "api_start"
@@ -255,6 +283,8 @@ class Status:
     phone_app: Component | None = None
     # WP-81: the last weekly restore drill.
     restore_drill: Component | None = None
+    # JV-07: the Google Sheets mirror's last sync.
+    sheets: Component | None = None
     # Money texts waiting in /tekshir's money block (WP-14): shown, never
     # counted into the backlog alarm — they are the owner's call, not a fault.
     money_review: int = 0
@@ -505,6 +535,11 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
             if "restore_drill" in rows
             else None
         ),
+        sheets=(
+            component_of(SHEETS_COMPONENT, rows[SHEETS_COMPONENT], now=now)
+            if SHEETS_COMPONENT in rows
+            else None
+        ),
         jobs={
             key[len(JOB_PREFIX) :]: component_of(key[len(JOB_PREFIX) :], row, now=now)
             for key, row in rows.items()
@@ -632,6 +667,28 @@ def phone_silent_for(status: Status) -> timedelta | None:
         return None
     awake = awake_between(last, status.now)
     return awake if awake > timedelta(hours=hours) else None
+
+
+def sheets_last_ok_at(sheets: Component) -> datetime | None:
+    """When the mirror last caught up with SQL, from its beat."""
+    return _parse_iso((sheets.detail or {}).get("last_ok_at"))
+
+
+def sheets_failure(status: Status) -> str | None:
+    """Why the mirror is failing, in the owner's words, once it has failed
+    for SHEETS_FAILING_AFTER; None while it works, is switched off or has
+    never run."""
+    sheets = status.sheets
+    if not settings.sheets_enabled or sheets is None:
+        return None
+    detail = sheets.detail or {}
+    if detail.get("ok") is not False:
+        return None
+    since = _parse_iso(detail.get("failing_since")) or sheets.last_seen_at
+    if since is None or status.now - since < SHEETS_FAILING_AFTER:
+        return None
+    code = str(detail.get("error") or "?")
+    return SHEETS_REASONS.get(code, code)
 
 
 def problems(status: Status) -> list[Problem]:
@@ -843,6 +900,15 @@ def problems(status: Status) -> list[Problem]:
                 "<code>make restore FILE=… DRY=1</code> bilan tekshir.",
             )
         )
+    sheets_reason = sheets_failure(status)
+    if sheets_reason is not None:
+        found.append(
+            Problem(
+                "sheets_failing",
+                "warning",
+                SHEETS_FAILING.format(sabab=escape(sheets_reason)),
+            )
+        )
     revoked, _never = phone_streams(status)
     if revoked:
         names = ", ".join(STREAM_LABEL[key] for key in revoked)
@@ -954,6 +1020,7 @@ _RECOVERY = {
     "phone_silent": "✅ Telefon ilovasi yana aloqada — tiklandi",
     "phone_stream_off": "✅ Telefondagi ruxsatlar yana joyida — tiklandi",
     "restore_drill_failed": "✅ Tiklash sinovi yana muvaffaqiyatli — tiklandi",
+    "sheets_failing": "✅ Google Sheets bilan sinxronlash tiklandi",
     "spend_high": "✅ API xarajati yana chegara ichida — tiklandi",
     "worker_silent": "✅ Rejalashtiruvchi (worker) qayta ishlayapti — tiklandi",
     "userbot_silent": "✅ Telegram o'quvchi qayta ulandi — tiklandi",
@@ -981,6 +1048,7 @@ __all__ = [
     "PROBLEM_KEYS",
     "RECOVERED_KIND",
     "REVIEW_BACKLOG_THRESHOLD",
+    "SHEETS_COMPONENT",
     "BackupInfo",
     "Component",
     "Problem",
@@ -994,6 +1062,8 @@ __all__ = [
     "mark_recovered",
     "problems",
     "recovery_text",
+    "sheets_failure",
+    "sheets_last_ok_at",
     "size_label",
     "stale_after",
 ]

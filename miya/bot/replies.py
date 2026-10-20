@@ -405,6 +405,83 @@ def receipt_card_for(receipt, source, detail=None) -> str:
     )
 
 
+# --- the Google Sheets mirror (JV-07) --------------------------------------------
+#
+# Plain cell text, never HTML: the sheet shows it verbatim. Header rows and the
+# words the cells use; services/sheets_sync.py fills them from SQL.
+
+SHEETS_TASKS_HEADER = (
+    "ID",
+    "Tur",
+    "Kim",
+    "Kimga",
+    "Matn",
+    "Muddat",
+    "Holat",
+    "Kanal",
+    "Manba vaqti",
+    "Kontekst",
+)
+SHEETS_FOLLOWUPS_HEADER = (
+    "ID",
+    "Mijoz",
+    "Kod",
+    "Kanal",
+    "Oxirgi xabar",
+    "Javobsiz",
+    "Ochiq eskalatsiya",
+    "Ochiq va'dalar",
+    "Keyingi muddat",
+)
+SHEETS_RECEIPTS_HEADER = (
+    "ID",
+    "Chekdagi vaqt",
+    "Summa",
+    "Valyuta",
+    "To'lovchi",
+    "Qabul qiluvchi karta",
+    "Bank/ilova",
+    "Chek №",
+    "Kimdan",
+    "Kanal",
+    "Bank tasdig'i",
+    "Bank yozuvi",
+)
+# Tur, Kim / Kimga: the owner is «siz», like the receipt card.
+SHEETS_KIND_PROMISE = "va'da"
+SHEETS_KIND_TASK = "vazifa"
+SHEETS_OWNER = RECEIPT_FROM_OWNER
+SHEETS_PROMISE_STATUS = {
+    "open": "ochiq",
+    "done": "bajarilgan",
+    "broken": "buzilgan",
+    "cancelled": "yopilgan",
+}
+SHEETS_TASK_STATUS = {
+    "todo": "ochiq",
+    "doing": "jarayonda",
+    "done": "bajarilgan",
+    "dropped": "yopilgan",
+}
+# Javobsiz: "ha · <when they asked>", else "yo'q".
+SHEETS_UNANSWERED_YES = "ha · {vaqt}"
+SHEETS_UNANSWERED_NO = "yo'q"
+# Kanal of a receipt: the bot, a group's title, or Telegram for a private chat.
+SHEETS_BOT_CHANNEL = RECEIPT_BOT_CHANNEL
+SHEETS_PRIVATE_CHANNEL = PRIVATE_CHAT_LABEL
+# Bank tasdig'i: the bank cross-check's verdict (JV-05), never a figure.
+SHEETS_VERDICT = {
+    "waiting": "⏳ kutilmoqda",
+    "confirmed": "✅ bankda tasdiqlandi",
+    "unconfirmed": "⏳ bankdan tasdiq yo'q",
+    "suspicious": "⚠️ shubhali",
+    "owner_ok": "✅ pul keldi (o'zingiz tasdiqladingiz)",
+    "owner_fake": "🚩 soxta (o'zingiz belgiladingiz)",
+}
+SHEETS_UNREADABLE = "🧾 chek o'qilmadi"
+SHEETS_STATUS_LINE = "📊 Sheets: oxirgi yangilanish {vaqt}"
+
+
 RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."
 
 
@@ -2489,6 +2566,16 @@ def _drill_line(status: health.Status) -> str | None:
     )
 
 
+def _sheets_line(status: health.Status) -> str | None:
+    """The Google Sheets mirror (JV-07): when it last caught up with SQL.
+    No line while the mirror is switched off."""
+    if not settings.sheets_enabled:
+        return None
+    sheets = getattr(status, "sheets", None)
+    last = health.sheets_last_ok_at(sheets) if sheets is not None else None
+    return SHEETS_STATUS_LINE.format(vaqt=_since_when(last, status.now))
+
+
 def _phone_line(status: health.Status) -> str | None:
     """The phone app: last contact, last new event, and any stream it wants
     but cannot use (WP-66).
@@ -2547,6 +2634,7 @@ def status_report(
         _search_line(status),
         *([line] if (line := _phone_line(status)) else []),
         *([line] if (line := _drill_line(status)) else []),
+        *([line] if (line := _sheets_line(status)) else []),
         "<b>Navbatda</b>: "
         f"kutayotgan suhbatlar {status.windows_pending} · "
         f"batch'da {status.windows_submitted} · "

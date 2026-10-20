@@ -12,6 +12,9 @@ Jobs:
   * daily_report — cron at REPORT_TIME; composes and sends the day's report
   * gcal_pull    — every GCAL_PULL_MINUTES; Google → events (when authed)
   * gcal_push    — every 5 min; extracted events → Google (when authed)
+  * sheets_sync  — every SHEETS_SYNC_SECONDS; the one-way Google Sheets mirror
+                   of promises, tasks, followed-up clients and receipts
+                   (JV-07); a no-op unless SHEETS_ENABLED and configured
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -119,6 +122,7 @@ from miya.services import (
     reports,
     restore_drill,
     safety,
+    sheets_sync,
     windows,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -459,6 +463,13 @@ async def gcal_push_job() -> None:
         pushed = await gcal.push_pending(session, api)
     if pushed:
         log.info("gcal push: %d events created in Google Calendar", pushed)
+
+
+async def sheets_sync_job() -> None:
+    """The Google Sheets mirror (JV-07): what changed in SQL, written to the
+    owner's spreadsheet. A no-op while SHEETS_ENABLED is false; it never
+    raises, and nothing else in MIYA waits on it."""
+    await sheets_sync.run()
 
 
 async def window_job(bot: Bot) -> None:
@@ -1764,6 +1775,13 @@ async def run() -> None:
         gcal_push_job,
         IntervalTrigger(minutes=5),
         id="gcal_push",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        sheets_sync_job,
+        IntervalTrigger(seconds=settings.sheets_sync_seconds),
+        id="sheets_sync",
         max_instances=1,
         coalesce=True,
     )

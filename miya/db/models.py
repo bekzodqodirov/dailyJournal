@@ -982,6 +982,7 @@ __all__ = [
     "RecapDigest",
     "Receipt",
     "ReminderLog",
+    "SheetRow",
     "Task",
     "Transaction",
     "TransactionEvidence",
@@ -1272,5 +1273,77 @@ class Receipt(Base):
             "issuer",
             "reference",
             postgresql_where=sa.text("reference IS NOT NULL"),
+        ),
+    )
+
+
+# The values the sheet_rows CHECKs allow (JV-07, 0024). The migration keeps its
+# own frozen copy; tests/test_sheets_sync.py holds the two equal.
+SHEET_TABS = ("Tasks_Promises", "Client_FollowUps", "Receipts")
+SHEET_ENTITY_KINDS = ("promise", "task", "receipt", "person")
+SHEET_ROW_STATES = ("pending", "synced", "failed", "tombstone", "cleared")
+
+
+class SheetRow(Base):
+    """Where one database row sits in the owner's Google Sheets mirror
+    (JV-07, 0024), and whether the sheet has caught up with it.
+
+    The mirror is one-way: SQL is the source of truth and nothing is read
+    back. ``entity_id`` names a promise, task, receipt or person by kind,
+    with no foreign key, so a purge leaves this row behind on purpose: it
+    becomes a ``tombstone`` and the sync clears its cells (``cleared``).
+    ``row_number`` is the sheet row the entity owns for good; every write is
+    to that explicit range, so a retried write never adds a second row.
+    ``content_hash`` is what was last planned for the row (blank zeros on a
+    tombstone, so nothing of forgotten cells is kept), ``last_error`` an
+    error code, never a message.
+    """
+
+    __tablename__ = "sheet_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tab: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    entity_kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    entity_id: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    row_number: Mapped[int | None] = mapped_column(sa.Integer)
+    content_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="pending"
+    )
+    attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(sa.String(64))
+    synced_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(f"tab IN ({_sql_list(SHEET_TABS)})", name="ck_sheet_rows_tab"),
+        sa.CheckConstraint(
+            f"entity_kind IN ({_sql_list(SHEET_ENTITY_KINDS)})",
+            name="ck_sheet_rows_entity_kind",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(SHEET_ROW_STATES)})", name="ck_sheet_rows_state"
+        ),
+        sa.CheckConstraint(
+            "row_number IS NULL OR row_number >= 2", name="ck_sheet_rows_row_number"
+        ),
+        sa.UniqueConstraint(
+            "tab", "entity_kind", "entity_id", name="uq_sheet_rows_entity"
+        ),
+        sa.Index(
+            "ux_sheet_rows_row_number",
+            "tab",
+            "row_number",
+            unique=True,
+            postgresql_where=sa.text("row_number IS NOT NULL"),
+        ),
+        sa.Index(
+            "ix_sheet_rows_due",
+            "next_attempt_at",
+            postgresql_where=sa.text("state IN ('pending', 'failed', 'tombstone')"),
         ),
     )

@@ -42,7 +42,7 @@ from miya.db.models import (
     Task,
     Transaction,
 )
-from miya.services import call_recordings, claims, windows
+from miya.services import call_recordings, claims, sheets_sync, windows
 from miya.services.people import best_match
 from miya.services.queries import day_bounds
 from miya.services.text import (
@@ -567,6 +567,9 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         result.person_deleted = True
 
     await session.flush()
+    # The Sheets mirror (JV-07) clears the rows of what is gone on its next
+    # sync; never a reason for the purge itself to fail.
+    await sheets_sync.tombstone_missing(session)
     result.files_deleted = _unlink(plan.files)
     log.warning(
         "purged %s %r: %d interactions, %d files",

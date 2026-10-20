@@ -37,6 +37,8 @@ files = [
     "miya/services/receipts.py",
     "miya/services/retry.py",
     "miya/services/safety.py",
+    "miya/services/sheets.py",
+    "miya/services/sheets_sync.py",
     "miya/services/when.py",
 ]
 

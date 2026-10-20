@@ -433,7 +433,11 @@ int` (polymorphic, no FK); `row_number int NULL`; `content_hash CHAR(64)`; `stat
 CHECK `('pending','synced','failed','tombstone','cleared')`; `attempts smallint`;
 `next_attempt_at`; `last_error String(64)`; `synced_at`; `uq (tab, entity_kind, entity_id)`;
 `ux (tab, row_number) WHERE row_number IS NOT NULL`; `ix_sheet_rows_due (next_attempt_at) WHERE
-state IN ('pending','failed','tombstone')`.
+state IN ('pending','failed','tombstone')`. Also `created_at`/`updated_at` and
+`ck_sheet_rows_row_number CHECK (row_number IS NULL OR row_number >= 2)` (row 1 is the header).
+No `history`: the rows are sync bookkeeping, not owner data, and change every minute. No person FK,
+so `merge_into._fk_columns` does not list it: a merged-away person's follow-up row becomes a
+tombstone and is cleared.
 
 **0025 — `jarvis_policy`.** `scope text PK`: `'global' | 'channel:<c>' | 'intent:<i>' |
 'channel:<c>:intent:<i>'`; `mode String(8) NULL` (NULL inherits) CHECK
@@ -1213,6 +1217,30 @@ list in under 3 s.
 3. A no-op when `SHEETS_ENABLED=false` or the key file is missing. Beats `sheets`. Problem
    `sheets_failing` only when enabled (with a recovery text and a test case). `/holat` line.
 4. README "Documented egress" gains Google Sheets.
+
+As built: rows are planned and committed before any network call and recorded after it, with no
+transaction held during the call; a row's outcome is written only if nothing changed it since it
+was planned. `Tasks_Promises` holds every promise and task; `Client_FollowUps` every person with
+an active client code, an open promise or an unanswered question (`loops.unanswered_questions`),
+whose row is cleared when none of those holds any more and reused if one does again; `Receipts`
+every receipt not `rejected`, with the bank's own record (`x<id> · amount currency · time ·
+bank`) in `Bank yozuvi` only when a bank row confirms it. Cell IDs are the bot's refs (`p`, `t`)
+plus `r<id>` and `k<id>`; times are `YYYY-MM-DD HH:MM` local; amounts `1250000.00`. `Ochiq
+eskalatsiya` stays blank until JV-22 fills it. Purge marks the rows of deleted entities as
+tombstones in its own transaction (`sheets_sync.tombstone_missing`, never raising). Missing tabs
+are added with a frozen header row; a grid too small is grown in the same
+`spreadsheets.batchUpdate`; each `values.batchUpdate` also rewrites the tab's header, and the
+first run in a process writes the header of a tab that exists but has nothing due. A failed
+row waits `SHEETS_SYNC_SECONDS`, doubling, up to an hour, counted from the end of the write; while
+any row waits out such a backoff a run with nothing due still beats failing. A tombstone keeps no
+digest of the cells it held (`content_hash` is blanked). The `sheets` beat carries `ok`,
+`error`, `last_ok_at` and `failing_since`; `sheets_failing` fires once `failing_since` is 10
+minutes old, and `{sabab}` words the error code. `make doctor` requires `SHEETS_SPREADSHEET_ID`
+when `SHEETS_ENABLED=true` (`SHEETS_HINTS`, like `TELETHON_HINTS`).
+With `SHEETS_ENABLED=true` but no key file or spreadsheet id, the job makes no network call and
+writes no rows; it writes only a failing `sheets` beat (`key_file_missing` / `no_spreadsheet_id`),
+so `sheets_failing` names the cause after 10 minutes. A tab that cannot be built from SQL keeps
+its rows as they are while the other tabs still go out, and the run reports `plan_failed`.
 
 **Owner strings.**
 - Tasks_Promises: "ID | Tur | Kim | Kimga | Matn | Muddat | Holat | Kanal | Manba vaqti | Kontekst"

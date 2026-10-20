@@ -163,6 +163,14 @@ def test_a_disabled_userbot_skips_the_telethon_checks():
     assert _check(env) == []
 
 
+def test_the_sheets_mirror_needs_its_spreadsheet_id_only_when_enabled():
+    assert _check(_env(SHEETS_ENABLED="false")) == []
+    errors = _texts(_check(_env(SHEETS_ENABLED="true")), "error")
+    hint = doctor.SHEETS_HINTS["SHEETS_SPREADSHEET_ID"]
+    assert errors == [f"❌ SHEETS_SPREADSHEET_ID bo'sh — to'ldir: {hint}"]
+    assert _check(_env(SHEETS_ENABLED="true", SHEETS_SPREADSHEET_ID="1AbC")) == []
+
+
 def test_a_missing_key_file_warns_only_when_a_recipient_is_set():
     assert len(_texts(_check(key_file=False), "warn")) == 1
 

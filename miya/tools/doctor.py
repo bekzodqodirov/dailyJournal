@@ -86,6 +86,10 @@ EXPECTED_ENV_KEYS: tuple[str, ...] = (
     "GCAL_CALENDAR_ID",
     "GCAL_PULL_MINUTES",
     "GCAL_DAYS_AHEAD",
+    "SHEETS_ENABLED",
+    "SHEETS_SERVICE_ACCOUNT_JSON",
+    "SHEETS_SPREADSHEET_ID",
+    "SHEETS_SYNC_SECONDS",
     "CALL_RECORDINGS_DIR",
     "AUDIO_RETENTION_DAYS",
     "TRANSCRIBE_DIARIZE_CALLS",
@@ -194,6 +198,12 @@ TELETHON_HINTS: dict[str, str] = {
     "TELETHON_API_ID": "my.telegram.org → API development tools",
     "TELETHON_API_HASH": "my.telegram.org → API development tools",
 }
+# Required only with the Sheets mirror switched on (JV-07).
+SHEETS_HINTS: dict[str, str] = {
+    "SHEETS_SPREADSHEET_ID": (
+        "jadval manzilidagi uzun id: docs.google.com/spreadsheets/d/<id>/edit"
+    ),
+}
 
 API_TOKEN_MIN_LENGTH = 32
 # An "8 GB" VPS reports about 7.6–7.8 GiB of MemTotal.
@@ -266,6 +276,8 @@ def check(
     required = dict(REQUIRED_HINTS)
     if _truthy(env.get("USERBOT_ENABLED", "true")):
         required.update(TELETHON_HINTS)
+    if _truthy(env.get("SHEETS_ENABLED", "false")):
+        required.update(SHEETS_HINTS)
     for key, hint in required.items():
         if key not in commented and not value(key):
             found.append(_error(f"❌ {key} bo'sh — to'ldir: {hint}"))
