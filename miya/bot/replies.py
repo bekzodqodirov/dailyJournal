@@ -272,6 +272,52 @@ def macro_document_note(filename: str | None) -> str:
     )
 
 
+# --- the spam and scam message shield (JV-09) ---------------------------------
+
+SCAM_WARNING = (
+    "🚫 {ism}dan kelgan xabar firibgarlikka o'xshaydi ({sabab}). Javob bermang, "
+    "havolani ochmang."
+)
+HIJACK_WARNING = (
+    "⚠️ {ism}ning akkaunti buzilgan bo'lishi mumkin: odatda bunday yozmaydi. Unga "
+    "qo'ng'iroq qilib tekshiring, pul o'tkazmang."
+)
+UNSAFE_IGNORED_LINE = "🚫 Kecha {n} ta spam/firibgar xabar e'tiborsiz qoldirildi."
+UNKNOWN_SENDER = "Nomaʼlum"
+# {sabab}: what made a message look like a scam, the hard rules only, in the
+# order the shield found them.
+SCAM_REASON_LABELS: dict[str, str] = {
+    safety.R_TEXT_LINK_MISMATCH: "havola yozilgan saytga emas, boshqasiga olib boradi",
+    safety.R_LOOKALIKE_DOMAIN: "bank yoki to'lov saytiga o'xshatilgan soxta sayt",
+    safety.R_BRAND_DOMAIN: "tanish nom begona saytda",
+    safety.R_MIXED_SCRIPT_DOMAIN: "sayt nomida kirill harflari yashiringan",
+    safety.R_USERINFO_URL: "havolaning haqiqiy manzili yashirilgan",
+    safety.R_EXEC_URL: "havola o'rnatiladigan dasturga olib boradi",
+    safety.R_ARCHIVE_URL: "havola arxiv faylga olib boradi",
+    safety.R_EXEC_FILE: "o'rnatiladigan dastur yuborilgan",
+    safety.R_ARCHIVE_FILE: "arxiv fayl yuborilgan",
+    safety.R_CODE_REQUEST: "SMS kod yoki parol so'ralyapti",
+    safety.R_CARD_DATA_REQUEST: "karta ma'lumotlari so'ralyapti",
+    safety.R_TELEGRAM_SCAM: "Telegram bu akkauntni firibgar deb belgilagan",
+    safety.R_TELEGRAM_FAKE: "Telegram bu akkauntni soxta deb belgilagan",
+    safety.R_PHOTO_LURE: "«rasmda sizmi?» degan aldov",
+}
+SCAM_REASON_FALLBACK = "shubhali belgilar"
+SCAM_REASONS_SHOWN = 2
+
+
+def scam_warning(*, who: str | None, reasons: list[str] | tuple[str, ...]) -> str:
+    """A message looked like a scam; MIYA left it alone."""
+    labels = [SCAM_REASON_LABELS[r] for r in reasons if r in SCAM_REASON_LABELS]
+    sabab = "; ".join(labels[:SCAM_REASONS_SHOWN]) or SCAM_REASON_FALLBACK
+    return SCAM_WARNING.format(ism=_shown(who or UNKNOWN_SENDER), sabab=sabab)
+
+
+def hijack_warning(*, who: str | None) -> str:
+    """A known contact wrote unlike themselves: their account may be taken."""
+    return HIJACK_WARNING.format(ism=_shown(who or UNKNOWN_SENDER))
+
+
 # --- receipts read from images (JV-04) -----------------------------------------
 
 RECEIPT_FOOTER = (
@@ -2166,8 +2212,10 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     """The one morning message. Deterministic — SQL and the loops engine."""
     parts = [f"{BRIEF_HEADER} · {full_date(brief.day)}"]
     system = _brief_system_line(brief)
+    unsafe = _brief_unsafe_line(brief)
     if brief.is_empty():
-        return "\n\n".join([*parts, BRIEF_ALL_CLEAR, *([system] if system else [])])
+        tail = [line for line in (unsafe, system) if line]
+        return "\n\n".join([*parts, BRIEF_ALL_CLEAR, *tail])
 
     if brief.events:
         lines = [
@@ -2222,6 +2270,8 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     if getattr(brief, "code_suggestions", 0):
         # Pulled, never pushed (WP-33): a count, no buttons, not a question.
         parts.append(CODE_SUGGESTIONS_LINE.format(n=brief.code_suggestions))
+    if unsafe:
+        parts.append(unsafe)
     line = queue_line(getattr(brief, "queue", None))
     if line:
         parts.append(line)
@@ -2229,6 +2279,13 @@ def _morning_brief_text(brief: MorningBrief) -> str:
         parts.append(system)
 
     return "\n\n".join(parts)
+
+
+def _brief_unsafe_line(brief: MorningBrief) -> str | None:
+    """Yesterday's spam and scam, counted (JV-09); read defensively like the
+    brief's other optional fields."""
+    count = getattr(brief, "unsafe_ignored", 0) or 0
+    return UNSAFE_IGNORED_LINE.format(n=count) if count else None
 
 
 def _brief_timed(brief: MorningBrief) -> list:

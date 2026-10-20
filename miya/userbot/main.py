@@ -19,6 +19,7 @@ Safety properties, all deliberate:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import sys
 import time
@@ -30,7 +31,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import Channel, Chat, MessageEntityTextUrl, User
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
@@ -361,20 +362,27 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
     interaction.media = media
 
 
-async def _counterparty(session, message, monitor: ChatMonitor):
+async def _counterparty_entity(message, monitor: ChatMonitor):
+    """The account this message is about: the peer in a DM, the speaker in a
+    group; None for the owner's own group messages. Its Telegram flags
+    (``scam``, ``fake``, ``contact``) feed the message shield (JV-09)."""
+    if monitor.chat_type is ChatType.private:
+        return await message.get_chat()
+    if message.out:
+        return None
+    return await message.get_sender()
+
+
+async def _counterparty(session, message, monitor: ChatMonitor, entity=None):
     """Who this message is about: the peer in a DM, the speaker in a group.
 
     A DM stays attached to the other person in both directions so `/kim` sees
     one thread; in a group an incoming message belongs to whoever wrote it and
-    an outgoing one belongs to nobody (the owner spoke).
+    an outgoing one belongs to nobody (the owner spoke). ``entity`` is the
+    account when the caller already looked it up.
     """
-    if monitor.chat_type is ChatType.private:
-        entity = await message.get_chat()
-    elif message.out:
-        return None
-    else:
-        entity = await message.get_sender()
-
+    if entity is None:
+        entity = await _counterparty_entity(message, monitor)
     if entity is None or not isinstance(entity, User):
         return None
     # A contact the owner saved carries the owner's own spelling, codes and
@@ -388,6 +396,188 @@ async def _counterparty(session, message, monitor: ChatMonitor):
         phone=getattr(entity, "phone", None),
         code_policy="attach" if saved else "suggest",
         source="contact" if saved else "tg_name",
+    )
+
+
+# --- the message shield (JV-09) -------------------------------------------------
+
+# How many of a sender's earlier messages say how they usually write.
+SHIELD_HISTORY = 50
+
+
+def _text_links(message) -> list[tuple[str, str]]:
+    """``(shown text, url)`` for each Telegram text link. Entity offsets count
+    UTF-16 code units, as Telegram does."""
+    raw = getattr(message, "message", None) or ""
+    encoded = raw.encode("utf-16-le")
+    links = []
+    for entity in getattr(message, "entities", None) or ():
+        if not isinstance(entity, MessageEntityTextUrl):
+            continue
+        start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+        links.append((encoded[start:end].decode("utf-16-le", "ignore"), entity.url))
+    return links
+
+
+def _button_urls(message) -> list[str]:
+    """The URLs on a message's inline buttons; read from the markup itself, so
+    nothing is fetched."""
+    urls = []
+    for row in getattr(getattr(message, "reply_markup", None), "rows", None) or ():
+        for button in getattr(row, "buttons", None) or ():
+            url = getattr(button, "url", None)
+            if isinstance(url, str) and url:
+                urls.append(url)
+    return urls
+
+
+@dataclasses.dataclass(slots=True)
+class _History:
+    prior_messages: int = 0
+    owner_wrote_before: bool = False
+    texts: tuple[str, ...] = ()
+    risky_files: bool = False
+    short_links: bool = False
+    loans: bool = False
+
+
+async def _sender_history(
+    session, *, person_id: int | None, chat_id: int, private: bool
+) -> _History:
+    """What the sender's earlier messages look like: their newest
+    SHIELD_HISTORY incoming messages (by person, else by private chat), and
+    whether the owner ever wrote in this private chat.
+
+    A group sender MIYA cannot name (an anonymous admin, a channel posting
+    into the group) has no history of their own: the group's is everyone
+    else's, so they count as unknown and nothing is compared."""
+    if person_id is None and not private:
+        return _History()
+    who = (
+        Interaction.person_id == person_id
+        if person_id is not None
+        else Interaction.tg_chat_id == chat_id
+    )
+    rows = (
+        await session.execute(
+            sa.select(Interaction.raw_text, Interaction.media)
+            .where(Interaction.source == InteractionSource.telegram_userbot)
+            .where(Interaction.direction == Direction.in_, who)
+            .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
+            .limit(SHIELD_HISTORY)
+        )
+    ).all()
+    wrote = False
+    if private:
+        wrote = bool(
+            await session.scalar(
+                sa.select(
+                    sa.exists().where(
+                        Interaction.source == InteractionSource.telegram_userbot,
+                        Interaction.tg_chat_id == chat_id,
+                        # MIYA's own replies are not the owner writing (JV-10).
+                        authorship.owner_words_clause(),
+                    )
+                )
+            )
+        )
+    texts = tuple(text for text, _ in rows if text)
+    risky = False
+    for _, media in rows:
+        risk = (media or {}).get("risk") if isinstance(media, dict) else None
+        if isinstance(risk, dict) and risk.get("kind") in (safety.HTML, safety.MACRO):
+            risky = True
+    return _History(
+        prior_messages=len(rows),
+        owner_wrote_before=wrote,
+        texts=texts,
+        risky_files=risky,
+        short_links=any(
+            safety.is_short_link(u) for t in texts for u in safety.extract_urls(t)
+        ),
+        loans=any(safety.is_loan_request(t) for t in texts),
+    )
+
+
+async def _message_shield(
+    session,
+    message,
+    monitor: ChatMonitor,
+    *,
+    entity,
+    person,
+    kind: MediaKind,
+    plan: MediaPlan,
+) -> safety.MessageVerdict | None:
+    """The JV-09 verdict on an incoming message, before any download or model
+    call. A failure here is logged with the message's ids and costs the
+    message nothing: it is stored without a verdict."""
+    try:
+        async with session.begin_nested():
+            history = await _sender_history(
+                session,
+                person_id=person.id if person is not None else None,
+                chat_id=message.chat_id,
+                private=monitor.chat_type is ChatType.private,
+            )
+        text = getattr(message, "message", None) or ""
+        features = safety.MessageFeatures(
+            text=text,
+            urls=tuple(
+                safety.extract_urls(
+                    text,
+                    text_links=_text_links(message),
+                    buttons=_button_urls(message),
+                )
+            ),
+            attachment=plan.risk,
+            has_file=kind is MediaKind.document,
+            sender_scam=bool(getattr(entity, "scam", False)),
+            sender_fake=bool(getattr(entity, "fake", False)),
+            forwarded=getattr(message, "fwd_from", None) is not None,
+            via_bot=bool(getattr(message, "via_bot_id", None)),
+            saved_contact=bool(
+                getattr(entity, "contact", False)
+                or getattr(entity, "mutual_contact", False)
+            ),
+            prior_messages=history.prior_messages,
+            owner_wrote_before=history.owner_wrote_before,
+            history_script=safety.dominant_script(history.texts),
+            history_risky_files=history.risky_files,
+            history_short_links=history.short_links,
+            history_loans=history.loans,
+        )
+        return safety.scam_verdict(
+            features, extra_safe=settings.safety_extra_safe_domains_list
+        )
+    except Exception as exc:
+        log.error(
+            "message shield failed for message %s in %s: %s",
+            getattr(message, "id", None),
+            message.chat_id,
+            type(exc).__name__,
+            extra={
+                "tg_chat_id": message.chat_id,
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+        return None
+
+
+def _quarantined(plan: MediaPlan) -> MediaPlan:
+    """A scam message's media is never fetched, read, transcribed or asked
+    about; a file the JV-01 shield refused keeps that reason."""
+    return dataclasses.replace(
+        plan,
+        download=False,
+        transcribe=False,
+        extract_audio=False,
+        vision=False,
+        read_document=False,
+        ask=False,
+        ask_reason=None,
+        skip_reason=plan.skip_reason or safety.SKIP_QUARANTINED,
     )
 
 
@@ -569,7 +759,36 @@ async def ingest_message(
         if await already_stored(session, message.chat_id, message):
             return False
 
-        person = await _counterparty(session, message, monitor)
+        entity = await _counterparty_entity(message, monitor)
+        person = await _counterparty(session, message, monitor, entity)
+        # JV-09: the spam and scam verdict, before anything is downloaded or
+        # read by a model. A scam is quarantined: nothing fetched, nothing
+        # asked, never windowed for extraction. An archive import is search
+        # history only and needs none.
+        shield = (
+            None
+            if message.out or archive
+            else await _message_shield(
+                session,
+                message,
+                monitor,
+                entity=entity,
+                person=person,
+                kind=kind,
+                plan=plan,
+            )
+        )
+        quarantined = shield is not None and shield.quarantined
+        if quarantined and kind is not MediaKind.text:
+            plan = _quarantined(plan)
+        elif shield is not None and shield.verdict == safety.VERDICT_SPAM and plan.ask:
+            # A spammer's big file is never worth a tap: no question is opened.
+            plan = dataclasses.replace(
+                plan,
+                ask=False,
+                ask_reason=None,
+                skip_reason=safety.SKIP_SPAM,
+            )
         media = None
         if kind is not MediaKind.text:
             media = {
@@ -620,16 +839,15 @@ async def ingest_message(
             )
             if echo is not None:
                 meta = authorship.tagged(meta, echo)
+        warn = _warn_owner(
+            incoming=not message.out,
+            archive=archive,
+            occurred_at=message.date.astimezone(settings.tz),
+        )
         if plan.risk is not None and plan.risk.dangerous:
-            meta = safety.with_file_verdict(
-                meta,
-                plan.risk,
-                notify=_warn_owner(
-                    incoming=not message.out,
-                    archive=archive,
-                    occurred_at=message.date.astimezone(settings.tz),
-                ),
-            )
+            meta = safety.with_file_verdict(meta, plan.risk, notify=warn)
+        if shield is not None:
+            meta = safety.with_message_verdict(meta, shield, notify=warn)
         try:
             async with session.begin_nested():
                 interaction = await create_interaction(
@@ -643,7 +861,7 @@ async def ingest_message(
                     media=media,
                     meta={**meta, "archive": True} if archive else meta,
                 )
-                if archive:
+                if archive or quarantined:
                     interaction.processed = True
         except sa.exc.IntegrityError as exc:
             # The catch-up and the live handler raced for the same message:

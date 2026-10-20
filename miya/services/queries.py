@@ -44,7 +44,7 @@ from miya.db.models import (
     UsageLog,
     due_at_expr,
 )
-from miya.services import authorship, codes, memories
+from miya.services import authorship, codes, memories, safety
 
 
 @dataclass(slots=True)
@@ -1239,6 +1239,36 @@ def not_archive():
     return sa.func.coalesce(Interaction.meta["archive"].astext, "") != "true"
 
 
+def safety_verdict():
+    """``meta.safety.verdict`` as text, '' when the message shield (JV-09) and
+    the file shield (JV-01) found nothing."""
+    return sa.func.coalesce(Interaction.meta[("safety", "verdict")].astext, "")
+
+
+def not_unsafe():
+    """Spam, scam and messages that carried an installer or an archive are
+    never an open question, a nudge or a follow-up (JV-09)."""
+    return safety_verdict().not_in(safety.HIDDEN_VERDICTS)
+
+
+async def unsafe_ignored_count(
+    session: AsyncSession, start: datetime, end: datetime
+) -> int:
+    """Incoming messages in ``[start, end)`` the shields set aside as spam or
+    scam (the brief's «🚫 Kecha …» line)."""
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(Interaction.direction == Direction.in_)
+            # An archive import is history the owner never saw arrive.
+            .where(not_archive())
+            .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+            .where(safety_verdict().in_(safety.HIDDEN_VERDICTS))
+        )
+        or 0
+    )
+
+
 def _addressed_to_owner():
     """Rows the userbot marked as aimed at the owner.
 
@@ -1457,11 +1487,14 @@ def _wrote_to_owner():
     """Incoming userbot messages a person wrote to the owner: anything in a
     private chat, and in a group only what was aimed at them (``to_me``,
     never ``to_me_maybe``). Archive imports and window rows are not
-    messages someone wrote that day."""
+    messages someone wrote that day, and spam and scam (``not_unsafe``) are
+    no one the owner owes an answer."""
     return sa.and_(
         is_member_message(),
         Interaction.direction == Direction.in_,
         not_archive(),
+        # JV-09: spam and scam are never someone waiting for an answer.
+        not_unsafe(),
         sa.or_(
             ChatMonitor.chat_type == ChatType.private,
             sa.and_(ChatMonitor.chat_type == ChatType.group, _addressed_to_owner()),

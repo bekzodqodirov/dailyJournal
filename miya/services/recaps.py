@@ -304,6 +304,8 @@ async def gather_activity(
             .join(ChatMonitor, ChatMonitor.tg_chat_id == Interaction.tg_chat_id)
             .where(is_member_message(), in_window)
             .where(Interaction.direction == Direction.in_)
+            # JV-09: spam and scam are never a question left «javobsiz».
+            .where(queries.not_unsafe())
             .where(Interaction.person_id.is_not(None))
             .where(
                 sa.or_(

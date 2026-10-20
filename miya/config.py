@@ -218,6 +218,13 @@ class Settings(BaseSettings):
     # are stale — the owner has moved on and the file is rarely still relevant.
     media_ask_expiry_hours: int = 48
 
+    # --- Message shield (JV-09) ----------------------------------------------
+    # Owner-verified domains added to the built-in look-alike allowlist
+    # (comma- or space-separated, «www.» and schemes ignored). They only stop
+    # a link from reading as a fake bank or payment site; an installer or an
+    # archive behind one is still refused.
+    safety_extra_safe_domains: str = ""
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"
@@ -551,6 +558,15 @@ class Settings(BaseSettings):
         raw = re.split(r"[,\s]+", self.payment_own_cards)
         cards = (c.strip().lstrip("*") for c in raw)
         return tuple(c for c in cards if len(c) == 4 and c.isdigit())
+
+    @property
+    def safety_extra_safe_domains_list(self) -> tuple[str, ...]:
+        """SAFETY_EXTRA_SAFE_DOMAINS as entries, blanks dropped, order kept."""
+        return tuple(
+            entry.strip()
+            for entry in re.split(r"[,\s]+", self.safety_extra_safe_domains)
+            if entry.strip()
+        )
 
     @property
     def owner_aliases_parsed(self) -> tuple[str, ...]:

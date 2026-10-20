@@ -6,8 +6,9 @@ meetings, today's deadlines that name a time of day by that time (JV-08),
 what else is due today or overdue (the reminder sweep's own selection,
 not a second one), questions nobody answered, missed calls, undated
 commitments that have been sitting, counterparties who went quiet with
-something open, and one line counting what still waits for the owner's tap
-(WP-19: the brief tells; the numbered question batch after it asks).
+something open, one line counting what still waits for the owner's tap
+(WP-19: the brief tells; the numbered question batch after it asks), and
+one counting yesterday's spam and scam that MIYA left alone (JV-09).
 
 Rendering is replies.morning_brief; this module only gathers.
 """
@@ -56,6 +57,9 @@ class MorningBrief:
     media_expired: int = 0
     # Open /holat problems (WP-80): one "🩺 Tizim" line; None when unknown.
     system_problems: int | None = None
+    # Yesterday's incoming spam and scam (JV-09): one count line, never a
+    # push, and on its own not a reason to send the brief.
+    unsafe_ignored: int = 0
 
     @property
     def day(self) -> date:
@@ -90,6 +94,7 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         code_suggestions=await codes.pending_suggestion_count(session),
         media_expired=await approvals.expired_since(session, now - timedelta(hours=24)),
         system_problems=await _system_problems(session, now),
+        unsafe_ignored=await _unsafe_yesterday(session, day),
     )
 
 
@@ -140,6 +145,23 @@ async def _label_brief(
             },
             exc_info=True,
         )
+
+
+async def _unsafe_yesterday(session: AsyncSession, day: date) -> int:
+    """Yesterday's spam and scam messages (JV-09); 0 when the count fails, so
+    the brief still goes out."""
+    start, end = queries.day_bounds(day - timedelta(days=1))
+    try:
+        async with session.begin_nested():
+            return await queries.unsafe_ignored_count(session, start, end)
+    except Exception as exc:
+        log.warning(
+            "the brief's spam line failed: %s",
+            type(exc).__name__,
+            extra={"error": type(exc).__name__, "day": day.isoformat()},
+            exc_info=True,
+        )
+        return 0
 
 
 async def _system_problems(session: AsyncSession, now: datetime) -> int | None:

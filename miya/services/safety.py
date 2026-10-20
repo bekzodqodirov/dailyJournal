@@ -1,4 +1,5 @@
-"""The dangerous-file shield (JV-01, owner decision 4).
+"""The dangerous-file shield (JV-01, owner decision 4) and the spam and scam
+message shield (JV-09).
 
 Executables, installers and archives are never downloaded, opened or offered
 for approval, on any channel; the owner is warned once instead. Everything
@@ -6,19 +7,36 @@ here is pure: no database, no network, no settings. The classifiers run on
 what a transport knows *before* a download (the claimed name and MIME type),
 and ``sniff_magic`` checks the bytes of an allowed type after it.
 
+The message shield reads what a message carries (its text, its links, its
+buttons, the sender's account flags) and what the caller found in the
+sender's history, and returns ``meta.safety``: ``scam`` (any one hard rule;
+quarantined), ``hijack`` (a known contact suddenly writing unlike
+themselves), ``spam`` (soft signals that add up) or nothing. A single soft
+signal never blocks a reply: a new client writing first is answered.
+
 The blocklists are code constants on purpose. No configuration key can
-loosen them; a file type is made safe only by a reviewed change here.
+loosen them; a file type is made safe only by a reviewed change here. The
+one message-shield key, SAFETY_EXTRA_SAFE_DOMAINS, only adds owner-verified
+domains to the look-alike allowlist and is passed in by the caller.
 """
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import unicodedata
 import zipfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
+
+from rapidfuzz.distance import Levenshtein
+
+from miya.services import codes, sms_money
+from miya.services.text import fold_apostrophes
 
 RiskKind = Literal["exec", "archive", "macro", "html", "mismatch", "ok"]
 
@@ -624,6 +642,9 @@ def _utf16(head: bytes) -> bool:
 
 SAFETY_NOTICE_KEY = "safety_notice"
 SAFETY_NOTIFIED_KEY = "safety_notified"
+# Set with safety_notified on a warning that was not sent because its chat
+# was already warned today (JV-09).
+SAFETY_FOLDED_KEY = "safety_folded"
 NOTICE_DANGEROUS_FILE = "dangerous_file"
 NOTICE_MACRO = "macro"
 # A warning about a message older than this is history, not news: an archive
@@ -646,12 +667,1240 @@ def with_file_verdict(
     """``meta.safety`` for a dangerous file, and the owner's warning queued.
 
     A warning is queued at most once per message: a key already there, sent
-    or not, is never replaced.
+    or not, is never replaced — except a message-shield warning (a scam or a
+    possible hijack, JV-09) by a dangerous file's own. That one says not to
+    open the file, so it goes out even when the shield's warning was already
+    sent or folded into the chat's daily one.
     """
     out = dict(meta or {})
     if verdict.dangerous:
         out["safety"] = verdict.as_safety()
     notice = notice_for(verdict)
+    queued = out.get(SAFETY_NOTICE_KEY)
+    if not notify or notice is None:
+        return out
+    if queued is None:
+        out[SAFETY_NOTICE_KEY] = notice
+    elif verdict.dangerous and queued in CHAT_DAILY_NOTICES:
+        out[SAFETY_NOTICE_KEY] = notice
+        out.pop(SAFETY_NOTIFIED_KEY, None)
+        out.pop(SAFETY_FOLDED_KEY, None)
+    return out
+
+
+# --- the message shield (JV-09) ---------------------------------------------------
+#
+# Verdicts in ``interactions.meta.safety``. A clean message gets no key at all.
+
+MessageVerdictKind = Literal["ok", "spam", "scam", "hijack"]
+
+VERDICT_OK: MessageVerdictKind = "ok"
+VERDICT_SPAM: MessageVerdictKind = "spam"
+VERDICT_SCAM: MessageVerdictKind = "scam"
+VERDICT_HIJACK: MessageVerdictKind = "hijack"
+
+# The message shield's verdicts that hide a message (spam and scam).
+UNSAFE_MESSAGE_VERDICTS: tuple[str, ...] = (VERDICT_SPAM, VERDICT_SCAM)
+# Never an open question, never nudged, never answered: spam, scam, and a
+# message that carried an installer or an archive (JV-01).
+HIDDEN_VERDICTS: tuple[str, ...] = (*UNSAFE_MESSAGE_VERDICTS, VERDICT_DANGEROUS_FILE)
+# Never answered by the AI; a possible hijack is shown to the owner but the AI
+# stays silent there too.
+REPLY_BLOCKING_VERDICTS: tuple[str, ...] = (*HIDDEN_VERDICTS, VERDICT_HIJACK)
+
+# Soft signals add up to this before a message counts as spam and auto-reply
+# is blocked. Every single soft signal weighs less (pinned by a test), so one
+# alone — a first-ever contact above all (owner decision 2) — never blocks.
+SPAM_SCORE = 50
+# A soft score never reaches the hard one.
+SOFT_SCORE_CAP = HARD_SCORE - 1
+
+# Hard rules: any one of them quarantines the message (no reply, no download,
+# no model call, the owner warned).
+R_TEXT_LINK_MISMATCH = "text_link_mismatch"
+R_LOOKALIKE_DOMAIN = "lookalike_domain"
+R_BRAND_DOMAIN = "brand_domain"
+R_MIXED_SCRIPT_DOMAIN = "mixed_script_domain"
+R_USERINFO_URL = "userinfo_url"
+R_EXEC_URL = "exec_url"
+R_ARCHIVE_URL = "archive_url"
+R_EXEC_FILE = "exec_file"
+R_ARCHIVE_FILE = "archive_file"
+R_CODE_REQUEST = "code_request"
+R_CARD_DATA_REQUEST = "card_data_request"
+R_TELEGRAM_SCAM = "telegram_scam_flag"
+R_TELEGRAM_FAKE = "telegram_fake_flag"
+R_PHOTO_LURE = "photo_lure"
+
+HARD_REASONS = frozenset(
+    {
+        R_TEXT_LINK_MISMATCH,
+        R_LOOKALIKE_DOMAIN,
+        R_BRAND_DOMAIN,
+        R_MIXED_SCRIPT_DOMAIN,
+        R_USERINFO_URL,
+        R_EXEC_URL,
+        R_ARCHIVE_URL,
+        R_EXEC_FILE,
+        R_ARCHIVE_FILE,
+        R_CODE_REQUEST,
+        R_CARD_DATA_REQUEST,
+        R_TELEGRAM_SCAM,
+        R_TELEGRAM_FAKE,
+        R_PHOTO_LURE,
+    }
+)
+
+# Soft signals and their weights.
+R_SHORTENER = "shortener"
+R_FREE_HOST = "free_host"
+R_CHEAP_TLD = "cheap_tld"
+R_PUNYCODE = "punycode"
+R_BARE_IP = "bare_ip"
+R_LURE = "lure_words"
+R_URGENCY = "urgency"
+R_MASS_FORWARD = "mass_forward"
+R_FORWARDED = "forwarded"
+R_VIA_BOT = "via_bot"
+R_FIRST_CONTACT = "first_contact"
+R_SCRIPT_SWITCH = "script_switch"
+
+SOFT_WEIGHTS: dict[str, int] = {
+    R_SHORTENER: 25,
+    R_FREE_HOST: 25,
+    R_CHEAP_TLD: 20,
+    R_PUNYCODE: 30,
+    R_BARE_IP: 30,
+    R_LURE: 20,
+    R_URGENCY: 10,
+    R_MASS_FORWARD: 20,
+    R_FORWARDED: 10,
+    R_VIA_BOT: 20,
+    R_FIRST_CONTACT: 15,
+    R_SCRIPT_SWITCH: 15,
+}
+
+# Possible hijack: a contact with history suddenly sends what they never did.
+R_HIJACK_FILE = "hijack_file"
+R_HIJACK_SHORT_LINK = "hijack_short_link"
+R_HIJACK_LOAN = "hijack_loan"
+# This many earlier messages from them before "unlike themselves" means
+# anything; with fewer there is nothing to compare with.
+HIJACK_MIN_HISTORY = 3
+# The script switch needs this much to compare: earlier messages with
+# letters, and letters in this one.
+SCRIPT_MIN_HISTORY = 5
+SCRIPT_MIN_LETTERS = 15
+SCRIPT_DOMINANCE = 0.8
+
+NOTICE_SCAM = "scam"
+NOTICE_HIJACK = "hijack"
+# Warned about at most once per chat per (owner's calendar) day.
+CHAT_DAILY_NOTICES = frozenset({NOTICE_SCAM, NOTICE_HIJACK})
+# media.skipped for a quarantined message's photo, voice or file.
+SKIP_QUARANTINED = "quarantined"
+# media.skipped for a spam message's big file: never worth the owner's tap.
+SKIP_SPAM = "spam"
+
+# The domains a look-alike imitates. The owner adds their own verified ones
+# with SAFETY_EXTRA_SAFE_DOMAINS; a host is safe when it is one of these or a
+# subdomain of one. Being safe never makes an installer link safe.
+#
+# The payment, bank and government ones are also what a misspelt name is
+# compared with (a «paymee.uz»); generic names like «google» or «telegram»
+# are not, since a real «doodle.com» or «telegraf.com» is one letter away —
+# the brand and mixed-script rules catch those.
+LOOKALIKE_TARGET_DOMAINS = frozenset(
+    {
+        # payments and cards
+        "payme.uz",
+        "paycom.uz",
+        "click.uz",
+        "uzum.uz",
+        "uzumbank.uz",
+        "apelsin.uz",
+        "paynet.uz",
+        "uzcard.uz",
+        "humocard.uz",
+        "humo.uz",
+        "visa.com",
+        "mastercard.com",
+        # banks
+        "cbu.uz",
+        "kapitalbank.uz",
+        "nbu.uz",
+        "agrobank.uz",
+        "sqb.uz",
+        "ipakyulibank.uz",
+        "hamkorbank.uz",
+        "asakabank.uz",
+        "aloqabank.uz",
+        "xb.uz",
+        "ofb.uz",
+        "infinbank.com",
+        "tbcbank.uz",
+        "anorbank.uz",
+        "davrbank.uz",
+        "trustbank.uz",
+        "octobank.uz",
+        "hayotbank.uz",
+        "turonbank.uz",
+        "universalbank.uz",
+        "mkbank.uz",
+        # government
+        "gov.uz",
+        "soliq.uz",
+        "lex.uz",
+        "mvd.uz",
+        "customs.uz",
+        "uzpost.uz",
+    }
+)
+SENSITIVE_SAFE_DOMAINS = LOOKALIKE_TARGET_DOMAINS | frozenset(
+    {
+        # accounts people get phished for
+        "telegram.org",
+        "telegram.me",
+        "t.me",
+        "whatsapp.com",
+        "wa.me",
+        "google.com",
+        "apple.com",
+        "icloud.com",
+    }
+)
+SAFE_DOMAINS = SENSITIVE_SAFE_DOMAINS | frozenset(
+    {
+        "youtube.com",
+        "youtu.be",
+        "instagram.com",
+        "facebook.com",
+        "googleapis.com",
+        "googleusercontent.com",
+        "gstatic.com",
+        "microsoft.com",
+        "live.com",
+        "yandex.uz",
+        "yandex.ru",
+        "yandex.com",
+        "mail.ru",
+        "gmail.com",
+        "beeline.uz",
+        "ucell.uz",
+        "uztelecom.uz",
+        "mobi.uz",
+        "uzmobile.uz",
+        "olx.uz",
+        "korzinka.uz",
+        "express24.uz",
+        "kun.uz",
+        "gazeta.uz",
+        "daryo.uz",
+        "alibaba.com",
+        "1688.com",
+        "taobao.com",
+        "aliexpress.com",
+        "wildberries.ru",
+        "ozon.ru",
+    }
+)
+
+# Names a look-alike borrows: a host that carries one and is not on the
+# allowlist is a hard hit. Matched as a whole part of a label, or glued to
+# one of the lure affixes below («payme-uz», «paymebonus», «tgpremium»).
+BRAND_TOKENS = frozenset(
+    {
+        "payme",
+        "paycom",
+        "click",
+        "uzum",
+        "uzumbank",
+        "apelsin",
+        "paynet",
+        "uzcard",
+        "humo",
+        "humocard",
+        "kapitalbank",
+        "agrobank",
+        "hamkorbank",
+        "ipakyuli",
+        "ipakyulibank",
+        "asakabank",
+        "aloqabank",
+        "xalqbank",
+        "anorbank",
+        "tbcbank",
+        "davrbank",
+        "octobank",
+        "infinbank",
+        "soliq",
+        "mygov",
+        "gov",
+        "telegram",
+        "whatsapp",
+    }
+)
+_BRAND_AFFIXES = frozenset(
+    {
+        "uz",
+        "pay",
+        "bonus",
+        "bank",
+        "app",
+        "online",
+        "gift",
+        "premium",
+        "card",
+        "login",
+        "verify",
+        "secure",
+        "support",
+        "official",
+        "help",
+        "free",
+        "web",
+        "auth",
+    }
+)
+_FUZZY_MIN_NAME = 5
+
+SHORTENER_DOMAINS = frozenset(
+    {
+        "bit.ly",
+        "bitly.com",
+        "tinyurl.com",
+        "t.co",
+        "goo.gl",
+        "cutt.ly",
+        "is.gd",
+        "v.gd",
+        "rb.gy",
+        "ow.ly",
+        "shorturl.at",
+        "clck.ru",
+        "tiny.cc",
+        "s.id",
+        "rebrand.ly",
+        "u.to",
+        "qps.ru",
+        "vk.cc",
+        "buff.ly",
+        "lnkd.in",
+        "t.ly",
+        "shorturl.asia",
+    }
+)
+FREE_HOST_DOMAINS = frozenset(
+    {
+        "telegra.ph",
+        "blogspot.com",
+        "wixsite.com",
+        "weebly.com",
+        "github.io",
+        "netlify.app",
+        "vercel.app",
+        "pages.dev",
+        "workers.dev",
+        "web.app",
+        "firebaseapp.com",
+        "glitch.me",
+        "000webhostapp.com",
+        "tilda.ws",
+        "ngrok.io",
+        "ngrok-free.app",
+        "herokuapp.com",
+        "replit.app",
+        "surge.sh",
+        "webflow.io",
+        "wordpress.com",
+        "ucoz.ru",
+        "narod.ru",
+        "site123.me",
+    }
+)
+# Services known by name: their names are never read as a look-alike of a
+# brand («telegra.ph» is not «telegram»), though they stay soft signals.
+_KNOWN_HOSTS = SHORTENER_DOMAINS | FREE_HOST_DOMAINS
+CHEAP_TLDS = frozenset(
+    {
+        "xyz",
+        "top",
+        "click",
+        "link",
+        "site",
+        "online",
+        "shop",
+        "store",
+        "live",
+        "icu",
+        "buzz",
+        "monster",
+        "rest",
+        "cfd",
+        "sbs",
+        "bond",
+        "lat",
+        "cyou",
+        "win",
+        "bid",
+        "loan",
+        "gq",
+        "tk",
+        "ml",
+        "cf",
+        "ga",
+        "work",
+        "fun",
+        "space",
+        "website",
+        "pw",
+        "su",
+        "zip",
+        "mov",
+    }
+)
+# Second-level labels under which the registrable name is one level deeper
+# («foo.com.uz», «bar.co.uk»).
+_SECOND_LEVEL = frozenset({"co", "com", "net", "org", "gov", "edu", "ac", "msk", "spb"})
+# Top-level domains a bare «name.tld» in text is read as a link for; a file
+# name («hisob.pdf») or a code («GS367.A») is not one.
+_BARE_TLDS = (
+    "uz|com|ru|net|org|io|me|info|biz|app|dev|ly|gl|gd|gy|cc|kz|kg|tj|tm|ph|to|in|co"
+    "|us|tv|ws|pro|page|ai|xyz|top|click|link|site|online|shop|store|live|icu|buzz"
+    "|monster|rest|cfd|sbs|bond|lat|cyou|win|bid|loan|gq|tk|ml|cf|ga|work|fun|space"
+    "|website|pw|su|zip|mov|uk|de|cn|tr|ae"
+)
+
+_SCHEME_URL = re.compile(r"(?i)(?<![\w@])(?:(?:https?|ftp)://|www\.)[^\s<>\"'«»]+")
+_BARE_URL = re.compile(
+    rf"(?i)(?<![\w@./:-])(?:[\w-]+\.)+(?:{_BARE_TLDS})(?![\w-])(?:/[^\s<>\"'«»]*)?"
+)
+_URL_TRAILING = ".,;:!?)]}»\"'"
+
+# Cyrillic letters that pass for Latin ones, from the client-code table
+# (codes.LOOKALIKE) plus the few it does not need.
+_CYRILLIC_LOOKALIKES: dict[str, str] = {
+    **{
+        ch.casefold(): latin.casefold()
+        for latin, chars in codes.LOOKALIKE.items()
+        for ch in chars
+        if ch != latin
+    },
+    "і": "i",
+    "ј": "j",
+    "ѕ": "s",
+    "ԁ": "d",
+    "ԛ": "q",
+    "ԝ": "w",
+    "ү": "y",
+}
+
+Source = Literal["text", "text_link", "button"]
+
+
+@dataclass(frozen=True, slots=True)
+class FoundUrl:
+    """One link a message carries, wherever it sits."""
+
+    url: str
+    host: str
+    path: str
+    source: Source = "text"
+    # The text a Telegram text link shows, when it is one.
+    shown: str | None = None
+    userinfo: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class LinkVerdict:
+    hard: tuple[str, ...] = ()
+    soft: tuple[str, ...] = ()
+
+
+def _trim_url(raw: str) -> str:
+    return raw.rstrip(_URL_TRAILING)
+
+
+def _parse(raw: str, source: Source, shown: str | None = None) -> FoundUrl | None:
+    url = _trim_url(raw.strip())
+    if not url:
+        return None
+    target = url if re.match(r"(?i)^[a-z][a-z0-9+.-]*://", url) else f"http://{url}"
+    try:
+        parts = urlsplit(target)
+        host = (parts.hostname or "").rstrip(".")
+    except ValueError:
+        return None
+    if not host:
+        return None
+    return FoundUrl(
+        url=url,
+        host=unicodedata.normalize("NFKC", host).casefold(),
+        path=parts.path or "",
+        source=source,
+        shown=shown,
+        userinfo="@" in (parts.netloc or ""),
+    )
+
+
+def _urls_in_text(text: str) -> list[str]:
+    found = [m.group(0) for m in _SCHEME_URL.finditer(text)]
+    rest = _SCHEME_URL.sub(" ", text)
+    found += [m.group(0) for m in _BARE_URL.finditer(rest)]
+    return found
+
+
+def extract_urls(
+    text: str | None,
+    *,
+    text_links: Iterable[tuple[str, str]] = (),
+    buttons: Iterable[str] = (),
+) -> list[FoundUrl]:
+    """Every link a message carries: written in its text, hidden behind a
+    Telegram text link (``(shown text, url)`` pairs) and on its URL buttons.
+
+    The text is read with format characters removed, so a zero-width space
+    cannot split a domain past the reader.
+    """
+    clean = display_name(text or "")
+    out: list[FoundUrl] = []
+    for raw in _urls_in_text(clean):
+        found = _parse(raw, "text")
+        if found is not None:
+            out.append(found)
+    for shown, url in text_links:
+        found = _parse(url, "text_link", display_name(shown or ""))
+        if found is not None:
+            out.append(found)
+    for url in buttons:
+        found = _parse(url, "button")
+        if found is not None:
+            out.append(found)
+    return out
+
+
+def normalise_domain(domain: str) -> str:
+    """«https://www.Payme.uz/» → «payme.uz»: what an allowlist entry means."""
+    text = unicodedata.normalize("NFKC", domain or "").strip().casefold()
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)
+    text = text.split("/")[0].split("@")[-1].split(":")[0].strip(".")
+    return text.removeprefix("www.")
+
+
+def _safe_domains(extra_safe: Iterable[str]) -> frozenset[str]:
+    """The allowlist: the code constant plus the owner's verified domains."""
+    return SAFE_DOMAINS | {normalise_domain(d) for d in extra_safe if d.strip()}
+
+
+def _within(host: str, domains: Iterable[str]) -> bool:
+    return any(host == d or host.endswith(f".{d}") for d in domains)
+
+
+def _labels(host: str) -> list[str]:
+    return [label for label in host.split(".") if label]
+
+
+def registrable(host: str) -> str:
+    """The name a person registered: «pay.payme.uz» → «payme.uz»,
+    «shop.foo.com.uz» → «foo.com.uz»."""
+    labels = _labels(normalise_domain(host))
+    if len(labels) >= 3 and labels[-2] in _SECOND_LEVEL:
+        return ".".join(labels[-3:])
+    return ".".join(labels[-2:])
+
+
+def _name_label(host: str) -> str:
+    """The label before the public suffix: «payme» of «pay.payme.uz»."""
+    labels = _labels(registrable(host))
+    return labels[0] if labels else ""
+
+
+def _idna_decoded(host: str) -> str:
+    if "xn--" not in host:
+        return host
+    try:
+        return host.encode("ascii").decode("idna").casefold()
+    except UnicodeError:
+        return host
+
+
+def _latinised(label: str) -> str:
+    return "".join(_CYRILLIC_LOOKALIKES.get(ch, ch) for ch in label)
+
+
+def _is_cyrillic(ch: str) -> bool:
+    return "CYRILLIC" in unicodedata.name(ch, "")
+
+
+def _mixed_script(label: str) -> bool:
+    """Latin and Cyrillic letters in one label: «pаyme» with a Cyrillic «а»."""
+    letters = [ch for ch in label if ch.isalpha()]
+    has_latin = any(ch.isascii() for ch in letters)
+    has_cyrillic = any(_is_cyrillic(ch) for ch in letters)
+    return has_latin and has_cyrillic
+
+
+def _brand_hit(labels: list[str]) -> bool:
+    """A brand name in any label but the top-level one. «gov» right under a
+    country code is that country's own government registry («gov.kz»)."""
+    last = len(labels) - 2
+    names = [lb for i, lb in enumerate(labels[:-1]) if not (i == last and lb == "gov")]
+    return any(_brand_in_label(label) for label in names)
+
+
+def _brand_in_label(label: str) -> bool:
+    for part in re.split(r"[-_0-9]+", label):
+        if not part:
+            continue
+        if part in BRAND_TOKENS:
+            return True
+        for brand in BRAND_TOKENS:
+            if len(brand) < 4:
+                continue
+            if part.startswith(brand) and part[len(brand) :] in _BRAND_AFFIXES:
+                return True
+            if part.endswith(brand) and part[: -len(brand)] in _BRAND_AFFIXES:
+                return True
+    return False
+
+
+# Letters and pairs that pass for each other at a glance. On a short name a
+# single swapped letter counts as a look-alike only when it is one of these
+# («uzkard» for «uzcard»), never any letter («uzcars» is another word).
+_CONFUSABLE_LETTERS = frozenset(
+    frozenset(pair)
+    for pair in (
+        ("c", "k"),
+        ("q", "k"),
+        ("x", "h"),
+        ("o", "0"),
+        ("l", "1"),
+        ("i", "1"),
+        ("i", "l"),
+        ("m", "n"),
+        ("u", "v"),
+        ("s", "5"),
+        ("e", "3"),
+        ("a", "4"),
+        ("g", "q"),
+    )
+)
+_CONFUSABLE_PAIRS = (("rn", "m"), ("vv", "w"), ("cl", "d"))
+# Below this length a look-alike is one edit away; from it, two.
+_FUZZY_LONG_NAME = 8
+
+
+def _unconfused(name: str) -> str:
+    """«payrne» → «payme»: letter pairs read as one letter."""
+    for pair, letter in _CONFUSABLE_PAIRS:
+        name = name.replace(pair, letter)
+    return name
+
+
+def _near(name: str, other: str) -> bool:
+    limit = 1 if len(other) < _FUZZY_LONG_NAME else 2
+    if abs(len(name) - len(other)) > limit:
+        return False
+    if Levenshtein.distance(name, other, score_cutoff=limit) > limit:
+        return False
+    if len(name) == len(other) and len(other) < _FUZZY_LONG_NAME:
+        swapped = [frozenset((a, b)) for a, b in zip(name, other, strict=True) if a != b]
+        return all(pair in _CONFUSABLE_LETTERS for pair in swapped)
+    return True
+
+
+def _fuzzy_lookalike(name: str, targets: Iterable[str]) -> bool:
+    """A name a payment, bank or government name is misspelt into: one edit
+    away (two from eight letters), or the same once confusable letters are
+    read as what they imitate, and not that name itself."""
+    if len(name) < _FUZZY_MIN_NAME:
+        return False
+    plain = _unconfused(name)
+    for domain in targets:
+        other = _name_label(domain)
+        if len(other) < _FUZZY_MIN_NAME or other == name:
+            continue
+        if plain == other or _near(name, other):
+            return True
+    return False
+
+
+def _bare_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+def _file_reason(path: str) -> str | None:
+    """An installer or an archive at the end of a link's path."""
+    name = path.rsplit("/", 1)[-1]
+    if "." not in name:
+        return None
+    verdict = classify_attachment(name)
+    if verdict.kind == EXEC:
+        return R_EXEC_URL
+    if verdict.kind == ARCHIVE:
+        return R_ARCHIVE_URL
+    return None
+
+
+def link_verdict(found: FoundUrl, *, extra_safe: Iterable[str] = ()) -> LinkVerdict:
+    """What one link is: hard hits (a look-alike, a disguise) and soft signals.
+
+    The allowlist is the code constant plus ``extra_safe`` (the owner's
+    SAFETY_EXTRA_SAFE_DOMAINS). An allowlisted host is never a look-alike,
+    but an installer or an archive behind it is still a hard hit: the domain
+    list never loosens the file rules.
+    """
+    hard: list[str] = []
+    soft: list[str] = []
+    host = found.host
+    safe = _safe_domains(extra_safe)
+    file_reason = _file_reason(found.path)
+    if file_reason:
+        hard.append(file_reason)
+    # A text link that opens a real allowlisted site disguises nothing
+    # («youtube.com» opening youtu.be, «gov.uz» opening my.gov.uz).
+    if found.source == "text_link" and found.shown and not _within(host, safe):
+        named = [u for u in (_parse(r, "text") for r in _urls_in_text(found.shown)) if u]
+        if any(registrable(u.host) != registrable(host) for u in named):
+            hard.append(R_TEXT_LINK_MISMATCH)
+    if found.userinfo:
+        hard.append(R_USERINFO_URL)
+
+    if _bare_ip(host):
+        soft.append(R_BARE_IP)
+        return LinkVerdict(tuple(hard), tuple(soft))
+    decoded = _idna_decoded(host)
+    if decoded != host:
+        soft.append(R_PUNYCODE)
+    if _within(host, safe) or _within(decoded, safe):
+        return LinkVerdict(tuple(hard), tuple(soft))
+
+    labels = _labels(decoded)
+    if any(_mixed_script(label) for label in labels):
+        hard.append(R_MIXED_SCRIPT_DOMAIN)
+    latin_labels = [_latinised(label) for label in labels]
+    latin_host = ".".join(latin_labels)
+    sensitive = SENSITIVE_SAFE_DOMAINS
+    if _within(latin_host, sensitive) and latin_host != decoded:
+        # Every letter a Cyrillic stand-in: «рауме.uz» spelled to read «payme».
+        hard.append(R_MIXED_SCRIPT_DOMAIN)
+    elif _brand_hit(latin_labels):
+        hard.append(R_BRAND_DOMAIN)
+    elif not _within(host, _KNOWN_HOSTS) and _fuzzy_lookalike(
+        _name_label(latin_host), LOOKALIKE_TARGET_DOMAINS
+    ):
+        hard.append(R_LOOKALIKE_DOMAIN)
+
+    if _within(host, SHORTENER_DOMAINS):
+        soft.append(R_SHORTENER)
+    if _within(host, FREE_HOST_DOMAINS):
+        soft.append(R_FREE_HOST)
+    if labels and labels[-1] in CHEAP_TLDS:
+        soft.append(R_CHEAP_TLD)
+    return LinkVerdict(tuple(dict.fromkeys(hard)), tuple(dict.fromkeys(soft)))
+
+
+def is_short_link(found: FoundUrl) -> bool:
+    """A link whose real target is hidden: a shortener or a free host."""
+    return _within(found.host, _KNOWN_HOSTS)
+
+
+# --- the message lexicons ---------------------------------------------------------
+#
+# Matched on folded text (format characters removed, apostrophes folded,
+# casefolded, ё→е). A marker ending in «\b» must end a word; the others are
+# stems. Extend them here, with a corpus case in tests/fixtures/scam_corpus.py.
+
+
+def _markers(markers: Iterable[str]) -> list[re.Pattern[str]]:
+    compiled = []
+    for marker in markers:
+        word_end = marker.endswith(r"\b")
+        stem = marker[:-2] if word_end else marker
+        tail = r"(?![\w'])" if word_end else ""
+        compiled.append(re.compile(r"(?<![\w'])" + re.escape(stem) + tail))
+    return compiled
+
+
+def _fold(text: str) -> str:
+    text = fold_apostrophes(display_name(text or "")).casefold().replace("ё", "е")
+    return re.sub(r"\s+", " ", text)
+
+
+def _any(patterns: Sequence[re.Pattern[str]], text: str) -> bool:
+    return any(p.search(text) for p in patterns)
+
+
+# The one-time-code words of the payment reader (sms_money.OTP_MARKERS) say a
+# code is meant; a request verb and an SMS context make it a request for one.
+# Its bank-warning words («hech kimga», «никому») say not to share a code and
+# name none, so «kelgan tovarni hech kimga bermang» asks for nothing.
+_BANK_WARNINGS = frozenset(
+    {"hech kimga", "ҳеч кимга", "nikomu", "никому", "ne soobshch", "не сообщ"}
+)
+_OTP = _markers(
+    (
+        *(m for m in sms_money.OTP_MARKERS if m not in _BANK_WARNINGS),
+        r"kodini\b",
+        r"кодни\b",
+        r"кодини\b",
+        r"кодингиз\b",
+    )
+)
+# Where the code came: an SMS, the phone. A bare «kelgan» is every delivery
+# («kelgan tovarlar»); it counts only next to the code or the SMS.
+_SMS_CONTEXT = _markers(
+    (
+        "sms",
+        "смс",
+        "telefoningizga",
+        "nomeringizga",
+        "raqamingizga",
+        "на телефон",
+        "на номер",
+    )
+)
+_ARRIVED_CODE = re.compile(
+    r"(?<![\w'])(?:kelgan kod|kod\w* kelgan|келган код|код\w* келган|пришедш\w* код"
+    r"|код\w*,? (?:котор\w+ )?(?:вам |тебе )?приш(?:ел|ла|ло|ли)(?![\w']))"
+)
+# Secrets nobody but a fraudster asks for, with or without an SMS.
+_SECRET = _markers(
+    (
+        "tasdiqlash kodi",
+        "bir martalik kod",
+        "parol",
+        "пароль",
+        r"otp\b",
+        "код подтвержден",
+        "kod podtverzhden",
+        "одноразов",
+        r"pin kod",
+        r"пин-код",
+        r"пин код",
+    )
+)
+# Card secrets: the security code on its own; the expiry date and the back of
+# the card only next to a card word, since a contract has a «срок действия»
+# and a page an «оборот» too.
+_CARD_STRONG = _markers(
+    (r"cvv\b", r"cvc\b", r"cvc2\b", "karta orqasidagi", "kartaning orqa")
+)
+_CARD_WEAK = _markers(
+    (
+        "amal qilish muddati",
+        "orqasidagi",
+        "срок действия",
+        "srok deystvi",
+        "на обороте",
+        "obratnoy storon",
+    )
+)
+_CARD_WORD = _markers(("karta", "карт", "card", "plastik", "пластик"))
+# Asking for something to be told, sent or typed: an imperative or a request
+# ending only, so neither the negative imperative («aytmang») nor what the
+# writer did themselves («yubordim», «yozib qo'ydim», «пришло») is one. Matched
+# on folded text, where «ё» is «е». The endings after a stem that ends in a
+# consonant: «ayt» → «ayting», «aytgin», «aytsangiz», «aytasizmi», «aytib
+# bering», «aytvoring».
+_LATIN_ASK = r"(?:ing|ingiz|gin|sangiz|asizmi|ib (?:bering|yuboring|jo'nating)|voring)"
+_CYRILLIC_ASK = r"(?:инг|ингиз|гин|сангиз|асизми|иб (?:беринг|юборинг)|воринг)"
+_REQUEST_VERB = re.compile(
+    r"(?<![\w'])(?:"
+    # «yubor», «ayt» alone are imperatives too; a bare «yoz» is the summer.
+    rf"(?:yubor|jo'nat|ayt|kirit){_LATIN_ASK}?"
+    rf"|yoz{_LATIN_ASK}"
+    r"|tashla(?:ng|ngiz|gin|sangiz|ysizmi|b (?:bering|yuboring)|voring)?"
+    rf"|(?:юбор|жўнат|айт|кирит){_CYRILLIC_ASK}?"
+    rf"|ез{_CYRILLIC_ASK}"
+    r"|ташла(?:нг|нгиз|гин|сангиз|йсизми|б (?:беринг|юборинг)|воринг)?"
+    r"|отправьте|отправь|отправите|пришлите|скажите|скажи|напишите|напиши"
+    r"|сообщите|сообщи|продиктуйте|продиктуй|скиньте|скинь|введите|назовите|назови"
+    r"|otprav'?te|prishlite|skazhite|napishite|skin'?te|vvedite|nazovite"
+    r")(?![\w'])"
+)
+# The advert words of the payment reader say an SMS is an advert, but some of
+# them are how any client writes («narx taklif qiling», «подробнее»): those
+# never count as a lure here.
+_BUSINESS_WORDS = frozenset(
+    {
+        "taklif",
+        "таклиф",
+        "predlozheni",
+        "предложени",
+        "offer",
+        "batafsil",
+        "батафсил",
+        "podrobn",
+        "подробн",
+        "ulaning",
+        "obuna",
+    }
+)
+_LURE = _markers(
+    (
+        *(m for m in sms_money.ADVERT_MARKERS if m not in _BUSINESS_WORDS),
+        "yutib oldingiz",
+        "yutdingiz",
+        "g'olib",
+        "sovrin",
+        "bepul",
+        "tekin",
+        "premium",
+        "pul ishlash",
+        "kunlik daromad",
+        "kunlik foyda",
+        "investitsiya",
+        "kripto",
+        "выиграли",
+        "победител",
+        "бесплатн",
+        "заработ",
+        "инвестиц",
+        "премиум",
+        "приз",
+        "крипт",
+        "vyigrali",
+        "besplatn",
+        "zarabot",
+    )
+)
+_URGENCY = _markers(
+    (
+        "shoshiling",
+        "zudlik bilan",
+        "faqat bugun",
+        "oxirgi imkoniyat",
+        "bloklanadi",
+        "bloklandi",
+        "bloklangan",
+        "muzlatiladi",
+        "24 soat ichida",
+        "срочно",
+        "немедленно",
+        "только сегодня",
+        "последний шанс",
+        "заблокир",
+        "srochno",
+        "zablokir",
+    )
+)
+_MASS_FORWARD = _markers(
+    (
+        "do'stlaringizga yuboring",
+        "do'stlaringizga ulashing",
+        "barchaga yuboring",
+        "guruhlarga yuboring",
+        "tarqating",
+        "ulashing",
+        "перешлите",
+        "поделитесь",
+        "разошлите",
+        "отправьте друзьям",
+        "share with",
+    )
+)
+# «Is this you?» asked on its own: the phrase ends its clause, so «bu sizmi
+# buyurtma bergansiz?» and «это вы отправили счет?» are ordinary questions.
+_PHOTO_LURE_QUESTION = re.compile(
+    r"(?<![\w'])(?:bu sizmi(?:siz)?|bu senmi|это ты|это вы|eto ty|eto vy|is this you)"
+    r"(?![\w'])\s*(?:[?!.…]|$)"
+)
+_PHOTO_LURE = _markers(
+    (
+        "bu sizmi rasmda",
+        "sizmi rasmda",
+        "rasmda sizmi",
+        "rasmda sizsiz",
+        "videoda sizmi",
+        "sizning rasmingiz",
+        "rasmda senmi",
+        "твои фото",
+        "ваши фото",
+        "ты на фото",
+        "вы на фото",
+        "tvoi foto",
+    )
+)
+# Borrowing, the hijacked account's usual ask.
+_LOAN = _markers(
+    (
+        "qarz berib tur",
+        "qarzga ber",
+        "qarz bera olasiz",
+        "qarz kerak",
+        "pul kerak edi",
+        "pul kerak bo'lib",
+        "kartamga tashla",
+        "kartamga o'tkaz",
+        "ertaga qaytaraman",
+        "одолжи",
+        "займи",
+        "в долг",
+        "скинь на карту",
+        "скиньте на карту",
+        "завтра верну",
+        "верну завтра",
+        "odolzhi",
+        "zaymi",
+        "v dolg",
+    )
+)
+_MENTION_OR_TAG = re.compile(r"(?<![\w])[#@]\w+")
+_MASS_LINKS = 3
+_MASS_TAGS = 5
+
+
+def is_loan_request(text: str | None) -> bool:
+    return _any(_LOAN, _fold(text or ""))
+
+
+def has_link(text: str | None) -> bool:
+    return bool(_urls_in_text(display_name(text or "")))
+
+
+Script = Literal["latin", "cyrillic"]
+
+
+def script_of(text: str | None, *, min_letters: int = 1) -> Script | None:
+    """The script most of a text's letters are written in, when it has enough."""
+    letters = [ch for ch in display_name(text or "") if ch.isalpha()]
+    if len(letters) < min_letters:
+        return None
+    cyrillic = sum(1 for ch in letters if _is_cyrillic(ch))
+    return "cyrillic" if cyrillic * 2 > len(letters) else "latin"
+
+
+def dominant_script(texts: Iterable[str | None]) -> Script | None:
+    """The script someone almost always writes in, or None when they mix or
+    there is too little to tell."""
+    scripts = [s for s in (script_of(t, min_letters=3) for t in texts) if s]
+    if len(scripts) < SCRIPT_MIN_HISTORY:
+        return None
+    for script in ("latin", "cyrillic"):
+        if scripts.count(script) >= SCRIPT_DOMINANCE * len(scripts):
+            return script
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class MessageFeatures:
+    """What the shield reads: the message, and what the caller found about
+    its sender. Built before any download or model call."""
+
+    text: str = ""
+    urls: tuple[FoundUrl, ...] = ()
+    # classify_attachment of what the message carries, before any download.
+    attachment: Verdict | None = None
+    has_file: bool = False
+    sender_scam: bool = False  # Telegram's User.scam
+    sender_fake: bool = False  # Telegram's User.fake
+    forwarded: bool = False  # fwd_from
+    via_bot: bool = False  # via_bot_id
+    saved_contact: bool = False
+    # Their earlier messages MIYA stored (the caller caps the count).
+    prior_messages: int = 0
+    owner_wrote_before: bool = False
+    history_script: Script | None = None
+    history_risky_files: bool = False
+    history_short_links: bool = False
+    history_loans: bool = False
+
+    @property
+    def first_contact(self) -> bool:
+        """Never seen, never written to, not in the owner's contacts."""
+        return not (self.contact or self.prior_messages)
+
+    @property
+    def contact(self) -> bool:
+        """In the owner's contacts, or someone the owner wrote to."""
+        return self.saved_contact or self.owner_wrote_before
+
+    @property
+    def known(self) -> bool:
+        """A contact with enough history to say how they usually write. A
+        stranger who wrote a few times is not one: their spam is spam, never
+        a hijacked account."""
+        return self.contact and self.prior_messages >= HIJACK_MIN_HISTORY
+
+
+@dataclass(frozen=True, slots=True)
+class MessageVerdict:
+    verdict: MessageVerdictKind
+    score: int
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def flagged(self) -> bool:
+        return self.verdict != VERDICT_OK
+
+    @property
+    def quarantined(self) -> bool:
+        """No reply, no download, no model call; the owner is warned."""
+        return self.verdict == VERDICT_SCAM
+
+    @property
+    def notice(self) -> str | None:
+        if self.verdict == VERDICT_SCAM:
+            return NOTICE_SCAM
+        if self.verdict == VERDICT_HIJACK:
+            return NOTICE_HIJACK
+        return None
+
+    @property
+    def hard_reasons(self) -> tuple[str, ...]:
+        return tuple(r for r in self.reasons if r in HARD_REASONS)
+
+    def as_safety(self) -> dict[str, object]:
+        """``interactions.meta.safety``."""
+        return {
+            "verdict": self.verdict,
+            "score": self.score,
+            "reasons": list(self.reasons),
+        }
+
+
+CLEAN = MessageVerdict(VERDICT_OK, 0)
+
+
+def _text_hits(
+    text: str, features: MessageFeatures, safe: frozenset[str]
+) -> tuple[list[str], list[str]]:
+    hard: list[str] = []
+    soft: list[str] = []
+    folded = _fold(text)
+    asks = bool(_REQUEST_VERB.search(folded))
+    code = _any(_OTP, folded) and (
+        _any(_SMS_CONTEXT, folded) or bool(_ARRIVED_CODE.search(folded))
+    )
+    if asks and (_any(_SECRET, folded) or code):
+        hard.append(R_CODE_REQUEST)
+    card = _any(_CARD_STRONG, folded) or (
+        _any(_CARD_WEAK, folded) and _any(_CARD_WORD, folded)
+    )
+    if asks and card:
+        hard.append(R_CARD_DATA_REQUEST)
+    # Links to the owner's everyday sites carry no lure and are no mass mail.
+    risky_urls = [u for u in features.urls if not _within(u.host, safe)]
+    lure = bool(_PHOTO_LURE_QUESTION.search(folded)) or _any(_PHOTO_LURE, folded)
+    if lure and (features.has_file or risky_urls):
+        hard.append(R_PHOTO_LURE)
+    if _any(_LURE, folded):
+        soft.append(R_LURE)
+    if _any(_URGENCY, folded):
+        soft.append(R_URGENCY)
+    tags = len(_MENTION_OR_TAG.findall(folded))
+    mass = len(risky_urls) >= _MASS_LINKS or tags >= _MASS_TAGS
+    if mass or _any(_MASS_FORWARD, folded):
+        soft.append(R_MASS_FORWARD)
+    return hard, soft
+
+
+def _hijack(features: MessageFeatures, text: str) -> list[str]:
+    """A contact with history doing what they never did before."""
+    if not features.known:
+        return []
+    found = []
+    kind = features.attachment.kind if features.attachment else OK
+    if kind in (HTML, MACRO) and not features.history_risky_files:
+        found.append(R_HIJACK_FILE)
+    if any(is_short_link(u) for u in features.urls) and not features.history_short_links:
+        found.append(R_HIJACK_SHORT_LINK)
+    if is_loan_request(text) and not features.history_loans:
+        found.append(R_HIJACK_LOAN)
+    return found
+
+
+def scam_verdict(
+    features: MessageFeatures, *, extra_safe: Iterable[str] = ()
+) -> MessageVerdict:
+    """The verdict on one incoming message.
+
+    Any hard rule makes it ``scam``. Otherwise a contact with history doing
+    something they never did (a risky file, a short link, a loan request) is
+    a possible ``hijack``; otherwise soft signals are summed and at
+    SPAM_SCORE it is ``spam``. A known contact is not a safety signal: it
+    lowers nothing, it only lets the hijack check compare.
+    """
+    hard: list[str] = []
+    soft: list[str] = []
+    attachment = features.attachment
+    if attachment is not None and attachment.kind == EXEC:
+        hard.append(R_EXEC_FILE)
+    if attachment is not None and attachment.kind == ARCHIVE:
+        hard.append(R_ARCHIVE_FILE)
+    if features.sender_scam:
+        hard.append(R_TELEGRAM_SCAM)
+    if features.sender_fake:
+        hard.append(R_TELEGRAM_FAKE)
+    extra = tuple(extra_safe)
+    for found in features.urls:
+        link = link_verdict(found, extra_safe=extra)
+        hard += link.hard
+        soft += link.soft
+    text_hard, text_soft = _text_hits(features.text, features, _safe_domains(extra))
+    hard += text_hard
+    soft += text_soft
+    if features.forwarded:
+        soft.append(R_FORWARDED)
+    if features.via_bot:
+        soft.append(R_VIA_BOT)
+    if features.first_contact:
+        soft.append(R_FIRST_CONTACT)
+    own = script_of(features.text, min_letters=SCRIPT_MIN_LETTERS)
+    if features.history_script and own and own != features.history_script:
+        soft.append(R_SCRIPT_SWITCH)
+
+    soft_reasons = tuple(dict.fromkeys(soft))
+    score = min(SOFT_SCORE_CAP, sum(SOFT_WEIGHTS[r] for r in soft_reasons))
+    if hard:
+        reasons = tuple(dict.fromkeys(hard)) + soft_reasons
+        return MessageVerdict(VERDICT_SCAM, HARD_SCORE, reasons)
+    hijack = _hijack(features, features.text)
+    if hijack:
+        return MessageVerdict(VERDICT_HIJACK, score, tuple(hijack) + soft_reasons)
+    if score >= SPAM_SCORE:
+        return MessageVerdict(VERDICT_SPAM, score, soft_reasons)
+    return MessageVerdict(VERDICT_OK, score, soft_reasons)
+
+
+def with_message_verdict(
+    meta: dict[str, Any] | None, verdict: MessageVerdict, *, notify: bool
+) -> dict[str, Any]:
+    """``meta.safety`` for a flagged message, and the owner's warning queued.
+
+    A clean message gets no key. A file verdict already there (JV-01's
+    ``dangerous_file``) is the harder one and stays; its own warning, queued
+    first, is the one the owner gets — never two for one message.
+    """
+    out = dict(meta or {})
+    if not verdict.flagged:
+        return out
+    out.setdefault("safety", verdict.as_safety())
+    notice = verdict.notice
     if notify and notice is not None and SAFETY_NOTICE_KEY not in out:
         out[SAFETY_NOTICE_KEY] = notice
     return out
+
+
+def _verdict_of(meta: dict[str, Any] | None) -> str | None:
+    safety = (meta or {}).get("safety")
+    if not isinstance(safety, dict):
+        return None
+    value = safety.get("verdict")
+    return value if isinstance(value, str) else None
+
+
+def is_hidden(meta: dict[str, Any] | None) -> bool:
+    """Spam, scam or a dangerous file: never an open question or a nudge."""
+    return _verdict_of(meta) in HIDDEN_VERDICTS
+
+
+def blocks_reply(meta: dict[str, Any] | None) -> bool:
+    """The AI never answers this message (the responder, JV-16, and the
+    outbox gate, JV-11, read it)."""
+    return _verdict_of(meta) in REPLY_BLOCKING_VERDICTS

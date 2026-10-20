@@ -87,8 +87,15 @@ async def awaiting_question(
     pull from /savollar takes every file.
 
     A file the shield refuses is never offered: one queued before it existed
-    (the size check used to run first) is closed here instead (JV-01)."""
+    (the size check used to run first) is closed here instead (JV-01). Nor is
+    one a spammer or a scammer sent (JV-09); that is filtered before the
+    limit, so their files never crowd out anyone else's."""
     query = sa.select(Interaction).where(_state_matches(PENDING))
+    query = query.where(
+        sa.func.coalesce(Interaction.meta[("safety", "verdict")].astext, "").not_in(
+            safety.UNSAFE_MESSAGE_VERDICTS
+        )
+    )
     if pushable_only:
         query = query.where(
             Interaction.media["approval"]["pushable"].astext.is_distinct_from("false")

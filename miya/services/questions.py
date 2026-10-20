@@ -40,6 +40,7 @@ from miya.services import (
     queries,
     receipts,
     reminders,
+    safety,
 )
 from miya.services.brief import BRIEF_KIND
 
@@ -222,10 +223,13 @@ async def collect(
         day = now.astimezone(settings.tz).date().isoformat()
         items.append(_pending(KIND_GROUPS, f"digest:{day}", Decimal(0), since, monitors))
 
-    # (f) Big files.
+    # (f) Big files. One a spammer or a scammer sent is never worth a tap
+    # (JV-09).
     for row in await approvals.awaiting_question(
         session, limit=20, pushable_only=for_push
     ):
+        if safety.is_hidden(row.meta):  # filtered in SQL; a guard for the rest
+            continue
         items.append(_pending(KIND_MEDIA, f"i{row.id}", Decimal(0), row.occurred_at, row))
 
     # (g) Money texts the reader could not book alone.

@@ -36,8 +36,9 @@ Jobs:
                    for a first import (quiet-hours aware; WP-15)
   * safety_notices — every minute; one warning per dangerous file someone
                    sent into a chat, one note per macro document read as
-                   text (JV-01); silent in quiet hours, never counted in the
-                   question budget
+                   text (JV-01), one scam or possible-hijack warning per
+                   chat per day (JV-09); silent in quiet hours, never
+                   counted in the question budget
   * receipt_notices — every minute; the receipt card for each payment
                    receipt someone sent into a chat, once (notified_at;
                    JV-04); held in quiet hours unless receipts are set to
@@ -995,20 +996,57 @@ async def pending_safety_notices(session, *, now: datetime) -> list[Interaction]
     )
 
 
+async def chat_warned_today(session, interaction: Interaction, *, now: datetime) -> bool:
+    """Was this chat's owner already warned about a scam or a possible hijack
+    today (JV-09)? Those warnings go out once per chat per calendar day."""
+    if interaction.tg_chat_id is None:
+        return False
+    meta = Interaction.meta
+    notified_at = meta[safety.SAFETY_NOTIFIED_KEY].astext.cast(sa.DateTime(timezone=True))
+    return bool(
+        await session.scalar(
+            sa.select(
+                sa.exists().where(
+                    Interaction.tg_chat_id == interaction.tg_chat_id,
+                    Interaction.id != interaction.id,
+                    meta[safety.SAFETY_NOTICE_KEY].astext.in_(
+                        sorted(safety.CHAT_DAILY_NOTICES)
+                    ),
+                    meta.has_key(safety.SAFETY_NOTIFIED_KEY),
+                    sa.not_(meta.has_key(safety.SAFETY_FOLDED_KEY)),
+                    notified_at >= reminders.day_start(now),
+                )
+            )
+        )
+    )
+
+
 async def safety_notice_text(session, interaction: Interaction) -> str | None:
     """The owner's warning for one queued notice, or None for an unknown kind."""
-    notice = (interaction.meta or {}).get(safety.SAFETY_NOTICE_KEY)
+    meta = interaction.meta or {}
+    notice = meta.get(safety.SAFETY_NOTICE_KEY)
     media = interaction.media or {}
     name = (media.get("risk") or {}).get("name") or media.get("filename")
     if notice == safety.NOTICE_MACRO:
         return replies.macro_document_note(name)
-    if notice != safety.NOTICE_DANGEROUS_FILE:
+    if notice not in (
+        safety.NOTICE_DANGEROUS_FILE,
+        safety.NOTICE_SCAM,
+        safety.NOTICE_HIJACK,
+    ):
         return None
     person = (
         await session.get(Person, interaction.person_id)
         if interaction.person_id
         else None
     )
+    who = person.display_name if person else None
+    if notice == safety.NOTICE_HIJACK:
+        return replies.hijack_warning(who=who)
+    if notice == safety.NOTICE_SCAM:
+        verdict = meta.get("safety") if isinstance(meta.get("safety"), dict) else {}
+        reasons = [r for r in verdict.get("reasons") or [] if isinstance(r, str)]
+        return replies.scam_warning(who=who, reasons=reasons)
     monitor = (
         await session.scalar(
             sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == interaction.tg_chat_id)
@@ -1021,7 +1059,7 @@ async def safety_notice_text(session, interaction: Interaction) -> str | None:
     else:
         chat = monitor.title
     return replies.dangerous_file_warning(
-        who=person.display_name if person else None,
+        who=who,
         filename=name,
         chat=chat,
         android=safety.is_android_package(name),
@@ -1030,34 +1068,49 @@ async def safety_notice_text(session, interaction: Interaction) -> str | None:
 
 async def safety_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
     """Warn the owner once about each dangerous file sent into a chat, and
-    about each macro document read as text (JV-01).
+    about each macro document read as text (JV-01); about a scam or a
+    possibly hijacked account at most once per chat per day (JV-09).
 
-    Never held for quiet hours — a warning about an installer is worth
-    having before it is opened — but delivered silently inside them. Not a
-    question: nothing here touches the question budget. A row is stamped
-    only after its message went out, one commit per message; one row that
-    cannot be rendered is logged and skipped, never a stop for the rest.
+    Never held for quiet hours — a warning about an installer or a scam is
+    worth having before it is opened — but delivered silently inside them.
+    Not a question: nothing here touches the question budget. A row is
+    stamped only after its message went out, one commit per message; a scam
+    warning for a chat already warned today is stamped as folded and never
+    sent. One row that cannot be rendered is logged and skipped, never a
+    stop for the rest.
     """
     now = now or datetime.now(settings.tz)
     silent = reminders.in_quiet_hours(now)
     sent = 0
     async with session_scope() as session:
         for interaction in await pending_safety_notices(session, now=now):
+            notice = (interaction.meta or {}).get(safety.SAFETY_NOTICE_KEY)
             try:
-                text = await safety_notice_text(session, interaction)
+                async with session.begin_nested():
+                    folded = notice in safety.CHAT_DAILY_NOTICES and (
+                        await chat_warned_today(session, interaction, now=now)
+                    )
+                    text = (
+                        None if folded else await safety_notice_text(session, interaction)
+                    )
             except Exception as exc:
                 log.error(
                     "safety notice for interaction %s failed to render: %s",
                     interaction.id,
                     type(exc).__name__,
+                    extra={
+                        "interaction_id": interaction.id,
+                        "tg_chat_id": interaction.tg_chat_id,
+                        "error": type(exc).__name__,
+                    },
                 )
                 continue
             if text is not None and not await notify(bot, text, silent=silent):
                 return  # unreachable: the rest stay queued for the next sweep
-            interaction.meta = {
-                **(interaction.meta or {}),
-                safety.SAFETY_NOTIFIED_KEY: now.isoformat(),
-            }
+            stamp = {safety.SAFETY_NOTIFIED_KEY: now.isoformat()}
+            if folded:
+                stamp[safety.SAFETY_FOLDED_KEY] = True
+            interaction.meta = {**(interaction.meta or {}), **stamp}
             await session.commit()
             if text is not None:
                 sent += 1
