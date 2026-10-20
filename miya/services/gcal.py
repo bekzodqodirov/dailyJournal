@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 
 GCAL_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 MIYA_MARKER = "[MIYA]"
+# The Google client's own exponential backoff on 429 and 5xx (JV-02).
+GOOGLE_NUM_RETRIES = 5
 
 
 class CalendarAPI(ABC):
@@ -86,7 +88,7 @@ class GoogleCalendarAPI(CalendarAPI):
                     maxResults=250,
                     pageToken=token,
                 )
-                .execute()
+                .execute(num_retries=GOOGLE_NUM_RETRIES)
             )
             items.extend(response.get("items", []))
             token = response.get("nextPageToken")
@@ -95,7 +97,8 @@ class GoogleCalendarAPI(CalendarAPI):
 
     def _insert(self, body: dict[str, Any]) -> dict[str, Any]:
         service = self._get_service()
-        return service.events().insert(calendarId=self._calendar_id, body=body).execute()
+        request = service.events().insert(calendarId=self._calendar_id, body=body)
+        return request.execute(num_retries=GOOGLE_NUM_RETRIES)
 
     async def list_events(
         self, time_min: datetime, time_max: datetime

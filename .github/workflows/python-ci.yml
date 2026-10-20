@@ -1,6 +1,7 @@
-# The Python side: lint, format, migrations and drift, the full suite on the
-# same PostgreSQL 16 + pgvector image production runs, the suite again at
-# other moments (calendar rot), and a Compose parse of .env.example.
+# The Python side: lint, format, the strict type check, migrations and drift,
+# the full suite on the same PostgreSQL 16 + pgvector image production runs,
+# the suite again at other moments (calendar rot), and a Compose parse of
+# .env.example.
 name: Python CI
 
 on:
@@ -65,6 +66,8 @@ jobs:
         run: ruff check .
       - name: ruff format
         run: ruff format --check .
+      - name: mypy (strict, the Jarvis code)
+        run: mypy
       - name: Migration round-trip database
         run: |
           PGPASSWORD=miya psql -h localhost -U miya -d miya -c 'CREATE DATABASE miya_c'

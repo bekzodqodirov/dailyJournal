@@ -41,6 +41,7 @@ from miya.db.models import (
     Transaction,
 )
 from miya.db.session import SessionLocal, engine, get_session
+from miya.logs import setup_logging
 from miya.services import (
     call_recordings,
     health,
@@ -60,10 +61,7 @@ log = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("api")
 
 
 def assert_startup_config() -> None:
@@ -98,10 +96,9 @@ async def _record_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    # Served by `python -m miya.api` this only replaces the same handler;
+    # served some other way it is the first configuration.
+    setup_logging("api")
     log.info("MIYA API starting (tz=%s, version=%s)", settings.timezone, __version__)
     await _record_start()
     yield

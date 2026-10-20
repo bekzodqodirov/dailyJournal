@@ -40,6 +40,11 @@ AssertedBy = Literal["me", "them"]
 
 _client: anthropic.AsyncAnthropic | None = None
 
+# The shared client's own exponential backoff on connection errors, 408, 409,
+# 429 and 5xx (JV-02). Stated here so it is visible and tested; call sites are
+# never wrapped in retry.with_backoff on top of it, which would retry twice.
+MODEL_CLIENT_MAX_RETRIES = 3
+
 
 class AnthropicUnavailable(RuntimeError):
     """Anthropic cannot be called at all — typically no API key configured."""
@@ -66,7 +71,9 @@ def get_client() -> anthropic.AsyncAnthropic:
         raise AnthropicUnavailable("ANTHROPIC_API_KEY is not set")
     global _client
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        _client = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key, max_retries=MODEL_CLIENT_MAX_RETRIES
+        )
     return _client
 
 

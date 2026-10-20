@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
 .PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
-        bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
+        bot worker userbot userbot-login shell install test lint fmt typecheck check gcal-auth \
         backfill import-history payments-corpus backup backup-key backup-key-show restore doctor update
 
 help: ## Show this help
@@ -139,4 +139,7 @@ lint: ## Lint
 fmt: ## Format
 	ruff format .
 
-check: lint test ## Lint + test
+typecheck: ## mypy strict on the Jarvis code (the files listed in pyproject.toml)
+	mypy
+
+check: lint typecheck test ## Lint + typecheck + test

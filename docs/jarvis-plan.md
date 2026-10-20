@@ -1017,8 +1017,8 @@ and reminded before the time.
 `miya/services/extraction.py`, `miya/services/prompts.py`, `miya/services/persistence.py`,
 `miya/services/records.py`, `miya/services/when.py` (new, pure), `miya/bot/formatting.py`,
 `miya/services/reminders.py`, `miya/services/queries.py`, `miya/services/rag.py`,
-`miya/config.py`, `.env.example`, `README.md`, `miya/tools/doctor.py`, `tests/test_due_time.py`,
-`tests/test_when.py`.
+`miya/config.py`, `pyproject.toml` (`when.py` joins the mypy `files`), `.env.example`,
+`README.md`, `miya/tools/doctor.py`, `tests/test_due_time.py`, `tests/test_when.py`.
 
 **Schema.** See §4.2 (0022).
 

@@ -18,7 +18,9 @@ CONTAINER_PORT = 8000
 def main() -> None:
     configure_logging()
     assert_startup_config()
-    uvicorn.run("miya.api.main:app", host="0.0.0.0", port=CONTAINER_PORT)
+    # log_config=None: uvicorn's own lines go through the root handler too,
+    # so the api writes one format (LOG_FORMAT) like every other process.
+    uvicorn.run("miya.api.main:app", host="0.0.0.0", port=CONTAINER_PORT, log_config=None)
 
 
 if __name__ == "__main__":

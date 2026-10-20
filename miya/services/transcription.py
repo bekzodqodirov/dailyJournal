@@ -15,11 +15,26 @@ from pathlib import Path
 import httpx
 
 from miya.config import settings
+from miya.services import retry
 
 log = logging.getLogger(__name__)
 
 SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
 SCRIBE_MODEL = "scribe_v1"
+# Backoff for the Scribe request: three tries, waits of at most 2 s then 4 s.
+SCRIBE_ATTEMPTS = 3
+SCRIBE_BACKOFF_BASE_SECONDS = 2.0
+SCRIBE_BACKOFF_CAP_SECONDS = 10.0
+
+
+def scribe_retry_on(exc: BaseException) -> bool:
+    """Transient failures worth another billed upload.
+
+    A read timeout is not one: the file was sent whole and Scribe is still
+    working on it, so a retry would bill the same recording again, and a long
+    call recording is as slow the second time.
+    """
+    return retry.is_transient_http(exc) and not isinstance(exc, httpx.ReadTimeout)
 
 
 @dataclass(slots=True)
@@ -111,7 +126,8 @@ class ElevenLabsScribe(Transcriber):
             # Who spoke when (WP-85); calls only, and only when switched on.
             data["diarize"] = "true"
 
-        try:
+        async def post() -> httpx.Response:
+            # The file is reopened per attempt: a retry must send it whole.
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 with file_path.open("rb") as fh:
                     response = await client.post(
@@ -120,6 +136,20 @@ class ElevenLabsScribe(Transcriber):
                         data=data,
                         files={"file": (file_path.name, fh)},
                     )
+            return retry.raise_for_transient_status(response)
+
+        # A connect, write or pool timeout, a dropped connection, a 429 or a
+        # 5xx is tried again; a read timeout or a 400 fails at once (JV-02).
+        try:
+            response = await retry.with_backoff(
+                post,
+                attempts=SCRIBE_ATTEMPTS,
+                base=SCRIBE_BACKOFF_BASE_SECONDS,
+                cap=SCRIBE_BACKOFF_CAP_SECONDS,
+                retry_on=scribe_retry_on,
+            )
+        except retry.TransientStatus as exc:
+            response = exc.response
         except httpx.HTTPError as exc:
             raise TranscriptionError(f"Scribe request failed: {exc}") from exc
 

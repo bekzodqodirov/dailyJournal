@@ -21,8 +21,14 @@ from abc import ABC, abstractmethod
 import httpx
 
 from miya.config import settings
+from miya.services import retry
 
 log = logging.getLogger(__name__)
+
+# Backoff for the remote embed request: three tries, waits of at most 1 s, 2 s.
+EMBED_ATTEMPTS = 3
+EMBED_BACKOFF_BASE_SECONDS = 1.0
+EMBED_BACKOFF_CAP_SECONDS = 5.0
 
 
 class EmbeddingError(RuntimeError):
@@ -92,13 +98,27 @@ class RemoteEmbedder(Embedder):
     async def embed(self, texts: list[str]) -> list[list[float]]:
         if not texts:
             return []
-        try:
+
+        async def post() -> httpx.Response:
             async with httpx.AsyncClient(timeout=self._timeout) as client:
                 response = await client.post(
                     f"{self._base_url}/v1/embed",
                     headers={"Authorization": f"Bearer {settings.api_bearer_token}"},
                     json={"texts": texts},
                 )
+            return retry.raise_for_transient_status(response)
+
+        # The api restarting or busy is retried; a 4xx is not (JV-02).
+        try:
+            response = await retry.with_backoff(
+                post,
+                attempts=EMBED_ATTEMPTS,
+                base=EMBED_BACKOFF_BASE_SECONDS,
+                cap=EMBED_BACKOFF_CAP_SECONDS,
+                retry_on=retry.is_transient_http,
+            )
+        except retry.TransientStatus as exc:
+            response = exc.response
         except httpx.HTTPError as exc:
             raise EmbeddingError(f"embed service unreachable: {exc}") from exc
         if response.status_code >= 400:

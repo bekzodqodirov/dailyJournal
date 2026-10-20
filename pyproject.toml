@@ -21,6 +21,22 @@ ignore = [
     "RUF003",
 ]
 
+[tool.mypy]
+# The strict gate for the Jarvis code (JV-02, `make typecheck`): miya/jarvis
+# and the shared helpers it is built on. Each new helper module joins `files`
+# in the work package that adds it. Imported modules outside the list are
+# analysed for their types but their own errors are not reported.
+python_version = "3.12"
+strict = true
+follow_imports = "silent"
+warn_unreachable = true
+files = [
+    "miya/jarvis",
+    "miya/logs.py",
+    "miya/services/retry.py",
+    "miya/services/safety.py",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

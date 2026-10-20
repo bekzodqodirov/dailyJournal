@@ -28,6 +28,7 @@ from datetime import datetime, timedelta
 
 from miya.config import settings
 from miya.db.session import engine
+from miya.logs import setup_logging
 
 log = logging.getLogger(__name__)
 
@@ -291,10 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("backfill")
     if args.archive:
         if not args.days or not args.all_private:
             print("--archive needs --all-private and --days N", file=sys.stderr)

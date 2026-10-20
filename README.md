@@ -110,7 +110,7 @@ every service refuses a blank or short API token.
 | `make backup-key` | Create the backup key and print the `.env` line |
 | `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
-| `make test` / `make lint` / `make fmt` | Local dev loop |
+| `make test` / `make lint` / `make fmt` / `make typecheck` | Local dev loop; `typecheck` runs mypy strict on the Jarvis code |
 
 On first start the api container downloads the bge-m3 embedding model (~2 GB,
 cached in a volume). Until it finishes, `/qidir` and semantic search politely
@@ -128,6 +128,7 @@ model, so give it half an hour).
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 make test          # schema + API tests; DB tests skip if no database
+make typecheck     # mypy strict on miya/jarvis and the helpers it uses
 ```
 
 Database-backed tests skip automatically unless `DATABASE_URL` points at a
@@ -186,6 +187,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `CLAIM_ASK_AFTER_MINUTES`, `CLAIM_DUPLICATE_DAYS`, `CLAIM_BANK_MATCH_HOURS` | 10 / 14 / 48 — when an unshown claim is queued, when a repeat folds into the first, how far a bank payment can settle a claim |
 | `CLAIM_BANK_AUTOCLOSE_TRANSACTIONS`, `CLAIM_BANK_AUTOACCEPT_SETTLEMENTS` | `true` / `false` — what bank evidence may settle without asking |
 | `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
+| `LOG_LEVEL`, `LOG_FORMAT` | `INFO` / `json` — every process writes one JSON object per line (`ts`, `level`, `logger`, `component`, `msg` and the record's extras; extras named `text`, `body`, `raw_text`, `transcript` or `draft` are dropped); `text` gives the plain lines |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.

@@ -36,6 +36,7 @@ from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
 from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
 from miya.db.session import engine, session_scope
+from miya.logs import setup_logging
 from miya.services import (
     approvals,
     audio,
@@ -970,10 +971,7 @@ async def _idle_forever() -> None:  # pragma: no cover - patched in tests
 
 
 async def run() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("userbot")
     if not settings.userbot_enabled:
         # Idle instead of exiting: the container uses `restart:
         # unless-stopped` (so it survives a VPS reboot), and a clean exit here

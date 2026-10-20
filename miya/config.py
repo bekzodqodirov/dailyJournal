@@ -404,6 +404,8 @@ class Settings(BaseSettings):
 
     # --- Misc ---------------------------------------------------------------
     log_level: str = "INFO"
+    # One JSON object per log line (JV-02), or the plain text lines.
+    log_format: Literal["json", "text"] = "json"
     debug: bool = Field(default=False)
 
     @model_validator(mode="before")

@@ -82,6 +82,7 @@ from miya.db.models import (
     Transaction,
 )
 from miya.db.session import engine, session_scope
+from miya.logs import setup_logging
 from miya.services import (
     backup,
     batch,
@@ -1410,10 +1411,7 @@ async def catch_up(bot: Bot, scheduler=None) -> None:
 
 
 async def run() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("worker")
     if not settings.assistant_bot_token or not settings.owner_telegram_id:
         raise SystemExit(
             "ASSISTANT_BOT_TOKEN and OWNER_TELEGRAM_ID must be set for the worker"

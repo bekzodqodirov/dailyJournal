@@ -172,6 +172,7 @@ EXPECTED_ENV_KEYS: tuple[str, ...] = (
     "QUIET_HOURS",
     "BATCH_FLUSH_HOURS",
     "LOG_LEVEL",
+    "LOG_FORMAT",
     "DEBUG",
 )
 
