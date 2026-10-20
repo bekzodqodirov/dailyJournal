@@ -66,6 +66,7 @@ from miya.services import (
     recaps,
     records,
     reminders,
+    safety,
 )
 from miya.services import codes as client_codes
 from miya.services.embeddings import get_embedder
@@ -180,6 +181,47 @@ async def _download(bot: Bot, message: Message, media, path: Path) -> bool:
             message, "⚠️ Faylni yuklab bo'lmadi — qaytadan yuborib ko'ring."
         )
         return False
+
+
+def _refusal(name: str | None) -> str:
+    return replies.dangerous_file_refused(name, android=safety.is_android_package(name))
+
+
+async def _refuse_dangerous(message: Message, media) -> bool:
+    """JV-01: an installer or an archive is refused before `_download`, so it
+    never reaches MEDIA_DIR. True when the owner was told so."""
+    name = getattr(media, "file_name", None)
+    verdict = safety.classify_attachment(name, getattr(media, "mime_type", None))
+    if not verdict.dangerous:
+        return False
+    log.warning(
+        "refused a dangerous file sent to the bot (kind=%s rule=%s)",
+        verdict.kind,
+        verdict.reason,
+    )
+    await _safe_answer(message, _refusal(name))
+    return True
+
+
+def _sniff_download(path: Path) -> safety.Verdict:
+    """The bytes of a downloaded file, before any parser or transcriber sees
+    them. An installer under a document's, a song's or a video's name is
+    deleted on the spot."""
+    verdict = safety.sniff_magic(path, path.suffix)
+    if verdict.dangerous:
+        path.unlink(missing_ok=True)
+        log.warning(
+            "deleted a disguised dangerous file (kind=%s rule=%s)",
+            verdict.kind,
+            verdict.reason,
+        )
+    return verdict
+
+
+def _with_risk(media: dict, verdict: safety.Verdict | None, name: str | None) -> dict:
+    if verdict is not None and verdict.kind == safety.MACRO:
+        return {**media, "risk": verdict.as_risk(name)}
+    return media
 
 
 # --- commands ---------------------------------------------------------------
@@ -1695,6 +1737,8 @@ async def cmd_process(message: Message, bot: Bot) -> None:
     if media is None:
         await _safe_answer(message, replies.PROCESS_NO_MEDIA)
         return
+    if await _refuse_dangerous(message, media):
+        return
 
     await _typing(message)
     is_video = bool(target.video or target.video_note)
@@ -1709,6 +1753,13 @@ async def cmd_process(message: Message, bot: Bot) -> None:
     path = _media_path(suffix)
     if not await _download(bot, message, media, path):
         return
+    name = getattr(media, "file_name", None)
+    sniffed: safety.Verdict | None = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(name))
+        return
+    if is_video or is_audio or is_photo:
+        sniffed = None  # only a document's bytes decide whether it is parsed
 
     async with session_scope() as session:
         interaction = await create_interaction(
@@ -1717,13 +1768,17 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             direction=Direction.in_,
             text=target.caption,
             occurred_at=target.date.astimezone(settings.tz),
-            media={
-                "type": "video" if is_video else "photo" if is_photo else "file",
-                "path": str(path),
-                "filename": getattr(media, "file_name", None),
-                "caption": target.caption,
-                "processed": False,
-            },
+            media=_with_risk(
+                {
+                    "type": "video" if is_video else "photo" if is_photo else "file",
+                    "path": str(path),
+                    "filename": name,
+                    "caption": target.caption,
+                    "processed": False,
+                },
+                sniffed,
+                name,
+            ),
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
         reply, keyboard = await _process_on_demand(
@@ -1733,14 +1788,26 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             is_video=is_video,
             is_audio=is_audio,
             is_photo=is_photo,
+            sniffed=sniffed,
         )
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
 async def _process_on_demand(
-    session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
+    session,
+    interaction,
+    path: Path,
+    *,
+    is_video: bool,
+    is_audio: bool,
+    is_photo: bool,
+    sniffed: safety.Verdict | None = None,
 ) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Run the right pipeline for one explicitly requested media file."""
+    """Run the right pipeline for one explicitly requested media file.
+
+    A document is parsed only when its bytes matched its name (`sniffed`);
+    a macro document is read as text and the owner told so (JV-01)."""
+    macro_read = False
     if is_video:
         audio_path = path.with_suffix(".mp3")
         if not await audio.extract_audio(path, audio_path):
@@ -1757,16 +1824,22 @@ async def _process_on_demand(
         if described is None and not interaction.raw_text:
             return replies.PHOTO_FAILED_HINT, None
     else:
-        parsed = await documents.read_document_async(path)
+        readable = sniffed is None or sniffed.readable
+        parsed = await documents.read_document_async(path) if readable else None
         if parsed is None and not interaction.raw_text:
             interaction.needs_review = True
             return replies.DOCUMENT_FAILED_HINT, None
         if parsed is not None:
             interaction.transcript = parsed.text
+            macro_read = sniffed is not None and sniffed.kind == safety.MACRO
 
     interaction.media = {**(interaction.media or {}), "processed": True}
     result = await process_interaction(session, interaction)
-    return _receipt(result)
+    reply, keyboard = _receipt(result)
+    if macro_read:
+        name = (interaction.media or {}).get("filename")
+        reply = reply + "\n" + replies.macro_document_note(name)
+    return reply, keyboard
 
 
 # --- client codes by hand (WP-33) ---------------------------------------------
@@ -2201,34 +2274,52 @@ async def cmd_code_import(message: Message, bot: Bot) -> None:
     interaction and only a preview comes back, with one Ha to write it.
     """
     document = message.document
+    if await _refuse_dangerous(message, document):
+        return
     suffix = Path(document.file_name or "").suffix.lower() or ".bin"
     path = _media_path(suffix)
     if not await _download(bot, message, document, path):
         return
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(document.file_name))
+        return
     async with session_scope() as session:
+        # Stored even when unreadable, like a file read_rows rejects: the row
+        # is what lets retention delete the download later.
         interaction = Interaction(
             source=InteractionSource.assistant_bot,
             direction=Direction.in_,
             occurred_at=message.date.astimezone(settings.tz),
             raw_text=message.caption,
-            media={
-                "type": "document",
-                "path": str(path),
-                "filename": document.file_name,
-            },
+            media=_with_risk(
+                {
+                    "type": "document",
+                    "path": str(path),
+                    "filename": document.file_name,
+                },
+                sniffed,
+                document.file_name,
+            ),
             meta={"kind": "client_import"},
             processed=True,
         )
         session.add(interaction)
         await session.flush()
-        try:
-            rows = client_import.read_rows(path)
-        except client_import.BadFile:
+        rows = None
+        if sniffed.readable:  # a file that is not what its name says is never parsed
+            try:
+                rows = client_import.read_rows(path)
+            except client_import.BadFile:
+                rows = None
+        if rows is None:
             body, keyboard = replies.IMPORT_BAD_FILE, None
         else:
             plan = await client_import.plan_import(session, rows)
             body = replies.import_preview(document.file_name or path.name, plan.counts())
             keyboard = keyboards.client_import(interaction.id)
+            if sniffed.kind == safety.MACRO:
+                body += "\n" + replies.macro_document_note(document.file_name)
     await _safe_answer(message, body, reply_markup=keyboard)
 
 
@@ -2533,11 +2624,16 @@ async def _spoken_question(
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message, bot: Bot) -> None:
-    await _typing(message)
     media = message.voice or message.audio
+    if await _refuse_dangerous(message, media):
+        return
+    await _typing(message)
     suffix = ".ogg" if message.voice else ".mp3"
     path = _media_path(suffix)
     if not await _download(bot, message, media, path):
+        return
+    if _sniff_download(path).dangerous:
+        await _safe_answer(message, _refusal(getattr(media, "file_name", None)))
         return
 
     async with session_scope() as session:
@@ -2618,11 +2714,20 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
 @router.message(F.document)
 async def on_document(message: Message, bot: Bot) -> None:
-    await _typing(message)
+    """A file sent to the bot. Installers and archives are refused before any
+    download (JV-01); everything else is checked by its bytes before it is
+    parsed, and a macro document is read as text only."""
     document = message.document
+    if await _refuse_dangerous(message, document):
+        return
+    await _typing(message)
     suffix = Path(document.file_name or "").suffix or ".bin"
     path = _media_path(suffix)
     if not await _download(bot, message, document, path):
+        return
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(document.file_name))
         return
 
     async with session_scope() as session:
@@ -2632,17 +2737,21 @@ async def on_document(message: Message, bot: Bot) -> None:
             direction=Direction.in_,
             text=message.caption,
             occurred_at=message.date.astimezone(settings.tz),
-            media={
-                "type": "document",
-                "path": str(path),
-                "filename": document.file_name,
-                "mime": document.mime_type,
-                "size": document.file_size,
-                "caption": message.caption,
-                "processed": False,
-            },
+            media=_with_risk(
+                {
+                    "type": "document",
+                    "path": str(path),
+                    "filename": document.file_name,
+                    "mime": document.mime_type,
+                    "size": document.file_size,
+                    "caption": message.caption,
+                    "processed": False,
+                },
+                sniffed,
+                document.file_name,
+            ),
         )
-        parsed = await documents.read_document_async(path)
+        parsed = await documents.read_document_async(path) if sniffed.readable else None
         keyboard = None
         if parsed is None and not message.caption:
             interaction.needs_review = True
@@ -2660,6 +2769,8 @@ async def on_document(message: Message, bot: Bot) -> None:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
             reply, keyboard = _receipt(result)
+            if parsed is not None and sniffed.kind == safety.MACRO:
+                reply = reply + "\n" + replies.macro_document_note(document.file_name)
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
@@ -2723,8 +2834,13 @@ async def on_video_note(message: Message, bot: Bot) -> None:
 async def on_video(message: Message, bot: Bot) -> None:
     """Videos are stored, not transcribed — `/process` opts into the cost."""
     media = message.video
+    if await _refuse_dangerous(message, media):
+        return
     path = _media_path(".mp4")
     if not await _download(bot, message, media, path):
+        return
+    if _sniff_download(path).dangerous:
+        await _safe_answer(message, _refusal(getattr(media, "file_name", None)))
         return
 
     async with session_scope() as session:

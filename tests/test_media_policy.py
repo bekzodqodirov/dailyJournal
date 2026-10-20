@@ -78,12 +78,22 @@ def test_an_oversized_document_is_never_downloaded():
 
 
 def test_an_unreadable_format_stays_metadata_only():
-    result = plan(MediaKind.document, filename="arxiv.zip", size=1024)
+    result = plan(MediaKind.document, filename="dizayn.psd", size=1024)
     assert result.download is False
     assert result.skip_reason == "unsupported_type"
 
     # Legacy binary .xls is deliberately not supported.
     assert plan(MediaKind.document, filename="eski.xls", size=10).download is False
+
+
+def test_an_archive_is_dangerous_not_merely_unreadable():
+    """JV-01: an archive is refused by the shield, never offered (it used to be
+    'unsupported_type', and a large one was even offered for download)."""
+    result = plan(MediaKind.document, filename="arxiv.zip", size=1024)
+    assert result.download is False
+    assert result.ask is False
+    assert result.skip_reason == "dangerous_file"
+    assert result.risk is not None and result.risk.kind == "archive"
 
 
 def test_plain_text_needs_no_handling():

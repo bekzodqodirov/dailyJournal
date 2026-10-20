@@ -24,7 +24,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
+from miya.db.enums import Direction
 from miya.db.models import Interaction
+from miya.services import media_policy, safety
 
 PENDING = "pending"
 ASKED = "asked"
@@ -82,15 +84,37 @@ async def awaiting_question(
 ) -> list[Interaction]:
     """Media the owner has not been asked about yet, oldest first. A push
     takes only pushable files (a row from before WP-46 counts as one); a
-    pull from /savollar takes every file."""
+    pull from /savollar takes every file.
+
+    A file the shield refuses is never offered: one queued before it existed
+    (the size check used to run first) is closed here instead (JV-01)."""
     query = sa.select(Interaction).where(_state_matches(PENDING))
     if pushable_only:
         query = query.where(
             Interaction.media["approval"]["pushable"].astext.is_distinct_from("false")
         )
-    return list(
-        await session.scalars(query.order_by(Interaction.occurred_at).limit(limit))
-    )
+    rows = await session.scalars(query.order_by(Interaction.occurred_at).limit(limit))
+    return [row for row in rows if not retire_if_dangerous(row)]
+
+
+def retire_if_dangerous(interaction: Interaction) -> bool:
+    """Close the approval of an installer or an archive, the way an ingest
+    under the shield would have recorded it: skipped, its risk and
+    ``meta.safety`` stored, and the owner's warning queued for a file
+    someone else sent live. True when it was closed."""
+    media = dict(interaction.media or {})
+    name = media.get("filename")
+    verdict = safety.classify_attachment(name, media.get("mime"))
+    if not verdict.dangerous:
+        return False
+    media["skipped"] = media_policy.SKIP_DANGEROUS
+    media["risk"] = verdict.as_risk(name)
+    interaction.media = media
+    set_state(interaction, DONE, error=media_policy.SKIP_DANGEROUS)
+    meta = interaction.meta or {}
+    notify = interaction.direction is Direction.in_ and not meta.get("archive")
+    interaction.meta = safety.with_file_verdict(meta, verdict, notify=notify)
+    return True
 
 
 async def approved_for_fetch(

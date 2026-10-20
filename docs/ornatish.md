@@ -39,7 +39,9 @@
    - Haftasiga 2 marta /xarajat'ni Anthropic Console'dagi summa bilan solishtir.
    - Bir marta: make restore FILE=/data/backups/<oxirgi fayl> DRY=1 → ichidagi jadvallar ro'yxati chiqsin.
 10b) Tashqi kuzatuvchi: healthchecks.io'da «MIYA» tekshiruvini yarat (davr 5 daqiqa, kutish 15 daqiqa), Telegram integratsiyasini ulab, ping manzilini .env'dagi DEADMAN_PING_URL= ga yoz, keyin docker compose up -d --force-recreate worker.
-11) Telefon ilovasi: faqat Telegramga kelgan yangi imzoli APK'ni, serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda).
+11) Telefon ilovasi — APK o'rnatishning yagona istisnosi: MIYA Companion faqat MIYA botidan keladi, xabar ostida imzo sertifikatining SHA-256 izi yoziladi. Shu APK'ni serverdagi telefon tuzatishlaridan keyin o'rnat (rotatsiya qadamlari pastda).
+    MIYA ilovasi faqat MIYA botidan keladi; boshqa hech kimdan kelgan APK faylni o'rnatmang.
+    Boshqa har qanday APK, .exe yoki arxivni (tanish odamdan kelgan bo'lsa ham) MIYA yuklab olmaydi va ochmaydi — faqat ogohlantiradi.
 
 ## Ishlab turgan serverni yangilash
 
@@ -61,7 +63,7 @@ Yangi APK boshqa kalit bilan imzolangan, shuning uchun eski ilova ustidan o'rnat
 4) Server manzilini yozib ol; token serverda: grep UPLOAD_TOKENS .env
 5) Eski ilovani o'chir: Sozlamalar → Ilovalar → MIYA Companion → O'chirish.
 6) Yangi APK'ni o'rnat:
-   6.1) Telegram'da APK faylini bos. «Noma'lum ilovalarni o'rnatish» so'ralsa: Telegram → Ruxsat berish.
+   6.1) Faqat MIYA botining chatidagi «📱 MIYA Companion» xabaridagi APK faylini bos — boshqa chatdan yoki boshqa odamdan kelganini emas. Xabardagi «Imzo SHA-256» izi dasturchi bergan iz bilan bir xil bo'lsin; farq qilsa, o'rnatma. «Noma'lum ilovalarni o'rnatish» so'ralsa: Telegram → Ruxsat berish.
    6.2) Play Protect ogohlantirsa: «Batafsil» → «Baribir o'rnatish».
    6.3) Ilovani och va sozlashni qaytadan o't: server manzili, token, yozuvlar papkasi, SMS rejimi.
    6.4) Har bir ruxsatni yoq: qo'ng'iroqlar ro'yxati, SMS, «MIYA — to'lov xabarlari» (bildirishnomalar). Tugma kulrang bo'lsa yoki ruxsat berilmasa: Sozlamalar → Ilovalar → MIYA Companion → ⋮ → «Cheklangan sozlamalarga ruxsat berish», keyin qaytadan urinib ko'r.

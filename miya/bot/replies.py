@@ -39,7 +39,7 @@ from miya.bot.formatting import (
 from miya.bot.formatting import ref as _ref_handle
 from miya.config import settings
 from miya.db.enums import ChatType, Currency, DebtDirection, PromiseMadeBy
-from miya.services import claims, health, reports
+from miya.services import claims, health, reports, safety
 from miya.services.brief import MorningBrief
 from miya.services.loops import MissedCall, UnansweredQuestion
 from miya.services.people import Match
@@ -206,6 +206,60 @@ DOCUMENT_FAILED_HINT = (
     "⚠️ Hujjatni o'qib bo'lmadi (formati qo'llab-quvvatlanmaydi yoki himoyalangan). "
     "Fayl saqlandi — /tekshir ro'yxatida turadi."
 )
+
+# --- the dangerous-file shield (JV-01) ----------------------------------------
+
+DANGEROUS_FILE_CAUTION = (
+    "Tanish odamdan kelgan bo'lsa ham ehtiyot bo'ling. Shubha bo'lsa, unga qo'ng'iroq "
+    "qilib so'rang."
+)
+# Where a file arrived, when the chat is a private one: its title would only
+# repeat the sender's name.
+PRIVATE_CHAT_LABEL = "Telegram"
+APK_RULE_LINE = (
+    "MIYA ilovasi faqat MIYA botidan keladi; boshqa hech kimdan kelgan APK faylni "
+    "o'rnatmang."
+)
+
+
+def _shown(text: str) -> str:
+    """A sender-chosen name, HTML-escaped and without bidi or zero-width
+    characters: an RLO must not make «gpj.apk» read as «kpa.jpg» or reverse
+    the rest of the warning."""
+    return escape(safety.display_name(text))
+
+
+def dangerous_file_warning(
+    *, who: str | None, filename: str | None, chat: str, android: bool = False
+) -> str:
+    """Someone sent an installer or an archive into a chat; MIYA left it alone."""
+    lines = [
+        f"⚠️ {_shown(who or 'Nomaʼlum')} sizga «{_shown(filename or 'fayl')}» faylini "
+        f"yubordi ({_shown(chat)}). Bu o'rnatiladigan dastur yoki arxiv — xavfli "
+        "bo'lishi mumkin. Ochmang va o'rnatmang. MIYA uni yuklab olmadi.",
+        DANGEROUS_FILE_CAUTION,
+    ]
+    if android:
+        lines.append(APK_RULE_LINE)
+    return "\n".join(lines)
+
+
+def dangerous_file_refused(filename: str | None, *, android: bool = False) -> str:
+    """The owner sent the bot an installer or an archive: it was not fetched."""
+    text = (
+        f"⚠️ «{_shown(filename or 'fayl')}» — o'rnatiladigan dastur yoki arxiv. MIYA "
+        "bunday fayllarni yuklab olmaydi va ochmaydi. Ichidagi ma'lumot kerak bo'lsa, "
+        "PDF yoki rasm qilib yuboring."
+    )
+    return f"{text}\n{APK_RULE_LINE}" if android else text
+
+
+def macro_document_note(filename: str | None) -> str:
+    """A macro-enabled document was read as text only."""
+    return (
+        f"ℹ️ «{_shown(filename or 'fayl')}» makrosli hujjat. MIYA uni faqat matn "
+        "sifatida o'qidi. Kompyuterda ochsangiz, makrosni yoqmang."
+    )
 
 
 RETRY_NOTHING_TO_DO = "✅ Qayta ishlanadigan yozuv yo'q."

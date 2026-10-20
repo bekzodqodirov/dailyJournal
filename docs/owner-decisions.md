@@ -73,6 +73,22 @@ owner's words may not be contradicted.
   a waybill number such as YW26-004715. Design default (handoff-plan §5 Q39): a code is exact
   and never fuzzy-matched.
 
+## Dangerous files (owner rule 4, docs/jarvis-plan.md decision 4)
+- The owner's decision of 2026-10-20 (docs/jarvis-plan.md §8.1): MIYA never downloads,
+  opens or offers to fetch an APK, an executable, an installer or an archive, on any
+  channel, even from a known contact (such files often come from hijacked accounts); the
+  owner is warned once instead.
+- Implemented in JV-01: `miya/services/safety.py` classifies a file by its normalised name,
+  its double extensions and its MIME type before any download, and checks the bytes of an
+  allowed document before it is parsed. The blocklists are code constants; no setting can
+  loosen them, and the owner's «✅ O'qi» tap cannot fetch such a file either. Macro
+  documents are read as text only, with a note.
+- The one exception is MIYA's own phone app: MIYA Companion comes only from the MIYA bot,
+  with its signing-certificate SHA-256 printed under it (docs/ornatish.md, step 11).
+- Design default (change if the owner disagrees): the warning goes out within a minute, also
+  at night (silently then), and is never counted in QUESTION_BUDGET_PER_DAY; the owner's own
+  outgoing files and messages older than a week raise no warning.
+
 ## Delivery
 - Owner's words (2026-09-25): «telegramga jonatishi maqul» — everything is delivered to
   Telegram.

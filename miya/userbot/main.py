@@ -42,7 +42,9 @@ from miya.services import (
     chats,
     documents,
     health,
+    media_policy,
     owner_address,
+    safety,
     windows,
 )
 from miya.services import usage as usage_service
@@ -154,6 +156,8 @@ class MediaOutcome:
     document: object | None = None  # DocumentText
     skip_reason: str | None = None
     failed: bool = False  # download or conversion failed; needs the owner's eye
+    # What the bytes turned out to be when they were not plain safe (JV-01).
+    risk: safety.Verdict | None = None
 
 
 async def fetch_media(
@@ -168,7 +172,7 @@ async def fetch_media(
     and only the results are persisted afterwards.
     """
     if not plan.download:
-        return MediaOutcome(skip_reason=plan.skip_reason)
+        return MediaOutcome(skip_reason=plan.skip_reason, risk=plan.risk)
 
     path = _media_path(suffix)
     try:
@@ -180,6 +184,14 @@ async def fetch_media(
         return MediaOutcome(failed=True)
     if not path.is_file():
         return MediaOutcome(failed=True)
+
+    sniffed = safety.sniff_magic(path, path.suffix)
+    if sniffed.dangerous:
+        # An installer under a document's, a song's or a video's name: gone
+        # before anything reads or transcribes it, and the owner is warned
+        # like for any other installer.
+        path.unlink(missing_ok=True)
+        return MediaOutcome(skip_reason=media_policy.SKIP_DANGEROUS, risk=sniffed)
 
     outcome = MediaOutcome(path=path)
 
@@ -203,6 +215,15 @@ async def fetch_media(
         return outcome
 
     if plan.read_document:
+        if not sniffed.readable:
+            # Not what its name says; never parsed, kept for the owner's eye.
+            outcome.skip_reason = media_policy.SKIP_MISMATCH
+            outcome.failed = True
+            return outcome
+        if sniffed.kind == safety.MACRO:
+            outcome.risk = sniffed
+        elif plan.risk is not None and plan.risk.kind == safety.MACRO:
+            outcome.risk = plan.risk
         outcome.document = await documents.read_document_async(path)
         if outcome.document is None:
             # The policy only plans a read for a format we support, so failing
@@ -255,11 +276,35 @@ async def _recheck_to_me(session, interaction: Interaction) -> None:
         )
 
 
+def _warn_owner(*, incoming: bool, archive: bool, occurred_at: datetime) -> bool:
+    """Only what others sent, live: never an archive import or old history."""
+    if not incoming or archive:
+        return False
+    return occurred_at >= datetime.now(settings.tz) - safety.NOTICE_MAX_AGE
+
+
+def _flag_risk(interaction: Interaction, verdict: safety.Verdict) -> None:
+    """media.risk, meta.safety and the owner's warning for a file found risky
+    only once its bytes were read (JV-01)."""
+    meta = interaction.meta or {}
+    if verdict.kind == safety.MACRO and interaction.transcript is None:
+        notify = False  # the warning says it was read as text; it was not
+    else:
+        notify = _warn_owner(
+            incoming=interaction.direction is Direction.in_,
+            archive=bool(meta.get("archive")),
+            occurred_at=interaction.occurred_at,
+        )
+    interaction.meta = safety.with_file_verdict(meta, verdict, notify=notify)
+
+
 async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
     """Write what `fetch_media` produced. Short, and inside one transaction."""
     media = dict(interaction.media or {})
     if outcome.skip_reason:
         media["skipped"] = outcome.skip_reason
+    if outcome.risk is not None:
+        media["risk"] = outcome.risk.as_risk(media.get("filename"))
     if outcome.path:
         media["path"] = str(outcome.path)
     if outcome.audio_path:
@@ -311,6 +356,9 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
                 "detail": outcome.document.detail,
             },
         }
+
+    if outcome.risk is not None:
+        _flag_risk(interaction, outcome.risk)
 
     media["processed"] = True
     interaction.media = media
@@ -512,6 +560,7 @@ async def ingest_message(
             docs_enabled=monitor.docs_enabled,
             filename=filename,
             size=size,
+            mime=mime,
         )
         if plan.ignore:
             return False
@@ -534,6 +583,9 @@ async def ingest_message(
                 "caption": text,
                 "processed": False,
             }
+            if plan.risk is not None:
+                # JV-01: what the shield saw, before anything was fetched.
+                media["risk"] = plan.risk.as_risk(filename)
             skip_archive = archive and (
                 plan.ask or (not transcribe_media and kind in _SPOKEN_KINDS)
             )
@@ -561,6 +613,16 @@ async def ingest_message(
             sender=person,
             aliases=_owner_aliases(),
         )
+        if plan.risk is not None and plan.risk.dangerous:
+            meta = safety.with_file_verdict(
+                meta,
+                plan.risk,
+                notify=_warn_owner(
+                    incoming=not message.out,
+                    archive=archive,
+                    occurred_at=message.date.astimezone(settings.tz),
+                ),
+            )
         try:
             async with session.begin_nested():
                 interaction = await create_interaction(
@@ -697,7 +759,7 @@ async def fetch_approved(client: TelegramClient) -> int:
                     interaction.needs_review = True
             continue
 
-        plan = forced_plan(kind, filename)
+        plan = forced_plan(kind, filename, mime=media.get("mime"))
         outcome = await fetch_media(client, message, plan, _suffix_for(kind, filename))
 
         async with session_scope() as session:

@@ -13,6 +13,12 @@ do what the returned plan says.
 | video                | ask the owner; `/process` still forces one directly.    |
 | oversized audio/doc  | ask the owner, up to MEDIA_ASK_MAX_BYTES.               |
 | sticker / gif        | ignored entirely — no interaction row.                  |
+| executable / archive | never fetched, never offered; the owner is warned.      |
+
+The dangerous-file shield (JV-01, ``services/safety.py``) runs before every
+other rule, on every channel: an installer or an archive is refused whatever
+its size and whatever the chat's toggles say, and the owner's "yes" cannot
+fetch one either.
 
 "Ask" is the third outcome, between doing it and dropping it: the message is
 stored, nothing is downloaded, and the owner gets a Telegram question with two
@@ -24,9 +30,19 @@ from __future__ import annotations
 import enum
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from miya.config import settings
-from miya.services import documents
+from miya.services import documents, safety
+
+Channel = Literal["telegram", "whatsapp", "gmail"]
+CHANNELS: tuple[Channel, ...] = ("telegram", "whatsapp", "gmail")
+
+# Why a download was declined (media.skipped).
+SKIP_DANGEROUS = "dangerous_file"
+SKIP_HTML = "html_file"
+# Downloaded, but the bytes are not what the name claims: never parsed.
+SKIP_MISMATCH = "mismatched_type"
 
 
 class MediaKind(str, enum.Enum):
@@ -56,16 +72,65 @@ class MediaPlan:
     # what the question tells him.
     ask: bool = False
     ask_reason: str | None = None
+    # What the shield found (exec, archive, macro, html); None for a safe file.
+    risk: safety.Verdict | None = None
+    channel: Channel = "telegram"
 
 
-def forced_plan(kind: MediaKind, filename: str | None = None) -> MediaPlan:
+def _check_channel(channel: str) -> Channel:
+    if channel not in CHANNELS:
+        raise ValueError(f"unknown media channel {channel!r}")
+    return cast(Channel, channel)
+
+
+def _shield(
+    kind: MediaKind, filename: str | None, mime: str | None, channel: Channel
+) -> tuple[MediaPlan | None, safety.Verdict | None]:
+    """The refusal for a dangerous or HTML attachment, else the macro risk.
+
+    Voice notes and photos carry no file name; documents, audio files and
+    videos do, and any of them can be an installer under another label.
+    """
+    if kind in (MediaKind.text, MediaKind.other, MediaKind.sticker):
+        return None, None
+    verdict = safety.classify_attachment(filename, mime)
+    if verdict.dangerous:
+        reason = SKIP_DANGEROUS
+    elif verdict.kind == safety.HTML:
+        reason = SKIP_HTML
+    else:
+        return None, verdict if verdict.kind == safety.MACRO else None
+    return MediaPlan(
+        kind=kind, skip_reason=reason, risk=verdict, channel=channel
+    ), verdict
+
+
+def forced_plan(
+    kind: MediaKind,
+    filename: str | None = None,
+    *,
+    mime: str | None = None,
+    channel: Channel = "telegram",
+) -> MediaPlan:
     """The plan for media the owner has explicitly approved.
 
     The same handling as the automatic path minus every gate: the size caps
     and the per-chat toggles have already been overruled by the person they
     exist to protect. Only genuine impossibility still refuses — a document
-    format nothing here can read.
+    format nothing here can read — and so does the shield: an installer or an
+    archive is never fetched, approved or not.
     """
+    channel = _check_channel(channel)
+    refused, risk = _shield(kind, filename, mime, channel)
+    if refused is not None:
+        return refused
+    plan = _forced(kind, filename)
+    plan.risk = risk
+    plan.channel = channel
+    return plan
+
+
+def _forced(kind: MediaKind, filename: str | None) -> MediaPlan:
     if kind in (MediaKind.voice, MediaKind.audio):
         return MediaPlan(kind=kind, download=True, transcribe=True)
     if kind in (MediaKind.video, MediaKind.video_note):
@@ -97,8 +162,39 @@ def plan_for(
     docs_enabled: bool,
     filename: str | None = None,
     size: int | None = None,
+    mime: str | None = None,
+    channel: Channel = "telegram",
 ) -> MediaPlan:
-    """Decide how one piece of media should be handled."""
+    """Decide how one piece of media should be handled.
+
+    The same policy serves every channel (Telegram, WhatsApp, Gmail); the
+    shield runs first, before the size branch, so a large installer is
+    refused rather than offered.
+    """
+    channel = _check_channel(channel)
+    refused, risk = _shield(kind, filename, mime, channel)
+    if refused is not None:
+        return refused
+    plan = _plan(
+        kind,
+        vision_enabled=vision_enabled,
+        docs_enabled=docs_enabled,
+        filename=filename,
+        size=size,
+    )
+    plan.risk = risk
+    plan.channel = channel
+    return plan
+
+
+def _plan(
+    kind: MediaKind,
+    *,
+    vision_enabled: bool,
+    docs_enabled: bool,
+    filename: str | None,
+    size: int | None,
+) -> MediaPlan:
     if kind in (MediaKind.text, MediaKind.other):
         return MediaPlan(kind=kind)
 

@@ -116,9 +116,16 @@ def test_approval_overrules_every_gate(kind, expected):
 
 def test_approval_cannot_conjure_a_reader_for_an_unreadable_format():
     """The caps are the owner's to overrule. A format nothing can parse is not."""
-    result = forced_plan(MediaKind.document, filename="arxiv.zip")
+    result = forced_plan(MediaKind.document, filename="dizayn.psd")
     assert result.download is False
     assert result.skip_reason == "unsupported_type"
+
+
+def test_approval_never_fetches_an_archive():
+    """JV-01: the shield is not a cap the owner's yes can overrule."""
+    result = forced_plan(MediaKind.document, filename="arxiv.zip")
+    assert result.download is False
+    assert result.skip_reason == "dangerous_file"
 
 
 # --- the state machine -------------------------------------------------------

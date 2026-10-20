@@ -28,6 +28,10 @@ Jobs:
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
                    for a first import (quiet-hours aware; WP-15)
+  * safety_notices — every minute; one warning per dangerous file someone
+                   sent into a chat, one note per macro document read as
+                   text (JV-01); silent in quiet hours, never counted in the
+                   question budget
   * code_index   — every 2 min; GS codes and waybills of every stored text
                    into code_mentions for exact lookup (WP-39)
   * profile_refresh — every 60 min; rewrites the written profile of up to
@@ -68,7 +72,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 from miya.bot import keyboards, notices, replies
 from miya.bot.formatting import clip, clock, escape, short_date
 from miya.config import settings
-from miya.db.models import DailyReport, Person, ReminderLog, Transaction
+from miya.db.enums import ChatType
+from miya.db.models import (
+    ChatMonitor,
+    DailyReport,
+    Interaction,
+    Person,
+    ReminderLog,
+    Transaction,
+)
 from miya.db.session import engine, session_scope
 from miya.services import (
     backup,
@@ -90,6 +102,7 @@ from miya.services import (
     reminders,
     reports,
     restore_drill,
+    safety,
     windows,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -866,6 +879,95 @@ async def money_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
             await session.commit()
 
 
+# One sweep sends at most this many warnings; the rest wait a minute.
+SAFETY_NOTICE_BATCH = 20
+
+
+async def pending_safety_notices(session, *, now: datetime) -> list[Interaction]:
+    """Queued file warnings not yet delivered, oldest first (JV-01)."""
+    meta = Interaction.meta
+    return list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.occurred_at >= now - safety.NOTICE_MAX_AGE)
+            .where(meta.has_key(safety.SAFETY_NOTICE_KEY))
+            .where(sa.not_(meta.has_key(safety.SAFETY_NOTIFIED_KEY)))
+            .order_by(Interaction.occurred_at, Interaction.id)
+            .limit(SAFETY_NOTICE_BATCH)
+        )
+    )
+
+
+async def safety_notice_text(session, interaction: Interaction) -> str | None:
+    """The owner's warning for one queued notice, or None for an unknown kind."""
+    notice = (interaction.meta or {}).get(safety.SAFETY_NOTICE_KEY)
+    media = interaction.media or {}
+    name = (media.get("risk") or {}).get("name") or media.get("filename")
+    if notice == safety.NOTICE_MACRO:
+        return replies.macro_document_note(name)
+    if notice != safety.NOTICE_DANGEROUS_FILE:
+        return None
+    person = (
+        await session.get(Person, interaction.person_id)
+        if interaction.person_id
+        else None
+    )
+    monitor = (
+        await session.scalar(
+            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == interaction.tg_chat_id)
+        )
+        if interaction.tg_chat_id is not None
+        else None
+    )
+    if monitor is None or monitor.chat_type is ChatType.private or not monitor.title:
+        chat = replies.PRIVATE_CHAT_LABEL
+    else:
+        chat = monitor.title
+    return replies.dangerous_file_warning(
+        who=person.display_name if person else None,
+        filename=name,
+        chat=chat,
+        android=safety.is_android_package(name),
+    )
+
+
+async def safety_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """Warn the owner once about each dangerous file sent into a chat, and
+    about each macro document read as text (JV-01).
+
+    Never held for quiet hours — a warning about an installer is worth
+    having before it is opened — but delivered silently inside them. Not a
+    question: nothing here touches the question budget. A row is stamped
+    only after its message went out, one commit per message; one row that
+    cannot be rendered is logged and skipped, never a stop for the rest.
+    """
+    now = now or datetime.now(settings.tz)
+    silent = reminders.in_quiet_hours(now)
+    sent = 0
+    async with session_scope() as session:
+        for interaction in await pending_safety_notices(session, now=now):
+            try:
+                text = await safety_notice_text(session, interaction)
+            except Exception as exc:
+                log.error(
+                    "safety notice for interaction %s failed to render: %s",
+                    interaction.id,
+                    type(exc).__name__,
+                )
+                continue
+            if text is not None and not await notify(bot, text, silent=silent):
+                return  # unreachable: the rest stay queued for the next sweep
+            interaction.meta = {
+                **(interaction.meta or {}),
+                safety.SAFETY_NOTIFIED_KEY: now.isoformat(),
+            }
+            await session.commit()
+            if text is not None:
+                sent += 1
+    if sent:
+        log.info("sent %d safety notice(s)", sent)
+
+
 async def backup_job(bot: Bot) -> None:
     """Nightly encrypted pg_dump (spec §10), then a copy to Telegram.
 
@@ -1450,6 +1552,14 @@ async def run() -> None:
         IntervalTrigger(minutes=1),
         args=[bot],
         id="money_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        safety_notice_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="safety_notices",
         max_instances=1,
         coalesce=True,
     )
