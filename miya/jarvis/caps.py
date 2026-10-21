@@ -143,7 +143,7 @@ async def last_send_at(
     """The latest send (or claim) from one account: the anti-ban gap.
 
     Owner-authored rows count too. Until the channel accounts table exists
-    (0029) each channel has one account, so ``account`` narrows only when the
+    (0030) each channel has one account, so ``account`` narrows only when the
     adapter names one in ``claimed_by``.
     """
     query = sa.select(sa.func.max(wire_moment())).where(

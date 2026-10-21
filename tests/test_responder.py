@@ -41,6 +41,7 @@ from miya.jarvis import (
     kb,
     outbox,
     policy,
+    qbank,
     redlines,
     responder,
     stalls,
@@ -64,7 +65,7 @@ OTHER_DM = 7162
 OWNER_ID = 900016
 _ids = itertools.count(9000)
 
-GREETING_REPLY = "Assalomu alaykum! Yuk qayerdan qayerga, necha kilo?"
+GREETING_REPLY = "Assalomu alaykum! Yuk qaysi shahardan?"
 PASS_GUARD = '{"verdict": "pass", "thread": "ok", "reason": "none"}'
 
 
@@ -820,6 +821,7 @@ async def test_responder_has_no_tools_and_no_private_data(session, on, monkeypat
         "intent",
         "kb",
         "style",
+        "questions",
     ]
     [inputs] = seen
     expected_thread = envelope.render(
@@ -829,8 +831,15 @@ async def test_responder_has_no_tools_and_no_private_data(session, on, monkeypat
             envelope.turn("CLIENT", "Xitoydan mebel olib kelmoqchiman", trigger.id),
         ]
     )
+    # An auto-eligible intent gets the owner's question bank (JV-23).
+    bank = await qbank.texts(session)
+    assert bank and bank[0] == qbank.SEEDS[0]
     assert inputs == draft.DraftInputs(
-        thread=expected_thread, intent="info_gathering", kb=(), style=owner_style
+        thread=expected_thread,
+        intent="info_gathering",
+        kb=(),
+        style=owner_style,
+        questions=bank,
     )
     assert asked == [
         {
@@ -944,9 +953,18 @@ async def test_prompt_limits_auto_intents_to_approved_shapes(session, on, monkey
     for kind in intent.AUTO_ELIGIBLE:
         prompt = draft.system_prompt(draft.DraftInputs(thread="t", intent=kind))
         assert draft.AUTO_RULE.format(intent=kind) in prompt
-        assert "Answer ONLY with: questions" in prompt
+        assert "Answer ONLY with: the approved questions" in prompt
+        assert "between the QUESTIONS delimiters" in prompt
         assert "copied word for word" in prompt
         assert "No other" in prompt and "statement of any kind" in prompt
+    asked = draft.user_content(
+        draft.DraftInputs(thread="t", intent="info_gathering", questions=qbank.SEEDS)
+    )
+    lines = asked.splitlines()
+    block = lines[
+        lines.index(draft.QUESTIONS_OPEN) + 1 : lines.index(draft.QUESTIONS_CLOSE)
+    ]
+    assert [json.loads(line) for line in block] == list(qbank.SEEDS)
     other = draft.system_prompt(draft.DraftInputs(thread="t", intent="other"))
     assert draft.DRAFT_RULE in other and "Answer ONLY" not in other
     assert draft.NEUTRAL_STYLE in other
@@ -980,7 +998,8 @@ async def test_general_question_without_kb_is_a_card(session, on, monkeypatch):
     t0 = _now()
     await _auto(session, t0, monkeypatch)
     on.intent = '{"intent": "general_question"}'
-    on.draft = _reply("Qaysi yuk haqida so'rayapsiz?")
+    # A question from the owner's question bank: an approved shape (JV-23).
+    on.draft = _reply("Qanday yuk?")
     await _says(session, person, "Sizlarda qanday xizmatlar bor?", at=t0)
     [outcome] = await _tick(session, t0 + timedelta(minutes=1))
     assert outcome.code == responder.DRAFTED

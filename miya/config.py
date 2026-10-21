@@ -301,6 +301,18 @@ class Settings(BaseSettings):
     jarvis_typing_chars_per_second: int = Field(default=6, ge=1, le=50)
     jarvis_typing_max_seconds: int = Field(default=15, ge=0, le=60)
 
+    # --- Rollout (JV-23) --------------------------------------------------
+    # A reply kind (greeting, information gathering, a general question) is
+    # offered for sending on its own only after this many days in draft mode,
+    # this many drafts you decided on, and this share of them approved without
+    # an edit, with no «Bu xato edi», red-line incident or channel limit in
+    # that time. Nothing graduates without your «✅ Ha, avtomatik» tap.
+    jarvis_graduation_min_days: int = Field(default=7, ge=1, le=365)
+    jarvis_graduation_min_drafts: int = Field(default=30, ge=1, le=10000)
+    jarvis_graduation_min_approval_pct: int = Field(default=90, ge=0, le=100)
+    # Replies sent on their own wait out the quiet hours unless this is true.
+    jarvis_auto_in_quiet_hours: bool = False
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

@@ -119,12 +119,13 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
 /holat — MIYA'ning ahvoli
-/jarvis — Jarvis holati (toxtat — to'xtatish, yoq [kanal] — yoqish, tarix)
+/jarvis — Jarvis holati (toxtat — to'xtatish, yoq [kanal] — yoqish, tarix, rejim)
 /shaxsiy &lt;ism yoki GS kod&gt; — shaxsiy chat: MIYA u yerga hech qachon o'zi yozmaydi
 /shaxsiylar — shaxsiy chatlar va oila/do'st takliflari
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
 /uslub [yukla] — yozish uslubingiz (yukla — eski yozishmalardan o'rganish)
 /bilim [qo'sh|tuzat|o'chir|taklif] — bilimlar bazasi: mijozlarga umumiy javoblar
+/savolbank [qo'sh|o'chir] — savollar banki: MIYA mijozga o'zi faqat shu savollarni beradi
 /qoralamalar — tasdiq kutayotgan qoralamalar va kuzatuv rejimidagi javoblar
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
@@ -172,6 +173,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
     ("uslub", "Yozish uslubingiz"),
     ("bilim", "Bilimlar bazasi: umumiy javoblar"),
+    ("savolbank", "Savollar banki: MIYA o'zi beradigan savollar"),
     ("qoralamalar", "Kutayotgan va kuzatuv qoralamalari"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
@@ -3546,7 +3548,8 @@ JARVIS_RESUMED = "✅ Jarvis yoqildi ({rejim} rejimi)."
 JARVIS_USAGE = (
     "<code>/jarvis</code> — holat · <code>/jarvis toxtat</code> — hammasini "
     "to'xtatish · <code>/jarvis yoq [kanal]</code> — qayta yoqish · "
-    "<code>/jarvis tarix</code> — oxirgi 20 ta amal"
+    "<code>/jarvis tarix</code> — oxirgi 20 ta amal · "
+    "<code>/jarvis rejim</code> — har javob turining rejimi"
 )
 JARVIS_UNKNOWN_CHANNEL = "Kanal nomi: telegram, whatsapp yoki gmail."
 JARVIS_FAILED = (
@@ -3576,6 +3579,15 @@ JARVIS_FIELD_LABELS = {
     "reason": "sabab",
     "linked": "bog'langan belgi",
     "repeat": "yana yozdi",
+    "approved_by": "tasdiqlovchi",
+    "offer": "avtomatikka o'tish taklifi",
+    "incident": "hodisa",
+    "demotion_told": "qoralamaga qaytgani aytildi",
+    "auto_notice": "avtomatik yuborilgani aytildi",
+    "mistake": "«Bu xato edi»",
+    "corpus_candidate": "qizil chiziq uchun ko'rib chiqish",
+    "question": "savol",
+    "question_proposed": "taklif qilingan savol",
 }
 JARVIS_STATE_LABELS = {
     "shadow": "kuzatuv",
@@ -3608,6 +3620,7 @@ JARVIS_BY_LABELS = {
     "gate": "tekshiruv",
     "adapter": "yuboruvchi",
     "reconcile": "qayta tekshiruv",
+    "migration": "yangilanish",
 }
 JARVIS_PAUSE_REASON_LABELS = {"owner": "siz"}
 # A reply rule's mode and reason (JV-12) in `/jarvis tarix`.
@@ -3624,6 +3637,7 @@ JARVIS_SCOPE_LABELS = {
     "channel:telegram": "Telegram",
     "channel:whatsapp": "WhatsApp",
     "channel:gmail": "Gmail",
+    "question_bank": "Savollar banki",
 }
 # A send whose outcome is not known (JV-19 wording): never sent again.
 JARVIS_SEND_UNKNOWN = (
@@ -4243,6 +4257,12 @@ def _jarvis_ref(kind: str, ref: str) -> str:
         return f"e{ref}"
     if kind == "rule":
         return f"qoida {ref}"
+    parts = ref.split(":")
+    if len(parts) == 4 and parts[0] == "channel" and parts[2] == "intent":
+        # A channel × intent scope (JV-23): «Telegram · salomlashish».
+        return f"{jarvis_channel_label(parts[1])} · {jarvis_intent_label(parts[3])}"
+    if len(parts) == 2 and parts[0] == "intent":
+        return jarvis_intent_label(parts[1])
     return JARVIS_SCOPE_LABELS.get(ref, ref)
 
 
@@ -4287,6 +4307,249 @@ def jarvis_history(actions) -> str:
             f"{escape(field)}: {change}{code}{by}"
         )
     return clip("\n".join(lines))
+
+
+# --- the rollout (JV-23) ---------------------------------------------------------------
+#
+# The graduation offer, the silent notice after an autonomous send, a
+# demotion and /jarvis rejim. The values come from miya.jarvis.rollout and
+# outbox as plain values: this module never imports miya.jarvis (rule 20).
+# A client's name is theirs to choose: shown through _shown, and so is the
+# text sent (it may carry their name).
+
+JARVIS_GRADUATION_OFFER = (
+    "🎓 «{intent}» javoblari tayyor: {d} kunda {n} ta qoralama, {p}% tini "
+    "o'zgartirmasdan tasdiqladingiz, qizil chiziq buzilmadi. Endi bunday "
+    "javoblarni MIYA o'zi yuborsinmi? (kuniga {cap} tagacha)"
+)
+JARVIS_BUTTON_GRADUATE = "✅ Ha, avtomatik"
+JARVIS_BUTTON_KEEP_DRAFT = "⏳ Yana kuzataylik"
+JARVIS_CEILING_HINT = (
+    "Avtomatik rejim uchun serverdagi .env da JARVIS_MODE=auto qilish kerak."
+)
+JARVIS_GRADUATED = (
+    "✅ «{intent}» javoblarini endi MIYA o'zi yuboradi (kuniga {cap} tagacha). "
+    "Har biridan keyin «↩️ Bu xato edi» tugmasi keladi."
+)
+JARVIS_KEPT_DRAFT = (
+    "⏳ Mayli, «{intent}» javoblari qoralama bo'lib qoladi. "
+    "{d} kundan keyin yana so'rayman."
+)
+JARVIS_GRADUATION_STALE = "Bu taklif eskirdi — holat: /jarvis rejim"
+JARVIS_GRADUATION_NOT_READY = (
+    "⏳ «{intent}» hali tayyor emas: taklifdan keyin holat o'zgardi. "
+    "Holat: /jarvis rejim"
+)
+JARVIS_NEVER_AUTO = "⛔ «{intent}» javoblari hech qachon avtomatik yuborilmaydi."
+JARVIS_AUTO_SENT = "🤖 Avtomatik yuborildi · {ism}: «{matn}»"
+JARVIS_BUTTON_MISTAKE = "↩️ Bu xato edi"
+JARVIS_DEMOTED = "↩️ «{intent}» yana qoralama rejimiga qaytdi: {sabab}."
+JARVIS_DEMOTION_REASONS = {
+    "mistake": "siz «Bu xato edi» deb belgiladingiz",
+    "breaker": "kanalda cheklov ishladi",
+    "incident": "yuborilgan javobda qizil chiziq topildi",
+    "cost_cap": "xarajat chegarasi bir haftada ikki marta oshdi",
+}
+JARVIS_DEMOTION_OTHER = "xavfsizlik uchun"
+JARVIS_MISTAKE_STALE = "Bu xabar eskirdi."
+JARVIS_MODES_HEADER = "🎛 Jarvis rejimlari — {kanal}:"
+JARVIS_MODES_LINE = "• {intent}: {rejim}"
+JARVIS_MODES_PROGRESS = " — {d} kun, {n} ta qoralama, {p}% o'zgartirmasdan"
+JARVIS_MODES_WAITING = ", {n} ta kutmoqda"
+JARVIS_MODES_CAPPED = " (ruxsat berilgan, lekin hozir: {rejim})"
+JARVIS_MODES_LIMITED = " · kanal cheklovi oxirgi 7 kunda"
+JARVIS_MODES_NEVER = "🔒 Hech qachon avtomatik emas: {intents}"
+JARVIS_MODES_CEILING = "Yuqori chegara (.env JARVIS_MODE): {rejim}"
+JARVIS_MODES_CRITERIA = (
+    "Avtomatikka o'tish: kamida {d} kun, {n} ta qoralama, {p}% o'zgartirmasdan "
+    "tasdiq, «Bu xato edi», qizil chiziq hodisasi va kanal cheklovisiz — keyin "
+    "MIYA so'raydi, siz «Ha» bossangizgina o'tadi."
+)
+JARVIS_MODES_REVIEWS = "🧪 Qizil chiziq uchun ko'rib chiqiladigan holatlar: {n} ta"
+
+
+def _rollout_intent(intent: str, channel: str | None = None) -> str:
+    """«salomlashish», or «salomlashish · WhatsApp» off Telegram."""
+    label = jarvis_intent_label(intent)
+    if channel and channel != "telegram":
+        label = f"{label} · {jarvis_channel_label(channel)}"
+    return escape(label)
+
+
+def _short_mode(mode: str) -> str:
+    return jarvis_mode_label(mode).split(" (")[0]
+
+
+def jarvis_graduation_offer(
+    *,
+    intent: str,
+    channel: str,
+    days: int,
+    drafts: int,
+    pct: int,
+    cap: int,
+    ceiling_ok: bool,
+) -> str:
+    """«🎓 …» with the ceiling hint when JARVIS_MODE is not auto."""
+    text = JARVIS_GRADUATION_OFFER.format(
+        intent=_rollout_intent(intent, channel), d=days, n=drafts, p=pct, cap=cap
+    )
+    return text if ceiling_ok else f"{text}\n{JARVIS_CEILING_HINT}"
+
+
+def jarvis_graduated(*, intent: str, channel: str, cap: int, ceiling_ok: bool) -> str:
+    text = JARVIS_GRADUATED.format(intent=_rollout_intent(intent, channel), cap=cap)
+    return text if ceiling_ok else f"{text}\n{JARVIS_CEILING_HINT}"
+
+
+def jarvis_kept_draft(*, intent: str, channel: str, days: int) -> str:
+    return JARVIS_KEPT_DRAFT.format(intent=_rollout_intent(intent, channel), d=days)
+
+
+def jarvis_never_auto(intent: str) -> str:
+    return JARVIS_NEVER_AUTO.format(intent=_rollout_intent(intent))
+
+
+def jarvis_graduation_not_ready(*, intent: str, channel: str) -> str:
+    return JARVIS_GRADUATION_NOT_READY.format(intent=_rollout_intent(intent, channel))
+
+
+def jarvis_auto_sent(name: str | None, body: str) -> str:
+    """«🤖 Avtomatik yuborildi · Akmal: «…»». The name and the text sent are
+    shown escaped and stripped of bidi and zero-width characters."""
+    return JARVIS_AUTO_SENT.format(
+        ism=_shown(name or JARVIS_UNNAMED_CLIENT), matn=_shown(body)
+    )
+
+
+def jarvis_demoted(*, intent: str, channel: str | None, code: str) -> str:
+    return JARVIS_DEMOTED.format(
+        intent=_rollout_intent(intent, channel),
+        sabab=JARVIS_DEMOTION_REASONS.get(code, JARVIS_DEMOTION_OTHER),
+    )
+
+
+def _mode_line(found) -> str:
+    """One intent of /jarvis rejim: its mode now, and in draft its progress
+    towards graduation; an ``auto`` the ceiling holds down says so."""
+    stored, effective = found.stored, found.effective
+    shown = "auto" if stored == "auto" else effective
+    line = JARVIS_MODES_LINE.format(
+        intent=escape(jarvis_intent_label(found.intent)), rejim=_short_mode(shown)
+    )
+    if stored == "auto" and effective != "auto":
+        line += JARVIS_MODES_CAPPED.format(rejim=_short_mode(effective))
+    elif effective == "draft":
+        line += JARVIS_MODES_PROGRESS.format(d=found.days, n=found.drafts, p=found.pct)
+        if found.pending:
+            line += JARVIS_MODES_WAITING.format(n=found.pending)
+    if found.breaker_recent:
+        line += JARVIS_MODES_LIMITED
+    return line
+
+
+def jarvis_modes(view) -> str:
+    """`/jarvis rejim`: per channel each reply kind's mode (and in draft its
+    progress towards graduation), the kinds that are never autonomous, the
+    env ceiling (with the hint when it is not auto) and the review cases."""
+    lines: list[str] = []
+    for channel in view.channels:
+        lines.append(
+            JARVIS_MODES_HEADER.format(kanal=jarvis_channel_label(channel.channel))
+        )
+        lines.extend(_mode_line(found) for found in channel.intents)
+        lines.append("")
+    lines.append(
+        JARVIS_MODES_NEVER.format(
+            intents=escape(", ".join(jarvis_intent_label(i) for i in view.never_auto))
+        )
+    )
+    lines.append(JARVIS_MODES_CEILING.format(rejim=_short_mode(view.ceiling)))
+    if view.ceiling != "auto":
+        lines.append(JARVIS_CEILING_HINT)
+    lines.append(
+        JARVIS_MODES_CRITERIA.format(
+            d=settings.jarvis_graduation_min_days,
+            n=settings.jarvis_graduation_min_drafts,
+            p=settings.jarvis_graduation_min_approval_pct,
+        )
+    )
+    if view.reviews:
+        lines.append(JARVIS_MODES_REVIEWS.format(n=view.reviews))
+    return clip("\n".join(lines))
+
+
+# --- /savolbank: the question bank (JV-23) ---------------------------------------------
+#
+# The questions are the owner's own words, shown escaped. qbank's refusal
+# codes are worded here.
+
+QBANK_HEADER = (
+    "❓ Savollar banki ({n} ta) — MIYA mijozga o'zi (sizning tugmangizsiz) faqat "
+    "shu savollarni bera oladi; boshqa har qanday savol sizga qoralama bo'lib keladi:"
+)
+QBANK_LINE = "{i}. {savol}"
+QBANK_EMPTY = "❓ Savollar banki bo'sh — MIYA mijozga o'zi hech qanday savol bermaydi."
+QBANK_USAGE = (
+    "<code>/savolbank</code> — ro'yxat · <code>/savolbank qo'sh Savol?</code> — "
+    "qo'shish · <code>/savolbank o'chir 3</code> — o'chirish"
+)
+QBANK_PROPOSED = (
+    "❓ Savollar bankiga qo'shilsinmi?\n«{savol}»\n"
+    "Shundan keyin MIYA bu savolni mijozlarga o'zi bera oladi."
+)
+QBANK_ADD = "✅ Qo'shish"
+QBANK_DISMISS = "✖️ Kerak emas"
+QBANK_REMOVE = "🗑 {i}"
+QBANK_ADDED = "✅ Savol qo'shildi: «{savol}»"
+QBANK_DECLINED = "✖️ Qo'shilmadi: «{savol}»"
+QBANK_REMOVED = "🗑 Savol olib tashlandi: «{savol}»"
+QBANK_STALE = "Bu savol allaqachon o'zgargan — /savolbank"
+QBANK_NOT_FOUND = "Bunday raqamli savol yo'q — /savolbank"
+QBANK_REFUSED = "⛔ Bu savolni qo'shib bo'lmaydi: {sabab}."
+QBANK_REASONS = {
+    "empty": "savol yozilmagan",
+    "too_long": "juda uzun (120 belgigacha)",
+    "not_one_question": "bitta savol bo'lishi kerak",
+    "red_line": "unda narx, muddat, va'da, raqam, havola yoki ism bor",
+    "not_a_question": "bu savol emas (savol so'zi yoki «-mi» kerak)",
+    "already": "bu savol bankda bor",
+    "full": "bank to'lgan — avval birini o'chiring",
+}
+QBANK_REASON_OTHER = "tekshiruvdan o'tmadi"
+
+
+def qbank_list(entries) -> str:
+    """`/savolbank`: the questions in force, numbered as the 🗑 buttons."""
+    if not entries:
+        return QBANK_EMPTY
+    lines = [QBANK_HEADER.format(n=len(entries))]
+    lines.extend(
+        QBANK_LINE.format(i=i, savol=escape(entry.text))
+        for i, entry in enumerate(entries, start=1)
+    )
+    lines.append(QBANK_USAGE)
+    return clip("\n".join(lines))
+
+
+def qbank_proposed(text: str) -> str:
+    return QBANK_PROPOSED.format(savol=escape(text))
+
+
+def qbank_refused(code: str) -> str:
+    return QBANK_REFUSED.format(sabab=QBANK_REASONS.get(code, QBANK_REASON_OTHER))
+
+
+def qbank_added(text: str) -> str:
+    return QBANK_ADDED.format(savol=escape(text))
+
+
+def qbank_declined(text: str) -> str:
+    return QBANK_DECLINED.format(savol=escape(text))
+
+
+def qbank_removed(text: str) -> str:
+    return QBANK_REMOVED.format(savol=escape(text))
 
 
 # --- /shaxsiy, /shaxsiylar, /guruhai (JV-12) -------------------------------------------

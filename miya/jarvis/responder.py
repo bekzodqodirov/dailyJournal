@@ -38,7 +38,8 @@ JV-16).
 5. Otherwise the **intent** (deterministic greeting, else EXTRACT_MODEL),
    **KB retrieval** (only entries whose answer passes the reply role: a
    verbatim quote of one is auto-safe), and a **draft** by REASON_MODEL with
-   no tools (``draft.DraftInputs`` is all it reads).
+   no tools (``draft.DraftInputs`` is all it reads; an auto-eligible intent
+   also gets the owner's question bank, JV-23).
 6. **Guards.** The deterministic guard (``outbox.preview``, the inputs
    ``create`` uses), then, only on a pass, the model guard (``guard.check``),
    which can only block: its block, error, refusal or parse failure becomes
@@ -1031,11 +1032,17 @@ async def _decide(
     knowledge = (
         () if found.intent == intent.GREETING else await _kb_for(session, chat.text)
     )
+    questions = (
+        await outbox.owner_question_bank(session)
+        if found.intent in intent.AUTO_ELIGIBLE
+        else ()
+    )
     inputs = draft.DraftInputs(
         thread=thread,
         intent=found.intent,
         kb=knowledge,
         style=await _style_for(session, chat, found.intent),
+        questions=questions,
     )
     try:
         written = await draft.write(

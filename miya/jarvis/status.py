@@ -7,7 +7,8 @@ trail is the ``history`` of the Jarvis rows themselves, newest first.
 The observation numbers (JV-16, ``shadow_counts``) say what the responder
 would have done today in ``shadow`` mode: the replies it would have prepared,
 how many of them it would have sent to the owner instead, and per intent how
-many drafts strayed from the approved shapes (``unapproved_statement``), so
+many drafts strayed from the approved shapes (``unapproved_statement``, or a
+question outside the owner's question bank, ``free_question``, JV-23), so
 the owner sees how often the model would need their eye. ``shadow_drafts``
 is ``/qoralamalar``.
 
@@ -370,9 +371,13 @@ def _between(
 
 
 def _strayed() -> sa.ColumnElement[bool]:
-    """The bound verdict carries the ``unapproved_statement`` flag."""
-    return OutboxMessage.guard["flags"].op("@>")(
-        sa.cast(sa.literal([gate.UNAPPROVED_STATEMENT], JSONB), JSONB)
+    """The bound verdict carries the ``unapproved_statement`` flag, or (JV-23)
+    ``free_question``: a question outside the owner's question bank is never
+    sent on its own either."""
+    flags = OutboxMessage.guard["flags"]
+    return sa.or_(
+        flags.op("@>")(sa.cast(sa.literal([gate.UNAPPROVED_STATEMENT], JSONB), JSONB)),
+        flags.op("@>")(sa.cast(sa.literal([gate.FREE_QUESTION], JSONB), JSONB)),
     )
 
 

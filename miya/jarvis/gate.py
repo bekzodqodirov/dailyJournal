@@ -17,10 +17,13 @@ skip a line. The first line that objects decides:
 
 An autonomous row (``auto:policy``, no owner tap) also needs the statement
 allowlist (§5.2 step 3, rule 13a): its bound verdict must say ``shapes_ok``,
-every sentence a courtesy, a question, a stall or an approved KB text, and a
-``general_question`` must quote an approved KB text (§6.2). One without it
-never goes out on its own: it goes back to the owner's card
-(``unapproved_statement``).
+every sentence a courtesy, a question from the owner's question bank, a
+stall or an approved KB text, and a ``general_question`` must quote an
+approved KB text (§6.2). One without it never goes out on its own: it goes
+back to the owner's card (``unapproved_statement``). A row that leaned on an
+approved KB text or a bank question is guarded again at the claim with the
+entries in force then, so an entry the owner retired approves nothing. The
+database holds the same line (``ck_outbox_messages_auto_shapes``, 0028).
 
 The red-line guard is reached through the small ``Guard`` interface.
 ``outbox`` registers the real one (``redlines.GUARD``, JV-13) when it is
@@ -96,15 +99,23 @@ BURST_DELETED: Final = "burst_deleted"
 WARNED_PERSONAL: Final = "warned_personal"
 WARNED_SAFETY: Final = "warned_safety"
 
-# Intents that may ever be sent on their own (§6.2); every other intent
-# always goes to the owner.
-AUTO_INTENTS: Final = frozenset(
-    {"greeting", "info_gathering", "general_question", "stall"}
-)
+# A question the statement allowlist read as one, but that is not in the
+# owner's question bank (JV-23): fine on a card, never sent on its own.
+FREE_QUESTION: Final = "free_question"
+
+# Intents that may ever be sent on their own (§6.2, JV-23): policy's list,
+# so no setting can make another one autonomous. Every other intent, the
+# holding reply (``stall``) among them, always goes to the owner.
+AUTO_INTENTS: Final = policy.AUTO_INTENTS
 # Auto intents that go out on their own only when the text quotes an active
 # knowledge-base entry verbatim (§6.2: «only when a KB entry matched»).
 KB_ONLY_INTENTS: Final = frozenset({"general_question"})
 KB_SHAPE: Final = "kb"
+# The shape of a question sentence that matched the owner's question bank.
+QUESTION_SHAPE: Final = "question"
+# Shapes whose approval rests on the owner's records (the KB entries, the
+# question bank): an autonomous row with one is guarded again at the claim.
+RECHECKED_SHAPES: Final = frozenset({KB_SHAPE, QUESTION_SHAPE})
 
 
 def body_hash(body: str) -> str:
@@ -174,7 +185,10 @@ class Guard(Protocol):
     ``client_script`` is the script the client wrote in (§5.2 step 2).
     ``approved_kb`` are the active owner-approved knowledge-base texts and
     ``stall_texts`` the owner's stall overrides: verbatim, they are approved
-    statements for the allowlist (§5.2 step 3).
+    statements for the allowlist (§5.2 step 3). ``question_bank`` is the
+    owner's question bank (JV-23): with it, a question that is not in it is
+    a ``free_question``, never ``shapes_ok``; None reads the question
+    grammar alone (a caller that is not deciding an autonomous send).
     """
 
     def check(
@@ -188,6 +202,7 @@ class Guard(Protocol):
         client_script: str | None = None,
         approved_kb: tuple[str, ...] = (),
         stall_texts: tuple[str, ...] = (),
+        question_bank: tuple[str, ...] | None = None,
     ) -> GuardResult: ...
 
 
@@ -221,6 +236,7 @@ def run_guard(
     client_script: str | None = None,
     approved_kb: tuple[str, ...] = (),
     stall_texts: tuple[str, ...] = (),
+    question_bank: tuple[str, ...] | None = None,
 ) -> GuardResult:
     """Run the guard; no guard, or one that raises, is a failed check. The
     error's class is kept in ``det_hits`` (``error:<class>``) for the log
@@ -237,6 +253,7 @@ def run_guard(
             client_script=client_script,
             approved_kb=approved_kb,
             stall_texts=stall_texts,
+            question_bank=question_bank,
         )
     except Exception as exc:
         return GuardResult(
@@ -354,6 +371,9 @@ class Context:
     # the owner's stall overrides (JV-15, JV-14).
     approved_kb: tuple[str, ...] = ()
     stall_texts: tuple[str, ...] = ()
+    # The owner's question bank in force now (JV-23): the claim passes the
+    # bank it read. Empty by default: fail closed, no question is approved.
+    question_bank: tuple[str, ...] = ()
     # The end of the quiet hours when ``now`` is inside them, else None.
     quiet_until: datetime | None = None
     auto_in_quiet_hours: bool = False
@@ -533,8 +553,8 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         return None  # the payload line refuses it
     sha = body_hash(row.body)
     bound = row.body_sha256 == sha and row.guard.get("body_sha256") == sha
-    leaned_on_kb = row.auto and KB_SHAPE in _shape_names(row.guard)
-    if row.ai and bound and row.guard.get("verdict") == GUARD_PASS and not leaned_on_kb:
+    leaned = row.auto and bool(RECHECKED_SHAPES & set(_shape_names(row.guard)))
+    if row.ai and bound and row.guard.get("verdict") == GUARD_PASS and not leaned:
         if row.auto and not (
             shapes_passed(row.guard)
             and auto_shapes_ok(row.intent, True, _shape_names(row.guard))
@@ -542,8 +562,9 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
             # Rule 13a: free-form statements go out only after an owner tap.
             return Decision("redraft", "guard", UNAPPROVED_STATEMENT)
         return None
-    # An autonomous row approved for a KB text is guarded again with the KB
-    # entries active now: a retired entry approves nothing (JV-15).
+    # An autonomous row approved for a KB text or a bank question is guarded
+    # again with the KB entries and the question bank in force now: a retired
+    # entry approves nothing (JV-15, JV-23).
     if not row.ai and bound:
         return None
     result = run_guard(
@@ -556,6 +577,7 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         client_script=ctx.client_script,
         approved_kb=ctx.approved_kb,
         stall_texts=ctx.stall_texts,
+        question_bank=ctx.question_bank,
     )
     if not row.ai:
         # The owner's words are flagged, never blocked; but a body that
@@ -646,6 +668,7 @@ __all__ = [
     "AUTO_INTENTS",
     "BURST_DELETED",
     "COMPOSING_HOLD",
+    "FREE_QUESTION",
     "GUARD_ERROR",
     "GUARD_FAILED",
     "GUARD_PASS",
@@ -659,6 +682,8 @@ __all__ = [
     "OWNER_REPLIED",
     "OWNER_SEEN",
     "PAYLOAD_NOT_TEXT",
+    "QUESTION_SHAPE",
+    "RECHECKED_SHAPES",
     "SAFETY_UNREADABLE",
     "TRIGGER_DELETED",
     "TRIGGER_EDITED",

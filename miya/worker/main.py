@@ -47,6 +47,14 @@ Jobs:
                    entries, and once a week suggests entries from the
                    owner's own answers to questions several clients asked
                    (JV-15); a suggestion is never used before the owner's tap
+  * jarvis_rollout — daily at 10:17, only with JARVIS_ENABLED; the rollout
+                   controller (JV-23): reads the week's autonomous sends
+                   again with today's red-line guard and checks the cost cap
+                   (either demotes a reply kind back to draft), then offers
+                   each reply kind that met the graduation criteria with
+                   «✅ Ha, avtomatik» / «⏳ Yana kuzataylik»; only the
+                   owner's tap promotes. jarvis_outbox tells each autonomous
+                   send (silently, with «↩️ Bu xato edi») and each demotion
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -536,7 +544,8 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
     card or escalation alert that their own message or the client's edit
     took off the table, and (JV-19) about what the Telegram sender recorded:
     a breaker trip, a flood wait, a failed send and a tapped send that went
-    out (``jarvis_send_notices``).
+    out (``jarvis_send_notices``); and (JV-23) about each autonomous send
+    and each automatic demotion (``jarvis_autonomy_notices``).
 
     Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
     startup (rule 20). Each step and each notice is contained on its own:
@@ -558,6 +567,7 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
         return  # Telegram is down: the rest wait for the next sweep
     await jarvis_takeover_notices(bot, now=now)
     await jarvis_send_notices(bot, now=now)
+    await jarvis_autonomy_notices(bot, now=now)
 
 
 async def _jarvis_unknown_notices(bot: Bot, *, now: datetime) -> bool:
@@ -724,6 +734,153 @@ async def jarvis_send_notices(bot: Bot, *, now: datetime | None = None) -> int:
                 extra={"outbox_id": outcome.id, "error": type(exc).__name__},
             )
     return told
+
+
+async def jarvis_autonomy_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """JV-23: each reply Jarvis sent on its own is followed by a silent
+    «🤖 Avtomatik yuborildi · {ism}: «{matn}»» notice with «↩️ Bu xato edi»
+    (the button is honoured only from that message), and each automatic
+    demotion (a breaker, a red line found in a sent reply, the cost cap) is
+    told once. Each notice is contained (rule 25); returns how many went out."""
+    from miya.jarvis import outbox, rollout
+
+    now = now or datetime.now(settings.tz)
+    told = 0
+    try:
+        async with session_scope() as session:
+            sends = await outbox.auto_untold(session, now=now)
+    except Exception as exc:
+        log.error("jarvis auto sends unreadable", extra={"error": type(exc).__name__})
+        sends = []
+    for send in sends:
+        try:
+            ok, sent = await deliver(
+                bot,
+                replies.jarvis_auto_sent(send.name, send.body),
+                reply_markup=keyboards.jarvis_auto_sent(send.id),
+                silent=True,
+            )
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_auto_noticed(
+                    session,
+                    send.id,
+                    message_id=sent.message_id if sent is not None else None,
+                    now=now,
+                )
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis auto-send notice failed",
+                extra={"outbox_id": send.id, "error": type(exc).__name__},
+            )
+    try:
+        async with session_scope() as session:
+            demotions = await rollout.demotions_untold(session)
+    except Exception as exc:
+        log.error("jarvis demotions unreadable", extra={"error": type(exc).__name__})
+        return told
+    silent = reminders.in_quiet_hours(now)
+    for demotion in demotions:
+        try:
+            text = replies.jarvis_demoted(
+                intent=demotion.intent, channel=demotion.channel, code=demotion.code
+            )
+            if not await notify(bot, text, silent=silent):
+                return told
+            async with session_scope() as session:
+                await rollout.mark_demotion_told(
+                    session,
+                    demotion.channel,
+                    demotion.intent,
+                    code=demotion.code,
+                    now=now,
+                )
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis demotion notice failed",
+                extra={
+                    "channel": demotion.channel,
+                    "intent": demotion.intent,
+                    "error": type(exc).__name__,
+                },
+            )
+    return told
+
+
+async def jarvis_rollout_job(bot: Bot, *, now: datetime | None = None) -> int:
+    """The rollout controller (JV-23), once a day. First the automatic
+    demotions: every reply sent on its own in the last week is read again
+    with today's red-line guard (a red line it breaks now demotes its kind),
+    and the cost cap reached on two days of the week demotes every kind.
+    Then each channel × reply kind that met the graduation criteria (§6.4) is
+    offered once with «✅ Ha, avtomatik» / «⏳ Yana kuzataylik», with the
+    JARVIS_MODE hint when the env ceiling is not auto; nothing is promoted
+    here. The demotions are told by ``jarvis_autonomy_notices``.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step and each offer is contained (rule 25);
+    returns how many offers went out."""
+    from miya.jarvis import policy, rollout
+
+    now = now or datetime.now(settings.tz)
+    for step in (rollout.recheck_sends, rollout.check_cost_cap):
+        try:
+            async with session_scope() as session:
+                await step(session, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis rollout step failed",
+                extra={"step": step.__name__, "error": type(exc).__name__},
+            )
+    try:
+        async with session_scope() as session:
+            due = await rollout.offers_due(session, now=now)
+    except Exception as exc:
+        log.error("jarvis rollout metrics failed", extra={"error": type(exc).__name__})
+        return 0
+    offered = 0
+    silent = reminders.in_quiet_hours(now)
+    for found in due:
+        try:
+            text = replies.jarvis_graduation_offer(
+                intent=found.intent,
+                channel=found.channel,
+                days=found.days,
+                drafts=found.drafts,
+                pct=found.pct,
+                cap=settings.jarvis_auto_daily_cap,
+                ceiling_ok=policy.ceiling() == "auto",
+            )
+            ok, sent = await deliver(
+                bot,
+                text,
+                reply_markup=keyboards.jarvis_graduation(found.channel, found.intent),
+                silent=silent,
+            )
+            if not ok or sent is None:
+                return offered  # Telegram is down: offered again tomorrow
+            async with session_scope() as session:
+                await rollout.record_offer(
+                    session,
+                    found.channel,
+                    found.intent,
+                    message_id=sent.message_id,
+                    now=now,
+                )
+            offered += 1
+        except Exception as exc:
+            log.error(
+                "jarvis graduation offer failed",
+                extra={
+                    "channel": found.channel,
+                    "intent": found.intent,
+                    "error": type(exc).__name__,
+                },
+            )
+    return offered
 
 
 # The ReminderLog kind that records "the owner was told today that the cost
@@ -2421,6 +2578,16 @@ async def run() -> None:
             id="kb_mining",
             max_instances=1,
             coalesce=True,
+        )
+        # Once a day, after the morning brief and outside the quiet hours.
+        scheduler.add_job(
+            jarvis_rollout_job,
+            CronTrigger(hour=10, minute=17, timezone=settings.timezone),
+            args=[bot],
+            id="jarvis_rollout",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
         )
     # Userbot pipeline. These jobs are harmless with the userbot switched off:
     # with no messages there is nothing to window and nothing to submit.

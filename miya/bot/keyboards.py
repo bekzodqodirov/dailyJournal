@@ -1258,3 +1258,105 @@ def command_setting(action) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- the rollout (JV-23) ----------------------------------------------------------------
+#
+# jg:y|n:<channel>:<intent> under a graduation offer (go autonomous, keep
+# watching); jv:x:<outbox id> under the silent notice of an autonomous send
+# («↩️ Bu xato edi», the draft prefix: the row is the payload). The channel
+# and the intent are the jarvis_policy scope's own key parts, checked
+# against the known channels and intents before anything is read. Not in
+# handlers._button_handlers: a typed batch answer never makes Jarvis
+# autonomous. The letters are miya.jarvis.rollout's (a test holds them
+# together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_GRADUATION_PREFIX = "jg"
+JARVIS_GRADUATE_YES = "y"
+JARVIS_GRADUATE_NO = "n"
+JARVIS_MISTAKE = "x"
+
+
+def jarvis_graduation(channel: str, intent: str) -> InlineKeyboardMarkup:
+    """✅ Ha, avtomatik / ⏳ Yana kuzataylik under one offer."""
+    ref = f"{channel}:{intent}"
+    yes = f"{JARVIS_GRADUATION_PREFIX}:{JARVIS_GRADUATE_YES}:{ref}"
+    no = f"{JARVIS_GRADUATION_PREFIX}:{JARVIS_GRADUATE_NO}:{ref}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_GRADUATE,
+                    callback_data=yes,
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_KEEP_DRAFT,
+                    callback_data=no,
+                ),
+            ]
+        ]
+    )
+
+
+def jarvis_auto_sent(row_id: int) -> InlineKeyboardMarkup:
+    """↩️ Bu xato edi under the notice of one autonomous send."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _jarvis_button(
+                    replies.JARVIS_BUTTON_MISTAKE,
+                    JARVIS_DRAFT_PREFIX,
+                    JARVIS_MISTAKE,
+                    row_id,
+                )
+            ]
+        ]
+    )
+
+
+# --- /savolbank (JV-23) -----------------------------------------------------------------
+#
+# qb:y|n:<ref> adds or drops a proposed question, qb:d:<ref> removes one from
+# the bank (ref: qbank.ref_of, a short hash of the exact text). Not in
+# handlers._button_handlers: a typed batch answer never puts a question in
+# the AI's mouth.
+
+QBANK_PREFIX = "qb"
+QBANK_ADD = "y"
+QBANK_DISMISS = "n"
+QBANK_REMOVE = "d"
+# Remove buttons per row under the list.
+QBANK_PER_ROW = 5
+
+
+def qbank_proposal(ref: str) -> InlineKeyboardMarkup:
+    """✅ Qo'shish / ✖️ Kerak emas under a proposed question."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.QBANK_ADD,
+                    callback_data=f"{QBANK_PREFIX}:{QBANK_ADD}:{ref}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.QBANK_DISMISS,
+                    callback_data=f"{QBANK_PREFIX}:{QBANK_DISMISS}:{ref}",
+                ),
+            ]
+        ]
+    )
+
+
+def qbank_list(refs: list[str]) -> InlineKeyboardMarkup | None:
+    """🗑 1 … 🗑 n under `/savolbank`, numbered as the list."""
+    buttons = [
+        InlineKeyboardButton(
+            text=replies.QBANK_REMOVE.format(i=i),
+            callback_data=f"{QBANK_PREFIX}:{QBANK_REMOVE}:{ref}",
+        )
+        for i, ref in enumerate(refs, start=1)
+    ]
+    if not buttons:
+        return None
+    rows = [buttons[i : i + QBANK_PER_ROW] for i in range(0, len(buttons), QBANK_PER_ROW)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

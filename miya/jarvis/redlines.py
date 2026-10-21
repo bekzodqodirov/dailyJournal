@@ -78,7 +78,7 @@ from miya.services.text import (
 
 # Bumped whenever a lexicon or a rule changes, so a stored verdict says which
 # checker made it (outbox_messages.guard.checker_version).
-CHECKER_VERSION: Final = "redlines-6"
+CHECKER_VERSION: Final = "redlines-7"
 
 # The longest AI reply (§5.2).
 MAX_CHARS: Final = 400
@@ -2427,10 +2427,33 @@ def _language_hits(clean: str, hits: _Hits) -> None:
 # Any other sentence is a ``statement``: the text is flagged
 # ``unapproved_statement``. That never blocks a draft card (the owner reads
 # every draft), but an AI row with it is never sent without an owner tap.
+#
+# The question bank (JV-23). The grammar cannot know every way a question
+# can carry an offer or a status, so a question goes out on its own only
+# when it is one of the owner's question bank (``qbank``): a closed list of
+# questions the owner approved («Yuk qaysi shahardan?», «Сколько мест?»),
+# matched after the same normalisation as a courtesy or a stall. Around
+# it a sentence may carry only the counterparty's name and words of address,
+# a courtesy segment, and the GS codes and waybills the client wrote in the
+# chat (``bank_key``). With a bank given (``question_bank``), a question that
+# is not in it is a ``free_question``: flagged ``free_question``, never
+# ``shapes_ok``, a card for the owner like a statement, never blocked.
 
-Shape = Literal["courtesy", "question", "stall", "kb", "statement"]
-SHAPES: Final[tuple[Shape, ...]] = ("courtesy", "question", "stall", "kb", "statement")
+Shape = Literal["courtesy", "question", "stall", "kb", "statement", "free_question"]
+SHAPES: Final[tuple[Shape, ...]] = (
+    "courtesy",
+    "question",
+    "stall",
+    "kb",
+    "statement",
+    "free_question",
+)
+# The shapes an autonomous send may be made of.
+APPROVED_SHAPES: Final[frozenset[Shape]] = frozenset(
+    {"courtesy", "question", "stall", "kb"}
+)
 SHAPE_FLAG: Final = gate.UNAPPROVED_STATEMENT
+FREE_QUESTION_FLAG: Final = gate.FREE_QUESTION
 # What the owner's card says about it (JV-18) and the escalation reason it
 # maps to (escalations.reasons has no «unapproved_statement»: no migration).
 SHAPE_LABEL: Final = "erkin gap"
@@ -2742,9 +2765,10 @@ class ShapeVerdict:
 
     @property
     def ok(self) -> bool:
-        """Every sentence has an approved shape (and there is one)."""
+        """Every sentence has an approved shape (and there is one): no
+        statement, and no question outside the owner's question bank."""
         return bool(self.sentences) and all(
-            s.shape != "statement" for s in self.sentences
+            s.shape in APPROVED_SHAPES for s in self.sentences
         )
 
     @property
@@ -2753,7 +2777,17 @@ class ShapeVerdict:
 
     @property
     def flags(self) -> tuple[str, ...]:
-        return () if self.ok else (SHAPE_FLAG,)
+        """``unapproved_statement`` for a statement (or no sentence at all),
+        ``free_question`` for a question outside the bank."""
+        if self.ok:
+            return ()
+        found: list[str] = []
+        shapes = self.shapes
+        if not shapes or "statement" in shapes:
+            found.append(SHAPE_FLAG)
+        if "free_question" in shapes:
+            found.append(FREE_QUESTION_FLAG)
+        return tuple(found)
 
 
 def _sentences(clean: str) -> list[tuple[str, bool]]:
@@ -3101,6 +3135,58 @@ def _text_keys(texts: Iterable[str]) -> tuple[frozenset[str], frozenset[str]]:
     return frozenset(whole - {""}), frozenset(sentences - {""})
 
 
+def sentences(text: str) -> tuple[str, ...]:
+    """The sentences of ``text`` as the allowlist splits them (a «.», «!»,
+    «?», «…» or line break ends one), cleaned; a question keeps its «?», so
+    each reads alone as it read in the text."""
+    return tuple(
+        piece.strip() + ("?" if asked else "")
+        for piece, asked in _sentences(_clean(text or ""))
+    )
+
+
+def sentence_key(text: str) -> str:
+    """The normalised form a courtesy, a stall or a KB text is matched by."""
+    return _ckey(text)
+
+
+def _bank_tokens(
+    sentence: str, names: frozenset[str], allowed_tokens: frozenset[str]
+) -> tuple[str, ...]:
+    """The words of a question sentence the bank is matched by: the client's
+    codes blanked out, a segment that is only a courtesy (with words of
+    address and the counterparty's name) left out, and every word of address
+    and the counterparty's name dropped. Nothing else is a slot."""
+    masked, _unknown = _mask_tokens(_clean(sentence), allowed_tokens)
+    out: list[str] = []
+    for segment in _SHAPE_SEGMENT.split(masked):
+        if not segment or not segment.strip():
+            continue
+        keys = _ckey_tokens(segment)
+        if not keys or _covered(keys, names):
+            continue
+        out.extend(t for t in keys if t not in _SHAPE_ADDRESS and t not in names)
+    return tuple(out)
+
+
+def bank_key(
+    sentence: str,
+    *,
+    names: frozenset[str] = frozenset(),
+    allowed_tokens: frozenset[str] = frozenset(),
+) -> str:
+    """The key a question sentence and a bank entry are compared by (JV-23).
+    ``names`` are the counterparty's name words (``_shape_names``),
+    ``allowed_tokens`` the chat's codes: the only slot fillers there are."""
+    return " ".join(_bank_tokens(sentence, names, allowed_tokens))
+
+
+def question_bank_keys(texts: Iterable[str]) -> frozenset[str]:
+    """The keys of the bank's questions (each one sentence, no slot)."""
+    keys = {bank_key(t) for t in texts if isinstance(t, str) and t.strip()}
+    return frozenset(keys - {""})
+
+
 def check_shapes(
     text: str,
     *,
@@ -3109,6 +3195,7 @@ def check_shapes(
     extra_stalls: Iterable[str] = (),
     allowed_tokens: frozenset[str] = frozenset(),
     allowed_names: Iterable[str] = (),
+    question_bank: Iterable[str] | None = None,
 ) -> ShapeVerdict:
     """The statement allowlist (§5.2 step 3): the shape of every sentence.
 
@@ -3117,8 +3204,11 @@ def check_shapes(
     templates of ``stalls``), and ``extra_stalls`` more of them (the owner's
     overrides that passed the stall role). ``allowed_tokens`` are the chat's codes (a
     question may carry one), ``allowed_names`` the counterparty's names (a
-    courtesy may carry one). Pure; the red lines are not read here except
-    on the part of a question before it asks."""
+    courtesy may carry one). ``question_bank`` is the owner's question bank
+    (JV-23): a question not in it is a ``free_question``; None (the
+    default) reads the question grammar alone, for a caller that is not
+    deciding an autonomous send. Pure; the red lines are not read here
+    except on the part of a question before it asks."""
     clean = _clean(text or "")
     if not clean.strip():
         return ShapeVerdict()
@@ -3143,18 +3233,24 @@ def check_shapes(
     for keys, shape in whole_shapes:
         if whole and whole in keys and not any(_odd_symbol(s) for s, _q in sentences):
             return ShapeVerdict(tuple(SentenceShape(shape) for _s in sentences))
+    bank = None if question_bank is None else question_bank_keys(question_bank)
     out: list[SentenceShape] = []
     for sentence, asked in sentences:
-        out.append(
-            _sentence_shape(
-                sentence,
-                asked,
-                stalls=stall_sentences,
-                kb=kb_sentences,
-                tokens_allowed=allowed_tokens,
-                names=names,
-            )
+        read = _sentence_shape(
+            sentence,
+            asked,
+            stalls=stall_sentences,
+            kb=kb_sentences,
+            tokens_allowed=allowed_tokens,
+            names=names,
         )
+        if (
+            bank is not None
+            and read.shape == "question"
+            and bank_key(sentence, names=names, allowed_tokens=allowed_tokens) not in bank
+        ):
+            read = SentenceShape("free_question", "unbanked")
+        out.append(read)
     return ShapeVerdict(tuple(out))
 
 
@@ -3257,6 +3353,7 @@ def check_outbound(
     client_script: Script | None = None,
     approved_kb: Iterable[str] = (),
     stall_texts: Iterable[str] = (),
+    question_bank: Iterable[str] | None = None,
 ) -> Verdict:
     """The binding red-line check on one outbound text (§5.2 step 2), with
     the statement allowlist (§5.2 step 3) for AI text.
@@ -3273,6 +3370,8 @@ def check_outbound(
     ``approved_kb`` (active owner-approved KB texts) and ``stall_texts`` (the
     owner's stall overrides; one counts only if it passes the stall role)
     are approved statements for the allowlist; they never loosen a red line.
+    ``question_bank`` is the owner's question bank (JV-23, ``check_shapes``):
+    only its questions keep ``shapes_ok``.
     """
     names = tuple(allowed_names)
     found = _red_line_hits(
@@ -3300,6 +3399,7 @@ def check_outbound(
             extra_stalls=overrides,
             allowed_tokens=allowed_tokens,
             allowed_names=names,
+            question_bank=question_bank,
         )
     flags = tuple(f for f in FLAGS if any(flag == f for flag, _ in found))
     codes_found = tuple(dict.fromkeys(code for _, code in found))
@@ -3715,9 +3815,9 @@ _SCRIPTS: Final[Mapping[str, Script]] = {
 
 class RedLineGuard:
     """``gate.Guard``: the deterministic check and the statement allowlist,
-    nothing else, with the names, the client's script and the approved texts
-    the outbox passes. The model check (JV-16) runs before a row is created
-    and can only add a block."""
+    nothing else, with the names, the client's script, the approved texts
+    and the question bank the outbox passes. The model check (JV-16) runs
+    before a row is created and can only add a block."""
 
     def check(
         self,
@@ -3730,6 +3830,7 @@ class RedLineGuard:
         client_script: str | None = None,
         approved_kb: tuple[str, ...] = (),
         stall_texts: tuple[str, ...] = (),
+        question_bank: tuple[str, ...] | None = None,
     ) -> GuardResult:
         return check_outbound(
             body,
@@ -3740,6 +3841,7 @@ class RedLineGuard:
             client_script=_SCRIPTS.get(client_script or ""),
             approved_kb=approved_kb,
             stall_texts=stall_texts,
+            question_bank=question_bank,
         ).result()
 
 
@@ -3752,6 +3854,7 @@ def install() -> None:
 
 
 __all__ = [
+    "APPROVED_SHAPES",
     "BLOCK",
     "CHECKER_VERSION",
     "COURTESY",
@@ -3759,6 +3862,7 @@ __all__ = [
     "FLAG",
     "FLAGS",
     "FLAG_LABELS",
+    "FREE_QUESTION_FLAG",
     "GUARD",
     "MAX_CHARS",
     "PASS",
@@ -3775,10 +3879,14 @@ __all__ = [
     "ShapeVerdict",
     "Signal",
     "Verdict",
+    "bank_key",
     "check_outbound",
     "check_shapes",
     "classify_inbound",
     "escalation_reasons",
     "install",
+    "question_bank_keys",
     "script_of",
+    "sentence_key",
+    "sentences",
 ]

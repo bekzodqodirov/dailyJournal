@@ -21,11 +21,20 @@ The lifecycle::
 
 An AI row is approved on its own (``auto:policy``) only when its intent
 graduated and its bound verdict carries ``shapes_ok`` (the statement
-allowlist, rule 13a): every sentence a courtesy, a question, a stall or an
-approved KB text (the answer of an active owner-approved knowledge-base
-entry, JV-15, which the outbox loads itself). A text with a free-form
-statement becomes a draft card (``unapproved_statement``) instead;
-``gate.evaluate`` holds the same line at the claim.
+allowlist, rule 13a): every sentence a courtesy, a question from the owner's
+question bank (JV-23, ``qbank``), a stall or an approved KB text (the answer
+of an active owner-approved knowledge-base entry, JV-15). The outbox loads
+the KB entries and the bank itself, never from a caller. A text with a
+free-form statement or a question outside the bank becomes a draft card
+(``unapproved_statement``) instead; ``gate.evaluate`` holds the same line at
+the claim, and the database the same again (``ck_outbox_messages_auto_shapes``,
+0028): a row that loses its passing shape check also loses the policy
+approver.
+
+The rollout (JV-23) reads and marks rows only through this module: the
+silent notice after an autonomous send (``auto_untold``,
+``mark_auto_noticed``), the owner's «↩️ Bu xato edi» (``flag_mistake``),
+an incident or a red-line review case (``note_review``).
 
 The model guard (JV-16, ``guard``) runs before a row is created, and only on
 a body the deterministic guard passes (``preview`` runs that check with
@@ -63,7 +72,7 @@ from miya.db.models import (
     OutboxMessage,
     Person,
 )
-from miya.jarvis import caps, chatkey, costs, gate, kb, policy, redlines, style
+from miya.jarvis import caps, chatkey, costs, gate, kb, policy, qbank, redlines, style
 from miya.services import authorship, codes, people, reminders, safety
 
 log = logging.getLogger(__name__)
@@ -166,7 +175,6 @@ CHANNEL_CAPS: Final[Mapping[str, str]] = {
     chatkey.WHATSAPP: "whatsapp_daily_send_cap",
     chatkey.GMAIL: "gmail_daily_send_cap",
 }
-AUTO_IN_QUIET_HOURS: Final = "jarvis_auto_in_quiet_hours"
 
 # Where a sent message's id is kept on its echo interaction.
 ECHO_ID_KEYS: Final[Mapping[str, str]] = {
@@ -210,6 +218,10 @@ class JarvisDisabled(OutboxError):
 
 class NotPlainText(OutboxError):
     """Rule 27: an outbox row carries a text body and nothing else."""
+
+
+class StaleTap(OutboxError):
+    """A tap from a message that is not the one the row was last shown on."""
 
 
 def channel_send_enabled(channel: str) -> bool:
@@ -583,6 +595,7 @@ def _run_guard(
     *,
     approved_kb: Sequence[str] = (),
     stall_texts: Sequence[str] = (),
+    question_bank: Sequence[str] = (),
 ) -> gate.GuardResult:
     return gate.run_guard(
         gate.registered_guard(),
@@ -594,7 +607,24 @@ def _run_guard(
         client_script=names.client_script,
         approved_kb=tuple(t for t in approved_kb if isinstance(t, str)),
         stall_texts=tuple(t for t in stall_texts if isinstance(t, str)),
+        # Always a bank, never None: an AI row is never judged by the
+        # question grammar alone (JV-23).
+        question_bank=tuple(t for t in question_bank if isinstance(t, str)),
     )
+
+
+async def owner_question_bank(session: AsyncSession) -> tuple[str, ...]:
+    """The owner's question bank in force now (JV-23, ``qbank``): the only
+    questions an autonomous reply may ask. Read from the owner's own records
+    here, never taken from a caller. A failure to read it is logged and
+    counts as an empty bank (every question goes to the owner's card); it
+    never raises into a create, an approval or a claim."""
+    try:
+        async with session.begin_nested():
+            return await qbank.texts(session)
+    except Exception as exc:
+        log.error("question bank unreadable", extra={"error": type(exc).__name__})
+        return ()
 
 
 async def owner_stall_texts(session: AsyncSession) -> tuple[str, ...]:
@@ -758,6 +788,7 @@ async def preview(
         await guard_names(session, row),
         approved_kb=tuple(kb_texts.values()),
         stall_texts=await owner_stall_texts(session) if ai else (),
+        question_bank=await owner_question_bank(session) if ai else (),
     )
 
 
@@ -907,6 +938,7 @@ async def create(
         await guard_names(session, row),
         approved_kb=tuple(kb_texts.values()),
         stall_texts=await owner_stall_texts(session) if ai else (),
+        question_bank=await owner_question_bank(session) if ai else (),
     )
     if ai:
         result = with_model_verdict(result, model_verdict)
@@ -1082,6 +1114,7 @@ async def approve(
                 await guard_names(session, row),
                 approved_kb=tuple(kb_texts.values()),
                 stall_texts=await owner_stall_texts(session),
+                question_bank=await owner_question_bank(session),
             )
             _bind(row, result)
             _log_guard_error(row, result)
@@ -1369,6 +1402,7 @@ async def _context(
     counters: _Counters,
     stall_texts: tuple[str, ...] = (),
     kb_texts: tuple[str, ...] = (),
+    question_bank: tuple[str, ...] = (),
 ) -> gate.Context:
     trigger = await _trigger(session, row)
     names = await guard_names(session, row)
@@ -1417,8 +1451,11 @@ async def _context(
         # entry retired since matches nothing and goes back to the card.
         approved_kb=kb_texts,
         stall_texts=stall_texts,
+        # The owner's question bank in force now (JV-23): a bank question an
+        # autonomous row leaned on and the owner removed since asks nothing.
+        question_bank=question_bank,
         quiet_until=quiet_until(now),
-        auto_in_quiet_hours=bool(getattr(settings, AUTO_IN_QUIET_HOURS, False)),
+        auto_in_quiet_hours=settings.jarvis_auto_in_quiet_hours,
     )
 
 
@@ -1439,6 +1476,18 @@ def _apply(
         )
         row.body_sha256 = decision.body_sha256 or gate.body_hash(row.body)
         _log_guard_error(row, decision.guard)
+        if (
+            decision.action != "send"
+            and row.approved_by == AUTO_APPROVER
+            and row.authored_by == gate.AI
+            and not gate.shapes_passed(row.guard or {})
+        ):
+            # A row the policy approved keeps that approver only with a
+            # passing shape check (ck_outbox_messages_auto_shapes): a fresh
+            # verdict without one takes it off, in the history.
+            _note(row, "approved_by", row.approved_by, None, by=BY_GATE, now=now)
+            row.approved_by = None
+            row.approved_at = None
     if decision.action == "send":
         _transition(row, SENDING, by=BY_GATE, now=now)
         row.lease_until = now + caps.SEND_LEASE
@@ -1535,6 +1584,7 @@ async def claim_ready(
     policies = await policy.load(session)
     owner_stalls = await owner_stall_texts(session)
     active_kb = tuple((await owner_kb_texts(session)).values())
+    bank = await owner_question_bank(session)
     claimed_by = account or channel
     rng = rng or random.Random()
     claimed: list[ClaimedSend] = []
@@ -1550,6 +1600,7 @@ async def claim_ready(
                     counters=counters,
                     stall_texts=owner_stalls,
                     kb_texts=active_kb,
+                    question_bank=bank,
                 )
                 decision = gate.evaluate(snapshot(row), ctx)
                 taken = _apply(row, decision, now=now, claimed_by=claimed_by)
@@ -2137,8 +2188,310 @@ async def flood_waits(
     return waits
 
 
+# --- the rollout's marks (JV-23) ------------------------------------------------------
+#
+# What the rollout controller (``rollout``) reads and writes on a row goes
+# through here, like every other change of a row: the silent notice after an
+# autonomous send and its «↩️ Bu xato edi» button, and the review cases for
+# the red-line corpus. None of them changes a state or a verdict.
+
+# history ``field`` of the silent notice after an autonomous send: ``new`` is
+# the notice's bot message id (None when Telegram gave none).
+AUTO_NOTICE_FIELD: Final = "auto_notice"
+# history ``field`` of the owner's «↩️ Bu xato edi» on that notice.
+MISTAKE_FIELD: Final = "mistake"
+# history ``field`` of a case kept for the red-line corpus review: ``new`` the
+# reasons (signals, ``statement``, guard flags), ``code`` where it came from.
+REVIEW_FIELD: Final = "corpus_candidate"
+REVIEW_MISTAKE: Final = "mistake"
+REVIEW_EDIT: Final = "owner_edit"
+REVIEW_INCIDENT: Final = "incident"
+# How far back a sent autonomous row is read again with today's guard.
+RECHECK_LOOKBACK: Final = timedelta(days=7)
+RECHECK_BATCH: Final = 200
+
+
+def _has(field: str) -> sa.ColumnElement[bool]:
+    found: sa.ColumnElement[bool] = OutboxMessage.history.op("@>")(
+        sa.cast(sa.literal([{"field": field}], JSONB), JSONB)
+    )
+    return found
+
+
+def latest_value(history: Sequence[object] | None, field: str) -> object | None:
+    """The ``new`` of the newest entry of ``field``, else None."""
+    for entry in reversed(list(history or [])):
+        if isinstance(entry, dict) and entry.get("field") == field:
+            return entry.get("new")
+    return None
+
+
+def has_entry(history: Sequence[object] | None, field: str) -> bool:
+    return any(isinstance(e, dict) and e.get("field") == field for e in history or [])
+
+
+@dataclass(frozen=True, slots=True)
+class AutoSent:
+    """An autonomous send the owner has not had its notice for yet."""
+
+    id: int
+    channel: str
+    intent: str | None
+    name: str | None
+    body: str
+    sent_at: datetime | None
+
+
+async def auto_untold(
+    session: AsyncSession, *, now: datetime, limit: int = OUTCOME_BATCH
+) -> list[AutoSent]:
+    """AI rows sent on their own in the last OUTCOME_LOOKBACK without their
+    silent «🤖 Avtomatik yuborildi» notice (``mark_auto_noticed``)."""
+    found = await session.execute(
+        sa.select(
+            OutboxMessage.id,
+            OutboxMessage.channel,
+            OutboxMessage.intent,
+            Person.display_name,
+            OutboxMessage.body,
+            OutboxMessage.sent_at,
+        )
+        .outerjoin(Person, Person.id == OutboxMessage.person_id)
+        .where(
+            OutboxMessage.state == SENT,
+            OutboxMessage.approved_by == AUTO_APPROVER,
+            OutboxMessage.authored_by == gate.AI,
+            OutboxMessage.sent_at >= now - OUTCOME_LOOKBACK,
+            sa.not_(_has(AUTO_NOTICE_FIELD)),
+        )
+        .order_by(OutboxMessage.sent_at, OutboxMessage.id)
+        .limit(limit)
+    )
+    return [
+        AutoSent(
+            id=row_id,
+            channel=channel,
+            intent=intent,
+            name=name,
+            body=body,
+            sent_at=sent_at,
+        )
+        for row_id, channel, intent, name, body, sent_at in found
+    ]
+
+
+async def mark_auto_noticed(
+    session: AsyncSession, row_id: int, *, message_id: int | None, now: datetime
+) -> None:
+    """The owner got the silent notice of this autonomous send; its button
+    is honoured only from that message."""
+    row = await _locked(session, row_id)
+    if row is None:
+        return
+    _note(row, AUTO_NOTICE_FIELD, None, message_id, by=BY_POLICY, now=now)
+    await session.flush()
+
+
+async def flag_mistake(
+    session: AsyncSession,
+    row_id: int,
+    *,
+    message_id: int | None,
+    by: str,
+    now: datetime,
+) -> OutboxMessage:
+    """The owner's «↩️ Bu xato edi» under the notice of an autonomous send,
+    under the row's lock: the row is marked, and its text is kept as a case
+    for the red-line corpus review. Honoured only from the notice the row
+    was last told on (``StaleTap``); a second tap, or a row that was not
+    sent on its own, is ``AlreadyAnswered``."""
+    row = await _locked(session, row_id)
+    if (
+        row is None
+        or row.state != SENT
+        or row.authored_by != gate.AI
+        or row.approved_by != AUTO_APPROVER
+    ):
+        raise AlreadyAnswered(str(row_id))
+    notice = latest_value(row.history, AUTO_NOTICE_FIELD)
+    if message_id is None or notice != message_id:
+        raise StaleTap(str(row_id))
+    if has_entry(row.history, MISTAKE_FIELD):
+        raise AlreadyAnswered(str(row_id))
+    _note(row, MISTAKE_FIELD, None, True, by=by, now=now)
+    _note(row, REVIEW_FIELD, None, [REVIEW_MISTAKE], by=by, now=now, code=REVIEW_MISTAKE)
+    await session.flush()
+    log.warning(
+        "autonomous send flagged as a mistake",
+        extra={"outbox_id": row.id, "intent": row.intent, "channel": row.channel},
+    )
+    return row
+
+
+async def note_review(
+    session: AsyncSession,
+    row_id: int,
+    *,
+    reasons: Sequence[str],
+    code: str,
+    by: str,
+    now: datetime,
+) -> OutboxMessage | None:
+    """Keep this row's AI text as a case for the red-line corpus review
+    (``code``: an owner's edit, an incident). None when the row is gone."""
+    row = await _locked(session, row_id)
+    if row is None:
+        return None
+    _note(row, REVIEW_FIELD, None, list(reasons), by=by, now=now, code=code)
+    await session.flush()
+    return row
+
+
+async def sent_auto_ids(
+    session: AsyncSession, *, now: datetime, after: int = 0
+) -> list[int]:
+    """Autonomous sends of the last RECHECK_LOOKBACK not yet found to be an
+    incident, at most RECHECK_BATCH of them with an id above ``after``: the
+    rollout pages through them all and reads each again with today's guard."""
+    reviewed = OutboxMessage.history.op("@>")(
+        sa.cast(
+            sa.literal([{"field": REVIEW_FIELD, "code": REVIEW_INCIDENT}], JSONB), JSONB
+        )
+    )
+    return list(
+        await session.scalars(
+            sa.select(OutboxMessage.id)
+            .where(
+                OutboxMessage.state == SENT,
+                OutboxMessage.approved_by == AUTO_APPROVER,
+                OutboxMessage.authored_by == gate.AI,
+                OutboxMessage.sent_at >= now - RECHECK_LOOKBACK,
+                sa.not_(reviewed),
+                OutboxMessage.id > after,
+            )
+            .order_by(OutboxMessage.id)
+            .limit(RECHECK_BATCH)
+        )
+    )
+
+
+async def recheck_sent(
+    session: AsyncSession, row_id: int, *, now: datetime
+) -> OutboxMessage | None:
+    """Read one autonomous send again with today's red-line guard (a
+    lexicon added since, a stall or KB entry retired). A red line it breaks
+    now is an incident found after the send (§6.4): the row is kept for the
+    corpus review with the guard's flags, and returned for the rollout to
+    demote its intent. Its bound verdict is left as it was when it went out.
+    None when it still passes, or is gone."""
+    row = await _locked(session, row_id)
+    if row is None or row.state != SENT or row.approved_by != AUTO_APPROVER:
+        return None
+    kb_ids = _kb_ids(row.guard)
+    kb_texts = await owner_kb_texts(session, kb_ids) if kb_ids else {}
+    result = _run_guard(
+        row,
+        await allowed_tokens(session, row),
+        await guard_names(session, row),
+        approved_kb=tuple(kb_texts.values()),
+        stall_texts=await owner_stall_texts(session),
+        question_bank=await owner_question_bank(session),
+    )
+    _log_guard_error(row, result)
+    if result.passed or gate.GUARD_ERROR in result.flags:
+        # A guard that raised says nothing about the text: not an incident.
+        return None
+    shape_notes = (gate.UNAPPROVED_STATEMENT, gate.FREE_QUESTION)
+    reasons = [f for f in result.flags if f not in shape_notes] or [result.verdict[:64]]
+    _note(row, REVIEW_FIELD, None, reasons, by=BY_POLICY, now=now, code=REVIEW_INCIDENT)
+    await session.flush()
+    log.warning(
+        "red line found in an autonomous send",
+        extra={"outbox_id": row.id, "intent": row.intent, "flags": ",".join(reasons)},
+    )
+    return row
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewCase:
+    """One case kept for the red-line corpus review: the AI's text, what the
+    owner made of it (their edit) and why it was kept."""
+
+    id: int
+    channel: str
+    intent: str | None
+    ai_body: str
+    owner_body: str | None
+    reasons: tuple[str, ...]
+    code: str | None
+    at: datetime | None
+
+
+def _reviews(history: Sequence[object] | None) -> list[tuple[Any, ...]]:
+    found: list[tuple[Any, ...]] = []
+    for entry in history or []:
+        if not isinstance(entry, dict) or entry.get("field") != REVIEW_FIELD:
+            continue
+        reasons = entry.get("new")
+        try:
+            at = datetime.fromisoformat(str(entry.get("at")))
+        except ValueError:
+            at = None
+        found.append(
+            (
+                tuple(str(r) for r in reasons) if isinstance(reasons, list) else (),
+                entry.get("code") if isinstance(entry.get("code"), str) else None,
+                at,
+            )
+        )
+    return found
+
+
+async def review_cases(session: AsyncSession, *, limit: int = 50) -> list[ReviewCase]:
+    """The red-line corpus review cases, newest first."""
+    rows = await session.execute(
+        sa.select(
+            OutboxMessage.id,
+            OutboxMessage.channel,
+            OutboxMessage.intent,
+            OutboxMessage.ai_body,
+            OutboxMessage.body,
+            OutboxMessage.authored_by,
+            OutboxMessage.history,
+        )
+        .where(_has(REVIEW_FIELD))
+        .order_by(OutboxMessage.updated_at.desc(), OutboxMessage.id.desc())
+        .limit(limit)
+    )
+    cases: list[ReviewCase] = []
+    for row_id, channel, intent, ai_body, body, author, history in rows:
+        for reasons, code, at in _reviews(history):
+            cases.append(
+                ReviewCase(
+                    id=row_id,
+                    channel=channel,
+                    intent=intent,
+                    ai_body=ai_body or body,
+                    owner_body=body if author == gate.OWNER else None,
+                    reasons=reasons,
+                    code=code,
+                    at=at,
+                )
+            )
+    return cases
+
+
+async def review_count(session: AsyncSession) -> int:
+    """How many rows hold a red-line corpus review case."""
+    value = await session.scalar(
+        sa.select(sa.func.count()).select_from(OutboxMessage).where(_has(REVIEW_FIELD))
+    )
+    return int(value or 0)
+
+
 __all__ = [
     "APPROVED",
+    "AUTO_NOTICE_FIELD",
     "BLOCKED",
     "CANCELLED",
     "CARD_FIELD",
@@ -2148,10 +2501,16 @@ __all__ = [
     "FAILED",
     "FLOOD_NOTICE_SECONDS",
     "FLOOD_WAIT_CODE",
+    "MISTAKE_FIELD",
     "NO_COMMAND",
     "OWNER_COMMAND_ORIGIN",
     "PENDING",
+    "RECHECK_LOOKBACK",
     "REDRAFT_CODES",
+    "REVIEW_EDIT",
+    "REVIEW_FIELD",
+    "REVIEW_INCIDENT",
+    "REVIEW_MISTAKE",
     "SENDING",
     "SENT",
     "SHADOW",
@@ -2160,6 +2519,7 @@ __all__ = [
     "UNKNOWN",
     "AlreadyAnswered",
     "Approval",
+    "AutoSent",
     "CardWarnings",
     "ClaimedSend",
     "FloodWait",
@@ -2169,9 +2529,12 @@ __all__ = [
     "OutboxError",
     "PacingPlan",
     "Reconciled",
+    "ReviewCase",
     "SendOutcome",
+    "StaleTap",
     "allowed_tokens",
     "approve",
+    "auto_untold",
     "cancel",
     "card_warnings",
     "channel_send_enabled",
@@ -2183,18 +2546,28 @@ __all__ = [
     "expire_due",
     "expire_edited",
     "fail",
+    "flag_mistake",
     "flood_waits",
+    "has_entry",
     "idempotency_key",
+    "latest_value",
+    "mark_auto_noticed",
     "mark_carded",
     "mark_told",
+    "note_review",
     "outcomes_untold",
+    "owner_question_bank",
     "owner_text",
     "pacing_for",
     "preview",
     "quiet_until",
+    "recheck_sent",
     "reconcile",
     "record_warning",
+    "review_cases",
+    "review_count",
     "safety_readable",
+    "sent_auto_ids",
     "snapshot",
     "unknown_untold",
     "unsafe_inbound",

@@ -63,6 +63,21 @@ MODE_RANK: Final[dict[Mode, int]] = {mode: rank for rank, mode in enumerate(MODE
 DEFAULT_MODE: Final[Mode] = "shadow"
 
 GLOBAL: Final = "global"
+# The row whose history holds the owner's question bank (JV-23, qbank.py):
+# not a mode scope, never read by the mode resolution.
+QUESTION_BANK: Final = "question_bank"
+
+# Intents that may ever be sent on their own (§6.2 as JV-23 binds it): a
+# greeting, information gathering, a general question that quotes an
+# approved KB entry. Everything else always goes to the owner: a price, a
+# discount, payment terms, a deadline, a promise, a guarantee, a payment
+# claim, an identity question, a complaint, a legal matter, other people,
+# ``other``, and the holding reply (``stall``) that answers any of them.
+AUTO_INTENTS: Final = frozenset({"greeting", "info_gathering", "general_question"})
+# The refusal of ``auto`` for an intent outside AUTO_INTENTS.
+NEVER_AUTO: Final = "never_auto"
+# The history ``code`` of a mode the rollout took back to draft (JV-23).
+DEMOTED: Final = "draft"
 
 # pause_reason / breaker_reason values (String(32)).
 PAUSE_OWNER: Final = "owner"
@@ -215,21 +230,43 @@ def stop_for(policies: Policies, channel: str, now: datetime) -> Stop | None:
 
 
 def _entry(
-    field: str, old: object, new: object, *, by: str, now: datetime
+    field: str,
+    old: object,
+    new: object,
+    *,
+    by: str,
+    now: datetime,
+    code: str | None = None,
 ) -> dict[str, object]:
-    return {
+    entry: dict[str, object] = {
         "at": now.isoformat(),
         "field": field,
         "old": old.isoformat() if isinstance(old, datetime) else old,
         "new": new.isoformat() if isinstance(new, datetime) else new,
         "by": by,
     }
+    if code is not None:
+        entry["code"] = code
+    return entry
+
+
+def scope_intent(scope: str) -> str | None:
+    """The intent an ``intent:<i>`` or ``channel:<c>:intent:<i>`` scope names."""
+    head, sep, intent = scope.rpartition("intent:")
+    if not sep or (head and not head.startswith("channel:")):
+        return None
+    return intent or None
 
 
 async def _locked(session: AsyncSession, scope: str) -> JarvisPolicy:
-    """The scope's row under a row lock, created when missing."""
+    """The scope's row under a row lock, created when missing. The row is
+    read fresh (``populate_existing``): an instance already in the session
+    would keep what it held before the lock waited for another commit."""
     row: JarvisPolicy | None = await session.scalar(
-        sa.select(JarvisPolicy).where(JarvisPolicy.scope == scope).with_for_update()
+        sa.select(JarvisPolicy)
+        .where(JarvisPolicy.scope == scope)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if row is not None:
         return row
@@ -299,7 +336,9 @@ async def trip_breaker(
     by: str,
     now: datetime,
 ) -> JarvisPolicy:
-    """Stop one channel after a platform limit; reading goes on (§5.7)."""
+    """Stop one channel after a platform limit; reading goes on (§5.7). Every
+    reply kind the channel sent on its own goes back to draft (§6.4,
+    ``demote_channel``); that never stops the trip."""
     row = await _locked(session, channel_scope(channel))
     history = list(row.history or [])
     history.append(_entry("breaker", row.breaker_reason, reason, by=by, now=now))
@@ -307,21 +346,123 @@ async def trip_breaker(
     row.breaker_until = until
     row.history = history
     await session.flush()
+    try:
+        async with session.begin_nested():
+            await demote_channel(session, channel=channel, code="breaker", now=now)
+    except Exception as exc:
+        # The trip holds whatever the demotion did (rule 25): the claim stops
+        # on the breaker either way, and the rollout job demotes again.
+        log.error(
+            "breaker demotion failed",
+            extra={"channel": channel, "error": type(exc).__name__},
+        )
     return row
 
 
 async def set_mode(
-    session: AsyncSession, *, scope: str, mode: Mode | None, by: str, now: datetime
+    session: AsyncSession,
+    *,
+    scope: str,
+    mode: Mode | None,
+    by: str,
+    now: datetime,
+    code: str | None = None,
 ) -> JarvisPolicy:
-    """Store a scope's mode (None inherits). The ceiling still applies."""
+    """Store a scope's mode (None inherits). The ceiling still applies.
+    ``auto`` for an intent outside AUTO_INTENTS is refused (``NEVER_AUTO``):
+    no setting makes a price, a promise or a holding reply autonomous."""
+    intent = scope_intent(scope)
+    if mode == "auto" and intent is not None and intent not in AUTO_INTENTS:
+        raise ValueError(NEVER_AUTO)
     row = await _locked(session, scope)
     if row.mode != mode:
         history = list(row.history or [])
-        history.append(_entry("mode", row.mode, mode, by=by, now=now))
+        history.append(_entry("mode", row.mode, mode, by=by, now=now, code=code))
         row.mode = mode
         row.history = history
         await session.flush()
     return row
+
+
+async def lock_scope(session: AsyncSession, scope: str) -> JarvisPolicy:
+    """A scope's row under a row lock, created when missing (JV-23: the
+    rollout's notes and the question bank)."""
+    return await _locked(session, scope)
+
+
+async def note(
+    session: AsyncSession,
+    *,
+    scope: str,
+    field: str,
+    old: object,
+    new: object,
+    by: str,
+    now: datetime,
+    code: str | None = None,
+) -> JarvisPolicy:
+    """Append one ``{at, field, old, new, by}`` entry to a scope's history,
+    under its row lock (JV-23: an offer, an incident, a told demotion, a
+    question bank edit). Nothing else of the row changes."""
+    row = await _locked(session, scope)
+    row.history = [
+        *(row.history or []),
+        _entry(field, old, new, by=by, now=now, code=code),
+    ]
+    await session.flush()
+    return row
+
+
+async def demote(
+    session: AsyncSession,
+    *,
+    channel: str,
+    intent: str,
+    code: str,
+    by: str,
+    now: datetime,
+) -> bool:
+    """Take one channel × intent back to draft (§6.4), whatever scope made
+    it ``auto`` (the channel × intent itself, the intent, the channel or the
+    global mode): its own scope is set to ``draft``, which wins over every
+    broader one. True when it was ``auto`` before. Restricting is immediate:
+    an approved row of it not sent yet goes back to the owner's card at the
+    claim (``gate`` re-resolves the mode)."""
+    policies = await load(session)
+    if stored_mode(policies, channel, intent) != "auto":
+        return False
+    await set_mode(
+        session,
+        scope=channel_intent_scope(channel, intent),
+        mode=DEMOTED,
+        by=by,
+        now=now,
+        code=code,
+    )
+    log.warning(
+        "jarvis intent demoted",
+        extra={"channel": channel, "intent": intent, "code": code},
+    )
+    return True
+
+
+async def demote_channel(
+    session: AsyncSession,
+    *,
+    channel: str,
+    code: str,
+    now: datetime,
+    by: str = "auto:policy",
+) -> list[str]:
+    """Every intent the channel may send on its own, back to draft (a
+    breaker trip, the cost cap twice in a week). The intents demoted."""
+    demoted: list[str] = []
+    for intent in sorted(AUTO_INTENTS):
+        if await demote(
+            session, channel=channel, intent=intent, code=code, by=by, now=now
+        ):
+            demoted.append(intent)
+    return demoted
 
 
 # --- reply rules and hard exclusions ---------------------------------------------------
@@ -1384,8 +1525,10 @@ async def suggest_personal(
 
 
 __all__ = [
+    "AUTO_INTENTS",
     "BUSINESS_WORDS",
     "DEFAULT_MODE",
+    "DEMOTED",
     "EXCLUDED_BROADCAST",
     "GLOBAL",
     "GROUP_NOT_ADDRESSED",
@@ -1396,8 +1539,10 @@ __all__ = [
     "LINK_KEY",
     "MODES",
     "MODE_RANK",
+    "NEVER_AUTO",
     "PAUSE_OWNER",
     "PERSONAL_CHAT",
+    "QUESTION_BANK",
     "REASON_GROUP",
     "REASON_PERSONAL",
     "RELATION_WORDS",
@@ -1420,6 +1565,8 @@ __all__ = [
     "channel_intent_scope",
     "channel_scope",
     "chat_kind",
+    "demote",
+    "demote_channel",
     "describe",
     "effective_mode",
     "enabled_group_titles",
@@ -1433,12 +1580,14 @@ __all__ = [
     "links_of",
     "load",
     "load_rules",
+    "lock_scope",
     "looks_like_bot",
     "lower_mode",
     "mark_chat",
     "mark_person",
     "mark_personal",
     "never_rule",
+    "note",
     "pause",
     "personal_chats",
     "personal_rule",
@@ -1446,6 +1595,7 @@ __all__ = [
     "personal_signals",
     "resume",
     "rule_mode",
+    "scope_intent",
     "set_group_reply",
     "set_mode",
     "snapshot",

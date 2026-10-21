@@ -1299,10 +1299,11 @@ async def test_red_line_guard_gates_ai_drafts(session, real_guard):
 
 
 async def test_the_allowlist_decides_auto_with_the_real_guard(session, real_guard):
-    """With the real guard: a greeting and a question in an auto-eligible
-    intent keep ``shapes_ok`` and go out on their own; a free-form statement
-    the red lines let through is a draft card; a KB text the caller hands
-    in is refused."""
+    """With the real guard: a greeting and a question from the owner's
+    question bank in an auto-eligible intent keep ``shapes_ok`` and go out
+    on their own; a question outside the bank (JV-23) and a free-form
+    statement the red lines let through are draft cards; a KB text the
+    caller hands in is refused."""
     from tests.test_outbox import NOW, _ai_row, _inbound, _setup
 
     person, trigger = await _setup(session, mode="auto")
@@ -1310,12 +1311,23 @@ async def test_the_allowlist_decides_auto_with_the_real_guard(session, real_guar
         session,
         person,
         trigger,
-        body="Assalomu alaykum, aka! Yuk qayerdan qayerga, necha kilo?",
+        body="Assalomu alaykum, aka! Yuk qaysi shahardan?",
         intent="info_gathering",
     )
     assert asked.state == "approved" and asked.approved_by == "auto:policy"
     assert asked.guard["shapes_ok"] is True
     assert asked.guard["shapes"] == ["courtesy", "question"]
+    unbanked = await _ai_row(
+        session,
+        person,
+        trigger,
+        body="Assalomu alaykum, aka! Yuk qayerdan qayerga, necha kilo?",
+        intent="info_gathering",
+    )
+    assert unbanked.state == "draft" and unbanked.last_error == "unapproved_statement"
+    assert unbanked.guard["verdict"] == "pass" and unbanked.guard["shapes_ok"] is False
+    assert unbanked.guard["shapes"] == ["courtesy", "free_question"]
+    assert unbanked.guard["flags"] == ["free_question"]
     free = await _ai_row(session, person, trigger, body="Bosh ustiga, aka.")
     assert free.state == "draft" and free.last_error == "unapproved_statement"
     assert free.guard["verdict"] == "pass" and free.guard["shapes_ok"] is False

@@ -58,6 +58,13 @@ This plan continues `docs/handoff-plan.md` (WP-01…85). Its work packages are n
      «kutib turing» shablonlari va siz tasdiqlagan bilimlar bazasidagi matn — so'zma-so'z. Boshqa
      har qanday erkin gap («mol bizda, aka», «hammasi joyida», «как штык») hech qachon o'zi
      ketmaydi: u qoralama bo'lib sizga keladi va siz o'qib tasdiqlamaguningizcha yuborilmaydi.
+   - **O'zi beradigan savollar faqat «savollar banki»dan:** qayerdan, qayerga, qanday yuk, necha
+     kilo, necha kub, necha joy, GS kodi, yukni kim qabul qiladi, hujjat yoki invoys bormi, yuk
+     qaysi manzilda — o'zbekcha (lotin va kirill) va ruscha, vaqt, narx va va'dasiz. Bankni
+     `/savolbank` bilan o'zingiz tahrirlaysiz (har yangi savol tekshiriladi va sizning
+     «✅ Qo'shish» tugmangizdan keyingina qo'shiladi). Bankda yo'q har qanday savol qoralama bo'lib
+     sizga keladi. Bu qoida faqat kodda emas, ma'lumotlar bazasining o'zida ham yozilgan: shakl
+     tekshiruvidan o'tmagan javob hech qachon «avtomatik tasdiqlangan» bo'lib saqlanmaydi.
    - Hech kimga birinchi bo'lib yozmaydi (faqat sizga yozganlarga javob beradi). «Botmisiz?» deb
      so'rashsa, yolg'on gapirmaydi — sizga yo'naltiradi.
 
@@ -72,8 +79,8 @@ This plan continues `docs/handoff-plan.md` (WP-01…85). Its work packages are n
    - Shundan keyin har bir javob turi (salomlashish, ma'lumot so'rash, umumiy savol) alohida
      «avtomatik»ga o'tadi — faqat 7 kundan, 30 ta qoralamadan, 90% o'zgartirishsiz tasdiqdan keyin
      va **faqat siz «Ha» bosganingizda**. Har bir avtomatik javobdan keyin «↩️ Bu xato edi» tugmasi
-     keladi — bossangiz, o'sha tur yana qoralamaga qaytadi. Narx, pul, muddat, va'da — hech qachon
-     avtomatik emas.
+     keladi — bossangiz, o'sha tur yana qoralamaga qaytadi. Narx, pul, muddat, va'da va «kutib
+     turing» javobi — hech qachon avtomatik emas.
    - `/jarvis toxtat` — hammasini darhol to'xtatadi. MIYA'ning qolgan qismi ishlayveradi.
 
 5. **Sizdan nima kerak bo'ladi.**
@@ -208,12 +215,15 @@ state is account-takeover-grade. A restore therefore needs a re-pair; the guide 
     closed into a fixed stall template plus an escalation.
 13a. **AI text goes out on its own only in approved shapes.** The lexicons cannot list every
     way to say a promise, so an autonomous send (`auto:policy`, no owner tap) needs the statement
-    allowlist as well as the red lines: every sentence is a courtesy from a closed set, a question,
-    a fixed stall template (or the owner's override that passed the stall role), or the verbatim
+    allowlist as well as the red lines: every sentence is a courtesy from a closed set, a question
+    from the owner's question bank (JV-23, `qbank`; any other question is a `free_question`), a
+    fixed stall template (or the owner's override that passed the stall role), or the verbatim
     text of an active owner-approved KB entry (`redlines.check_shapes`, `shapes_ok` in the bound
     verdict). Any other sentence is an `unapproved_statement`: it never blocks a draft card, but
     such a row is never approved for auto send, and the gate sends an auto row without a passing
-    shape check back to the owner's card at the claim.
+    shape check back to the owner's card at the claim. The database enforces it as well: an
+    autonomous AI row without `shapes_ok` true cannot be stored (`ck_outbox_messages_auto_shapes`,
+    0028).
 14. **AI-authored text contains no digits** except a GS code or waybill that appears verbatim in
     the same chat's inbound messages.
 15. **The client responder has no tools and no private data.** Its inputs are this thread, the
@@ -278,6 +288,7 @@ No new Python process. One new optional Node process.
                                                                |                 |                 |
   bot (aiogram, owner only) -----------------------------------+  records decisions only:        |
      /jarvis /shaxsiy /guruhai /uslub /bilim /qoralamalar       |  approve, edit, snooze, mark    |
+     /savolbank                                                 |                                 |
      command mode -> ACT_TOOLS -> outbox.create (proposal)      |  personal (row lock, re-check)  |
                                                                                  |                 |
   api (FastAPI) ---------------------------------------------------------------- +                 |
@@ -318,7 +329,8 @@ No new Python process. One new optional Node process.
             GMAIL_/WHATSAPP_DAILY_SEND_CAP), cost cap; owner-authored rows count towards
             the per-account gap and channel caps (anti-ban), not the AI caps
           guard binding: body_sha256 unchanged, else re-guard (red lines, for every row);
-            an auto row also needs shapes_ok (statement allowlist), else back to draft
+            an auto row also needs shapes_ok (statement allowlist, questions from the
+            owner's question bank, JV-23), else back to draft
             (unapproved_statement), never sent
           payload shape: text body only (rule 27)
           quiet hours for AI auto rows
@@ -368,7 +380,7 @@ by the deterministic `when.py`. Nothing leaves without a tap. `POST /v1/ask` sta
 
 `miya/jarvis/` (mypy strict): `chatkey`, `policy`, `caps`, `gate`, `outbox`, `costs`, `redlines`,
 `stalls`, `envelope`, `intent`, `style`, `style_prompt`, `kb`, `draft`, `guard`, `responder`,
-`chat_state`, `cards`, `commands`, `rollout`.
+`chat_state`, `cards`, `commands`, `rollout`, `qbank`.
 Shared helpers in `miya/services/`: `safety.py` (pure), `when.py` (pure), `receipts.py`,
 `sheets.py`, `sheets_sync.py`, `gmail.py`, `authorship.py`, `retry.py`, `wa_ingest.py`; and
 `miya/logs.py`. The only Telethon write module is `miya/userbot/sender.py`.
@@ -379,8 +391,9 @@ Ref letters (verify against `miya/bot/formatting.py:201` and the question-log re
 `j` outbox row, `e` escalation, `r` receipt, `b` knowledge entry.
 
 Callback prefixes (all new; taken today: `birl ch cl kod md mx ng rec rv sv unut vq`):
-`jv:` drafts and auto-send notices, `je:` escalations, `ja:` owner-command confirmations, `jr:`
-personal rules, `js:` style profile, `kb:` knowledge base, `jg:` graduation, `rcp:` receipts.
+`jv:` drafts and auto-send notices (`jv:x:<id>` «↩️ Bu xato edi»), `je:` escalations, `ja:`
+owner-command confirmations, `jr:` personal rules, `js:` style profile, `kb:` knowledge base,
+`jg:` graduation, `qb:` the question bank (JV-23), `rcp:` receipts.
 Payloads are id-only and at most 64 bytes. **None of them is added to `_button_handlers`**
 (`handlers.py:2378-2384`), so a typed «hammasi ha» can never approve a send.
 
@@ -389,7 +402,7 @@ Payloads are id-only and at most 64 bytes. **None of them is added to `_button_h
 ## 4. Data model
 
 Conventions for every table: state columns are `String(N)` plus a named CHECK (only two new
-native enum labels, in 0028); `created_at`/`updated_at` via `created_at_column`; `history JSONB
+native enum labels, in 0029); `created_at`/`updated_at` via `created_at_column`; `history JSONB
 NOT NULL DEFAULT '[]'::jsonb` where a row has a lifecycle, entries `{at, field, old, new, by}`;
 money `Numeric(14,2)` + `CURRENCY` + `CHECK > 0`; every CASCADE/SET NULL FK is the first column of
 an index; each new model goes into `models.__all__`, `tests/conftest.py::_truncate` (FK order),
@@ -408,9 +421,10 @@ an index; each new model goes into `models.__all__`, `tests/conftest.py::_trunca
 | `0025_jarvis_core` | JV-11 | `jarvis_policy`, `reply_rules`, `jarvis_chat_state`, `escalations`, `outbox_messages` |
 | `0026_owner_style` | JV-14 | `owner_style_profiles`, `owner_style_examples`, `owner_style_people`, `chat_monitors.style_import_*` |
 | `0027_knowledge_base` | JV-15 | `knowledge_entries` |
-| `0028_source_labels` | JV-24 | `interaction_source` + `'whatsapp'`, `'email'` |
-| `0029_channel_accounts` | JV-24 | `channel_accounts`, `wa_chats`, `email_threads`, `contact_handles`, interaction FKs |
-| `0030_windows_any_chat` | JV-25 | windows and passages for any chat kind |
+| `0028_auto_shapes` | JV-23 | `ck_outbox_messages_auto_shapes`; `jarvis_policy` scope `question_bank` |
+| `0029_source_labels` | JV-24 | `interaction_source` + `'whatsapp'`, `'email'` |
+| `0030_channel_accounts` | JV-24 | `channel_accounts`, `wa_chats`, `email_threads`, `contact_handles`, interaction FKs |
+| `0031_windows_any_chat` | JV-25 | windows and passages for any chat kind |
 
 ### 4.2 Tables
 
@@ -455,7 +469,8 @@ so `merge_into._fk_columns` does not list it: a merged-away person's follow-up r
 tombstone and is cleared.
 
 **0025 — `jarvis_policy`.** `scope text PK`: `'global' | 'channel:<c>' | 'intent:<i>' |
-'channel:<c>:intent:<i>'`; `mode String(8) NULL` (NULL inherits) CHECK
+'channel:<c>:intent:<i>'` (0028 adds `'question_bank'`, the row whose `history` is the owner's
+question bank); `mode String(8) NULL` (NULL inherits) CHECK
 `('off','shadow','draft','auto')`; `paused_until`, `pause_reason String(32)`, `breaker_until`,
 `breaker_reason String(32)`, `history`. The data step seeds `('global','shadow')`.
 
@@ -499,7 +514,7 @@ NULL, indexed; `last_inbound_interaction_id` FK interactions SET NULL, indexed;
   `tg_chat_id BIGINT`; `to_address text`.
 - FKs, each indexed: `person_id` SET NULL; `trigger_interaction_id` CASCADE (purging the client
   message takes the draft); `command_interaction_id` SET NULL; `sent_interaction_id` SET NULL;
-  `escalation_id` SET NULL. `account_id` is added in 0029.
+  `escalation_id` SET NULL. `account_id` is added in 0030.
 - `reply_to_external_id text`.
 - `origin String(16)` CHECK `('auto_reply','stall','owner_command','escalation')`;
   `intent String(24)`; `authored_by String(8)` CHECK `('ai','owner')`.
@@ -518,6 +533,8 @@ NULL, indexed; `last_inbound_interaction_id` FK interactions SET NULL, indexed;
 - `ck_outbox_messages_sent_approved CHECK (state <> 'sent' OR approved_by IS NOT NULL)`.
 - `ck_outbox_messages_guarded CHECK (state NOT IN ('approved','sending','sent') OR
   authored_by='owner' OR guard->>'verdict'='pass')`.
+- `ck_outbox_messages_auto_shapes` (0028, JV-23): an AI row with `approved_by='auto:policy'`
+  carries `guard->'shapes_ok' = true` (see 0028 below).
 - `ix_outbox_messages_ready (channel, next_attempt_at) WHERE state='approved'`;
   `ix_outbox_messages_sent_at (sent_at) WHERE sent_at IS NOT NULL`;
   `ux_outbox_messages_external (channel, external_message_id) WHERE external_message_id IS NOT
@@ -549,10 +566,22 @@ NULL`, `lang String(4)`, `tags text[]` GIN; `state` CHECK `('suggested','active'
 `guard JSONB`; the Memory search columns copied exactly (embedding + HNSW + unembedded partial
 index, `search_norm` + computed `search_tsv` GIN + trgm GIN); `history`.
 
-**0028.** `ALTER TYPE interaction_source ADD VALUE IF NOT EXISTS 'whatsapp'`, then `'email'`.
+**0028 — autonomy, defense in depth (JV-23).** No new table. `ck_outbox_messages_auto_shapes
+CHECK (authored_by <> 'ai' OR approved_by IS DISTINCT FROM 'auto:policy' OR
+COALESCE(guard->'shapes_ok' = 'true'::jsonb, false))`: an AI-authored row approved by the policy
+itself must carry a passing shape check (rule 13a with the question bank), in every state; the
+JSON boolean `true` only, so neither a missing key (NULL) nor the string `"true"` passes (the
+binding decision named `guard->>'shapes_ok' = 'true'`; the jsonb comparison is the same line
+without the string loophole). The data step first takes the policy approver off rows that would
+break it (an `approved` one goes back to `draft` with `unapproved_statement`, a finished one keeps
+its state), each in its history; a row on the wire without a passing check cannot exist and stops
+the upgrade if it does. `ck_jarvis_policy_scope` gains `question_bank`. Downgrade deletes that row
+and restores the old pattern.
+
+**0029.** `ALTER TYPE interaction_source ADD VALUE IF NOT EXISTS 'whatsapp'`, then `'email'`.
 Nothing else in the same run uses them. Downgrade leaves the labels (PostgreSQL cannot drop them).
 
-**0029 — channels.**
+**0030 — channels.**
 - `channel_accounts`: `channel` CHECK `('telegram','whatsapp','gmail')`, `label`, `address`,
   `uq (channel, address)`; `state` CHECK `('pending_link','linked','logged_out','restricted',
   'banned','paused','error')`; `read_enabled DEFAULT true`, `send_enabled DEFAULT false`;
@@ -574,7 +603,7 @@ Nothing else in the same run uses them. Downgrade leaves the labels (PostgreSQL 
   metadata ? 'gmail_message_id'`.
 - `outbox_messages` gains `account_id` FK SET NULL, indexed.
 
-**0030 — any-chat windows.** `conversation_windows.tg_chat_id` and `passages.tg_chat_id` become
+**0031 — any-chat windows.** `conversation_windows.tg_chat_id` and `passages.tg_chat_id` become
 nullable; both gain `wa_chat_id` and `email_thread_id` (FK CASCADE, indexed); CHECK
 `num_nonnulls(tg_chat_id, wa_chat_id, email_thread_id) = 1`; the `ix_interactions_unwindowed`
 predicate is rebuilt with JSON and FK conditions (no `source = 'whatsapp'` literal).
@@ -658,7 +687,25 @@ never an autonomous send.
      does («… груз пришёл», «… доедет»); offer («… kelsa qulaymi?», «Yuborsakmi?»); or state
      the cargo's status or place. The words before and after the question word must pass the
      red lines read as a statement (their verb forms are read by the grammar). A refused
-     question is a statement: a draft card, never a block;
+     question is a statement: a draft card, never a block. **The question bank (JV-23):** the
+     grammar cannot list every way a question carries an offer, so for an autonomous send a
+     question must also be one of the owner's question bank (`miya/jarvis/qbank.py`): a closed,
+     owner-editable list seeded with the questions a cargo business asks (origin city,
+     destination, cargo type, weight, volume or cubes, number of places, GS code, contact
+     person, documents or invoice, pickup address) in Uzbek Latin, Uzbek Cyrillic and Russian,
+     with no time, price or promise in them; every seed passes the red-line guard in the reply
+     role and this shape check. A question is matched after normalisation
+     (`redlines.bank_key`), and the only slot fillers are the counterparty's name, words of
+     address, a courtesy segment and the GS codes and waybills the client wrote in the chat.
+     A grammatical question outside the bank is a `free_question` (flag `free_question`): it
+     never blocks and changes nothing on a draft card, but `shapes_ok` is false, so it is never
+     sent without the owner's tap. The owner edits the bank with `/savolbank` (list, add,
+     remove); each addition is guarded (one question, the reply role, the grammar) and enters
+     the bank only on the owner's «✅ Qo'shish» (`qb:` buttons, not in `_button_handlers`); a
+     removal is at once. The bank lives in the history of the `jarvis_policy` row
+     `question_bank` (0028), so no table is added and the audit trail is the bank. The outbox
+     loads it itself, like the KB entries, and the claim guards an autonomous row that asked a
+     bank question again with the bank in force then;
    - **stall**: a fixed template of §5.3 or a sentence of one, or the owner's override that
      passed the `stall` role;
    - **kb**: the verbatim text (after normalisation) of an active owner-approved KB entry, a
@@ -669,13 +716,16 @@ never an autonomous send.
 
    Any other sentence makes the text `unapproved_statement` (a flag that never blocks; its
    escalation reason is `other`, so no migration). The verdict carries `shapes_ok` (true only when
-   the red lines passed and every sentence has a shape) and the shapes, bound to `body_sha256` like
-   the rest. In draft mode the flag changes nothing: the owner reads every text. `outbox.create`
-   approves an auto-intent row on its own only with `shapes_ok`, else it becomes a draft card
-   (`last_error=unapproved_statement`); `outbox.approve` is the owner's tap only and refuses
+   the red lines passed and every sentence has a shape, every question one of the bank's) and the
+   shapes, bound to `body_sha256` like the rest; the database refuses an autonomous row without
+   it (`ck_outbox_messages_auto_shapes`, 0028). In draft mode the flag changes nothing: the
+   owner reads every text. `outbox.create` approves an auto-intent row on its own only with
+   `shapes_ok`, else it becomes a draft card (`last_error=unapproved_statement`, for a statement
+   and for a `free_question` alike); `outbox.approve` is the owner's tap only and refuses
    `by=auto:policy`; `gate.evaluate` redrafts an auto row whose bound verdict lacks a passing
-   shape check, and one whose re-guarded body fails it. The deterministic
-   blocklist stays binding for every row.
+   shape check, and one whose re-guarded body fails it; a gate decision that binds a verdict
+   without one also takes the policy approver off the row. The deterministic blocklist stays
+   binding for every row.
 4. **Model check** (EXTRACT_MODEL, JSON). It can block or escalate; it can never approve or
    override a deterministic block. An error, refusal or parse failure counts as a block.
 
@@ -690,8 +740,10 @@ Stalls are fixed templates keyed by reason × script (Latin, Cyrillic, Russian) 
 generated. The owner may override a template; the override passes the guard in the `stall` role.
 At most one stall per open escalation; a second push from the client gets silence and a higher
 escalation priority. No stall invents a fact ("I'm in a meeting"). Every template, and an override
-that passed the `stall` role, is an approved shape for the statement allowlist (§5.2 step 3), so a
-stall can go out on its own once the `stall` intent graduates.
+that passed the `stall` role, is an approved shape for the statement allowlist (§5.2 step 3). A
+holding reply itself is never sent on its own (JV-23 binding decision: the `stall` intent never
+graduates, since it answers a price, deadline, promise or payment message); a stall sentence in a
+graduated intent's text is still an approved shape.
 
 ### 5.4 Who the AI may write to
 
@@ -723,7 +775,9 @@ immediate; loosening needs a confirm tap.
 - The responder gets no tools and no private data. Its input is this chat's last
   `JARVIS_HISTORY_TURNS` turns in an untrusted envelope (`windows.quote_body`, bidi and zero-width
   stripped, truncated, hidden HTML and quoted mail chains removed), the style prompt, scrubbed
-  examples and active KB entries. Forbidden inputs (pinned by a test): `Person.notes`, debts,
+  examples, active KB entries and, in an auto-eligible intent, the owner's question bank (JV-23:
+  owner-approved questions, quoted as JSON strings like the KB entries; the prompt allows only
+  these, word for word). Forbidden inputs (pinned by a test): `Person.notes`, debts,
   promises, claims, transactions, memories, the RAG tools, other chats, codes not in this thread,
   the owner's phone or card numbers.
 - Code fixes the recipient and channel; output is strict JSON `{reply, needs_owner, reason_code}`.
@@ -778,9 +832,13 @@ intent to `auto` needs the owner to raise the ceiling in `.env` as well as tap �
 ### 6.2 Intents
 
 - May ever be auto: `greeting`, `info_gathering`, `general_question` (only when a KB entry
-  matched), `stall`.
+  matched). `policy.AUTO_INTENTS` holds them; `policy.set_mode` refuses `auto` for any other
+  intent scope.
 - Always escalate: `price`, `discount`, `payment_terms`, `deadline`, `promise`, `guarantee`,
   `payment_claim`, `identity`, `complaint`, `legal`, `other_people`.
+- Never auto either (JV-23): `stall`, the holding reply those escalations queue (it waits for the
+  owner's tap like every reply to a red-line message), and `other`. So a message with a payment
+  claim or a price, deadline or promise ask never gets an autonomous reply of any kind.
 
 ### 6.3 Timeline
 
@@ -798,15 +856,31 @@ intent to `auto` needs the owner to raise the ceiling in `.env` as well as tap �
 
 All must hold: at least `JARVIS_GRADUATION_MIN_DAYS` (7) days in `draft`; at least
 `JARVIS_GRADUATION_MIN_DRAFTS` (30) drafts; at least `JARVIS_GRADUATION_MIN_APPROVAL_PCT` (90) %
-approved without an edit; zero «Bu xato edi» flags; no channel breaker trip in the last 7 days.
-Then the bot offers promotion with a button. Nothing promotes silently. Graduation only lets an
+approved without an edit; zero «Bu xato edi» flags; no channel breaker trip in the last 7 days;
+the cost cap not reached on two days of the last week (JV-23: the next daily job would demote it
+again). Then the bot offers promotion with a button. Nothing promotes silently. Graduation only lets an
 intent go out on its own; each row of it still needs, at creation and at the claim, the
 deterministic blocklist, the model guard (JV-16, block-only) **and** `shapes_ok` from the statement
-allowlist (§5.2 step 3). A graduated intent's text with a free-form statement is a draft card.
-The approval-rate metric counts those drafts like any other.
+allowlist (§5.2 step 3), where every question must come from the owner's question bank
+(`/savolbank`). A graduated intent's text with a free-form statement or a question outside the bank
+is a draft card. The approval-rate metric counts those drafts like any other. The database holds
+the same line (`ck_outbox_messages_auto_shapes`, 0028): an autonomous row without a passing shape
+check cannot be stored, whatever code path tried.
 
-**Demotion (automatic, back to draft):** a «Bu xato edi» tap, a guard incident found after a send,
-a breaker trip, or the cost cap hit twice in a week.
+Metrics are counted per channel × intent from `outbox_messages` since the window began: its last
+mode change or incident (an owner's «Bu xato edi», an edit that took out a red-line sentence, a
+red line found after a send). Drafts the owner decided on count (sent, edited, cancelled, expired);
+ones still waiting count neither way; «approved without an edit» is the owner's tap on the AI's
+own words. Percentages round down. An offer is made at most once every
+`JARVIS_GRADUATION_MIN_DAYS` days; the tap re-checks the criteria under the scope's row lock. The
+promotion needs the env ceiling too: with `JARVIS_MODE` below `auto` the tap stores `auto` and the
+owner is shown «Avtomatik rejim uchun serverdagi .env da JARVIS_MODE=auto qilish kerak.».
+
+**Demotion (automatic, back to draft):** a «Bu xato edi» tap, a guard incident found after a send
+(the daily job reads every autonomous send of the week again with that day's guard), a breaker trip, or
+the cost cap hit twice in a week. Each is told to the owner once. The sent text of a «Bu xato
+edi», of an incident, and of a draft whose red-line or free-form sentence the owner took out in an
+edit is kept on its outbox row as a review case for the red-line corpus.
 
 ### 6.5 Caps by stage
 
@@ -865,10 +939,10 @@ Every key below goes to `miya/config.py` (with `Field` bounds or `Literal`), `.e
 | `JARVIS_REPLY_DELAY_MAX_SECONDS` | `7` | JV-19 | Upper bound; validator min ≤ max |
 | `JARVIS_TYPING_CHARS_PER_SECOND` | `6` | JV-19 | Typing time per character |
 | `JARVIS_TYPING_MAX_SECONDS` | `15` | JV-19 | Typing time cap |
-| `JARVIS_GRADUATION_MIN_DAYS` | `7` | JV-23 | |
-| `JARVIS_GRADUATION_MIN_DRAFTS` | `30` | JV-23 | |
-| `JARVIS_GRADUATION_MIN_APPROVAL_PCT` | `90` | JV-23 | |
-| `JARVIS_AUTO_IN_QUIET_HOURS` | `false` | JV-23 | |
+| `JARVIS_GRADUATION_MIN_DAYS` | `7` | JV-23 | Days in draft before an intent is offered; also the gap between two offers |
+| `JARVIS_GRADUATION_MIN_DRAFTS` | `30` | JV-23 | Drafts the owner decided on before an offer |
+| `JARVIS_GRADUATION_MIN_APPROVAL_PCT` | `90` | JV-23 | Share of them approved without an edit, rounded down |
+| `JARVIS_AUTO_IN_QUIET_HOURS` | `false` | JV-23 | Autonomous rows go out in the quiet hours too |
 | `GMAIL_ENABLED` | `false` | JV-26 | Read switch |
 | `GMAIL_TOKEN_JSON` | `./secrets/gmail_token.json` | JV-26 | Separate from the calendar token |
 | `GMAIL_PULL_MINUTES` | `2` | JV-26 | `history.list` poll |
@@ -934,7 +1008,8 @@ with one exception: **JV-10 lands right after JV-02**, because JV-06 is its firs
 commit order is therefore JV-01, JV-02, JV-10, JV-03 … JV-09, JV-11 … JV-31; every WP's
 dependencies precede it in that order (the graph is acyclic). The migration chain follows the
 same order without gaps: 0022 (JV-03), 0023 (JV-04), 0024 (JV-07), 0025 (JV-11), 0026 (JV-14),
-0027 (JV-15), 0028 and 0029 (JV-24), 0030 (JV-25), each `down_revision` the previous one. JV-10
+0027 (JV-15), 0028 (JV-23), 0029 and 0030 (JV-24), 0031 (JV-25), each `down_revision` the
+previous one. JV-10
 must be merged before JV-19; JV-12 before the first draft card is ever shown.
 
 ### 8.1 Coverage: every spec requirement and owner decision has a WP
@@ -2254,7 +2329,8 @@ open now, the observation-mode escalations apart, the sends the owner commanded,
 doubt (`unknown`, by their claim moment), the spend (`costs.spend_between` over the Jarvis
 operations) and, per intent, the drafts and observation drafts made (`caps.became`), how many
 the owner approved with the AI's words, how many they rewrote (the row turned the owner's,
-`authored_by`; every AI row keeps `ai_body` from the start) and how many strayed (`unapproved_statement`; a rewritten draft is judged by the owner's words). The brief
+`authored_by`; every AI row keeps `ai_body` from the start) and how many strayed (`unapproved_statement`, or since JV-23 `free_question`; a rewritten draft
+is judged by the owner's words). The brief
 gathers yesterday's, the recap today's (`recaps.jarvis_day`), each only with JARVIS_ENABLED and
 in its own savepoint: a failed read logs its error class and leaves that part out, never the
 report. The lines under the headline are shared (`formatting.jarvis_day_lines`, since
@@ -2286,14 +2362,20 @@ the column stays blank. The intent labels moved from `replies.py` to `formatting
 
 #### JV-23 — Rollout controller: per-intent graduation, auto mode, demotion
 
-**Priority** P1 · **Depends on** JV-19, JV-21 · **Migration** none
+**Priority** P1 · **Depends on** JV-19, JV-21 · **Migration** `0028_auto_shapes`
 
 **Goal.** After 1-2 weeks of drafts, autonomy grows to the spec's level one intent at a time,
 always with the owner's yes.
 
-**Files.** `miya/jarvis/rollout.py`, `miya/worker/main.py`, `miya/bot/handlers.py`,
-`miya/bot/keyboards.py`, `miya/bot/replies.py`, `miya/config.py`, `.env.example`, `README.md`,
-`miya/tools/doctor.py`, `tests/test_rollout.py`.
+**Files.** `miya/jarvis/rollout.py`, `miya/jarvis/qbank.py`, `miya/jarvis/policy.py`,
+`miya/jarvis/gate.py`, `miya/jarvis/redlines.py`, `miya/jarvis/outbox.py`, `miya/jarvis/cards.py`,
+`miya/jarvis/status.py` (a `free_question` counts as strayed), `miya/jarvis/caps.py`,
+`miya/jarvis/draft.py` and `miya/jarvis/responder.py` (the drafter is given the question bank),
+`miya/jarvis/__init__.py`, `miya/db/models.py`, `alembic/versions/0028_auto_shapes.py`,
+`miya/worker/main.py`, `miya/bot/handlers.py`, `miya/bot/keyboards.py`, `miya/bot/replies.py`,
+`miya/config.py`, `.env.example`, `README.md`, `miya/tools/doctor.py`, `tests/test_rollout.py`,
+`tests/test_responder.py`, `tests/test_outbox.py`, `tests/test_redlines.py`, `tests/test_style.py`,
+`tests/test_brief_jarvis_lines.py`.
 
 **Behaviour.** `jarvis_rollout` (daily) computes channel × intent metrics from outbox history and
 offers promotion (§6.4) with `jg:y` / `jg:n`. In auto mode rows are approved with `auto:policy`
@@ -2305,19 +2387,77 @@ Breakers and incidents demote automatically. Never-auto intents are rejected. `/
 shows the mode of each intent. Auto rows are held in quiet hours unless
 `JARVIS_AUTO_IN_QUIET_HOURS`.
 
+Two binding decisions from the red-line work are part of this WP:
+
+- **(A) The question bank.** An auto-sendable question must come from a closed, owner-editable
+  question bank (§5.2 step 3): seeded in Uzbek Latin, Uzbek Cyrillic and Russian with the origin
+  city, destination, cargo type, weight, volume or cubes, number of places, GS code, contact
+  person, documents or invoice and pickup address, with no time, price or promise (every seed
+  passes the red-line guard in the reply role and the shape check; a test holds them), matched
+  after normalisation, with slot fillers limited to the counterparty's name or honorific, a
+  courtesy segment, and the GS codes and waybills already in the chat. A free-form AI question
+  stays draft-only: `shapes_ok`
+  is false for auto unless every question sentence matches a bank entry (`free_question`
+  otherwise); drafts are unaffected. The owner edits the bank with `/savolbank` (list, `qo'sh`,
+  `o'chir`); each addition is guarded and enters the bank only on «✅ Qo'shish» (`qb:y|n|d:<ref>`,
+  not in `_button_handlers`). No new table: the bank is the history of the `jarvis_policy` row
+  `question_bank`, replayed over the code seeds (`qbank.replay`); a removal takes the question's
+  twins in the other scripts too (the Latin and Cyrillic texts share a key; `qbank.TWINS` groups
+  each seed's Latin, Cyrillic and Russian texts). In an auto-eligible intent the drafter is given
+  the bank's texts and asks only those, word for word (§5.6); a question it writes outside them
+  is a card for the owner.
+- **(B) Defense in depth.** Migration `0028_auto_shapes` adds `ck_outbox_messages_auto_shapes`
+  (§4.2): an AI-authored row with `approved_by='auto:policy'` must carry `shapes_ok` true;
+  NULL never passes. The later migrations are renumbered (JV-24 `0029`/`0030`, JV-25 `0031`).
+
+Also: the holding reply (`stall`) and `other` are never autonomous (§6.2), so a bare courtesy
+reply never goes out on its own for a message with a payment claim or a price, deadline or
+promise ask (JV-16 escalates those; `test_courtesy_never_auto_after_a_red_line_ask` pins it at
+the auto level). The metrics window starts at the channel × intent's last mode change or
+incident; the cost cap reached twice in the week holds an offer back (the next daily job would
+demote it again); an offer is made at most once every `JARVIS_GRADUATION_MIN_DAYS` days and the tap
+re-checks the criteria under the scope's row lock (an old offer is stale). A breaker trip demotes
+every autonomous intent of its channel inside `policy.trip_breaker` (contained); the daily job
+reads every autonomous send of the week again with that day's guard, paging by id (a red line
+found is an incident; a shape note such as `free_question` is never its reason)
+and demotes on the cost cap reached twice in a week; each automatic demotion is told once
+(«↩️ «{intent}» yana qoralama rejimiga qaytdi: {sabab}.»). The sent text of a «Bu xato edi», of
+an incident, and of a draft whose red-line or free-form sentence the owner took out in an edit is
+kept on its outbox row (`corpus_candidate`) as a review case for `tests/fixtures/redline_corpus.py`;
+`/jarvis rejim` counts them.
+
 **Owner strings.** "🎓 «{intent}» javoblari tayyor: {d} kunda {n} ta qoralama, {p}% tini
 o'zgartirmasdan tasdiqladingiz, qizil chiziq buzilmadi. Endi bunday javoblarni MIYA o'zi
 yuborsinmi? (kuniga {cap} tagacha)" Buttons "✅ Ha, avtomatik" / "⏳ Yana kuzataylik" · "🤖
 Avtomatik yuborildi · {ism}: «{matn}»" with "↩️ Bu xato edi" · "↩️ «{intent}» yana qoralama
 rejimiga qaytdi: {sabab}." · intent labels "salomlashish", "ma'lumot so'rash", "umumiy savol",
 "kutib turish javobi" · ceiling hint: "Avtomatik rejim uchun serverdagi .env da JARVIS_MODE=auto
-qilish kerak."
+qilish kerak." · the demotion reasons, the `/jarvis rejim` lines and the `/savolbank` strings are
+in `miya/bot/replies.py` (`JARVIS_DEMOTION_REASONS`, `JARVIS_MODES_*`, `QBANK_*`).
 
 **Tests.** `test_criteria_math`, `test_no_silent_promotion`, `test_never_auto_intents_rejected`,
 `test_xato_demotes`, `test_env_ceiling_respected`, `test_auto_held_in_quiet_hours`,
-`test_auto_needs_shapes_ok`.
+`test_auto_needs_shapes_ok`; besides: `test_question_bank_seeds_pass_the_guard`,
+`test_bank_slot_fillers_are_name_honorific_and_codes`, `test_savolbank_add_and_remove`,
+`test_a_removed_bank_question_redrafts_at_the_claim`,
+`test_breaker_and_incident_demote_automatically`, `test_cost_cap_twice_in_a_week_demotes`,
+`test_courtesy_never_auto_after_a_red_line_ask`, `test_owner_edit_is_kept_for_review`,
+`test_rejim_shows_each_intent`, `test_migration_0028_takes_the_approver_off_forged_rows`.
 
 **Acceptance.** Green; graduation happens only on the owner's tap.
+
+**Deviations recorded.** (1) §6.2 listed `stall` among the intents that may ever be auto; the
+JV-23 binding list makes it never-auto, and `gate.AUTO_INTENTS` is now `policy.AUTO_INTENTS`
+without it. (2) The CHECK compares `guard->'shapes_ok'` with the JSON boolean `true` rather than
+`guard->>'shapes_ok' = 'true'`, which would also have let the string `"true"` pass. (3) The
+`jarvis_policy` scope pattern gains `question_bank` in 0028 (the bank lives there instead of a
+new table). (4) A bank question's slot fillers include a courtesy segment («Rahmat aka, yuk
+qaysi shahardan?»), as §5.2 step 3 describes, besides the name, honorific and codes. (5) §5.6's
+drafter inputs gain the owner's question bank in an auto-eligible intent: owner-authored and not
+private, like the KB entries, so a graduated `info_gathering` intent asks the bank's questions
+word for word instead of writing its own. (6) §6.4's criteria gain the cost cap: an intent is
+not offered, and a tap does not promote it, while the cost cap was reached on two days of the
+last week, since the next daily job would demote it again.
 
 ---
 
@@ -2325,11 +2465,11 @@ qilish kerak."
 
 #### JV-24 — Multi-channel identity schema
 
-**Priority** P2 · **Depends on** JV-11 · **Migration** `0028_source_labels`, `0029_channel_accounts`
+**Priority** P2 · **Depends on** JV-11 · **Migration** `0029_source_labels`, `0030_channel_accounts`
 
 **Goal.** WhatsApp and Gmail chats and people are first-class.
 
-**Files.** `alembic/versions/0028_source_labels.py`, `alembic/versions/0029_channel_accounts.py`,
+**Files.** `alembic/versions/0029_source_labels.py`, `alembic/versions/0030_channel_accounts.py`,
 `miya/db/enums.py`, `miya/db/models.py`, `miya/services/people.py`, `miya/services/purge.py`,
 `tests/conftest.py`, `tests/test_schema.py`, `tests/test_channels_schema.py`.
 
@@ -2348,12 +2488,12 @@ and phone; `merge_into` moves handles, chats and threads; purge plans by `wa_cha
 
 #### JV-25 — Windows, extraction, recall and purge for any chat kind
 
-**Priority** P2 · **Depends on** JV-24 · **Migration** `0030_windows_any_chat`
+**Priority** P2 · **Depends on** JV-24 · **Migration** `0031_windows_any_chat`
 
 **Goal.** WhatsApp and Gmail messages get promise and task extraction (including the owner's own
 outgoing messages), recall and purge.
 
-**Files.** `alembic/versions/0030_windows_any_chat.py`, `miya/services/windows.py`,
+**Files.** `alembic/versions/0031_windows_any_chat.py`, `miya/services/windows.py`,
 `miya/services/passages.py`, `miya/services/recall.py`, `miya/services/purge.py`,
 `miya/db/models.py`, `tests/test_windows_any_chat.py`.
 
@@ -2611,7 +2751,7 @@ tasdiqlash", "Jarvisni to'xtatish", "WhatsAppni ulash", "Gmailni ulash", "Google
     when the payee card is the owner's and the phone is healthy.
 11. **Cost growth.** Hard daily cap, labelled `usage_log` operations, deterministic fast paths.
 12. **Migration traps.** New enum labels in the same run, ids over 32 characters, server-default
-    drift. Labels are isolated in 0028; CI round-trips.
+    drift. Labels are isolated in 0029; CI round-trips.
 13. **Compromised server.** With sending enabled, it could message clients as the owner. SQL caps,
     the outbox-only path, breakers, the kill switch and approval in the careful phase contain it.
 14. **Sheets misuse.** Someone treats the mirror as truth. It is one-way and labels mirrored

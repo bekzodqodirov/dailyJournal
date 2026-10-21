@@ -1422,9 +1422,18 @@ OUTBOX_STATES = (
     "blocked",
 )
 OUTBOX_APPROVERS = ("button", "reply", "command", "auto:policy")
-# global | channel:<c> | intent:<i> | channel:<c>:intent:<i>
+# global | question_bank | channel:<c> | intent:<i> | channel:<c>:intent:<i>
+# (0025; 0028 added question_bank, the row of the owner's question bank).
 JARVIS_SCOPE_PATTERN = (
-    "^(global|channel:[a-z]+|intent:[a-z_]+|channel:[a-z]+:intent:[a-z_]+)$"
+    "^(global|question_bank|channel:[a-z]+|intent:[a-z_]+"
+    "|channel:[a-z]+:intent:[a-z_]+)$"
+)
+# 0028: an AI row the policy approved on its own carries a passing shape
+# check (rule 13a), the JSON boolean true; COALESCE so a verdict without the
+# key never passes.
+OUTBOX_AUTO_SHAPES_CHECK = (
+    "authored_by <> 'ai' OR approved_by IS DISTINCT FROM 'auto:policy' "
+    "OR COALESCE(guard->'shapes_ok' = 'true'::jsonb, false)"
 )
 
 
@@ -1662,7 +1671,9 @@ class OutboxMessage(Base):
     and an adapter gets one only through ``outbox.claim_ready``, which re-runs
     the whole gate. The body is plain text and nothing else. ``guard`` is the
     red-line verdict bound to ``body_sha256``; a DB CHECK keeps AI text that
-    did not pass it from ever being approved, claimed or sent.
+    did not pass it from ever being approved, claimed or sent, and another
+    (0028) keeps an autonomous row (``auto:policy``) without a passing shape
+    check (``shapes_ok``) from existing at all.
     """
 
     __tablename__ = "outbox_messages"
@@ -1752,6 +1763,9 @@ class OutboxMessage(Base):
             "state NOT IN ('approved', 'sending', 'sent') OR authored_by = 'owner' "
             "OR COALESCE(guard->>'verdict', '') = 'pass'",
             name="ck_outbox_messages_guarded",
+        ),
+        sa.CheckConstraint(
+            OUTBOX_AUTO_SHAPES_CHECK, name="ck_outbox_messages_auto_shapes"
         ),
         sa.Index("ux_outbox_messages_idempotency", "idempotency_key", unique=True),
         sa.Index("ix_outbox_messages_person", "person_id"),

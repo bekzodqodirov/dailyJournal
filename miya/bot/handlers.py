@@ -957,12 +957,14 @@ async def cmd_status(message: Message) -> None:
 JARVIS_PAUSE_WORDS = {"toxtat", "to'xtat", "stop"}
 JARVIS_RESUME_WORDS = {"yoq", "yoqish", "start"}
 JARVIS_HISTORY_WORDS = {"tarix"}
+JARVIS_MODES_WORDS = {"rejim", "rejimlar", "rejimi"}
 
 
 @router.message(Command("jarvis"))
 async def cmd_jarvis(message: Message, command: CommandObject) -> None:
     """`/jarvis` status · `toxtat` pauses everything · `yoq [kanal]` resumes ·
-    `tarix` lists the last 20 actions (JV-11).
+    `tarix` lists the last 20 actions (JV-11) · `rejim` shows each reply
+    kind's mode per channel and its progress towards graduation (JV-23).
 
     miya.jarvis is imported here, on the owner's command, never at startup
     (rule 20). A pause is checked at claim time, so it holds the moment this
@@ -983,7 +985,13 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
             await _safe_answer(message, replies.JARVIS_UNKNOWN_CHANNEL)
             return
         scope = jarvis_policy.channel_scope(channel)
-    if sub and sub not in JARVIS_PAUSE_WORDS | JARVIS_RESUME_WORDS | JARVIS_HISTORY_WORDS:
+    known = (
+        JARVIS_PAUSE_WORDS
+        | JARVIS_RESUME_WORDS
+        | JARVIS_HISTORY_WORDS
+        | JARVIS_MODES_WORDS
+    )
+    if sub and sub not in known:
         await _safe_answer(message, replies.JARVIS_USAGE)
         return
     try:
@@ -1008,6 +1016,10 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
                 body = replies.jarvis_history(
                     await jarvis_status.recent_actions(session, limit=20)
                 )
+            elif sub in JARVIS_MODES_WORDS:
+                from miya.jarvis import rollout as jarvis_rollout
+
+                body = replies.jarvis_modes(await jarvis_rollout.modes(session, now=now))
             else:
                 body = replies.jarvis_status(await jarvis_status.gather(session, now))
     except Exception as exc:
@@ -1168,8 +1180,141 @@ async def _jarvis_tap(callback: CallbackQuery, kind: str) -> None:
 @router.callback_query(F.data.startswith(f"{keyboards.JARVIS_DRAFT_PREFIX}:"))
 async def on_jarvis_draft_button(callback: CallbackQuery) -> None:
     """✅ Yuborish / ✏️ Tahrirlash / 🙋 O'zim yozaman / ✖️ Bekor under a draft
-    card (JV-18). Not in ``_button_handlers``."""
+    card (JV-18), and ↩️ Bu xato edi under the notice of an autonomous send
+    (JV-23). Not in ``_button_handlers``."""
+    action, ident = _jarvis_tap_args(callback.data)
+    if action == keyboards.JARVIS_MISTAKE:
+        await _jarvis_mistake(callback, ident)
+        return
     await _jarvis_tap(callback, "draft")
+
+
+async def _jarvis_mistake(callback: CallbackQuery, ident: int | None) -> None:
+    """«↩️ Bu xato edi» (JV-23): the reply kind goes back to draft at once and
+    the sent text is kept for the red-line review; honoured only from the
+    notice the row was told on, a second tap changes nothing."""
+    from miya.jarvis import rollout as jarvis_rollout
+
+    message = callback.message
+    if ident is None:
+        await _ack(callback)
+        return
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            result = await jarvis_rollout.mistake(
+                session,
+                ident,
+                message_id=getattr(message, "message_id", None),
+                now=now,
+            )
+    except Exception as exc:
+        log.error(
+            "jarvis mistake tap failed",
+            extra={"outbox_id": ident, "error": type(exc).__name__},
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if result.code != "demoted" or result.intent is None:
+        if message is not None:
+            await _strip_buttons(message)
+            await _safe_answer(
+                message,
+                replies.JARVIS_MISTAKE_STALE
+                if result.code == "stale"
+                else replies.JARVIS_ANSWERED,
+            )
+        await _ack(callback)
+        return
+    if message is not None:
+        await _strip_buttons(message)
+        await _safe_answer(
+            message,
+            replies.jarvis_demoted(
+                intent=result.intent,
+                channel=result.channel,
+                code=jarvis_rollout.MISTAKE,
+            ),
+        )
+    await _ack(callback)
+
+
+def _graduation_args(data: str | None) -> tuple[str, str, str] | None:
+    """(action, channel, intent) of a ``jg:`` payload, or None."""
+    parts = (data or "").split(":")
+    if len(parts) != 4 or parts[0] != keyboards.JARVIS_GRADUATION_PREFIX:
+        return None
+    action, channel, intent = parts[1], parts[2], parts[3]
+    if action not in (keyboards.JARVIS_GRADUATE_YES, keyboards.JARVIS_GRADUATE_NO):
+        return None
+    return action, channel, intent
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_GRADUATION_PREFIX}:"))
+async def on_jarvis_graduation_button(callback: CallbackQuery) -> None:
+    """✅ Ha, avtomatik / ⏳ Yana kuzataylik under a graduation offer (JV-23):
+    the owner's tap is the only way a reply kind is sent on its own. Under
+    the scope's row lock and re-checked; a never-auto kind is refused, an
+    old offer is stale. Not in ``_button_handlers``. miya.jarvis is imported
+    here, never at startup (rule 20)."""
+    from miya.jarvis import policy as jarvis_policy
+    from miya.jarvis import rollout as jarvis_rollout
+
+    parsed = _graduation_args(callback.data)
+    message = callback.message
+    if parsed is None:
+        await _ack(callback)
+        return
+    action, channel, intent = parsed
+    now = datetime.now(settings.tz)
+    message_id = getattr(message, "message_id", None)
+    try:
+        async with session_scope() as session:
+            if action == keyboards.JARVIS_GRADUATE_YES:
+                result = await jarvis_rollout.accept(
+                    session, channel, intent, message_id=message_id, now=now
+                )
+            else:
+                result = await jarvis_rollout.decline(
+                    session, channel, intent, message_id=message_id, now=now
+                )
+    except Exception as exc:
+        log.error(
+            "jarvis graduation tap failed",
+            extra={
+                "channel": channel,
+                "intent": intent,
+                "tap": action,
+                "error": type(exc).__name__,
+            },
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if result.code == "promoted":
+        body = replies.jarvis_graduated(
+            intent=intent,
+            channel=channel,
+            cap=settings.jarvis_auto_daily_cap,
+            ceiling_ok=result.ceiling_ok,
+        )
+    elif result.code == "declined":
+        body = replies.jarvis_kept_draft(
+            intent=intent, channel=channel, days=settings.jarvis_graduation_min_days
+        )
+    elif result.code == jarvis_policy.NEVER_AUTO:
+        body = replies.jarvis_never_auto(intent)
+    elif result.code == "not_ready":
+        body = replies.jarvis_graduation_not_ready(intent=intent, channel=channel)
+    else:
+        body = replies.JARVIS_GRADUATION_STALE
+    if message is not None:
+        await _strip_buttons(message)
+        await _safe_answer(message, body)
+    await _ack(callback)
 
 
 @router.callback_query(F.data.startswith(f"{keyboards.JARVIS_ESCALATION_PREFIX}:"))
@@ -2092,6 +2237,131 @@ async def on_knowledge_button(callback: CallbackQuery) -> None:
         await _edit_callback(callback, body)
     else:
         await _ack(callback)
+
+
+# --- /savolbank: the question bank (JV-23) ---------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20). The
+# qb: buttons are not in _button_handlers, so a typed batch answer never puts a
+# question in the AI's mouth. An addition is the owner's ✅ on the proposal
+# card, guarded again under the row lock; a removal is at once.
+
+QBANK_ADD_WORDS = KB_ADD_WORDS
+QBANK_REMOVE_WORDS = KB_RETIRE_WORDS
+
+
+async def _qbank_command(session, sub: str, rest: str, *, now: datetime):
+    """One `/savolbank` subcommand: [(text, keyboard)]."""
+    from miya.jarvis import qbank
+
+    if not sub:
+        entries = await qbank.load(session)
+        return [
+            (
+                replies.qbank_list(entries),
+                keyboards.qbank_list([entry.ref for entry in entries]),
+            )
+        ]
+    if sub in QBANK_ADD_WORDS:
+        change = await qbank.propose(session, rest, by=records.BY_COMMAND, now=now)
+        if change.code != "proposed" or change.entry is None:
+            return [(replies.qbank_refused(change.code), None)]
+        return [
+            (
+                replies.qbank_proposed(change.entry.text),
+                keyboards.qbank_proposal(change.entry.ref),
+            )
+        ]
+    if sub in QBANK_REMOVE_WORDS:
+        number = rest.strip()
+        entries = await qbank.load(session)
+        if not number.isdigit() or not 1 <= int(number) <= len(entries):
+            return [(replies.QBANK_NOT_FOUND, None)]
+        removed = await qbank.remove(
+            session, entries[int(number) - 1].ref, by=records.BY_COMMAND, now=now
+        )
+        if removed.entry is None:
+            return [(replies.QBANK_STALE, None)]
+        return [(replies.qbank_removed(removed.entry.text), None)]
+    return [(replies.QBANK_USAGE, None)]
+
+
+@router.message(Command("savolbank"))
+async def cmd_question_bank(message: Message, command: CommandObject) -> None:
+    """`/savolbank` — the owner's question bank (JV-23): the only questions
+    Jarvis may ask a client on its own. `/savolbank qo'sh Savol?` proposes
+    one (guarded: one question, no time, price, promise or figure) for the
+    owner's ✅, `/savolbank o'chir 3` removes the third at once."""
+    first, rest = _first_word(command.args or "")
+    sub = _kb_word(first) if first else ""
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            outgoing = await _qbank_command(session, sub, rest.strip(), now=now)
+    except Exception as exc:
+        log.error(
+            "/savolbank failed",
+            extra={"command": sub or "list", "error": type(exc).__name__},
+        )
+        outgoing = [(replies.JARVIS_FAILED, None)]
+    for body, keyboard in outgoing:
+        await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _qbank_tap(action: str, ref: str, *, now: datetime) -> str:
+    """One qb: tap: the card's new text."""
+    from miya.jarvis import qbank
+
+    async with session_scope() as session:
+        if action == keyboards.QBANK_ADD:
+            change = await qbank.confirm(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "added" and change.entry is not None:
+                return replies.qbank_added(change.entry.text)
+        elif action == keyboards.QBANK_DISMISS:
+            change = await qbank.decline(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "declined" and change.entry is not None:
+                return replies.qbank_declined(change.entry.text)
+        else:
+            change = await qbank.remove(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "removed" and change.entry is not None:
+                return replies.qbank_removed(change.entry.text)
+    if change.code == "stale":
+        return replies.QBANK_STALE
+    return replies.qbank_refused(change.code)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.QBANK_PREFIX}:"))
+async def on_question_bank_button(callback: CallbackQuery) -> None:
+    """✅ Qo'shish / ✖️ Kerak emas under a proposed question, 🗑 under the
+    list (JV-23). Under the row lock and re-checked; a second tap changes
+    nothing. Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) == 3 else ""
+    ref = parts[2] if len(parts) == 3 else ""
+    actions = (keyboards.QBANK_ADD, keyboards.QBANK_DISMISS, keyboards.QBANK_REMOVE)
+    if action not in actions or not ref.isalnum():
+        await _ack(callback)
+        return
+    try:
+        body = await _qbank_tap(action, ref, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "question bank tap failed",
+            extra={"qbank_action": action, "ref": ref, "error": type(exc).__name__},
+        )
+        await _ack(callback)
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        return
+    if callback.message is None:
+        await _ack(callback)
+        return
+    if action == keyboards.QBANK_REMOVE:
+        # The list keeps its other buttons; the outcome is a message of its own.
+        await _safe_answer(callback.message, body)
+        await _ack(callback)
+        return
+    await _edit_callback(callback, body)
 
 
 @router.message(Command("unut"))

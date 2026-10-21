@@ -390,7 +390,13 @@ def _out(
         authored_by=authored_by,
         body=body,
         body_sha256="0" * 64,
-        guard={"verdict": "pass", "flags": list(flags)},
+        # As the chokepoint binds it: an autonomous row always carries a
+        # passing shape check (0028, ck_outbox_messages_auto_shapes).
+        guard={
+            "verdict": "pass",
+            "flags": list(flags),
+            "shapes_ok": fields.get("approved_by") == "auto:policy",
+        },
         state=states[-1],
         idempotency_key=f"jv22-{next(_keys)}",
         history=_history(at, *states, code=code),

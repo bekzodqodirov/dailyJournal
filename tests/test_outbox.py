@@ -572,43 +572,45 @@ async def test_an_unapproved_statement_is_a_draft_never_auto(session, jarvis):
 
 
 async def test_an_auto_row_without_shapes_ok_is_never_sent(session, jarvis):
-    """At the claim an autonomous row whose verdict lacks a passing shape
-    check (it says no, or it was stored before the check) goes back to the
-    owner's card; so does a re-guarded body that fails it."""
+    """At the claim an autonomous row whose re-guarded body fails the shape
+    check goes back to the owner's card. A row whose bound verdict lacks a
+    passing shape check (it says no, or it was stored before the check)
+    cannot even exist (0028: ck_outbox_messages_auto_shapes); the gate's own
+    refusal of one is ``test_gate_refuses_auto_without_a_passing_shape_check``."""
     person, trigger = await _setup(session, mode="auto")
     said_no = await _ai_row(session, person, trigger, body="Salom!")
     legacy = await _ai_row(session, person, trigger, body="Assalomu alaykum!")
     changed = await _ai_row(session, person, trigger, body="Rahmat!")
     for row in (said_no, legacy, changed):
         assert row.approved_by == "auto:policy"
-    await session.execute(
-        sa.text(
-            "UPDATE outbox_messages SET guard = jsonb_set(guard, '{shapes_ok}', "
-            "'false') WHERE id = :i"
-        ),
-        {"i": said_no.id},
-    )
-    await session.execute(
-        sa.text("UPDATE outbox_messages SET guard = guard - 'shapes_ok' WHERE id = :i"),
-        {"i": legacy.id},
-    )
+    for sql in (
+        "UPDATE outbox_messages SET guard = jsonb_set(guard, '{shapes_ok}', "
+        "'false') WHERE id = :i",
+        "UPDATE outbox_messages SET guard = guard - 'shapes_ok' WHERE id = :i",
+    ):
+        for row in (said_no, legacy):
+            with pytest.raises(sa.exc.IntegrityError) as caught:
+                async with session.begin_nested():
+                    await session.execute(sa.text(sql), {"i": row.id})
+            assert "ck_outbox_messages_auto_shapes" in str(caught.value)
     await session.execute(
         sa.text("UPDATE outbox_messages SET body = :b WHERE id = :i"),
         {"b": "Bosh ustiga, aka.", "i": changed.id},
     )
     gate.register_guard(PassGuard(shapes_ok=False))
-    assert await outbox.claim_ready(session, "telegram", now=NOW) == []
-    for row in (said_no, legacy, changed):
-        back = await _reload(session, row.id)
-        assert back.state == "draft", back.id
-        assert back.last_error == gate.UNAPPROVED_STATEMENT
-        assert back.approved_by is None and back.approved_at is None
-        assert back.history[-1]["by"] == "gate"
-    fresh = await _reload(session, changed.id)
-    assert fresh.guard["body_sha256"] == gate.body_hash("Bosh ustiga, aka.")
-    assert fresh.guard["shapes_ok"] is False and fresh.guard["verdict"] == "pass"
-    # Nothing of them reached an adapter.
-    assert (await caps.day_counts(session, NOW)).auto_sent == 0
+    claimed = await outbox.claim_ready(session, "telegram", now=NOW)
+    assert changed.id not in [c.id for c in claimed]
+    back = await _reload(session, changed.id)
+    assert back.state == "draft", back.id
+    assert back.last_error == gate.UNAPPROVED_STATEMENT
+    assert back.approved_by is None and back.approved_at is None
+    assert back.history[-1]["by"] == "gate"
+    assert back.guard["body_sha256"] == gate.body_hash("Bosh ustiga, aka.")
+    assert back.guard["shapes_ok"] is False and back.guard["verdict"] == "pass"
+    # The policy approver went with the passing shape check, in the history.
+    assert any(
+        e["field"] == "approved_by" and e["old"] == "auto:policy" for e in back.history
+    )
 
 
 def test_gate_refuses_auto_without_a_passing_shape_check():
@@ -2141,14 +2143,15 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
     assert off and not [job for job in off if job.startswith("jarvis")]
     on = await jobs(True)
     # The owner-style refresh (JV-14), the knowledge-base job (JV-15), the
-    # responder (JV-16) and the cards (JV-18) import miya.jarvis: Jarvis-only
-    # too.
+    # responder (JV-16), the cards (JV-18) and the rollout (JV-23) import
+    # miya.jarvis: Jarvis-only too.
     assert set(on) - set(off) == {
         "jarvis_outbox",
         "jarvis_respond",
         "jarvis_cards",
         "style_refresh",
         "kb_mining",
+        "jarvis_rollout",
     }
     # The userbot imports miya.jarvis only inside functions, after the
     # JARVIS_ENABLED check, never at module level: the responder inside
@@ -2381,13 +2384,24 @@ def _migration():
     return module
 
 
+def _migration_0028():
+    path = ROOT / "alembic" / "versions" / "0028_auto_shapes.py"
+    spec = importlib.util.spec_from_file_location("migration_0028", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_the_migration_freezes_the_model_lists():
     migration = _migration()
     assert migration.revision == "0025_jarvis_core" and len(migration.revision) <= 32
     assert migration.down_revision == "0024_sheet_rows"
     assert migration.CHANNELS == m.JARVIS_CHANNELS
     assert migration.MODES == m.JARVIS_MODES
-    assert migration.SCOPE_PATTERN == m.JARVIS_SCOPE_PATTERN
+    # 0028 (JV-23) widened the scope pattern by the question bank's row.
+    later = _migration_0028()
+    assert migration.SCOPE_PATTERN == later.PREVIOUS_SCOPE_PATTERN
+    assert later.SCOPE_PATTERN == m.JARVIS_SCOPE_PATTERN
     assert migration.RULE_SUBJECTS == m.REPLY_RULE_SUBJECTS
     assert migration.RULE_MODES == m.REPLY_RULE_MODES
     assert migration.RULE_REASONS == m.REPLY_RULE_REASONS

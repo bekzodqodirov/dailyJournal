@@ -83,6 +83,7 @@ from miya.jarvis import (
     gate,
     outbox,
     responder,
+    rollout,
 )
 from miya.services import codes, queries, reminders, safety
 from miya.services.brief import BRIEF_KIND
@@ -1686,6 +1687,10 @@ async def owner_reply(
             return TapResult("answered")
         except outbox.NotPlainText:
             return TapResult("failed")
+        # The AI's words the owner took out may be a red line the guard
+        # missed: kept for the corpus review (JV-23). Contained: it never
+        # raises into the owner's reply.
+        await rollout.note_owner_edit(session, ref.id, now=now)
         return TapResult(
             "edited", card=await draft_card(session, ref.id), channel=row.channel
         )

@@ -717,7 +717,10 @@ async def test_owner_stall_override_is_an_approved_stall(session, styled, monkey
         )
 
     before = await stall_row(OVERRIDE)
-    assert before.state == "draft" and before.last_error == gate.UNAPPROVED_STATEMENT
+    # A holding reply is never sent on its own (JV-23): always a draft. Before
+    # the override is in force it is no approved shape either.
+    assert before.state == "draft" and before.guard["shapes_ok"] is False
+    assert gate.UNAPPROVED_STATEMENT in before.guard["flags"]
     assert not await style.set_stall_override(
         session,
         reason="general",
@@ -757,10 +760,11 @@ async def test_owner_stall_override_is_an_approved_stall(session, styled, monkey
     )
     assert chosen.source == "owner" and chosen.text == OVERRIDE
     after = await stall_row(OVERRIDE + " ")
-    assert after.state == "approved" and after.approved_by == "auto:policy"
-    assert after.guard["shapes_ok"] is True
-    [claimed] = await outbox.claim_ready(session, "telegram", now=NOW)
-    assert claimed.id == after.id
+    # In force, the override is an approved stall shape; the row still waits
+    # for the owner's tap, as every holding reply does (JV-23).
+    assert after.guard["shapes_ok"] is True and set(after.guard["shapes"]) == {"stall"}
+    assert after.state == "draft" and after.approved_by is None
+    assert await outbox.claim_ready(session, "telegram", now=NOW) == []
     with pytest.raises(outbox.OutboxError, match=outbox.APPROVED_TEXTS_REFUSED):
         await outbox.create(
             session,

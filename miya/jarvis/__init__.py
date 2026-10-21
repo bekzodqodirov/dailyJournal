@@ -85,4 +85,14 @@ The owner's commands (JV-20):
   (``people.find_person``, asked back when two people match), the chat must
   already exist, and a scheduled time must agree with ``when.parse`` of the
   owner's words. ``POST /v1/ask`` never gets these tools.
+
+The rollout (JV-23):
+
+* ``rollout`` — per channel × intent graduation: the metrics from the outbox
+  history, the daily offer (``jarvis_rollout``), the owner's «✅ Ha,
+  avtomatik» as the only promotion, «↩️ Bu xato edi», breakers, incidents
+  and the cost cap as automatic demotions, and the red-line review cases.
+* ``qbank`` — the owner's question bank: the only questions an autonomous
+  reply may ask (``/savolbank``), kept in the history of the
+  ``question_bank`` row of ``jarvis_policy``.
 """
