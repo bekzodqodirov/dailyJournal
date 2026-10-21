@@ -13,9 +13,13 @@ owner asks for it, in one of two ways:
   monitored private chat (``chats.request_style_import``), and the sweep
   reads each one's newest messages through ``fetch_style_history``.
 
-The Telethon history calls live here, outside ``miya/userbot/``, so that
-package stays asserted to read history in exactly one reviewable place (its
-sweep delegates to this module rather than calling ``iter_messages`` itself).
+The Telethon history calls the owner asked for live here; this module
+imports Telethon, so the userbot AST guard (``tests/test_userbot.py``) scans
+it too and allows history reads only in the functions it names
+(``catch_up_chat``, ``backfill_chat``, ``archive_chat``,
+``fetch_style_history``), next to the userbot's own ``fetch_approved`` and
+``sender.reconcile`` (the userbot's sweep delegates to this module rather
+than calling ``iter_messages`` itself).
 
 Messages already stored are skipped, so running it twice is harmless.
 """

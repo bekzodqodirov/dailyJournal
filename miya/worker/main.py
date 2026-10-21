@@ -529,7 +529,9 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
     is unknown), and the owner is told once about each unknown row — MIYA
     never sends it again. Then (JV-17) the owner is told once about a draft
     card or escalation alert that their own message or the client's edit
-    took off the table.
+    took off the table, and (JV-19) about what the Telegram sender recorded:
+    a breaker trip, a flood wait, a failed send and a tapped send that went
+    out (``jarvis_send_notices``).
 
     Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
     startup (rule 20). Each step and each notice is contained on its own:
@@ -547,8 +549,10 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
                 "jarvis outbox step failed",
                 extra={"step": step.__name__, "error": type(exc).__name__},
             )
-    if await _jarvis_unknown_notices(bot, now=now):
-        await jarvis_takeover_notices(bot, now=now)
+    if not await _jarvis_unknown_notices(bot, now=now):
+        return  # Telegram is down: the rest wait for the next sweep
+    await jarvis_takeover_notices(bot, now=now)
+    await jarvis_send_notices(bot, now=now)
 
 
 async def _jarvis_unknown_notices(bot: Bot, *, now: datetime) -> bool:
@@ -612,6 +616,99 @@ async def jarvis_takeover_notices(bot: Bot, *, now: datetime | None = None) -> i
                     "row_id": notice.row_id,
                     "error": type(exc).__name__,
                 },
+            )
+    return told
+
+
+# The ReminderLog kinds that record the Telegram sender's limits the owner
+# was told about (JV-19): a breaker trip (ref: the channel and the trip's end)
+# and a flood wait (ref: the row and its attempt), each once.
+JARVIS_BREAKER_KIND = "jarvis_breaker"
+JARVIS_FLOOD_KIND = "jarvis_flood_wait"
+
+
+async def _told_refs(kind: str, refs: list[str]) -> set[str]:
+    if not refs:
+        return set()
+    async with session_scope() as session:
+        return set(
+            await session.scalars(
+                sa.select(ReminderLog.ref).where(
+                    ReminderLog.kind == kind, ReminderLog.ref.in_(refs)
+                )
+            )
+        )
+
+
+async def _note_told(kind: str, refs: list[str]) -> None:
+    async with session_scope() as session:
+        session.add_all([ReminderLog(kind=kind, ref=ref) for ref in refs])
+
+
+async def jarvis_send_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """What the Telegram sender (JV-19) recorded, told once each: a tripped
+    breaker («⛔ Telegram yuborishni cheklab qo'ydi»), a flood wait of a
+    minute or more («⏳»), a send that failed for good («✖️ … yuborib
+    bo'lmadi») and a send the owner tapped that went out («✅ Yuborildi»,
+    silently, as a reply to its card). Each step and each notice is
+    contained (rule 25); returns how many went out."""
+    from miya.jarvis import outbox, policy
+
+    now = now or datetime.now(settings.tz)
+    silent = reminders.in_quiet_hours(now)
+    told = 0
+    try:
+        async with session_scope() as session:
+            telegram = (await policy.load(session)).get(policy.channel_scope("telegram"))
+        until = telegram.breaker_until if telegram is not None else None
+        if telegram is not None and until is not None and telegram.tripped(now):
+            ref = f"telegram:{until.isoformat()}"
+            if not await _told_refs(JARVIS_BREAKER_KIND, [ref]):
+                if not await notify(bot, replies.JARVIS_TELEGRAM_LIMITED, silent=silent):
+                    return told
+                await _note_told(JARVIS_BREAKER_KIND, [ref])
+                told += 1
+    except Exception as exc:
+        log.error("jarvis breaker notice failed", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            waits = await outbox.flood_waits(session, now=now)
+        done = await _told_refs(JARVIS_FLOOD_KIND, [wait.ref for wait in waits])
+        fresh = [wait for wait in waits if wait.ref not in done]
+        if fresh:
+            text = replies.jarvis_flood_wait(max(wait.seconds for wait in fresh))
+            if not await notify(bot, text, silent=silent):
+                return told
+            await _note_told(JARVIS_FLOOD_KIND, [wait.ref for wait in fresh])
+            told += 1
+    except Exception as exc:
+        log.error("jarvis flood-wait notice failed", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            outcomes = await outbox.outcomes_untold(session, now=now)
+    except Exception as exc:
+        log.error("jarvis send outcomes unreadable", extra={"error": type(exc).__name__})
+        return told
+    for outcome in outcomes:
+        try:
+            if outcome.state == outbox.SENT:
+                text = replies.jarvis_sent(outcome.sent_at or now)
+                quiet = True
+            else:
+                text = replies.jarvis_send_failed(outcome.name, outcome.code)
+                quiet = silent
+            ok, _ = await deliver(
+                bot, text, silent=quiet, reply_to=outcome.card_message_id
+            )
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_told(session, outcome.id, now=now, by=outbox.BY_ADAPTER)
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis send notice failed",
+                extra={"outbox_id": outcome.id, "error": type(exc).__name__},
             )
     return told
 

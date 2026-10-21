@@ -1,11 +1,18 @@
-"""Telethon userbot — passive, read-only (spec §7B).
+"""Telethon userbot — a passive reader, with one narrow sender (spec §7B, JV-19).
 
-This process **never writes to Telegram**. There is no call to `send_message`,
+This module **never writes to Telegram**. There is no call to `send_message`,
 `send_file`, `edit_message`, `delete_messages` or `send_read_acknowledge`
-anywhere in this package, and a test asserts that stays true. It connects with
-an existing session string, registers read-only handlers for new messages in
-monitored chats, and stores each one as an interaction. Extraction happens
-later, per conversation window, in the worker (spec §7B).
+here, and a test asserts that stays true. It connects with an existing
+session string, registers read-only handlers for new messages in monitored
+chats, and stores each one as an interaction. Extraction happens later, per
+conversation window, in the worker (spec §7B).
+
+The one exception is ``miya.userbot.sender`` (JV-19): with JARVIS_ENABLED and
+TELEGRAM_SEND_ENABLED it runs as a task next to the reader and sends the
+outbox rows that passed the gate (the ones the owner approved and, in auto
+mode, the ones Jarvis may send by itself), which it takes only from
+``outbox.claim_ready``. The same AST test allows a Telegram write call only
+in its named send functions; without both switches it is never imported.
 
 Safety properties, all deliberate:
   * ``USERBOT_ENABLED=false`` idles without connecting — one flag disables it.
@@ -18,6 +25,9 @@ Safety properties, all deliberate:
     the owner reading a chat, typing in it, writing in it, and a client
     editing or deleting a message. Those handlers only write MIYA's own
     database; none of them writes to Telegram.
+  * A Telegram flood wait never ends the process: Telethon sleeps through
+    one up to USERBOT_FLOOD_SLEEP_SECONDS, the dialog sync waits out a short
+    one and skips a long one (JV-19), and the sweeps contain their own.
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import signal
 import sys
 import time
 import uuid
@@ -35,6 +46,7 @@ from pathlib import Path
 import sqlalchemy as sa
 from telethon import TelegramClient, events
 from telethon import utils as tg_utils
+from telethon.errors import FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Channel,
@@ -1559,6 +1571,9 @@ async def beat_userbot(
         # A catch-up line must survive the next beat, which rewrites the
         # detail whole (WP-21).
         detail.update(_last_catch_up or {})
+        # The sender's state (JV-19) rides the same beat: the detail is
+        # replaced whole, so this beat stays its one writer.
+        detail.update(_sender_status)
     try:
         async with session_scope() as session:
             await health.beat(session, "userbot", detail=detail)
@@ -1666,20 +1681,65 @@ async def _startup_catch_up(client: TelegramClient) -> None:
 # --- dialog sync -------------------------------------------------------------
 
 
-async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
-    """Register the dialog list. Titles only — no messages are fetched."""
-    dialogs: list[DialogInfo] = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        dialogs.append(
-            DialogInfo(
-                tg_chat_id=dialog.id,
-                chat_type=chat_type_of(entity),
-                title=chat_title_of(entity),
-                is_bot=bool(getattr(entity, "bot", False)),
-                top_message_id=getattr(getattr(dialog, "message", None), "id", None),
-            )
-        )
+# A flood wait on the dialog list up to this long is slept through and the
+# list read again (JV-19); a longer one skips this sync, and the next sweep
+# reads the list again. Either way the process goes on.
+DIALOG_FLOOD_WAIT_MAX_SECONDS = 60
+DIALOG_SYNC_ATTEMPTS = 3
+
+
+async def _read_dialogs(
+    client: TelegramClient, *, sleep_through: bool = True
+) -> list[DialogInfo] | None:
+    """The dialog list, or None when Telegram asked for a long wait.
+
+    ``sleep_through=False`` (the sender, inside a claim): any flood wait is
+    raised instead of slept through or skipped, so the caller re-queues at
+    Telegram's time rather than holding the claim or reading an empty cache."""
+    for attempt in range(1, DIALOG_SYNC_ATTEMPTS + 1):
+        dialogs: list[DialogInfo] = []
+        try:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                dialogs.append(
+                    DialogInfo(
+                        tg_chat_id=dialog.id,
+                        chat_type=chat_type_of(entity),
+                        title=chat_title_of(entity),
+                        is_bot=bool(getattr(entity, "bot", False)),
+                        top_message_id=getattr(
+                            getattr(dialog, "message", None), "id", None
+                        ),
+                    )
+                )
+            return dialogs
+        except FloodWaitError as exc:
+            if not sleep_through:
+                raise
+            seconds = int(exc.seconds or 0)
+            if seconds > DIALOG_FLOOD_WAIT_MAX_SECONDS or attempt == DIALOG_SYNC_ATTEMPTS:
+                log.warning(
+                    "dialog sync skipped: Telegram asked for a wait",
+                    extra={"seconds": seconds, "attempt": attempt},
+                )
+                return None
+            await asyncio.sleep(seconds)
+    return None
+
+
+async def sync_from_client(
+    client: TelegramClient, *, sleep_through: bool = True
+) -> tuple[int, int]:
+    """Register the dialog list. Titles only — no messages are fetched.
+
+    A FloodWait never escapes (JV-19): a short one is slept through and the
+    list read again, a long one skips the sync with the previous tops kept,
+    so the startup no longer exits ``run()`` over it. The sender passes
+    ``sleep_through=False``: there a FloodWait is raised to it instead, so it
+    never sleeps inside a claim nor mistakes a skipped sync for a missing chat."""
+    dialogs = await _read_dialogs(client, sleep_through=sleep_through)
+    if dialogs is None:
+        return 0, 0
     async with session_scope() as session:
         created, renamed = await sync_dialogs(session, dialogs)
     global _dialog_tops
@@ -1690,6 +1750,108 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
         "dialog sync: %d chats seen, %d new, %d renamed", len(dialogs), created, renamed
     )
     return created, renamed
+
+
+# --- the sender (JV-19) ------------------------------------------------------
+#
+# The sender's share of the userbot beat detail, which it updates and the
+# beat merges in (detail is replaced whole, so the beat stays its one writer).
+_sender_status: dict = {}
+
+
+def sender_wanted() -> bool:
+    """Both switches on: JARVIS_ENABLED and TELEGRAM_SEND_ENABLED."""
+    return bool(settings.jarvis_enabled and settings.telegram_send_enabled)
+
+
+def start_sender(client: TelegramClient, *, user_id: int | None):
+    """Start the Telegram sender next to the reader, or None when it is off.
+
+    ``miya.userbot.sender`` (and with it miya.jarvis) is imported only here,
+    with both switches on (rule 20). A sender that cannot start is logged
+    and the reader goes on without it (rule 25)."""
+    if not sender_wanted():
+        _sender_status.clear()
+        return None
+    try:
+        from miya.userbot import sender
+
+        account = f"tg:{user_id}" if user_id is not None else None
+        return sender.start(client, account=account, status=_sender_status)
+    except Exception as exc:
+        log.error("telegram sender not started", extra={"error": type(exc).__name__})
+        _sender_status["sender"] = "not_started"
+        return None
+
+
+# A shutdown waits this long for the sender to put back a row it was pacing
+# (released as ``interrupted``, approved again) before the client goes.
+SENDER_STOP_TIMEOUT_SECONDS = 5.0
+
+
+async def stop_sender(sending) -> None:
+    """Cancel the sender and wait for it to record what it was doing, so a
+    row stopped during its pause or "typing…" waits approved for the next
+    start instead of becoming «in doubt». Never raises (rule 25)."""
+    if sending is None:
+        return
+    try:
+        sending.cancel()
+        task = getattr(sending, "task", None)
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=SENDER_STOP_TIMEOUT_SECONDS)
+    except Exception as exc:
+        log.error(
+            "telegram sender not stopped cleanly", extra={"error": type(exc).__name__}
+        )
+
+
+async def _shutdown(client: TelegramClient, sending) -> None:
+    """SIGTERM/SIGINT: the sender is stopped first, while the client can
+    still end "typing…", then the client disconnects, which ends
+    ``run_until_disconnected`` and lets ``run()`` clean up."""
+    await stop_sender(sending)
+    try:
+        await client.disconnect()
+    except Exception as exc:
+        log.error("userbot disconnect failed", extra={"error": type(exc).__name__})
+
+
+def install_stop_signals(client: TelegramClient, sending) -> tuple[int, ...]:
+    """Turn SIGTERM (``docker compose stop``) and SIGINT into a clean
+    shutdown instead of Python's immediate exit, which runs no ``finally``.
+    Returns the signals installed (none where the loop cannot take them)."""
+    loop = asyncio.get_running_loop()
+    stopping: list[asyncio.Task] = []
+
+    def _stop() -> None:
+        if not stopping:
+            log.info("userbot stopping on a signal")
+            stopping.append(asyncio.ensure_future(_shutdown(client, sending)))
+
+    installed: list[int] = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError) as exc:
+            log.warning(
+                "userbot signal handler not installed",
+                extra={"signal": int(sig), "error": type(exc).__name__},
+            )
+    return tuple(installed)
+
+
+def remove_stop_signals(installed: tuple[int, ...]) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in installed:
+        try:
+            loop.remove_signal_handler(sig)
+        except Exception as exc:
+            log.warning(
+                "userbot signal handler not removed",
+                extra={"signal": int(sig), "error": type(exc).__name__},
+            )
 
 
 # --- process -----------------------------------------------------------------
@@ -1749,6 +1911,14 @@ async def run() -> None:
         session,
         settings.telethon_api_id,
         settings.telethon_api_hash,
+        # Telethon sleeps through a flood wait only this short by itself; a
+        # longer one reaches the code, so a send never blocks silently (JV-19).
+        flood_sleep_threshold=settings.userbot_flood_sleep_seconds,
+        # After its own retries of an internal Telegram error, Telethon raises
+        # that error, not a bare ValueError, so the sender can tell "already
+        # sent" (RANDOM_ID_DUPLICATE) and "outcome unknown" (a -503 timeout)
+        # apart from a chat missing from the session cache (JV-19).
+        raise_last_call_error=True,
     )
     # connect(), not start(): start() would prompt for a phone number on stdin
     # if the session were invalid, which in a container never returns.
@@ -1775,7 +1945,11 @@ async def run() -> None:
         global _RUNTIME_ALIASES
         if getattr(me, "username", None):
             _RUNTIME_ALIASES = ("@" + me.username,)
-        log.info("userbot connected as %s (read-only)", display_name_of(me))
+        log.info(
+            "userbot connected as %s (%s)",
+            display_name_of(me),
+            "sending outbox replies" if sender_wanted() else "read-only",
+        )
         await beat_userbot(enabled=True, connected=True, user_id=me.id)
         await sync_from_client(client)
 
@@ -1793,12 +1967,20 @@ async def run() -> None:
         # Whatever was said while this process was down (WP-21), read once
         # the live handlers are in place so nothing falls between the two.
         catcher = asyncio.create_task(_startup_catch_up(client))
+        # The outbox replies that passed the gate (JV-19), only with both
+        # switches on.
+        sending = start_sender(client, user_id=me.id)
+        signals = install_stop_signals(client, sending)
         log.info("listening for new messages in monitored chats")
         try:
             await client.run_until_disconnected()
         finally:
+            remove_stop_signals(signals)
             sweeper.cancel()
             catcher.cancel()
+            # Awaited before the client and the pool go, so a row stopped
+            # mid-pacing is put back before the connection it needs is gone.
+            await stop_sender(sending)
     finally:
         await client.disconnect()
         await engine.dispose()

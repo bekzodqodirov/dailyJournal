@@ -8,6 +8,7 @@ first test is the important one — it is what keeps the userbot passive.
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,11 +19,16 @@ from miya.services.media_policy import MediaKind
 from miya.userbot import main as userbot
 
 USERBOT_PACKAGE = Path(userbot.__file__).parent
+MIYA_PACKAGE = USERBOT_PACKAGE.parent
+SENDER = USERBOT_PACKAGE / "sender.py"
 
 # Two different invariants, kept apart on purpose.
 #
-# Writing to Telegram is forbidden outright and everywhere: the counterparty
-# must never see a trace of MIYA in a conversation.
+# Writing to Telegram as the owner happens in exactly one place (JV-19): the
+# named send functions of miya/userbot/sender.py, which take their rows only
+# from outbox.claim_ready. Everywhere else in the userbot, and in every module
+# that imports Telethon, no write call may appear: the counterparty must
+# never see a trace of MIYA in a conversation it did not send on purpose.
 WRITE_CALLS = {
     "send_message",
     "send_file",
@@ -30,25 +36,103 @@ WRITE_CALLS = {
     "edit_message",
     "delete_messages",
     "forward_messages",
+    "action",
+    "mark_read",
+    "reply",
+    "respond",
+    "edit",
+    "delete",
+    "forward_to",
+    "pin_message",
+    "unpin_message",
+    "send_reaction",
+    "click",
+    "upload_file",
+    # Draft.send / Draft.set_message, Message.pin / unpin, and the dialog and
+    # participant writes.
+    "send",
+    "set_message",
+    "pin",
+    "unpin",
+    "delete_dialog",
+    "kick_participant",
+    "edit_permissions",
+    "edit_admin",
+    "edit_folder",
 }
+# Raw MTProto requests that write (or show the owner as active), for the
+# record. The guard itself is stricter: any raw request name (RAW_REQUEST,
+# a capitalised name ending in ``Request``) named anywhere, called, imported
+# or aliased, outside the sender's ``_send`` fails it, so a raw read such as
+# GetHistoryRequest cannot get past the history guard either.
+RAW_REQUEST = re.compile(r"[A-Z]\w*Request")
+RAW_WRITE_REQUESTS = {
+    "SendMessageRequest",
+    "SendMediaRequest",
+    "SendMultiMediaRequest",
+    "ForwardMessagesRequest",
+    "EditMessageRequest",
+    "DeleteMessagesRequest",
+    "DeleteHistoryRequest",
+    "ReadHistoryRequest",
+    "ReadMessageContentsRequest",
+    "ReadMentionsRequest",
+    "ReadReactionsRequest",
+    "SetTypingRequest",
+    "SaveDraftRequest",
+    "SendReactionRequest",
+    "UpdatePinnedMessageRequest",
+    "GetBotCallbackAnswerRequest",
+    "ImportContactsRequest",
+    "AddContactRequest",
+    "JoinChannelRequest",
+    "ImportChatInviteRequest",
+    "UpdateStatusRequest",
+    "UploadFileRequest",
+    "SaveFilePartRequest",
+    "SendInlineBotResultRequest",
+    "StartBotRequest",
+    "SendVoteRequest",
+    "SendScreenshotNotificationRequest",
+    "SendEncryptedRequest",
+    "SendQuickReplyMessagesRequest",
+    "SendPaidReactionRequest",
+    "LeaveChannelRequest",
+    "DeleteChatUserRequest",
+}
+# The only functions that may write, all in sender.py.
+SENDER_WRITE_FUNCTIONS = {"_mark_read", "_typing", "_send"}
 
 # Reading history is a weaker rule — it is about *unsolicited* reading. The
 # userbot lives on live events and must not trawl backwards on its own, but
 # re-reading one message the owner explicitly approved is the opposite of
 # unsolicited. The allowlist is by function so the exception stays one
-# reviewable line rather than a whole-file exemption.
+# reviewable line rather than a whole-file exemption: the approved-media
+# re-read, the backfill tool's reads the owner asked for (a named backfill,
+# a switched-on chat's catch-up, the archive import, the style import), and
+# the sender's read-back of a send whose outcome is not known.
 HISTORY_CALLS = {"get_messages", "iter_messages"}
-HISTORY_ALLOWED_IN = {"fetch_approved", "fetch_style_history"}
+HISTORY_ALLOWED_IN = {
+    "fetch_approved",
+    "catch_up_chat",
+    "backfill_chat",
+    "archive_chat",
+    "fetch_style_history",
+    "reconcile",
+}
 
 
 def _calls_by_function(source: str) -> dict[str | None, set[str]]:
-    """Attribute calls in each function; None is module level."""
+    """Attribute calls in each function, by the innermost function that
+    makes them (a nested helper is its own name); None is module level."""
     tree = ast.parse(source)
     owner: dict[int, str | None] = {}
+    # ast.walk is breadth first: an enclosing function comes before the
+    # functions nested in it, so the innermost one is written last.
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             for child in ast.walk(node):
-                owner.setdefault(id(child), node.name)
+                owner[id(child)] = node.name
 
     found: dict[str | None, set[str]] = {}
     for node in ast.walk(tree):
@@ -57,17 +141,134 @@ def _calls_by_function(source: str) -> dict[str | None, set[str]]:
     return found
 
 
-@pytest.mark.parametrize("path", sorted(USERBOT_PACKAGE.glob("*.py")))
-def test_the_userbot_never_writes_to_telegram(path):
-    calls = _calls_by_function(path.read_text())
-    everything = set().union(*calls.values()) if calls else set()
-    assert not (everything & WRITE_CALLS), (
-        f"{path.name} calls {sorted(everything & WRITE_CALLS)} — the userbot "
-        "must stay strictly read-only (spec §7B)"
+def _raw_requests_by_function(source: str) -> dict[str | None, set[str]]:
+    """Raw requests named in each function (innermost), or at module level
+    (None): a call, a bare name, an attribute or an import alias. Every raw
+    TL request counts, not only the known writes (RAW_REQUEST)."""
+    tree = ast.parse(source)
+    owner: dict[int, str | None] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            for child in ast.walk(node):
+                owner[id(child)] = node.name
+    found: dict[str | None, set[str]] = {}
+    for node in ast.walk(tree):
+        names: list[str] = []
+        if isinstance(node, ast.Name):
+            names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.append(node.attr)
+        elif isinstance(node, ast.alias):
+            names += [node.name.rsplit(".", 1)[-1], node.asname or ""]
+        hits = {name for name in names if name and RAW_REQUEST.fullmatch(name)}
+        if hits:
+            found.setdefault(owner.get(id(node)), set()).update(hits)
+    return found
+
+
+def _imports_telethon(path: Path) -> bool:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import) and any(
+            a.name.split(".")[0] == "telethon" for a in node.names
+        ):
+            return True
+        if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[0] == (
+            "telethon"
+        ):
+            return True
+    return False
+
+
+def _scanned() -> list[Path]:
+    """Every module of miya/userbot (recursively) and every module of MIYA
+    that imports Telethon."""
+    paths = {p for p in USERBOT_PACKAGE.rglob("*.py") if "__pycache__" not in p.parts}
+    paths |= {
+        p
+        for p in MIYA_PACKAGE.rglob("*.py")
+        if "__pycache__" not in p.parts and _imports_telethon(p)
+    }
+    return sorted(paths)
+
+
+SCANNED = _scanned()
+
+
+def test_the_scan_reaches_every_telethon_module():
+    names = {p.relative_to(MIYA_PACKAGE).as_posix() for p in SCANNED}
+    assert {
+        "userbot/__init__.py",
+        "userbot/main.py",
+        "userbot/sender.py",
+        "tools/backfill.py",
+        "tools/userbot_login.py",
+    } <= names
+
+
+@pytest.mark.parametrize("path", SCANNED, ids=lambda p: p.name)
+def test_write_calls_only_in_sender_functions(path):
+    """JV-19: the userbot writes to Telegram only in the named send
+    functions of sender.py; no other function there or anywhere else."""
+    source = path.read_text(encoding="utf-8")
+    offending = []
+    for function, called in _calls_by_function(source).items():
+        writes = called & WRITE_CALLS
+        if writes and not (path == SENDER and function in SENDER_WRITE_FUNCTIONS):
+            offending.append(f"{function or '<module>'}: {sorted(writes)}")
+    for function, named in _raw_requests_by_function(source).items():
+        if not (path == SENDER and function in SENDER_WRITE_FUNCTIONS):
+            offending.append(f"{function or '<module>'}: {sorted(named)}")
+    assert not offending, (
+        f"{path.name} writes to Telegram outside the sender's named functions "
+        f"{sorted(SENDER_WRITE_FUNCTIONS)}: {offending}"
     )
 
 
-@pytest.mark.parametrize("path", sorted(USERBOT_PACKAGE.glob("*.py")))
+def test_the_sender_writes_exactly_where_it_says():
+    calls = _calls_by_function(SENDER.read_text(encoding="utf-8"))
+    raw = _raw_requests_by_function(SENDER.read_text(encoding="utf-8"))
+    assert "send_read_acknowledge" in calls["_mark_read"]
+    assert "action" in calls["_typing"]
+    assert raw == {"_send": {"SendMessageRequest"}}
+    # The high-level helpers are not used: they take no random_id.
+    everything = set().union(*calls.values())
+    assert not everything & {"send_message", "send_file", "forward_messages"}
+
+
+def test_the_write_detector_catches_each_shape():
+    source = (
+        "async def outer(client):\n"
+        "    async def inner():\n"
+        "        await client.send_message(1, 'x')\n"
+        "    await client.get_dialogs()\n"
+        "from telethon.tl.functions.messages import ReadHistoryRequest as R\n"
+        "async def raw(client):\n"
+        "    await client(functions.messages.SetTypingRequest(1, None))\n"
+        "async def aliased(client):\n"
+        "    request = SendMessageRequest\n"
+    )
+    calls = _calls_by_function(source)
+    # The nested helper's call is its own, not the enclosing function's.
+    assert calls["inner"] == {"send_message"}
+    assert calls["outer"] == {"get_dialogs"}
+    raw = _raw_requests_by_function(source)
+    assert raw == {
+        None: {"ReadHistoryRequest"},
+        "raw": {"SetTypingRequest"},
+        "aliased": {"SendMessageRequest"},
+    }
+    # Any raw request, not only the listed writes: a raw history read too.
+    unlisted = "async def trawl(client):\n    await client(GetHistoryRequest(1))\n"
+    assert _raw_requests_by_function(unlisted) == {"trawl": {"GetHistoryRequest"}}
+    assert all(RAW_REQUEST.fullmatch(name) for name in RAW_WRITE_REQUESTS)
+    drafts = (
+        "async def d(draft, message):\n    await draft.send()\n    await message.pin()\n"
+    )
+    assert _calls_by_function(drafts)["d"] & WRITE_CALLS == {"send", "pin"}
+
+
+@pytest.mark.parametrize("path", SCANNED, ids=lambda p: p.name)
 def test_history_is_only_read_where_the_owner_asked_for_it(path):
     for function, called in _calls_by_function(path.read_text()).items():
         offending = called & HISTORY_CALLS
@@ -76,9 +277,83 @@ def test_history_is_only_read_where_the_owner_asked_for_it(path):
         pytest.fail(
             f"{path.name}:{function or '<module>'} calls {sorted(offending)} — "
             "the userbot follows live events and must not pull history on its "
-            f"own. Only {sorted(HISTORY_ALLOWED_IN)} may, to re-read a message "
-            "the owner approved."
+            f"own. Only {sorted(HISTORY_ALLOWED_IN)} may, to read what the "
+            "owner asked for."
         )
+
+
+def test_sender_uses_claim_ready_only():
+    """The sender never reads or changes outbox_messages itself: of the
+    outbox it uses claim_ready, complete and fail only, and its send path
+    is reached only from the rows a claim returned."""
+    tree = ast.parse(SENDER.read_text(encoding="utf-8"))
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "outbox"
+    }
+    # Names of constants and types are no access to rows.
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "outbox"
+    }
+    assert called == {"claim_ready", "complete", "fail"}
+    assert used - called <= {"ClaimedSend", "FLOOD_WAIT_CODE", "BY_ADAPTER"}
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)} | {
+        n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+    }
+    assert "OutboxMessage" not in names
+    imported = {
+        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+    }
+    assert "miya.db.models" not in imported
+    source = SENDER.read_text(encoding="utf-8")
+    assert "outbox_messages" not in source.replace("``outbox_messages``", "")
+    # send_one is reached only from poll_once, over what claim_ready returned.
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    callers = {
+        name
+        for name, function in functions.items()
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "send_one"
+    }
+    assert callers == {"poll_once"}
+    poll = functions["poll_once"]
+    loops = [n for n in ast.walk(poll) if isinstance(n, ast.For)]
+    [loop] = loops
+    assert isinstance(loop.iter, ast.Name) and loop.iter.id == "rows"
+    claims = [
+        n
+        for n in ast.walk(poll)
+        if isinstance(n, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "rows" for t in n.targets)
+    ]
+    [claim] = claims
+    value = claim.value.value if isinstance(claim.value, ast.Await) else claim.value
+    assert isinstance(value, ast.Call) and value.func.attr == "claim_ready"
+    # The write functions are reached only from send_one.
+    for writer in SENDER_WRITE_FUNCTIONS:
+        reached_from = {
+            name
+            for name, function in functions.items()
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == writer
+        }
+        assert reached_from == {"send_one"}, writer
 
 
 def test_the_kill_switch_stops_the_process_before_it_connects(monkeypatch):

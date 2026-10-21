@@ -283,6 +283,24 @@ class Settings(BaseSettings):
     # Escalation alerts a day; past it the rest fold into one message.
     jarvis_escalation_daily_cap: int = Field(default=30, ge=0, le=1000)
 
+    # --- Telegram sender (JV-19) --------------------------------------------
+    # Starts the sender inside the userbot process (with JARVIS_ENABLED): the
+    # outbox replies that passed the gate (the ones you approved and, in auto
+    # mode, the ones Jarvis may send by itself) go out from your account.
+    # Off, the cards stay in copy mode and nothing is ever written to Telegram.
+    telegram_send_enabled: bool = False
+    # Telethon sleeps through a flood wait up to this many seconds by itself;
+    # a longer one reaches the sender, which re-queues the row or trips the
+    # Telegram breaker instead of waiting inside a claim.
+    userbot_flood_sleep_seconds: int = Field(default=5, ge=0, le=60)
+    # Human pacing: a random pause between these two before a reply (the chat
+    # is marked read only then), and "typing…" for the reply's length at this
+    # many characters a second, never longer than the cap.
+    jarvis_reply_delay_min_seconds: int = Field(default=3, ge=0, le=60)
+    jarvis_reply_delay_max_seconds: int = Field(default=7, ge=0, le=60)
+    jarvis_typing_chars_per_second: int = Field(default=6, ge=1, le=50)
+    jarvis_typing_max_seconds: int = Field(default=15, ge=0, le=60)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"
@@ -576,6 +594,23 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"STYLE_MIN_SAMPLES={self.style_min_samples} must not exceed "
                 f"STYLE_SAMPLE_SIZE={self.style_sample_size}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reply_delay_ordered(self) -> Settings:
+        # The pre-send pause is drawn between the two. Only a pair the owner
+        # set is refused (rule 20: an unset key never fails); otherwise the
+        # pacing takes the smaller one as the lower bound (outbox.pacing_for).
+        pair = {"jarvis_reply_delay_min_seconds", "jarvis_reply_delay_max_seconds"}
+        if (
+            pair <= self.model_fields_set
+            and self.jarvis_reply_delay_min_seconds > self.jarvis_reply_delay_max_seconds
+        ):
+            raise ValueError(
+                "JARVIS_REPLY_DELAY_MIN_SECONDS="
+                f"{self.jarvis_reply_delay_min_seconds} must not exceed "
+                f"JARVIS_REPLY_DELAY_MAX_SECONDS={self.jarvis_reply_delay_max_seconds}"
             )
         return self
 

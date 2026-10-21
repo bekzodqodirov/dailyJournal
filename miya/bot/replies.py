@@ -3430,6 +3430,49 @@ JARVIS_SEND_UNKNOWN = (
 )
 
 
+# --- the Telegram sender (JV-19) -----------------------------------------------------
+# Told by the worker from what the sender recorded: the Telegram breaker, a
+# flood wait, and how each send the owner tapped ended.
+JARVIS_TELEGRAM_LIMITED = (
+    "⛔ Telegram yuborishni cheklab qo'ydi. MIYA Telegramdan yozishni to'xtatdi; "
+    "o'qish davom etadi. @SpamBot orqali holatni tekshiring. "
+    "Qayta yoqish: /jarvis yoq telegram"
+)
+JARVIS_TELEGRAM_FLOOD = (
+    "⏳ Telegram {daqiqa} daqiqa kutishni so'radi — xabarlar keyinroq yuboriladi."
+)
+JARVIS_SEND_FAILED = "✖️ {ism}ga yuborib bo'lmadi: {sabab}"
+JARVIS_SENT = "✅ Yuborildi ({vaqt})"
+# The adapter's failure codes (miya.jarvis.outbox / miya.userbot.sender).
+JARVIS_SEND_FAIL_REASONS = {
+    "user_blocked": "u sizni bloklagan",
+    "user_deactivated": "akkaunt o'chirilgan",
+    "write_forbidden": "bu chatga yozish taqiqlangan",
+    "paid_only": "faqat pullik xabar qabul qiladi",
+}
+# Any other code: the chat could not be found, Telegram refused the text, an
+# error MIYA did not expect.
+JARVIS_SEND_FAIL_OTHER = "kutilmagan xato"
+
+
+def jarvis_send_failed(name: str | None, code: str | None) -> str:
+    """«✖️ Akmalga yuborib bo'lmadi: u sizni bloklagan». The name is the
+    client's to choose: shown through _shown."""
+    return JARVIS_SEND_FAILED.format(
+        ism=_shown(name or JARVIS_UNNAMED_CLIENT),
+        sabab=JARVIS_SEND_FAIL_REASONS.get(code or "", JARVIS_SEND_FAIL_OTHER),
+    )
+
+
+def jarvis_sent(sent_at: datetime) -> str:
+    return JARVIS_SENT.format(vaqt=clock(sent_at))
+
+
+def jarvis_flood_wait(seconds: int) -> str:
+    """The wait in whole minutes, rounded up (90 seconds is «2 daqiqa»)."""
+    return JARVIS_TELEGRAM_FLOOD.format(daqiqa=max(1, -(-seconds // 60)))
+
+
 # --- the owner first (JV-17) ---------------------------------------------------------
 # Told once, about a draft card or an escalation alert the owner was shown.
 JARVIS_OWN_REPLY_DRAFT = "🙋 Siz o'zingiz javob berdingiz — qoralama bekor qilindi."

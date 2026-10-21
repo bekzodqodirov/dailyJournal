@@ -303,6 +303,9 @@ def new_code_paths() -> list[Path]:
     """The files rule 26 names, as far as they exist today."""
     paths = _python_sources(PACKAGE / "jarvis") if (PACKAGE / "jarvis").is_dir() else []
     paths.append(PACKAGE / "logs.py")
+    # The Telegram sender (JV-19), the userbot's one new module.
+    if (PACKAGE / "userbot" / "sender.py").is_file():
+        paths.append(PACKAGE / "userbot" / "sender.py")
     paths += [
         p
         for p in sorted((PACKAGE / "services").glob("*.py"))
@@ -480,6 +483,7 @@ STRICT_MODULES = (
     "miya/services/retry.py",
     "miya/services/safety.py",
     "miya/services/when.py",
+    "miya/userbot/sender.py",
 )
 
 

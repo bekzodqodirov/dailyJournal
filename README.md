@@ -9,7 +9,10 @@ Owner-facing language is Uzbek. Code, comments and commits are English.
 
 **Status: all five phases complete.** The assistant bot captures text, voice,
 photos and documents; call recordings sync in from the phone via Syncthing; a
-passive Telegram userbot reads whichever chats the owner whitelists. Everything
+passive Telegram userbot reads whichever chats the owner whitelists (and, only
+with `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`, sends from their account
+the outbox replies that passed the gate: the ones the owner approved and, in
+`auto` mode, the ones Jarvis may send by itself). Everything
 is transcribed, extracted and persisted as debts, promises, transactions,
 events, tasks and searchable memories. Questions are answered with figures
 straight from SQL, a report and tomorrow's plan arrive every evening, reminders
@@ -23,7 +26,7 @@ encrypted every night.
 ```
 ┌──────────────── CAPTURE ────────────────────────────────────────────┐
 │ A) Assistant bot (aiogram)   — owner-facing: notes, voice, receipts │
-│ B) Userbot (Telethon)        — passive, read-only DM/group reader   │
+│ B) Userbot (Telethon)        — DM/group reader; outbox replies      │
 │ C) Call recordings           — Syncthing folder sync from the phone │
 │ D) Google Calendar           — pull events, push extracted ones     │
 └────────────────────────────┬────────────────────────────────────────┘
@@ -197,6 +200,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `JARVIS_DEBOUNCE_SECONDS`, `JARVIS_OWNER_FIRST_SECONDS`, `JARVIS_MAX_MESSAGE_AGE_SECONDS`, `JARVIS_MAX_AI_TURNS`, `JARVIS_HISTORY_TURNS` | 45 s / 120 s / 900 s / 2 / 8 — the responder (with `JARVIS_ENABLED`): a burst of client messages in a private chat gets one reply, looked at this long after the latest one; you get the owner-first window, from the client's first unanswered message, to answer yourself (then Jarvis drafts nothing); a message older than the age limit, one read by the catch-up or a backfill, and an edit never get a reply of their own (an edit of a message Jarvis already drafted for replaces that draft, see `JARVIS_TAKEOVER_MINUTES`); after the given number of Jarvis replies in a row without you, the chat is only forwarded to you; the reply writer (`REASON_MODEL`, with no tools) reads only that chat's latest turns, your style profile and the knowledge-base answers that matched, never debts, other people or figures. A price, deadline, promise, payment claim, complaint or identity question is never drafted: it goes to you with a fixed holding reply. Every draft passes the red lines and then a check by `EXTRACT_MODEL`, which may only block (it also flags spam, scams and hijacked accounts); usage is recorded as `jarvis_intent`, `jarvis_draft` and `jarvis_guard`, priced from config, and above `JARVIS_DAILY_COST_CAP_USD` no model is called. In `shadow` mode the drafts are only stored: `/qoralamalar` lists them |
 | `JARVIS_TAKEOVER_MINUTES` | 120 min — you always come first (with `JARVIS_ENABLED`): Jarvis drafts nothing for a chat you have read, are typing in or have answered; the moment you write in a chat yourself (MIYA's own replies never count), its pending drafts are cancelled, its open escalation is closed as answered by you and Jarvis stays silent there for this long. A client who edits their message gets a fresh draft; one who deletes it gets none. A cancelled draft or a closed escalation you were shown is reported to you once |
 | `JARVIS_ESCALATION_SNOOZE_MINUTES`, `JARVIS_SNOOZE_MAX`, `JARVIS_ESCALATION_DAILY_CAP` | 60 min / 3 / 30 — the cards (with `JARVIS_ENABLED`, in `draft` or `auto` mode): each draft reply reaches you as a card with the client's message and the exact text («✏️ Tahrirlash»: reply to the card with your own text or a voice note, which becomes the text, flagged when it names a price or a time; «🙋 O'zim yozaman»: Jarvis stays silent in that chat for `JARVIS_TAKEOVER_MINUTES`; «✖️ Bekor»). A price, deadline, promise, payment or identity question is alerted at once, without waiting for the owner-first window (only the holding reply to the client waits for it): the client's messages, their name and code, their open balance from the ledger (never a figure from a model) and the holding reply; reply to the alert with your own words and «✅ Tasdiqlash va yuborish» sends exactly them. «⏰ 1 soatdan keyin eslat» shows the alert again after this many minutes, and the snooze that reaches the maximum sends it to the morning brief instead. Past the daily cap the day's further alerts fold into one message; draft cards past `JARVIS_DRAFT_DAILY_CAP` are left to the morning brief. At night cards arrive silently. Until a channel can send, no card has a send button: copy the text and send it yourself. A typed batch answer («hammasi ha») never approves a send |
+| `TELEGRAM_SEND_ENABLED`, `USERBOT_FLOOD_SLEEP_SECONDS`, `JARVIS_REPLY_DELAY_MIN_SECONDS`, `JARVIS_REPLY_DELAY_MAX_SECONDS`, `JARVIS_TYPING_CHARS_PER_SECOND`, `JARVIS_TYPING_MAX_SECONDS` | `false` / 5 s / 3 s / 7 s / 6 / 15 s — Telegram sending (with `JARVIS_ENABLED`): the userbot sends from your account the replies that passed the outbox gate (the ones you approved and, in `auto` mode, the ones Jarvis may send by itself), and the cards get «✅ Yuborish» instead of copy mode. Each reply waits a random 3–7 s, marks the chat read only then, shows "typing…" for its length (6 characters a second, at most 15 s) and goes out as plain text, at most one every `JARVIS_SEND_MIN_GAP_SECONDS`; you hear «✅ Yuborildi» under the card. Telethon sleeps through a flood wait up to `USERBOT_FLOOD_SLEEP_SECONDS`; a longer one re-queues the message («⏳ Telegram N daqiqa kutishni so'radi»), and a long one, a spam limit or a lost session stops Telegram sending and tells you («⛔ … Qayta yoqish: /jarvis yoq telegram») while reading goes on. A client who blocked you, a deleted account, a chat closed to writing or one that takes only paid messages is told as «✖️ … yuborib bo'lmadi»; a message whose fate is unclear is never sent twice («❓ … aniq emas») |
 | `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO` / `json` — every process writes one JSON object per line (`ts`, `level`, `logger`, `component`, `msg` and the record's extras; extras named `text`, `body`, `raw_text`, `transcript` or `draft` are dropped); `text` gives the plain lines |
 
@@ -469,13 +473,19 @@ The userbot reads the owner's **personal** Telegram account with Telethon so
 that business conversations become debts, promises and facts without anyone
 re-typing them. It is passive by construction:
 
-* It never sends, edits, deletes, forwards or marks anything as read. A test
-  parses the package and fails the build if a writing call ever appears.
+* It never edits, deletes or forwards anything. Sending and marking a chat
+  read happen in exactly one place, `miya/userbot/sender.py` (JV-19), only with
+  `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`, and only for outbox rows that
+  passed the gate — the ones the owner approved and, in `auto` mode, the ones
+  Jarvis may send by itself (`auto:policy`) — taken through
+  `outbox.claim_ready`, which re-runs every check. A test parses the package, and every module that imports Telethon,
+  and fails the build if a writing call appears anywhere else.
 * It reads history only when the owner asks for it: a group's backfill after
   «Ha», and `/uslub yukla`, which reads up to the 300 newest messages of each
   monitored private chat (read-only, stored as archive rows, media kept as
   metadata only). Otherwise only messages that arrive after it starts are
-  read; the dialog list is used for chat titles only.
+  read (the sender reads a chat's newest messages back only to check a send
+  whose outcome was unclear); the dialog list is used for chat titles only.
 * `USERBOT_ENABLED=false` turns the whole thing off in one flag.
 * In a group that is switched off and not yet decided, it keeps only a
   message counter and two timestamps (when the owner last wrote there, when
@@ -652,8 +662,9 @@ command ends, success or not.
 
 ### Documented egress
 
-Five external services receive data, plus one optional bare ping. Nothing
-else leaves the VPS.
+Five external services receive data, plus one optional bare ping and, only
+with `TELEGRAM_SEND_ENABLED`, Telegram sending as the owner. Nothing else
+leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
@@ -662,6 +673,7 @@ else leaves the VPS.
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
 | **Google Sheets API** (only with `SHEETS_ENABLED=true`) | Promise and task texts, deadlines and statuses with the names of the people involved, the Telegram group's title and a context line of up to 300 characters (the conversation summary or, without one, the verbatim message text or call transcript); client names, codes, group titles and last-contact times; receipt figures, names, card last four digits, references, the bank cross-check verdict and the bank's own matching transaction (ref, amount, currency, time, bank) | The one-way mirror in the owner's own spreadsheet |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
+| **Telegram, as the owner** (only with `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`) | The exact text of each outbox reply that passed the gate (approved by the owner, or on its own in `auto` mode), into the chat it answers, with that chat's read receipt and "typing…" status | Telegram sending as the owner |
 
 | **`DEADMAN_PING_URL`** (optional) | A bare GET every `DEADMAN_PING_MINUTES`, no data | An outside watcher notices a dead server |
 
@@ -678,9 +690,12 @@ the other party's consent vary by jurisdiction. Complying with the law where the
 owner and the other party are located is the owner's responsibility.
 
 The Telegram userbot automates a personal account, which technically
-violates Telegram's Terms of Service. It stays strictly passive — it never sends
-messages, never marks chats as read, and never bulk-downloads history on its
-own — and `USERBOT_ENABLED=false` disables it entirely.
+violates Telegram's Terms of Service. It stays passive — it never bulk-downloads
+history on its own, and it sends a message or marks a chat read only when the
+owner switched sending on (`TELEGRAM_SEND_ENABLED`) and the reply passed the
+outbox gate (the owner's tap, or `auto` mode's own allowlist), paced like a
+person, stopping at Telegram's first limit — and
+`USERBOT_ENABLED=false` disables it entirely.
 
 ---
 
@@ -794,8 +809,11 @@ free and offline.
   person, then a chat purge that leaves nothing behind.
 * An interrupted result stream is replayed on the next poll without
   re-applying what already landed.
-* The userbot package is parsed by a test that fails if any Telegram-writing
-  call (`send_message`, `send_read_acknowledge`, `iter_messages`, …) appears.
+* The userbot package, and every module that imports Telethon, is parsed by
+  a test that fails if any Telegram-writing call (`send_message`,
+  `send_read_acknowledge`, a raw `SendMessageRequest`, …) appears outside the
+  sender's named send functions, or a history read (`iter_messages`, …)
+  outside the reads the owner asked for.
 * `USERBOT_ENABLED=false` returns before a client is even constructed; a
   missing session exits instead of prompting on stdin.
 * Each of the three window triggers is exercised separately, a long backlog

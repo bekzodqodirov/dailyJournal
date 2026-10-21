@@ -149,14 +149,6 @@ UNTRIGGERED_SAFETY_LOOKBACK: Final = timedelta(hours=24)
 # How far before the claim an untagged echo may have been stored.
 ECHO_SLACK: Final = timedelta(minutes=2)
 
-# Pacing defaults, the plan's values for the JV-19 settings
-# (JARVIS_REPLY_DELAY_MIN/MAX_SECONDS, JARVIS_TYPING_CHARS_PER_SECOND,
-# JARVIS_TYPING_MAX_SECONDS) until those keys exist.
-DELAY_MIN_SECONDS: Final = 3.0
-DELAY_MAX_SECONDS: Final = 7.0
-TYPING_CHARS_PER_SECOND: Final = 6
-TYPING_MAX_SECONDS: Final = 15
-
 # The send switch and the platform's daily cap of each channel. The keys
 # land with their adapters (TELEGRAM_SEND_ENABLED in JV-19,
 # GMAIL_SEND_ENABLED and GMAIL_DAILY_SEND_CAP in JV-27, WHATSAPP_* in JV-30);
@@ -1315,14 +1307,34 @@ class ClaimedSend:
     authored_by: str
     lease_until: datetime
     pacing: PacingPlan
+    # The platform's id of the message the row answers (a Telegram message id
+    # read from the trigger interaction), for the read receipt and a quoted
+    # reply; None for a row without a trigger.
+    trigger_message_id: int | None = None
+
+    @property
+    def claimed_at(self) -> datetime:
+        """When the row went on the wire: the claim moment of its lease."""
+        return self.lease_until - caps.SEND_LEASE
 
 
 def pacing_for(
     body: str, *, channel: str, has_trigger: bool, rng: random.Random
 ) -> PacingPlan:
-    typing_seconds = min(len(body) / TYPING_CHARS_PER_SECOND, TYPING_MAX_SECONDS)
+    """The human pacing of one send (JV-19): a pause drawn uniformly between
+    JARVIS_REPLY_DELAY_MIN_SECONDS and JARVIS_REPLY_DELAY_MAX_SECONDS (the
+    smaller of the two is the lower bound, so a lone key set above the other
+    default never fails), then "typing…" for the body's length at
+    JARVIS_TYPING_CHARS_PER_SECOND, at most JARVIS_TYPING_MAX_SECONDS."""
+    low, high = sorted(
+        (settings.jarvis_reply_delay_min_seconds, settings.jarvis_reply_delay_max_seconds)
+    )
+    typing_seconds = min(
+        len(body) / max(settings.jarvis_typing_chars_per_second, 1),
+        settings.jarvis_typing_max_seconds,
+    )
     return PacingPlan(
-        pre_delay_seconds=rng.uniform(DELAY_MIN_SECONDS, DELAY_MAX_SECONDS),
+        pre_delay_seconds=rng.uniform(low, high),
         typing_ms=int(typing_seconds * 1000),
         # A chat is marked read only when a reply is actually sent into it.
         mark_read=has_trigger and channel != chatkey.GMAIL,
@@ -1557,6 +1569,7 @@ async def claim_ready(
         if row.approved_by == AUTO_APPROVER:
             counters.auto_sent += 1
         lease = row.lease_until or now + caps.SEND_LEASE
+        trigger_message = await _trigger_message_id(session, row)
         claimed.append(
             ClaimedSend(
                 id=row.id,
@@ -1576,10 +1589,39 @@ async def claim_ready(
                     has_trigger=row.trigger_interaction_id is not None,
                     rng=rng,
                 ),
+                trigger_message_id=trigger_message,
             )
         )
         log.info("outbox row claimed", extra={"outbox_id": row.id, "channel": channel})
     return claimed
+
+
+async def _trigger_message_id(session: AsyncSession, row: OutboxMessage) -> int | None:
+    """The platform message id of the row's trigger, when it has one. A read
+    that fails is logged and reads as none: the send goes out unquoted and
+    marks nothing read (rule 25), it never undoes the claim."""
+    if row.trigger_interaction_id is None:
+        return None
+    key = ECHO_ID_KEYS.get(row.channel)
+    try:
+        async with session.begin_nested():
+            meta = await session.scalar(
+                sa.select(Interaction.meta).where(
+                    Interaction.id == row.trigger_interaction_id
+                )
+            )
+    except Exception as exc:
+        log.error(
+            "trigger message id unreadable",
+            extra={
+                "outbox_id": row.id,
+                "interaction_id": row.trigger_interaction_id,
+                "error": type(exc).__name__,
+            },
+        )
+        return None
+    value = meta.get(key) if isinstance(meta, dict) and key else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 async def _hold_after_error(
@@ -1746,9 +1788,33 @@ async def complete(
     if echo is not None:
         row.sent_interaction_id = echo.id
     await _note_ai_sent(session, row, sent_at)
+    await _advance_cursor(session, row, external_id)
     await session.flush()
     log.info("outbox row sent", extra={"outbox_id": row.id, "channel": row.channel})
     return row
+
+
+async def _advance_cursor(
+    session: AsyncSession, row: OutboxMessage, external_id: str
+) -> None:
+    """The catch-up cursor (WP-21) moves past a Telegram message MIYA sent,
+    as it does for every message the live reader stores (JV-19): the
+    catch-up never reads its own send back as news. Only forward."""
+    if row.channel != chatkey.TELEGRAM or row.tg_chat_id is None:
+        return
+    message_id = _tg_message_id(external_id)
+    if message_id is None:
+        return
+    await session.execute(
+        sa.update(ChatMonitor)
+        .where(ChatMonitor.tg_chat_id == row.tg_chat_id)
+        .values(
+            last_seen_message_id=sa.func.greatest(
+                sa.func.coalesce(ChatMonitor.last_seen_message_id, 0), message_id
+            )
+        )
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def fail(
@@ -1911,6 +1977,156 @@ async def mark_told(
     await session.flush()
 
 
+# --- what the owner hears about a send (JV-19) ---------------------------------------
+#
+# The adapters report codes (``fail``), never text; these are the codes the
+# owner is told about. The bot words them (``replies.jarvis_send_failed``).
+
+# A flood wait the adapter re-queued the row for: it waits ``approved`` until
+# Telegram's time is up.
+FLOOD_WAIT_CODE: Final = "flood_wait"
+# The owner hears about a flood wait only from this long: a shorter one is
+# pacing, not news.
+FLOOD_NOTICE_SECONDS: Final = 60
+# A finished send is news for the owner for this long; an older one is not
+# told any more.
+OUTCOME_LOOKBACK: Final = timedelta(hours=24)
+OUTCOME_BATCH: Final = 20
+
+
+@dataclass(frozen=True, slots=True)
+class SendOutcome:
+    """A send the owner has not been told about: one they approved that
+    went out (``sent``), or one that failed for good (``failed``, with the
+    adapter's code)."""
+
+    id: int
+    state: str
+    code: str | None
+    name: str | None
+    sent_at: datetime | None
+    # The card the owner tapped, so the notice answers it.
+    card_message_id: int | None
+
+
+def _told() -> sa.ColumnElement[bool]:
+    told: sa.ColumnElement[bool] = OutboxMessage.history.op("@>")(
+        sa.cast(sa.literal([{"field": TOLD_FIELD}], JSONB), JSONB)
+    )
+    return told
+
+
+async def outcomes_untold(
+    session: AsyncSession, *, now: datetime, limit: int = OUTCOME_BATCH
+) -> list[SendOutcome]:
+    """Sends from the last OUTCOME_LOOKBACK the owner has not been told
+    about: one they approved that went out, and one that failed for good.
+    An autonomous send has a notice of its own (JV-23), and an ``unknown``
+    one is told by ``unknown_untold``. ``mark_told`` records each told."""
+    found = await session.execute(
+        sa.select(
+            OutboxMessage.id,
+            OutboxMessage.state,
+            OutboxMessage.last_error,
+            Person.display_name,
+            OutboxMessage.sent_at,
+            OutboxMessage.card_tg_message_id,
+        )
+        .outerjoin(Person, Person.id == OutboxMessage.person_id)
+        .where(
+            sa.not_(_told()),
+            OutboxMessage.updated_at >= now - OUTCOME_LOOKBACK,
+            sa.or_(
+                sa.and_(
+                    OutboxMessage.state == SENT,
+                    OutboxMessage.approved_by != AUTO_APPROVER,
+                ),
+                OutboxMessage.state == FAILED,
+            ),
+        )
+        .order_by(OutboxMessage.id)
+        .limit(limit)
+    )
+    return [
+        SendOutcome(
+            id=row_id,
+            state=state,
+            code=code,
+            name=name,
+            sent_at=sent_at,
+            card_message_id=card,
+        )
+        for row_id, state, code, name, sent_at, card in found
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class FloodWait:
+    """A row waiting out a flood wait Telegram asked for (JV-19): ``ref``
+    names this one wait (the row and its attempt), ``seconds`` how long
+    Telegram asked for."""
+
+    id: int
+    ref: str
+    seconds: int
+    until: datetime
+
+
+def _flood_started(history: Sequence[object] | None) -> datetime | None:
+    """When the adapter re-queued the row for its latest flood wait."""
+    for entry in reversed(list(history or [])):
+        if not isinstance(entry, dict) or entry.get("field") != "state":
+            continue
+        if entry.get("new") == APPROVED and entry.get("code") == FLOOD_WAIT_CODE:
+            at = entry.get("at")
+            try:
+                return datetime.fromisoformat(at) if isinstance(at, str) else None
+            except ValueError:
+                return None
+        return None
+    return None
+
+
+async def flood_waits(
+    session: AsyncSession,
+    *,
+    now: datetime,
+    channel: str = chatkey.TELEGRAM,
+    min_seconds: int = FLOOD_NOTICE_SECONDS,
+) -> list[FloodWait]:
+    """Rows of ``channel`` waiting out a flood wait of at least
+    ``min_seconds`` that is not over yet."""
+    found = await session.execute(
+        sa.select(
+            OutboxMessage.id,
+            OutboxMessage.attempts,
+            OutboxMessage.next_attempt_at,
+            OutboxMessage.history,
+        )
+        .where(
+            OutboxMessage.channel == channel,
+            OutboxMessage.state == APPROVED,
+            OutboxMessage.last_error == FLOOD_WAIT_CODE,
+            OutboxMessage.next_attempt_at > now,
+        )
+        .order_by(OutboxMessage.id)
+        .limit(OUTCOME_BATCH)
+    )
+    waits: list[FloodWait] = []
+    for row_id, attempts, until, history in found:
+        started = _flood_started(history)
+        if started is None or until is None:
+            continue
+        seconds = int((until - started).total_seconds())
+        if seconds >= min_seconds:
+            waits.append(
+                FloodWait(
+                    id=row_id, ref=f"{row_id}:{attempts}", seconds=seconds, until=until
+                )
+            )
+    return waits
+
+
 __all__ = [
     "APPROVED",
     "BLOCKED",
@@ -1920,6 +2136,8 @@ __all__ = [
     "ESCALATION_ORIGIN",
     "EXPIRED",
     "FAILED",
+    "FLOOD_NOTICE_SECONDS",
+    "FLOOD_WAIT_CODE",
     "PENDING",
     "REDRAFT_CODES",
     "SENDING",
@@ -1932,12 +2150,14 @@ __all__ = [
     "Approval",
     "CardWarnings",
     "ClaimedSend",
+    "FloodWait",
     "IllegalTransition",
     "JarvisDisabled",
     "NotPlainText",
     "OutboxError",
     "PacingPlan",
     "Reconciled",
+    "SendOutcome",
     "allowed_tokens",
     "approve",
     "cancel",
@@ -1951,9 +2171,11 @@ __all__ = [
     "expire_due",
     "expire_edited",
     "fail",
+    "flood_waits",
     "idempotency_key",
     "mark_carded",
     "mark_told",
+    "outcomes_untold",
     "owner_text",
     "pacing_for",
     "preview",

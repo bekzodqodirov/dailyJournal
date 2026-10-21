@@ -2150,10 +2150,11 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
         "style_refresh",
         "kb_mining",
     }
-    # The userbot has no Telegram write path yet. It imports miya.jarvis only
-    # inside functions, after the JARVIS_ENABLED check, never at module level:
-    # the responder inside enqueue_reply (JV-16), chat_state inside the
-    # owner-first signal handlers (JV-17).
+    # The userbot imports miya.jarvis only inside functions, after the
+    # JARVIS_ENABLED check, never at module level: the responder inside
+    # enqueue_reply (JV-16), chat_state inside the owner-first signal handlers
+    # (JV-17), and the Telegram sender (JV-19, which imports miya.jarvis
+    # itself) only inside start_sender, with both switches on.
     tree = ast.parse(Path(userbot.__file__).read_text(encoding="utf-8"))
     at_module = [
         node.module or "" for node in tree.body if isinstance(node, ast.ImportFrom)
@@ -2183,6 +2184,16 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
         ("on_message_deleted", "chat_state"),
     }
     assert deep == []
+    senders = {
+        function.name
+        for function in ast.walk(tree)
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+        for node in ast.walk(function)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "") == "miya.userbot"
+        and any(alias.name == "sender" for alias in node.names)
+    }
+    assert senders == {"start_sender"}
 
 
 async def test_the_outbox_job_reconciles_and_tells_the_owner(
