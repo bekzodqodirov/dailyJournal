@@ -229,6 +229,53 @@ def for_message(
     )
 
 
+def parse_override_key(key: object) -> tuple[Reason, Script, Honorific] | None:
+    """``reason:script:honorific`` back to its parts; None for anything that
+    is not the key of a template."""
+    if not isinstance(key, str):
+        return None
+    parts = key.split(":")
+    if len(parts) != 3:
+        return None
+    reason, script, form = parts
+    for r in REASONS:
+        if r != reason:
+            continue
+        for sc in SCRIPTS:
+            if sc != script:
+                continue
+            for h in HONORIFICS:
+                if h == form:
+                    return r, sc, h
+    return None
+
+
+def approved_overrides(overrides: Mapping[str, object] | None) -> dict[str, str]:
+    """The owner's overrides that are in force (JV-14): a template's key and
+    a text that passes the red-line guard in the ``stall`` role, in its
+    key's script. Anything else is left out, so a stored override that a
+    stricter guard now refuses approves nothing."""
+    found: dict[str, str] = {}
+    for key, value in (overrides or {}).items():
+        parts = parse_override_key(key)
+        if parts is None or not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        verdict = redlines.check_outbound(
+            text, "stall", client_script=parts[1], stall_texts=(text,)
+        )
+        if verdict.passed:
+            found[key] = text
+    return found
+
+
+def approved_texts(overrides: Mapping[str, object] | None) -> tuple[str, ...]:
+    """The override texts the statement allowlist counts as stalls, beside
+    the fixed templates (which ``redlines.check_shapes`` always knows):
+    what ``gate.Context.stall_texts`` carries."""
+    return tuple(dict.fromkeys(approved_overrides(overrides).values()))
+
+
 def all_templates() -> list[tuple[Reason, Script, Honorific, str]]:
     return [
         (reason, script, form, TEMPLATES[reason][script][form])
@@ -247,10 +294,13 @@ __all__ = [
     "Reason",
     "Stall",
     "all_templates",
+    "approved_overrides",
+    "approved_texts",
     "choose",
     "for_message",
     "honorific_of",
     "override_key",
+    "parse_override_key",
     "reason_for",
     "template",
 ]

@@ -192,6 +192,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `SAFETY_EXTRA_SAFE_DOMAINS` | Blank — domains you have verified yourself (comma-separated), added to the built-in list of real bank, payment and government sites; a link to one is never called a look-alike, but an installer or an archive behind it is still refused. Spam and scam messages are flagged in `meta.safety`, never answered and kept out of «javobsiz» lists; you are warned about a scam or a possibly hijacked account once per chat per day (silently at night, never from the question budget), and the brief counts what was ignored yesterday |
 | `JARVIS_ENABLED`, `JARVIS_MODE` | `false` / `draft` — the Jarvis act layer's master switch and its mode ceiling (`off`, `shadow`, `draft`, `auto`): every message MIYA may send in your name is a row in `outbox_messages`, and an adapter gets one only through `outbox.claim_ready`, which re-runs the whole gate (kill switches, pauses, mode, personal chats, the spam and file shield, owner-first signals, caps, the red-line guard, plain text only, quiet hours); the mode stored per channel and reply kind in `jarvis_policy` starts at `shadow` and never exceeds this ceiling. Off, no Jarvis job runs and core MIYA never loads it. `/jarvis` shows the status, `/jarvis toxtat` stops all sending at once, `/jarvis yoq [kanal]` resumes, `/jarvis tarix` lists the last 20 actions |
 | `JARVIS_DRAFT_DAILY_CAP`, `JARVIS_AUTO_DAILY_CAP`, `JARVIS_PER_CHAT_DAILY_CAP`, `JARVIS_SEND_MIN_GAP_SECONDS`, `JARVIS_DRAFT_EXPIRY_HOURS`, `JARVIS_DAILY_COST_CAP_USD` | 40 / 20 / 6 / 20 s / 12 h / 3.00 USD — counted in SQL from the start of your day: draft cards, replies sent on their own, AI replies into one chat, the gap between two sends from one account (your own approved texts count too), how old a draft may get before it is never sent, and Jarvis's own model spend (above it Jarvis only forwards to you and makes no model call; a call it cannot price counts as over). Jarvis never spends `QUESTION_BUDGET_PER_DAY` |
+| `STYLE_SAMPLE_SIZE`, `STYLE_MIN_SAMPLES` | 300 / 50 — the style profile (`/uslub`) is learned from your newest genuine outgoing private messages: never MIYA's own replies, never a chat you marked personal, archive imports included (`/uslub yukla` reads older history for style and search only, never sends anything). Below the minimum no profile is built. The traits are deterministic counts over those messages; the profile's prose is written by `REASON_MODEL` (priced from config, refused when it holds a digit), and the few-shot examples are your own replies with no figure, price, promise, link, phone or other person's name in them. A new profile waits as a draft until you tap «✅ Faollashtirish»; it is rebuilt weekly (with `JARVIS_ENABLED`) only when the messages changed |
 | `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
 | `LOG_LEVEL`, `LOG_FORMAT` | `INFO` / `json` — every process writes one JSON object per line (`ts`, `level`, `logger`, `component`, `msg` and the record's extras; extras named `text`, `body`, `raw_text`, `transcript` or `draft` are dropped); `text` gives the plain lines |
 
@@ -253,6 +254,7 @@ ledger only ever has the bank's own record and your own words.
 | `/shaxsiy <ism yoki GS kod>` | Mark a person (by name or client code) or a chat (a family group by its title) personal: MIYA never writes there on its own, reading goes on. Every address the person is known at is kept (their Telegram chat, a WhatsApp number written with its country code), so `/unut` or `/birlashtir` never reopens it. On a chat already personal it asks before unmarking (✅ Ha, chiqar / ✖️ Yo'q) |
 | `/shaxsiylar` | The personal chats, each with 🔓 (unmark, asks first), and likely family and friends found in the database (kinship in the contact name or the relationship you set, your informal «sen» towards them, no work talk, no client code), each with 🔒 to mark in one tap; nothing is marked without you |
 | `/guruhai <guruh>` | AI replies in one group: on after a confirm tap, and then only as drafts for your tap and only to messages addressed to you; off at once. Groups get no AI reply until switched on; `/guruhai` alone lists the groups that are on |
+| `/uslub [yukla]` | Your texting style as MIYA learned it: greetings, how you address people, message length, frequent phrases, emoji, script and Russian words, with a few of your own replies as examples; «✅ Faollashtirish» makes it the one Jarvis drafts with, «🔄 Qayta tuzish» builds it again. `yukla` reads your older private chats (read-only) to learn from more messages (media is not downloaded) and, with `JARVIS_ENABLED`, tells you when the profile is ready; without it, open `/uslub` again in a few minutes |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
@@ -463,8 +465,11 @@ re-typing them. It is passive by construction:
 
 * It never sends, edits, deletes, forwards or marks anything as read. A test
   parses the package and fails the build if a writing call ever appears.
-* It downloads no history. Only messages that arrive after it starts are read;
-  the dialog list is used for chat titles only.
+* It reads history only when the owner asks for it: a group's backfill after
+  «Ha», and `/uslub yukla`, which reads up to the 300 newest messages of each
+  monitored private chat (read-only, stored as archive rows, media kept as
+  metadata only). Otherwise only messages that arrive after it starts are
+  read; the dialog list is used for chat titles only.
 * `USERBOT_ENABLED=false` turns the whole thing off in one flag.
 * In a group that is switched off and not yet decided, it keeps only a
   message counter and two timestamps (when the owner last wrote there, when
@@ -668,8 +673,8 @@ owner and the other party are located is the owner's responsibility.
 
 The Telegram userbot automates a personal account, which technically
 violates Telegram's Terms of Service. It stays strictly passive — it never sends
-messages, never marks chats as read, and never bulk-downloads history — and
-`USERBOT_ENABLED=false` disables it entirely.
+messages, never marks chats as read, and never bulk-downloads history on its
+own — and `USERBOT_ENABLED=false` disables it entirely.
 
 ---
 

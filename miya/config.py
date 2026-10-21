@@ -245,6 +245,13 @@ class Settings(BaseSettings):
     # config); above it Jarvis only escalates and makes no model call.
     jarvis_daily_cost_cap_usd: Decimal = Field(default=Decimal("3.00"), ge=0)
 
+    # --- Owner style (JV-14) ------------------------------------------------
+    # How many of the owner's newest genuine outgoing private messages the
+    # style profile is learned from (never MIYA's own replies, never a chat
+    # marked personal), and the fewest below which no profile is built.
+    style_sample_size: int = Field(default=300, ge=10, le=5000)
+    style_min_samples: int = Field(default=50, ge=1, le=5000)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"
@@ -525,6 +532,19 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"REPORT_TIME={self.report_time} falls inside "
                 f"QUIET_HOURS={self.quiet_hours}; pick a time outside the quiet range"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _style_min_within_sample(self) -> Settings:
+        # A minimum above the sample size would never build a profile. Only a
+        # pair the owner set is refused (rule 20: an unset key never fails);
+        # otherwise the build uses the smaller of the two (style.min_samples).
+        both = {"style_min_samples", "style_sample_size"} <= self.model_fields_set
+        if both and self.style_min_samples > self.style_sample_size:
+            raise ValueError(
+                f"STYLE_MIN_SAMPLES={self.style_min_samples} must not exceed "
+                f"STYLE_SAMPLE_SIZE={self.style_sample_size}"
             )
         return self
 

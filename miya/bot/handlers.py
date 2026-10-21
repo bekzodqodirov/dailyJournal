@@ -1359,6 +1359,118 @@ async def _ack(callback: CallbackQuery) -> None:
         log.debug("could not acknowledge the callback", exc_info=True)
 
 
+# --- the owner's style (JV-14) --------------------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# The js: buttons are not in _button_handlers, so a typed batch answer never
+# changes the style the AI writes in.
+
+STYLE_IMPORT_WORDS = {"yukla", "yuklash", "import"}
+
+
+async def _style_page(session, *, now: datetime, force: bool = False):
+    """The `/uslub` card and its buttons: the newest draft (or the active
+    profile); with none yet, or with ``force``, one is built now."""
+    from miya.jarvis import style as jarvis_style
+
+    profile = None if force else await jarvis_style.current_profile(session)
+    if profile is None:
+        result = await jarvis_style.build_profile(
+            session, now=now, by=records.BY_COMMAND, force=force
+        )
+        if result.status == "too_few" or result.profile is None:
+            return (
+                replies.style_too_few(result.sample_count, jarvis_style.min_samples()),
+                None,
+            )
+        profile = result.profile
+    card = await jarvis_style.card(session, profile)
+    return (
+        replies.style_card(card),
+        keyboards.style_card(profile.version, active=profile.state == "active"),
+    )
+
+
+@router.message(Command("uslub"))
+async def cmd_style(message: Message, command: CommandObject) -> None:
+    """`/uslub` — the owner's texting style as MIYA learned it, with
+    ✅ Faollashtirish / 🔄 Qayta tuzish · `/uslub yukla` — read the older
+    private chats (read-only) to learn from more of the owner's messages."""
+    words = (command.args or "").split()
+    sub = fold_apostrophes(words[0]).casefold() if words else ""
+    if sub and sub not in STYLE_IMPORT_WORDS:
+        await _safe_answer(message, replies.STYLE_USAGE)
+        return
+    now = datetime.now(settings.tz)
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            if sub:
+                asked = await chats.request_style_import(session, now=now)
+                if not asked:
+                    body = replies.STYLE_IMPORT_NO_CHATS
+                elif settings.jarvis_enabled:
+                    # style_refresh says «✅ Uslub tayyor» once it is read.
+                    body = replies.STYLE_IMPORT_STARTED
+                else:
+                    body = replies.STYLE_IMPORT_STARTED_MANUAL
+            else:
+                body, keyboard = await _style_page(session, now=now)
+    except Exception as exc:
+        log.error(
+            "/uslub failed",
+            extra={"command": sub or "show", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _style_tap(action: str, version: int, *, now: datetime):
+    """One js: tap: (text, keyboard)."""
+    from miya.jarvis import style as jarvis_style
+
+    async with session_scope() as session:
+        if action == keyboards.STYLE_ACTIVATE:
+            profile = await jarvis_style.activate(
+                session, version, by=records.BY_BUTTON, now=now
+            )
+            if profile is None:
+                return replies.STYLE_STALE, None
+            return replies.style_activated(profile.version), None
+        return await _style_page(session, now=now, force=True)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.STYLE_PREFIX}:"))
+async def on_style_button(callback: CallbackQuery) -> None:
+    """✅ Faollashtirish / 🔄 Qayta tuzish under `/uslub` (JV-14). The
+    activation runs under a row lock; a tap on a retired version changes
+    nothing. Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    version = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if (
+        action not in (keyboards.STYLE_ACTIVATE, keyboards.STYLE_REBUILD)
+        or version is None
+    ):
+        await _ack(callback)
+        return
+    try:
+        body, keyboard = await _style_tap(action, version, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "style tap failed",
+            extra={
+                "style_action": action,
+                "version": version,
+                "error": type(exc).__name__,
+            },
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    if callback.message is not None:
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+    await _ack(callback)
+
+
 @router.message(Command("unut"))
 async def cmd_purge(message: Message, command: CommandObject) -> None:
     """`/unut` — destructive, so it only ever shows a plan and asks first."""

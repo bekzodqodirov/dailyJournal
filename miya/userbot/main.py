@@ -693,6 +693,7 @@ async def ingest_message(
     *,
     archive: bool = False,
     transcribe_media: bool = True,
+    read_media: bool = True,
 ) -> bool:
     """Store one Telegram message. Extraction is the window job's business.
 
@@ -701,7 +702,8 @@ async def ingest_message(
 
     ``archive`` (WP-76): an old message imported for search only — stored
     processed, never windowed or extracted, never an open question. Without
-    ``transcribe_media`` its voice and video are kept as metadata only.
+    ``transcribe_media`` its voice and video are kept as metadata only;
+    without ``read_media`` (the style import, JV-14) all of its media is.
     """
     kind = kind_of(message)
     filename, size, mime = _file_info(message)
@@ -803,7 +805,9 @@ async def ingest_message(
                 # JV-01: what the shield saw, before anything was fetched.
                 media["risk"] = plan.risk.as_risk(filename)
             skip_archive = archive and (
-                plan.ask or (not transcribe_media and kind in _SPOKEN_KINDS)
+                plan.ask
+                or not read_media
+                or (not transcribe_media and kind in _SPOKEN_KINDS)
             )
             if skip_archive:
                 # An archive import asks nothing and spends nothing unless told.
@@ -1043,6 +1047,96 @@ async def fetch_backfills(client: TelegramClient) -> int:
     return done
 
 
+# The style import's pause (JV-14): a long FloodWait sets the monotonic time
+# before which no sweep asks Telegram for history again.
+_style_import_resume_at = 0.0
+
+
+async def fetch_style_imports(client: TelegramClient) -> int:
+    """Read the private chats the owner asked to learn their style from
+    (JV-14, ``/uslub yukla``).
+
+    The same shape as ``fetch_backfills``: the bot recorded the request on
+    each monitor row (``chats.request_style_import``), and this process
+    reads it through ``miya.tools.backfill.fetch_style_history``, so this
+    package still contains no history call of its own. Read-only: what is
+    read is stored as archive rows, nothing is sent. Each chat is contained
+    on its own: a failure is logged with its ids, counted on the row (a
+    chat is given up on after a few sweeps) and the next chat goes on. A
+    long FloodWait ends the sweep and is no failure: the paused chat stays
+    pending with its attempts untouched, and no sweep reads anything until
+    Telegram's wait is over.
+    """
+    global _style_import_resume_at
+    from miya.tools import backfill as backfill_tool
+
+    if time.monotonic() < _style_import_resume_at:
+        return 0
+
+    async with session_scope() as session:
+        jobs = [
+            (monitor.id, monitor.tg_chat_id)
+            for monitor in await chats.pending_style_imports(session)
+        ]
+
+    done = 0
+    for monitor_id, chat_id in jobs:
+        try:
+            result = await backfill_tool.fetch_style_history(client, chat_id)
+        except Exception as exc:
+            log.error(
+                "style import of a chat failed",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "error": type(exc).__name__,
+                },
+            )
+            result = None
+        if result is not None and result.paused:
+            # Telegram's limit, not the chat's failure: the row stays pending
+            # as it is, and the sweeps wait the whole FloodWait out.
+            _style_import_resume_at = time.monotonic() + result.wait_seconds
+            log.info(
+                "style import paused by Telegram",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "seconds": result.wait_seconds,
+                },
+            )
+            break
+        try:
+            async with session_scope() as session:
+                monitor = await session.get(ChatMonitor, monitor_id)
+                if monitor is None:
+                    continue
+                if result is None:
+                    chats.mark_style_import_failed(monitor)
+                else:
+                    chats.mark_style_imported(monitor)
+                    done += 1
+                    log.info(
+                        "style import read a chat",
+                        extra={
+                            "monitor_id": monitor_id,
+                            "tg_chat_id": chat_id,
+                            "stored": result.stored,
+                            "seen": result.seen,
+                        },
+                    )
+        except Exception as exc:
+            log.error(
+                "style import state not saved",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "error": type(exc).__name__,
+                },
+            )
+    return done
+
+
 async def beat_userbot(
     *, enabled: bool, connected: bool | None = None, user_id: int | None = None
 ) -> bool:
@@ -1071,7 +1165,8 @@ async def beat_userbot(
 async def approved_media_loop(
     client: TelegramClient, *, user_id: int | None = None
 ) -> None:
-    """The owner's answers, polled: approved attachments and requested backfills.
+    """The owner's answers, polled: approved attachments, requested backfills
+    and the style history import (JV-14).
 
     Every pass also beats the ``userbot`` heartbeat, so a reader whose
     Telegram session died shows up as silent within USERBOT_STALE_MINUTES.
@@ -1094,6 +1189,10 @@ async def approved_media_loop(
             await fetch_backfills(client)
         except Exception:
             log.exception("backfill sweep failed")
+        try:
+            await fetch_style_imports(client)
+        except Exception as exc:
+            log.error("style import sweep failed", extra={"error": type(exc).__name__})
         await asyncio.sleep(APPROVED_POLL_SECONDS)
 
 

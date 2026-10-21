@@ -18,6 +18,11 @@ Jobs:
   * jarvis_outbox — every minute, only with JARVIS_ENABLED; expires stale
                    drafts, reconciles claimed sends whose lease ran out and
                    tells the owner once about a send in doubt (JV-11)
+  * style_refresh — every 10 min, only with JARVIS_ENABLED; builds the
+                   owner's style profile (JV-14) once a requested history
+                   import is read and tells the owner it is ready, and
+                   rebuilds it weekly when the owner's messages changed (a
+                   new version waits as a draft for the owner's tap)
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -518,6 +523,76 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
                 "jarvis unknown-send notice failed",
                 extra={"outbox_id": row_id, "error": type(exc).__name__},
             )
+
+
+# The ReminderLog kind that records "the style profile of this import was
+# announced" (ref: the import request's timestamp), so the owner hears it once.
+STYLE_READY_KIND = "style_ready"
+
+
+async def style_refresh_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The owner's style profile (JV-14). Once every chat of the latest
+    ``/uslub yukla`` has been read (or given up on), a profile is built and
+    the owner is told once; besides, the profile is rebuilt when the newest
+    one is a week old and its input changed (``build_profile`` skips an
+    unchanged input), and the owner is told about the new draft.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step is contained: a failure is logged with
+    its class and the job ends until its next run (rule 25).
+    """
+    from miya.jarvis import style
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            progress = await chats.style_import_progress(session)
+            told = progress.requested_at is not None and bool(
+                await session.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(ReminderLog)
+                    .where(
+                        ReminderLog.kind == STYLE_READY_KIND,
+                        ReminderLog.ref == progress.requested_at.isoformat(),
+                    )
+                )
+            )
+    except Exception as exc:
+        log.error("style import progress unreadable", extra={"error": type(exc).__name__})
+        return
+    if progress.requested_at is not None and not progress.finished:
+        return  # the userbot is still reading; the profile waits for all of it
+    import_due = progress.finished and not told
+    try:
+        async with session_scope() as session:
+            if not import_due and not await style.refresh_due(session, now=now):
+                return
+            result = await style.build_profile(session, now=now)
+            version = result.profile.version if result.profile is not None else None
+    except Exception as exc:
+        log.error("style profile build failed", extra={"error": type(exc).__name__})
+        return
+    if not import_due and result.status != "built":
+        return
+    if result.status == "too_few":
+        text = replies.style_too_few(result.sample_count, style.min_samples())
+    else:
+        text = replies.style_ready(result.sample_count, result.example_count)
+    try:
+        if not await notify(bot, text, silent=reminders.in_quiet_hours(now)):
+            return
+        if import_due and progress.requested_at is not None:
+            async with session_scope() as session:
+                session.add(
+                    ReminderLog(
+                        kind=STYLE_READY_KIND, ref=progress.requested_at.isoformat()
+                    )
+                )
+    except Exception as exc:
+        log.error(
+            "style ready notice failed",
+            extra={"version": version, "error": type(exc).__name__},
+        )
 
 
 async def window_job(bot: Bot) -> None:
@@ -1892,6 +1967,14 @@ async def run() -> None:
             IntervalTrigger(minutes=1),
             args=[bot],
             id="jarvis_outbox",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            style_refresh_job,
+            IntervalTrigger(minutes=10),
+            args=[bot],
+            id="style_refresh",
             max_instances=1,
             coalesce=True,
         )

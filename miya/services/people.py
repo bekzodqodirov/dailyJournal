@@ -778,6 +778,45 @@ async def _merge_reply_rules(
     await session.flush()
 
 
+async def _merge_style_tone(
+    session: AsyncSession, source: Person, target: Person
+) -> None:
+    """``owner_style_people`` (JV-14) is keyed by the person, so it is not
+    in ``_fk_columns``: the source's row goes, and the target's tone is
+    recomputed from the merged history. miya.jarvis is loaded only when the
+    style was ever learned for either of them (rule 20), and a failure there
+    is logged and never stops the merge (rule 25): the next profile build
+    writes the tone again."""
+    from miya.db import models as m
+
+    try:
+        async with session.begin_nested():
+            held = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.OwnerStylePerson)
+                .where(m.OwnerStylePerson.person_id.in_([source.id, target.id]))
+            )
+            if not held:
+                return
+            await session.execute(
+                sa.delete(m.OwnerStylePerson).where(
+                    m.OwnerStylePerson.person_id == source.id
+                )
+            )
+            from miya.jarvis import style
+
+            await style.refresh_person(session, target.id)
+    except Exception as exc:
+        log.error(
+            "style tone not recomputed after a merge",
+            extra={
+                "source_id": source.id,
+                "target_id": target.id,
+                "error": type(exc).__name__,
+            },
+        )
+
+
 async def merge_plan(session: AsyncSession, source: Person, target: Person) -> dict:
     """What moving ``source`` into ``target`` would carry over, by kind."""
     counts: dict[str, int] = {}
@@ -837,6 +876,7 @@ async def merge_into(
         await session.execute(
             sa.update(model).where(column == source.id).values({column.key: target.id})
         )
+    await _merge_style_tone(session, source, target)
 
     # Identity fields only where the target has none; the source's unique
     # telegram_id is cleared first.

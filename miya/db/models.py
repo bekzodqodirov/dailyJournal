@@ -161,6 +161,19 @@ class ChatMonitor(Base):
     # (never read before it) and the newest message id the userbot saw.
     monitoring_since: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_seen_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    # The style history import (JV-14, 0026): ``/uslub yukla`` stamps the
+    # request on every monitored private chat; the userbot reads the chat's
+    # recent history for search and style only, then stamps it done. A chat
+    # that keeps failing stops being retried after a few sweeps.
+    style_import_requested_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    style_import_done_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    style_import_attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
@@ -979,6 +992,9 @@ __all__ = [
     "JarvisPolicy",
     "Memory",
     "OutboxMessage",
+    "OwnerStyleExample",
+    "OwnerStylePerson",
+    "OwnerStyleProfile",
     "Passage",
     "Person",
     "Promise",
@@ -1765,5 +1781,154 @@ class OutboxMessage(Base):
             "ix_outbox_messages_lease",
             "lease_until",
             postgresql_where=sa.text("state = 'sending'"),
+        ),
+    )
+
+
+# The values the owner-style CHECKs allow (JV-14, 0026). The migration keeps
+# its own frozen copy; tests/test_style.py holds the two equal.
+STYLE_PROFILE_STATES = ("draft", "active", "retired")
+STYLE_EXAMPLE_SOURCES = ("history", "owner_edit")
+STYLE_ADDRESS_FORMS = ("siz", "sen", "unknown")
+STYLE_PERSON_SCRIPTS = ("latin", "cyrillic", "mixed")
+STYLE_PERSON_LANGS = ("uz", "ru", "mix")
+
+
+class OwnerStyleProfile(Base):
+    """One built version of the owner's texting style (JV-14, 0026).
+
+    ``traits`` are deterministic counts (``style.compute_traits``: greetings,
+    honorifics, phrases, emoji, length, punctuation, script and language mix);
+    ``prompt_text`` is model prose about them, refused when it holds a digit;
+    ``stalls`` the owner's stall overrides, each used only while it passes
+    the red-line guard in the stall role. A new version is a ``draft`` until
+    the owner activates it; at most one is ``active``.
+    """
+
+    __tablename__ = "owner_style_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    traits: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    prompt_text: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    stalls: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    sample_count: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    window_start: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    window_end: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    input_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    # The model role's configured value (like RecapDigest.model), or the
+    # deterministic writer's name when no model wrote the prose.
+    model: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    approved_by: Mapped[str | None] = mapped_column(sa.String(16))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("version", name="uq_owner_style_profiles_version"),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(STYLE_PROFILE_STATES)})",
+            name="ck_owner_style_profiles_state",
+        ),
+        sa.CheckConstraint(
+            "sample_count >= 0", name="ck_owner_style_profiles_sample_count"
+        ),
+        sa.Index(
+            "ux_owner_style_profiles_active",
+            sa.text("(true)"),
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+    )
+
+
+class OwnerStyleExample(Base):
+    """A context-reply pair of a profile (JV-14, 0026): a client's message and
+    the owner's own answer to it. Neither text is copied: both are joined by
+    id, so ``/unut`` and edits apply, and purging either takes the example.
+    ``embedding`` is the context's, for retrieval by similarity."""
+
+    __tablename__ = "owner_style_examples"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("owner_style_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    context_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    intent: Mapped[str | None] = mapped_column(sa.String(24))
+    script: Mapped[str | None] = mapped_column(sa.String(16))
+    source: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="history"
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "profile_id", "interaction_id", name="uq_owner_style_examples_interaction"
+        ),
+        sa.CheckConstraint(
+            f"source IN ({_sql_list(STYLE_EXAMPLE_SOURCES)})",
+            name="ck_owner_style_examples_source",
+        ),
+        sa.Index("ix_owner_style_examples_interaction", "interaction_id"),
+        sa.Index("ix_owner_style_examples_context", "context_interaction_id"),
+        sa.Index(
+            "ix_owner_style_examples_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+
+class OwnerStylePerson(Base):
+    """How the owner writes to one person (JV-14, 0026), counted from their
+    own messages to them: the honorific («aka»), siz or sen, the script, the
+    language and the usual greeting. ``people.merge_into`` recomputes it."""
+
+    __tablename__ = "owner_style_people"
+
+    person_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="CASCADE"), primary_key=True
+    )
+    honorific: Mapped[str | None] = mapped_column(sa.String(16))
+    address_form: Mapped[str] = mapped_column(
+        sa.String(8), nullable=False, server_default="unknown"
+    )
+    script: Mapped[str | None] = mapped_column(sa.String(16))
+    lang: Mapped[str | None] = mapped_column(sa.String(4))
+    greeting: Mapped[str | None] = mapped_column(sa.Text)
+    sample_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"address_form IN ({_sql_list(STYLE_ADDRESS_FORMS)})",
+            name="ck_owner_style_people_address_form",
+        ),
+        sa.CheckConstraint(
+            f"script IN ({_sql_list(STYLE_PERSON_SCRIPTS)})",
+            name="ck_owner_style_people_script",
+        ),
+        sa.CheckConstraint(
+            f"lang IN ({_sql_list(STYLE_PERSON_LANGS)})",
+            name="ck_owner_style_people_lang",
         ),
     )

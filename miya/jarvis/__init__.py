@@ -25,4 +25,12 @@ The red lines (JV-13), pure:
   guard (RED LINE 1 and 2, rule 14); ``outbox`` registers it with ``gate``.
 * ``stalls`` — the fixed stall templates the client gets while the owner
   decides.
+
+The owner's style (JV-14):
+
+* ``style`` — the sampler (the owner's own words only, never a personal
+  chat), deterministic traits, scrubbed few-shot examples, per-person tone,
+  the profile versions and the owner's stall overrides.
+* ``style_prompt`` — the prose prompt and its checks, the deterministic
+  fallback prose and the style block a reply drafter reads (pure).
 """

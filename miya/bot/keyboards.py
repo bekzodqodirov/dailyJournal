@@ -1063,3 +1063,33 @@ def group_reply_confirm(monitor_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- /uslub (JV-14) -----------------------------------------------------------------
+#
+# js:y:<version> activates a draft profile, js:r:<version> builds it again.
+# Not in handlers._button_handlers: a typed batch answer never changes the
+# style the AI writes in.
+
+STYLE_PREFIX = "js"
+STYLE_ACTIVATE = "y"
+STYLE_REBUILD = "r"
+
+
+def style_card(version: int, *, active: bool) -> InlineKeyboardMarkup:
+    """✅ Faollashtirish (a draft only) and 🔄 Qayta tuzish."""
+    row = []
+    if not active:
+        row.append(
+            InlineKeyboardButton(
+                text=replies.STYLE_ACTIVATE,
+                callback_data=f"{STYLE_PREFIX}:{STYLE_ACTIVATE}:{int(version)}",
+            )
+        )
+    row.append(
+        InlineKeyboardButton(
+            text=replies.STYLE_REBUILD,
+            callback_data=f"{STYLE_PREFIX}:{STYLE_REBUILD}:{int(version)}",
+        )
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[row])

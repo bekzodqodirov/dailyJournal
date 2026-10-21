@@ -121,6 +121,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /shaxsiy &lt;ism yoki GS kod&gt; — shaxsiy chat: MIYA u yerga hech qachon o'zi yozmaydi
 /shaxsiylar — shaxsiy chatlar va oila/do'st takliflari
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
+/uslub [yukla] — yozish uslubingiz (yukla — eski yozishmalardan o'rganish)
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -165,6 +166,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("shaxsiy", "Chatni shaxsiy deb belgilash"),
     ("shaxsiylar", "Shaxsiy chatlar va takliflar"),
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
+    ("uslub", "Yozish uslubingiz"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -1988,6 +1990,7 @@ _COUNT_LABEL = {
     "digests": "AI xulosa",
     "outbox": "Jarvis xabari (qoralama yoki yuborilgan)",
     "escalations": "Jarvis eskalatsiyasi",
+    "style_examples": "uslub misoli",
 }
 PURGE_REPORTS_NOTE = (
     "<i>O'sha kunlarning saqlangan kunlik xulosalari butunlay o'chadi (boshqa "
@@ -3625,3 +3628,98 @@ def group_reply_usage(enabled_titles) -> str:
         return GROUP_REPLY_USAGE
     shown = ", ".join(f"«{_rule_name(t)}»" for t in enabled_titles)
     return f"{GROUP_REPLY_USAGE}\n{GROUP_REPLY_ENABLED.format(list=shown)}"
+
+
+# --- /uslub (JV-14) -----------------------------------------------------------------
+#
+# The values come from miya.jarvis.style, passed in plainly: this module is
+# imported at startup and must not import miya.jarvis (rule 20). An example's
+# client line is the counterparty's text: shown through _shown, like the
+# owner's own reply beside it.
+
+STYLE_CARD = (
+    "🗣 Uslubingiz ({n} ta xabardan):\n"
+    "• Salomlashish: {salom}\n"
+    "• Murojaat: {murojaat}\n"
+    "• O'rtacha uzunlik: {k} so'z\n"
+    "• Tez-tez: {iboralar}\n"
+    "• Emoji: {emoji}\n"
+    "• Yozuv: lotin {p}% · kirill {q}% · rus so'zlari {r}%\n"
+    "Misollar:{misollar}"
+)
+STYLE_EXAMPLE_LINE = "• «{mijoz}» → «{siz}»"
+STYLE_NONE = "—"
+STYLE_EMOJI_LABELS = {"low": "kam", "medium": "o'rtacha", "high": "ko'p"}
+STYLE_STATE_LINE = "Versiya: v{v} · {holat}"
+STYLE_STATE_LABELS = {
+    "active": "faol",
+    "draft": "qoralama — faollashtirilmagan",
+    "retired": "eskirgan",
+}
+STYLE_ACTIVATE = "✅ Faollashtirish"
+STYLE_REBUILD = "🔄 Qayta tuzish"
+STYLE_IMPORT_STARTED = (
+    "📥 Uslub uchun eski yozishmalaringizni yuklayapman. Tayyor bo'lganda yozaman."
+)
+# Without JARVIS_ENABLED nothing sends «✅ Uslub tayyor», so nothing is promised.
+STYLE_IMPORT_STARTED_MANUAL = (
+    "📥 Uslub uchun eski yozishmalaringizni yuklayapman. Bir necha daqiqadan "
+    "so'ng /uslub ni oching."
+)
+STYLE_IMPORT_NO_CHATS = (
+    "📥 Yuklash uchun shaxsiy chat topilmadi (shaxsiy deb belgilangan va "
+    "o'chirilgan chatlar o'qilmaydi)."
+)
+STYLE_READY = "✅ Uslub tayyor: {n} ta xabar, {m} ta misol. /uslub"
+STYLE_TOO_FEW = (
+    "🗣 Uslubni o'rganish uchun xabarlaringiz hali kam: {n} ta (kamida {min} ta "
+    "kerak). Eski yozishmalardan o'rganish: <code>/uslub yukla</code>"
+)
+STYLE_ACTIVATED = "✅ Uslub v{v} faollashtirildi."
+STYLE_STALE = "Bu uslub versiyasi eskirgan — hozirgisi: /uslub"
+STYLE_USAGE = (
+    "<code>/uslub</code> — yozish uslubingiz · <code>/uslub yukla</code> — eski "
+    "yozishmalaringizdan o'rganish"
+)
+
+
+def _style_list(values) -> str:
+    shown = [f"«{_shown(v)}»" for v in values if v]
+    return ", ".join(shown) if shown else STYLE_NONE
+
+
+def style_card(card) -> str:
+    """`/uslub`: the counted traits, a few of the owner's own replies as
+    examples (the client's name replaced), and the version's state."""
+    examples = [
+        STYLE_EXAMPLE_LINE.format(mijoz=_shown(pair.context), siz=_shown(pair.reply))
+        for pair in card.examples
+    ]
+    body = STYLE_CARD.format(
+        n=card.sample_count,
+        salom=_style_list(card.greetings),
+        murojaat=", ".join(_shown(v) for v in card.address) or STYLE_NONE,
+        k=card.avg_words,
+        iboralar=_style_list(card.phrases),
+        emoji=STYLE_EMOJI_LABELS.get(card.emoji_level, STYLE_EMOJI_LABELS["low"]),
+        p=card.latin_pct,
+        q=card.cyrillic_pct,
+        r=card.russian_pct,
+        misollar=("\n" + "\n".join(examples)) if examples else f" {STYLE_NONE}",
+    )
+    state = STYLE_STATE_LINE.format(
+        v=card.version, holat=STYLE_STATE_LABELS.get(card.state, card.state)
+    )
+    return clip(f"{body}\n{state}")
+
+
+def style_ready(n: int, m: int) -> str:
+    return STYLE_READY.format(n=n, m=m)
+
+
+def style_too_few(n: int, minimum: int) -> str:
+    return STYLE_TOO_FEW.format(n=n, min=minimum)
+
+
+def style_activated(version: int) -> str:
+    return STYLE_ACTIVATED.format(v=version)

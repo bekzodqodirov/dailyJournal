@@ -56,7 +56,7 @@ from miya.db.models import (
     OutboxMessage,
     Person,
 )
-from miya.jarvis import caps, chatkey, costs, gate, policy, redlines
+from miya.jarvis import caps, chatkey, costs, gate, policy, redlines, style
 from miya.services import authorship, codes, people, reminders, safety
 
 log = logging.getLogger(__name__)
@@ -512,6 +512,20 @@ def _run_guard(
     )
 
 
+async def owner_stall_texts(session: AsyncSession) -> tuple[str, ...]:
+    """The owner's stall overrides in force (JV-14): the active style
+    profile's, each passing the stall role. They are read from the owner's
+    own records here, never taken from a caller. A failure to read them is
+    logged and counts as none (an auto row that leaned on one goes back to
+    the card); it never raises into a create, an approval or a claim."""
+    try:
+        async with session.begin_nested():
+            return await style.stall_texts(session)
+    except Exception as exc:
+        log.error("stall overrides unreadable", extra={"error": type(exc).__name__})
+        return ()
+
+
 async def _chat_state(session: AsyncSession, chat_key: str) -> gate.ChatState | None:
     state = await session.get(JarvisChatState, chat_key)
     if state is None:
@@ -588,15 +602,16 @@ async def create(
     ``approved_kb`` are the active owner-approved KB texts the draft was
     written from (JV-15) and ``stall_texts`` the owner's stall overrides
     (JV-14): verbatim, they are approved statements; they never loosen a
-    red line. Texts a caller hands in are not trusted as approved: until
-    the outbox loads them itself (the active KB entries by id, the
-    overrides from ``owner_style_profiles``), any is refused, and so is a
+    red line. Texts a caller hands in are never trusted as approved: the
+    outbox loads the owner's stall overrides itself from the active
+    ``owner_style_profiles`` row (``owner_stall_texts``), and until JV-15
+    loads the KB entries by id, any caller text is refused, and so is a
     bare string (it would be read one character a text)."""
     if isinstance(approved_kb, str) or isinstance(stall_texts, str):
         raise OutboxError(APPROVED_TEXTS_REFUSED)
     if approved_kb or stall_texts:
-        # JV-15 / JV-14: the outbox resolves the approved texts from the
-        # owner's own records, and the claim rechecks them still active.
+        # The outbox resolves the approved texts from the owner's own
+        # records, and the claim rechecks them still in force.
         raise OutboxError(APPROVED_TEXTS_REFUSED)
     if not settings.jarvis_enabled:
         raise JarvisDisabled("jarvis_disabled")
@@ -671,7 +686,7 @@ async def create(
         await allowed_tokens(session, row),
         await guard_names(session, row),
         approved_kb=approved_kb,
-        stall_texts=stall_texts,
+        stall_texts=await owner_stall_texts(session) if ai else (),
     )
     _bind(row, result)
     state, code = await _initial_state(
@@ -814,6 +829,7 @@ async def approve(
                 row,
                 await allowed_tokens(session, row),
                 await guard_names(session, row),
+                stall_texts=await owner_stall_texts(session),
             )
             _bind(row, result)
             _log_guard_error(row, result)
@@ -978,6 +994,7 @@ async def _context(
     now: datetime,
     policies: policy.Policies,
     counters: _Counters,
+    stall_texts: tuple[str, ...] = (),
 ) -> gate.Context:
     trigger = await _trigger(session, row)
     names = await guard_names(session, row)
@@ -1020,12 +1037,12 @@ async def _context(
         allowed_names=names.allowed,
         other_names=names.others,
         client_script=names.client_script,
-        # The approved texts of the statement allowlist: JV-15 passes the
-        # active KB entries, JV-14 the owner's stall overrides. Until then a
-        # body re-guarded here matches none, and an auto row that leaned on
-        # one goes back to the card (never out).
+        # The approved texts of the statement allowlist: the owner's stall
+        # overrides in force now (JV-14), read once per claim; JV-15 passes
+        # the active KB entries. Until then a body re-guarded here matches no
+        # KB text, and an auto row that leaned on one goes back to the card.
         approved_kb=(),
-        stall_texts=(),
+        stall_texts=stall_texts,
         quiet_until=quiet_until(now),
         auto_in_quiet_hours=bool(getattr(settings, AUTO_IN_QUIET_HOURS, False)),
     )
@@ -1132,6 +1149,7 @@ async def claim_ready(
         chat_ai_sent={},
     )
     policies = await policy.load(session)
+    owner_stalls = await owner_stall_texts(session)
     claimed_by = account or channel
     rng = rng or random.Random()
     claimed: list[ClaimedSend] = []
@@ -1140,7 +1158,12 @@ async def claim_ready(
         try:
             async with session.begin_nested():
                 ctx = await _context(
-                    session, row, now=now, policies=policies, counters=counters
+                    session,
+                    row,
+                    now=now,
+                    policies=policies,
+                    counters=counters,
+                    stall_texts=owner_stalls,
                 )
                 decision = gate.evaluate(snapshot(row), ctx)
                 taken = _apply(row, decision, now=now, claimed_by=claimed_by)

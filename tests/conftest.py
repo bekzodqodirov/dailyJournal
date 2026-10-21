@@ -86,6 +86,11 @@ async def _truncate(session) -> None:
         # reference interactions and people; the policy references nothing.
         m.OutboxMessage,
         m.Escalation,
+        # The owner's style (JV-14): examples reference profiles and
+        # interactions, tones reference people.
+        m.OwnerStyleExample,
+        m.OwnerStyleProfile,
+        m.OwnerStylePerson,
         m.JarvisChatState,
         m.ReplyRule,
         m.JarvisPolicy,

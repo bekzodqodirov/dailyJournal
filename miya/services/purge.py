@@ -37,6 +37,8 @@ from miya.db.models import (
     JarvisChatState,
     Memory,
     OutboxMessage,
+    OwnerStyleExample,
+    OwnerStyleProfile,
     Passage,
     Person,
     Promise,
@@ -163,6 +165,23 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
         "tasks": await _count(session, Task, Task.source_interaction_id, ids),
         "memories": await _count(session, Memory, Memory.source_interaction_id, ids),
         "receipts": await _count(session, Receipt, Receipt.interaction_id, ids),
+        # The owner's style examples (JV-14) hang off the reply and the client
+        # message it answers; either one purged takes the example.
+        "style_examples": (
+            await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(OwnerStyleExample)
+                .where(
+                    sa.or_(
+                        OwnerStyleExample.interaction_id.in_(ids),
+                        OwnerStyleExample.context_interaction_id.in_(ids),
+                    )
+                )
+            )
+            or 0
+        )
+        if ids
+        else 0,
     }
 
     if ids:
@@ -778,6 +797,26 @@ async def _forget_person(session: AsyncSession, plan: PurgePlan) -> None:
             .where(Person.id.in_(plan.profile_stale_person_ids))
             .values(profile_updated_at=None)
         )
+    # The owner's style guides (JV-14) are written name-free, but a guide is
+    # model prose: the forgotten person's names are struck from it too, and a
+    # frequent phrase that names them (one built before they were known) is
+    # dropped from the traits. Their examples went with their messages; their
+    # tone goes with the person.
+    if pattern is not None:
+        for profile in await session.scalars(sa.select(OwnerStyleProfile)):
+            redacted = _redact(pattern, profile.prompt_text)
+            if redacted != profile.prompt_text:
+                profile.prompt_text = redacted or ""
+            traits = dict(profile.traits or {})
+            rows = traits.get("phrases") or []
+            kept = [
+                row
+                for row in rows
+                if not (row and isinstance(row[0], str) and pattern.search(row[0]))
+            ]
+            if len(kept) != len(rows):
+                traits["phrases"] = kept
+                profile.traits = traits
     # Deleting the person cascades to their debts and promises, including
     # ones that came from a call the owner is otherwise keeping.
     await session.execute(sa.delete(Person).where(Person.id == plan.person_id))

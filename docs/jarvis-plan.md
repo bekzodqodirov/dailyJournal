@@ -1644,6 +1644,18 @@ yozaman." · "✅ Uslub tayyor: {n} ta xabar, {m} ta misol. /uslub"
 
 **Acceptance.** The profile builds from fixtures. Owner check: `/uslub` reads like them.
 
+**As built.** `chats.request_style_import` stamps every monitored private chat except the
+Telegram service chat, Saved Messages and a chat with an active `never` rule (a personal chat
+is never read for style). `style_refresh` runs every 10 minutes, only with `JARVIS_ENABLED`
+(rule 20): it builds once a requested import is read and says «✅ Uslub tayyor» once, and
+otherwise rebuilds when the newest profile is a week old and `input_hash` changed; `/uslub`
+works without it and builds on demand. `owner_style_people` is keyed by the person, so it is not
+in `merge_into._fk_columns`; the merge drops the source's row and recomputes the target's.
+The owner's stall overrides are stored by `style.set_stall_override` and read by `outbox`
+itself (`owner_stall_texts`, for `create`, `approve` and every claim); a caller still cannot hand
+approved texts in. Usage is recorded as `jarvis_style` and the prose call is skipped over the
+cost cap.
+
 ---
 
 #### JV-15 — Business knowledge base for general answers

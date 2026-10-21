@@ -8,7 +8,10 @@ owner asks for it, in one of two ways:
   a bounded number of days;
 * with one tap: "Yangi guruh: … — o'qiymi?" → Ha in the bot records a request
   on the chat's monitor row (``chats.accept_join``), and the userbot's sweep
-  performs it through ``backfill_chat`` on its next pass.
+  performs it through ``backfill_chat`` on its next pass;
+* for the owner's style (JV-14): ``/uslub yukla`` records a request on every
+  monitored private chat (``chats.request_style_import``), and the sweep
+  reads each one's newest messages through ``fetch_style_history``.
 
 The Telethon history calls live here, outside ``miya/userbot/``, so that
 package stays asserted to read history in exactly one reviewable place (its
@@ -196,6 +199,98 @@ async def archive_private_chats(
         )
         results.append(counts)
     return results
+
+
+# The style history import (JV-14): per chat, at most this many of the
+# newest messages are read (the owner's lines and the client lines they
+# answer), and a run stops trying after this many messages that failed to
+# store, as the chat's failure.
+STYLE_HISTORY_LIMIT = 300
+STYLE_HISTORY_MAX_ERRORS = 5
+
+
+class StyleImportError(RuntimeError):
+    """The chat's history could not be stored; the sweep counts a failure."""
+
+
+@dataclass(slots=True)
+class StyleHistory:
+    """What one chat's style import read (JV-14)."""
+
+    stored: int = 0
+    seen: int = 0
+    failed: int = 0
+    # A long FloodWait ended the pass: the chat is not done, and Telegram
+    # asked for this many seconds before the next history call.
+    paused: bool = False
+    wait_seconds: int = 0
+
+
+async def fetch_style_history(
+    client, chat_id: int, *, limit: int = STYLE_HISTORY_LIMIT
+) -> StyleHistory:
+    """Read one allowed private chat's newest ``limit`` messages for the
+    owner's style (JV-14): stored as archive rows, searchable, never
+    extracted and never asked about; media is kept as metadata only (nothing
+    is downloaded, transcribed or read by a model). Read-only:
+    nothing is sent, marked read or changed in Telegram.
+
+    Messages already stored are skipped. A message that fails to store is
+    logged with its ids and the rest go on; more than
+    STYLE_HISTORY_MAX_ERRORS of them raise ``StyleImportError``. A FloodWait
+    up to FLOOD_WAIT_MAX_SECONDS is slept through and the read resumes
+    where it stopped; a longer one ends the pass with ``paused`` and the
+    wait in ``wait_seconds``.
+    """
+    from telethon.errors import FloodWaitError
+
+    from miya.userbot.main import ingest_message
+
+    counts = StyleHistory()
+    offset_id = 0
+    while True:
+        try:
+            async for message in client.iter_messages(
+                chat_id, limit=max(limit - counts.seen, 0), offset_id=offset_id
+            ):
+                offset_id = message.id
+                counts.seen += 1
+                try:
+                    stored = await ingest_message(
+                        client,
+                        message,
+                        archive=True,
+                        transcribe_media=False,
+                        read_media=False,
+                    )
+                except Exception as exc:
+                    counts.failed += 1
+                    log.error(
+                        "style import could not store a message",
+                        extra={
+                            "tg_chat_id": chat_id,
+                            "tg_message_id": getattr(message, "id", None),
+                            "error": type(exc).__name__,
+                        },
+                    )
+                    if counts.failed > STYLE_HISTORY_MAX_ERRORS:
+                        raise StyleImportError(str(chat_id)) from exc
+                    continue
+                if stored:
+                    counts.stored += 1
+            return counts
+        except FloodWaitError as exc:
+            if exc.seconds > FLOOD_WAIT_MAX_SECONDS:
+                log.warning(
+                    "style import paused by FloodWait",
+                    extra={"tg_chat_id": chat_id, "seconds": exc.seconds},
+                )
+                counts.paused = True
+                counts.wait_seconds = exc.seconds
+                return counts
+            await asyncio.sleep(exc.seconds)
+            if counts.seen >= limit:
+                return counts
 
 
 ARCHIVE_SUMMARY = (
