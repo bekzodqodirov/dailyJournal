@@ -6,7 +6,8 @@ JV-16).
    calls ``enqueue_candidate``: one upsert of ``jarvis_chat_state`` that sets
    ``respond_after`` JARVIS_DEBOUNCE_SECONDS ahead (a burst pushes it on, so
    it collapses into one reply). No model call in a Telethon handler; never
-   from the catch-up, a backfill or an edit.
+   from the catch-up or a backfill. An edit queues the chat again only when
+   it expired a draft that read the edited words (JV-17, ``chat_state``).
 2. **Claim.** ``jarvis_respond`` (every 15 s) claims due chat states with
    ``SKIP LOCKED`` and leases them (``respond_after`` moves ``CLAIM_LEASE``
    ahead), then reads each chat in a transaction of its own: no row lock is
@@ -16,9 +17,12 @@ JV-16).
 3. **The gate.** Jarvis on, the chat eligible (a private chat, no personal
    rule, no hard exclusion), the trigger fresh, the owner-first window over
    (JARVIS_OWNER_FIRST_SECONDS from the client's first unanswered message),
-   the owner has not answered, nothing in the burst the shield flagged, no
-   open escalation (a second push gets silence: the escalation's history
-   grows), the per-chat cap, the AI turn limit, the cost cap. An open
+   the owner has not answered, read the latest message or typed in the chat
+   just now (JV-17: typing pushes the look-in on), the AI is not paused
+   there after the owner wrote, no deleted message is answered, nothing in
+   the burst the shield flagged, no open escalation (a second push gets
+   silence: the escalation's history grows), the per-chat cap, the AI turn
+   limit, the cost cap. An open
    escalation holds the chat only until the owner writes in it (resolved,
    ``auto:own``) or, still ``open``, for JARVIS_DRAFT_EXPIRY_HOURS (expired).
 4. **Deterministic signals first** (``redlines.classify_inbound``): a price,
@@ -75,10 +79,12 @@ from miya.db.models import (
 from miya.db.session import session_scope
 from miya.jarvis import (
     caps,
+    chat_state,
     chatkey,
     costs,
     draft,
     envelope,
+    gate,
     guard,
     intent,
     kb,
@@ -103,12 +109,11 @@ HANDLED_LOOKBACK: Final = timedelta(days=2)
 _monotonic = time.monotonic
 
 BY: Final = "auto:policy"
-# Who closed an escalation the responder settled: the owner's own message in
-# the chat, or its age (JARVIS_DRAFT_EXPIRY_HOURS).
-BY_OWN: Final = "auto:own"
+# Who closed an escalation the responder settled by its age
+# (JARVIS_DRAFT_EXPIRY_HOURS); the owner's own message closes one through
+# chat_state.resolve_escalation (``auto:own``).
 BY_EXPIRY: Final = "auto:expiry"
 OPEN: Final = "open"
-RESOLVED: Final = "resolved"
 EXPIRED: Final = "expired"
 OTHER: Final = "other"
 STALL_INTENT: Final = "stall"
@@ -122,8 +127,9 @@ GONE: Final = "gone"
 INELIGIBLE: Final = "ineligible"
 STALE: Final = "stale"
 NOTHING: Final = "nothing"
-OWNER_REPLIED: Final = "owner_replied"
-AI_PAUSED: Final = "ai_paused"
+OWNER_REPLIED: Final = gate.OWNER_REPLIED
+OWNER_SEEN: Final = gate.OWNER_SEEN
+AI_PAUSED: Final = gate.AI_PAUSED
 WAITING: Final = "owner_first"
 UNSAFE: Final = "unsafe"
 REPEAT: Final = "repeat"
@@ -343,17 +349,36 @@ def unsafe(interaction: Interaction) -> bool:
     return safety.blocks_reply(_meta(interaction)) or _risky(interaction)
 
 
+def _edited_away(history: Sequence[object] | None) -> bool:
+    """Was this escalation cancelled because the client edited the message
+    its stall answered (JV-17)? Then the edited words are read again."""
+    last = history[-1] if history else None
+    return isinstance(last, dict) and last.get("code") == chat_state.TRIGGER_EDITED
+
+
 async def _handled_upto(session: AsyncSession, chat_key: str, now: datetime) -> int:
     """The newest client message of this chat the responder already answered
-    (a proposal's trigger, an escalation or one of its repeats)."""
+    (a proposal's trigger, an escalation or one of its repeats). A draft a
+    client edit or a deletion in its burst expired, and the escalation an
+    edit cancelled with it, answered nothing: those messages are read again
+    (JV-17)."""
     triggered = await session.scalar(
         sa.select(sa.func.max(OutboxMessage.trigger_interaction_id)).where(
-            OutboxMessage.chat_key == chat_key
+            OutboxMessage.chat_key == chat_key,
+            sa.not_(
+                sa.and_(
+                    OutboxMessage.state == outbox.EXPIRED,
+                    # COALESCE: an expired row with no code answered its message.
+                    sa.func.coalesce(OutboxMessage.last_error, "").in_(
+                        outbox.REDRAFT_CODES
+                    ),
+                )
+            ),
         )
     )
     handled = int(triggered or 0)
-    for interaction_id, history in await session.execute(
-        sa.select(Escalation.interaction_id, Escalation.history).where(
+    for interaction_id, state, history in await session.execute(
+        sa.select(Escalation.interaction_id, Escalation.state, Escalation.history).where(
             Escalation.chat_key == chat_key,
             sa.or_(
                 Escalation.state.in_(ESCALATION_OPEN_STATES),
@@ -361,6 +386,8 @@ async def _handled_upto(session: AsyncSession, chat_key: str, now: datetime) -> 
             ),
         )
     ):
+        if state == chat_state.CANCELLED and _edited_away(history):
+            continue
         handled = max(handled, int(interaction_id))
         for entry in history or []:
             value = entry.get("new") if isinstance(entry, dict) else None
@@ -399,7 +426,8 @@ async def _burst(
     after_at: datetime | None,
     now: datetime,
 ) -> list[Interaction]:
-    """The client's unanswered live messages, oldest first."""
+    """The client's unanswered live messages, oldest first; never one the
+    client deleted (JV-17)."""
     query = sa.select(Interaction).where(
         Interaction.tg_chat_id == tg_chat_id,
         Interaction.source == InteractionSource.telegram_userbot,
@@ -407,6 +435,7 @@ async def _burst(
         Interaction.id > after_id,
         Interaction.occurred_at >= now - max_age(),
         sa.not_(Interaction.meta.has_key("archive")),
+        sa.not_(Interaction.meta.has_key(outbox.DELETED_KEY)),
     )
     if after_at is not None:
         query = query.where(Interaction.occurred_at > after_at)
@@ -517,10 +546,18 @@ async def _settle_escalation(
     session: AsyncSession, chat: _Chat, *, now: datetime
 ) -> None:
     """Close the chat's open escalation when it no longer holds the chat: the
-    owner wrote in the chat after it opened (resolved, ``auto:own``), or an
-    ``open`` one is older than JARVIS_DRAFT_EXPIRY_HOURS (expired). Otherwise
-    one model failure or tripwire would mute the chat for good. Contained: a
-    failure is logged with the ids and the escalation is left as it was."""
+    owner wrote in the chat after it opened (resolved, ``auto:own``: the
+    userbot's signal does it at once, JV-17, and this catches a message
+    stored without one), or an ``open`` one is older than
+    JARVIS_DRAFT_EXPIRY_HOURS (expired). Otherwise one model failure or
+    tripwire would mute the chat for good. Contained: a failure is logged
+    with the ids and the escalation is left as it was."""
+    if chat.owner_at is not None:
+        resolved = await chat_state.resolve_escalation(
+            session, chat.chat_key, owner_at=chat.owner_at, now=now
+        )
+        if resolved is not None:
+            return
     escalation_id: int | None = None
     try:
         async with session.begin_nested():
@@ -529,28 +566,21 @@ async def _settle_escalation(
                 return
             escalation_id = escalation.id
             old = escalation.state
-            values: dict[str, object]
-            if chat.owner_at is not None and chat.owner_at > escalation.created_at:
-                values = {
-                    "state": RESOLVED,
-                    "resolution": OWNER_REPLIED,
-                    "answered_by": BY_OWN,
-                    "answered_at": chat.owner_at,
-                }
-                by, code = BY_OWN, OWNER_REPLIED
-            elif old == OPEN and escalation.created_at <= now - escalation_expiry():
-                values = {"state": EXPIRED, "resolution": EXPIRED}
-                by, code = BY_EXPIRY, EXPIRED
-            else:
+            if old != OPEN or escalation.created_at > now - escalation_expiry():
                 return
             history = [
                 *(escalation.history or []),
-                _entry("state", values["state"], now=now, code=code, old=old, by=by),
+                _entry("state", EXPIRED, now=now, code=EXPIRED, old=old, by=BY_EXPIRY),
             ]
             await session.execute(
                 sa.update(Escalation)
                 .where(Escalation.id == escalation.id)
-                .values(**values, history=history, updated_at=sa.func.now())
+                .values(
+                    state=EXPIRED,
+                    resolution=EXPIRED,
+                    history=history,
+                    updated_at=sa.func.now(),
+                )
             )
             await session.flush()
             log.info(
@@ -558,7 +588,7 @@ async def _settle_escalation(
                 extra={
                     "chat_key": chat.chat_key,
                     "escalation_id": escalation_id,
-                    "code": code,
+                    "code": EXPIRED,
                 },
             )
     except Exception as exc:
@@ -817,6 +847,9 @@ async def _load(
         out_at = max(out_at or state.owner_replied_at, state.owner_replied_at)
     if owner_at is not None and owner_at >= state.last_inbound_at:
         return Outcome(key, OWNER_REPLIED)
+    if state.owner_seen_at is not None and state.owner_seen_at >= state.last_inbound_at:
+        # The owner read the client's latest message (JV-17): theirs to answer.
+        return Outcome(key, OWNER_SEEN)
     burst = await _burst(
         session,
         tg_chat_id=tg_chat_id,
@@ -827,6 +860,10 @@ async def _load(
     if not burst:
         return Outcome(key, NOTHING)
     ready = burst[0].occurred_at + owner_first()
+    composing = state.owner_composing_at
+    if composing is not None and composing + gate.COMPOSING_HOLD > now:
+        # The owner is typing in the chat (JV-17): look again once they stop.
+        ready = max(ready, composing + gate.COMPOSING_HOLD)
     if now < ready:
         return ready
     trigger = burst[-1]

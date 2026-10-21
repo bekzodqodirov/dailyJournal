@@ -1839,6 +1839,48 @@ tahrirladi — qoralama yangilanadi." · "✅ {ism}ga o'zingiz javob berdingiz �
 
 **Acceptance.** Every signal covered with fake events.
 
+**As built.** `miya/jarvis/chat_state.py` (mypy strict) turns the signals into state; the
+userbot's handlers (`on_message_read`, `on_draft_update`, `on_message_deleted`,
+`on_message_edited`, `note_owner_message`, registered by `add_signal_handlers` next to the
+NewMessage/MessageEdited handlers, now at `main.py:1788-1791`, only with JARVIS_ENABLED) only
+write MIYA's own database, import `chat_state` lazily and are contained. Telethon 1.44 has
+`events.MessageRead(inbox=True)`, `events.MessageDeleted` and `events.Raw(UpdateDraftMessage)`; a
+read counts only when it covers the client's latest stored message, a read while MIYA sends in the
+chat (a `sending` row, or `last_ai_sent_at` within a minute) is the sender's own, and a cleared
+draft (`DraftMessageEmpty`) says nothing (the gate's 60-second `COMPOSING_HOLD` ages typing out).
+The owner's own typing (`UpdateUserTyping`) is not delivered to their other sessions, so the cloud
+draft is the typing signal. "Genuine owner message" is `authorship.is_owner_typed` /
+`owner_typed_clause`: `is_owner_words` minus every message MIYA sent (an owner command's echo
+included), and an untagged echo whose external id or exact text matches a row of the chat on the
+wire around it (Q11: `sending`/`unknown` with a lease reaching two minutes before the message, or
+`sent` within two minutes) is no takeover either; the signal and the claim share that one
+predicate (`authorship.owner_takeover_clause`). An outgoing sticker or GIF, which the media policy
+never stores, takes the chat over too (`note_owner_sticker`; MIYA never sends media). The takeover
+runs for live messages and for the catch-up (`backfill.catch_up_chat`), from the message's own
+time (clamped to now): `owner_replied_at` and `ai_paused_until` only move forward, the AI turn
+count starts again, `draft`/`approved` AI rows whose client message came first are cancelled
+(`auto:own`, `owner_replied`; a tap after the owner's message is kept), and the open escalation
+whose client message came first (even one written after the owner's message, by a responder that
+could not see it yet) is resolved at once (the responder keeps resolving one for a message stored
+without a signal, through the same `chat_state.resolve_escalation`). `shadow` rows stay: they are
+never sent and are the observation record. The claim also reads the owner's stored typed messages,
+so a signal that failed never lets a row through. A client edit expires every pending AI row that
+could have read the message (its trigger is the message or a later one within
+JARVIS_MAX_MESSAGE_AGE_SECONDS), cancels an `open` escalation whose stall was among them, and
+re-queues a still-fresh chat (not when the edit swapped the message's media); `record_edit` runs
+the JV-09 shield on the new words first (a verdict already there stays), so an edit into a scam is
+never drafted. The responder then treats those rows as unanswered, and `outbox.create` gives the
+fresh proposal a revision of the idempotency key, so the same text is a new row. A deletion marks
+`meta.deleted_at` (private chats and small groups have no chat id in the update: their message ids
+are account-wide, channels and supergroups are matched by chat) and cancels the rows answering it
+(`trigger_deleted`); a draft for a later message of the same burst expires (`burst_deleted`) and
+the chat is queued again; the burst never includes a deleted message, and a read covers the
+client's latest message that is not deleted. The three owner strings are in `replies.py`;
+`jarvis_outbox` tells them once, silently, as a reply to the card or alert, only for a draft that
+had a card (`card_tg_message_id`) or an escalation that was alerted (`alerted_at`), so they start
+with JV-18's cards; the edit notice waits for the fresh draft, and is never told when none is
+coming.
+
 ---
 
 #### JV-18 — Draft and escalation cards, the three buttons, a real 1-hour snooze

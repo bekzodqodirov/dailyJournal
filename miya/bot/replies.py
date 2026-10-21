@@ -3422,6 +3422,27 @@ JARVIS_SEND_UNKNOWN = (
 )
 
 
+# --- the owner first (JV-17) ---------------------------------------------------------
+# Told once, about a draft card or an escalation alert the owner was shown.
+JARVIS_OWN_REPLY_DRAFT = "🙋 Siz o'zingiz javob berdingiz — qoralama bekor qilindi."
+JARVIS_CLIENT_EDITED = "✏️ Mijoz xabarini tahrirladi — qoralama yangilanadi."
+JARVIS_OWN_REPLY_ESCALATION = "✅ {ism}ga o'zingiz javob berdingiz — eskalatsiya yopildi."
+JARVIS_UNNAMED_CLIENT = "Mijoz"
+
+
+def jarvis_takeover_notice(kind: str, name: str | None = None) -> str:
+    """The note for a chat_state.Notice (kinds ``draft_cancelled``,
+    ``draft_edited``, ``escalation_closed``). The client's name is theirs to
+    choose: shown through _shown."""
+    if kind == "escalation_closed":
+        return JARVIS_OWN_REPLY_ESCALATION.format(
+            ism=_shown(name or JARVIS_UNNAMED_CLIENT)
+        )
+    if kind == "draft_edited":
+        return JARVIS_CLIENT_EDITED
+    return JARVIS_OWN_REPLY_DRAFT
+
+
 # --- the responder in observation mode (JV-16) -------------------------------------
 JARVIS_SHADOW_LINE = (
     "Kuzatuv: bugun {n} ta javob tayyorlanardi ({e} tasi sizga yo'naltirilardi)."

@@ -14,6 +14,10 @@ Safety properties, all deliberate:
   * No history is downloaded on start: only messages that arrive from now on.
     ``chat_monitors`` is synced from the dialog list, which reads titles only.
   * Nothing is ingested from a chat whose ``monitor_enabled`` is false.
+  * With JARVIS_ENABLED it also records the owner-first signals (JV-17):
+    the owner reading a chat, typing in it, writing in it, and a client
+    editing or deleting a message. Those handlers only write MIYA's own
+    database; none of them writes to Telegram.
 """
 
 from __future__ import annotations
@@ -30,8 +34,16 @@ from pathlib import Path
 
 import sqlalchemy as sa
 from telethon import TelegramClient, events
+from telethon import utils as tg_utils
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, MessageEntityTextUrl, User
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    DraftMessage,
+    MessageEntityTextUrl,
+    UpdateDraftMessage,
+    User,
+)
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
@@ -442,11 +454,17 @@ class _History:
 
 
 async def _sender_history(
-    session, *, person_id: int | None, chat_id: int, private: bool
+    session,
+    *,
+    person_id: int | None,
+    chat_id: int,
+    private: bool,
+    edited: Interaction | None = None,
 ) -> _History:
     """What the sender's earlier messages look like: their newest
     SHIELD_HISTORY incoming messages (by person, else by private chat), and
-    whether the owner ever wrote in this private chat.
+    whether the owner ever wrote in this private chat. For an ``edited``
+    message (JV-17) only what came before it counts, as at its ingest.
 
     A group sender MIYA cannot name (an anonymous admin, a channel posting
     into the group) has no history of their own: the group's is everyone
@@ -458,11 +476,16 @@ async def _sender_history(
         if person_id is not None
         else Interaction.tg_chat_id == chat_id
     )
+    before: list = []
+    others: list = []
+    if edited is not None:
+        before = [Interaction.occurred_at <= edited.occurred_at]
+        others = [Interaction.id != edited.id]
     rows = (
         await session.execute(
             sa.select(Interaction.raw_text, Interaction.media)
             .where(Interaction.source == InteractionSource.telegram_userbot)
-            .where(Interaction.direction == Direction.in_, who)
+            .where(Interaction.direction == Direction.in_, who, *before, *others)
             .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
             .limit(SHIELD_HISTORY)
         )
@@ -477,6 +500,7 @@ async def _sender_history(
                         Interaction.tg_chat_id == chat_id,
                         # MIYA's own replies are not the owner writing (JV-10).
                         authorship.owner_words_clause(),
+                        *before,
                     )
                 )
             )
@@ -508,10 +532,12 @@ async def _message_shield(
     person,
     kind: MediaKind,
     plan: MediaPlan,
+    edited: Interaction | None = None,
 ) -> safety.MessageVerdict | None:
     """The JV-09 verdict on an incoming message, before any download or model
-    call. A failure here is logged with the message's ids and costs the
-    message nothing: it is stored without a verdict."""
+    call; with ``edited``, on the new words of that stored message (JV-17).
+    A failure here is logged with the message's ids and costs the message
+    nothing: it is stored without a verdict."""
     try:
         async with session.begin_nested():
             history = await _sender_history(
@@ -519,6 +545,7 @@ async def _message_shield(
                 person_id=person.id if person is not None else None,
                 chat_id=message.chat_id,
                 private=monitor.chat_type is ChatType.private,
+                edited=edited,
             )
         text = getattr(message, "message", None) or ""
         features = safety.MessageFeatures(
@@ -630,6 +657,57 @@ _SPOKEN_KINDS = (MediaKind.voice, MediaKind.audio, MediaKind.video_note, MediaKi
 MAX_EDITS = 10
 
 
+async def _reshield(
+    session, message, monitor: ChatMonitor, row: Interaction, meta: dict
+) -> dict:
+    """``meta`` with the JV-09 verdict on an edited incoming message's new
+    words (and its owner warning queued). A verdict already there stays: it
+    is the harder one, and an edit never clears it. Contained: a failure is
+    logged with the ids and the message keeps the verdict it had."""
+    try:
+        kind = kind_of(message)
+        filename, size, mime = _file_info(message)
+        plan = plan_for(
+            kind,
+            vision_enabled=monitor.vision_enabled,
+            docs_enabled=monitor.docs_enabled,
+            filename=filename,
+            size=size,
+            mime=mime,
+        )
+        entity = await _counterparty_entity(message, monitor)
+        person = (
+            await session.get(Person, row.person_id)
+            if row.person_id is not None
+            else None
+        )
+    except Exception as exc:
+        log.error(
+            "edited message not shielded",
+            extra={
+                "interaction_id": row.id,
+                "tg_chat_id": row.tg_chat_id,
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+        return meta
+    shield = await _message_shield(
+        session,
+        message,
+        monitor,
+        entity=entity,
+        person=person,
+        kind=kind,
+        plan=plan,
+        edited=row,
+    )
+    if shield is None:
+        return meta
+    warn = _warn_owner(incoming=True, archive=False, occurred_at=row.occurred_at)
+    return safety.with_message_verdict(meta, shield, notify=warn)
+
+
 async def record_edit(client: TelegramClient, message) -> bool:
     """A message was edited: keep the old words as a revision and store the
     new ones (WP-74). Reactions and pins also arrive as edits; the text is
@@ -668,6 +746,10 @@ async def record_edit(client: TelegramClient, message) -> bool:
             if isinstance(row.media, dict) and "caption" in row.media:
                 row.media = {**row.media, "caption": new}
             row.raw_text = new  # the WP-39 listener re-indexes it
+            if row.direction is Direction.in_ and not meta.get("archive"):
+                # JV-17 may draft a reply to the new words: the JV-09 shield
+                # reads them first, as it read the old ones at ingest.
+                meta = await _reshield(session, message, monitor, row, meta)
             if isinstance(getattr(message, "id", None), int):
                 monitor.last_seen_message_id = max(
                     monitor.last_seen_message_id or 0, message.id
@@ -918,24 +1000,30 @@ async def enqueue_reply(message) -> bool:
     from miya.jarvis import responder
 
     async with session_scope() as session:
-        interaction = await session.scalar(
-            sa.select(Interaction).where(
-                Interaction.source == InteractionSource.telegram_userbot,
-                Interaction.tg_chat_id == chat_id,
-                Interaction.meta.has_key("tg_message_id"),
-                Interaction.meta["tg_message_id"].astext.cast(sa.BigInteger)
-                == message_id,
-            )
-        )
+        interaction = await _stored(session, chat_id, message_id)
         if interaction is None:
             return False
         return await responder.enqueue_candidate(session, interaction, now=now)
 
 
+async def _stored(session, chat_id: int, message_id: int) -> Interaction | None:
+    """The interaction a Telegram message was stored as, if it was."""
+    return await session.scalar(
+        sa.select(Interaction).where(
+            Interaction.source == InteractionSource.telegram_userbot,
+            Interaction.tg_chat_id == chat_id,
+            Interaction.meta.has_key("tg_message_id"),
+            Interaction.meta["tg_message_id"].astext.cast(sa.BigInteger) == message_id,
+        )
+    )
+
+
 async def on_new_message(client: TelegramClient, message) -> None:
     """The live NewMessage handler: store the message, then (JV-16) queue it
-    as a reply candidate when ``ingest_message`` returned True. Each step is
-    contained: one bad message never takes the reader down."""
+    as a reply candidate when ``ingest_message`` returned True, or (JV-17),
+    for the owner's own outgoing message, let the owner take the chat over
+    (a sticker or GIF too, which is never stored). Each step is contained:
+    one bad message never takes the reader down."""
     try:
         stored = await ingest_message(client, message)
     except Exception:
@@ -944,6 +1032,11 @@ async def on_new_message(client: TelegramClient, message) -> None:
         log.exception("failed to ingest message %s", getattr(message, "id", "?"))
         return
     if not stored:
+        if getattr(message, "out", False):
+            await note_owner_sticker(message)
+        return
+    if getattr(message, "out", False):
+        await note_owner_message(message)
         return
     try:
         await enqueue_reply(message)
@@ -956,6 +1049,255 @@ async def on_new_message(client: TelegramClient, message) -> None:
                 "error": type(exc).__name__,
             },
         )
+
+
+# --- the owner-first signals (JV-17) -------------------------------------------
+#
+# Each handler only records a signal in MIYA's own database, through
+# miya.jarvis.chat_state, imported here only with JARVIS_ENABLED (rule 20).
+# Each is contained: a signal that cannot be recorded is logged with its ids
+# and the reader goes on (rule 25).
+
+
+def _ids(message) -> tuple[int, int] | None:
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "id", None)
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return None
+    return chat_id, message_id
+
+
+async def note_owner_message(message) -> bool:
+    """A stored outgoing message (live, or read by the catch-up): when the
+    owner typed it themselves, it cancels the chat's pending drafts, closes
+    its escalation and pauses the AI there for JARVIS_TAKEOVER_MINUTES. MIYA's
+    own sends never count (``chat_state.owner_wrote`` asks authorship). True
+    when the chat was taken over."""
+    if not settings.jarvis_enabled or not getattr(message, "out", False):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            interaction = await _stored(session, *ids)
+            if interaction is None:
+                return False
+            taken = await chat_state.owner_wrote(
+                session, interaction, now=datetime.now(settings.tz)
+            )
+            return taken is not None
+    except Exception as exc:
+        log.error(
+            "owner takeover not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def note_owner_sticker(message) -> bool:
+    """An outgoing sticker or GIF in an allowed chat: the media policy never
+    stores one, but the owner sent it themselves (MIYA never sends media,
+    rule 27), so it takes the chat over as a typed message does. True when
+    the chat was taken over."""
+    if (
+        not settings.jarvis_enabled
+        or not getattr(message, "out", False)
+        or kind_of(message) is not MediaKind.sticker
+    ):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        now = datetime.now(settings.tz)
+        date = getattr(message, "date", None)
+        at = date.astimezone(settings.tz) if isinstance(date, datetime) else now
+        async with session_scope() as session:
+            monitor = await session.scalar(
+                sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == ids[0])
+            )
+            if monitor is None or not monitor.monitor_enabled:
+                return False
+            taken = await chat_state.owner_wrote_at(
+                session, tg_chat_id=ids[0], person_id=None, at=at, now=now
+            )
+            return taken is not None
+    except Exception as exc:
+        log.error(
+            "owner takeover not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+def _media_swapped(interaction: Interaction, message) -> bool:
+    """Did the edit replace the message's media with another kind? Its new
+    file was never fetched or shielded, so nothing is drafted from it."""
+    media = interaction.media if isinstance(interaction.media, dict) else {}
+    stored = media.get("type") or MediaKind.text.value
+    return stored != kind_of(message).value
+
+
+async def note_client_edit(message) -> bool:
+    """A client edited a stored message: the drafts that read it expire and
+    the chat is queued for a fresh one (not when the edit swapped the
+    message's media). True when a draft expired."""
+    if not settings.jarvis_enabled or getattr(message, "out", False):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            interaction = await _stored(session, *ids)
+            if interaction is None:
+                return False
+            expired = await chat_state.client_edited(
+                session,
+                interaction,
+                now=datetime.now(settings.tz),
+                requeue=not _media_swapped(interaction, message),
+            )
+            return bool(expired)
+    except Exception as exc:
+        log.error(
+            "client edit not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def on_message_edited(client: TelegramClient, message) -> None:
+    """The live MessageEdited handler: keep the revision (WP-74), then
+    (JV-17) let a client's edit expire the drafts that read the old words."""
+    try:
+        changed = await record_edit(client, message)
+    except Exception:
+        log.exception("failed to record an edit of %s", getattr(message, "id", "?"))
+        return
+    if changed:
+        await note_client_edit(message)
+
+
+async def on_message_read(event) -> bool:
+    """``events.MessageRead(inbox=True)``: the owner read a chat up to
+    ``max_id``. A read of a voice note's contents (no chat) says nothing."""
+    if not settings.jarvis_enabled or getattr(event, "contents", False):
+        return False
+    if getattr(event, "outbox", False):
+        return False  # the client read the owner's messages, not the reverse
+    chat_id = getattr(event, "chat_id", None)
+    max_id = getattr(event, "max_id", None)
+    if not isinstance(chat_id, int) or not isinstance(max_id, int):
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            return await chat_state.owner_read(
+                session, tg_chat_id=chat_id, max_id=max_id, now=datetime.now(settings.tz)
+            )
+    except Exception as exc:
+        log.error(
+            "owner read not recorded",
+            extra={
+                "tg_chat_id": chat_id,
+                "tg_message_id": max_id,
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def on_draft_update(update) -> bool:
+    """``events.Raw(UpdateDraftMessage)``: the owner's cloud draft in a chat
+    changed, so they are typing there. A cleared draft (``DraftMessageEmpty``)
+    and a draft in a Saved Messages sub-chat say nothing."""
+    if not settings.jarvis_enabled or not isinstance(update, UpdateDraftMessage):
+        return False
+    draft = update.draft
+    if not isinstance(draft, DraftMessage) or update.saved_peer_id is not None:
+        return False
+    chat_id: int | None = None
+    try:
+        chat_id = tg_utils.get_peer_id(update.peer)
+        from miya.jarvis import chat_state
+
+        now = datetime.now(settings.tz)
+        at = draft.date.astimezone(settings.tz) if draft.date is not None else now
+        async with session_scope() as session:
+            return await chat_state.owner_composing(
+                session, tg_chat_id=chat_id, at=at, now=now
+            )
+    except Exception as exc:
+        log.error(
+            "owner typing not recorded",
+            extra={"tg_chat_id": chat_id, "error": type(exc).__name__},
+        )
+        return False
+
+
+async def on_message_deleted(event) -> int:
+    """``events.MessageDeleted``: Telegram names the chat only for channels
+    and supergroups; the drafts answering a deleted client message are
+    cancelled. Returns how many were."""
+    if not settings.jarvis_enabled:
+        return 0
+    ids = [i for i in (getattr(event, "deleted_ids", None) or []) if isinstance(i, int)]
+    chat_id = getattr(event, "chat_id", None)
+    if not ids:
+        return 0
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            cancelled = await chat_state.client_deleted(
+                session,
+                tg_chat_id=chat_id if isinstance(chat_id, int) else None,
+                message_ids=ids,
+                now=datetime.now(settings.tz),
+            )
+            return len(cancelled)
+    except Exception as exc:
+        log.error(
+            "deleted messages not recorded",
+            extra={
+                "tg_chat_id": chat_id,
+                "tg_message_ids": ids[:20],
+                "error": type(exc).__name__,
+            },
+        )
+        return 0
+
+
+def add_signal_handlers(client: TelegramClient) -> bool:
+    """Register the owner-first handlers (JV-17); only with JARVIS_ENABLED,
+    so with Jarvis off the reader is exactly as before. True when added."""
+    if not settings.jarvis_enabled:
+        return False
+    client.add_event_handler(on_message_read, events.MessageRead(inbox=True))
+    client.add_event_handler(on_draft_update, events.Raw(UpdateDraftMessage))
+    client.add_event_handler(on_message_deleted, events.MessageDeleted())
+    return True
 
 
 # --- who a message was aimed at ----------------------------------------------
@@ -1441,14 +1783,12 @@ async def run() -> None:
             await on_new_message(client, event.message)
 
         async def _on_edit(event) -> None:
-            try:
-                await record_edit(client, event.message)
-            except Exception:
-                log.exception("failed to record an edit of %s", getattr(event, "id", "?"))
+            await on_message_edited(client, event.message)
 
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
         client.add_event_handler(_on_edit, events.MessageEdited())
+        add_signal_handlers(client)
         sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
         # Whatever was said while this process was down (WP-21), read once
         # the live handlers are in place so nothing falls between the two.

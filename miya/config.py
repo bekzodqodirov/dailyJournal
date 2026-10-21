@@ -270,6 +270,8 @@ class Settings(BaseSettings):
     jarvis_max_ai_turns: int = Field(default=2, ge=0, le=20)
     # How many of the chat's latest turns the reply writer sees.
     jarvis_history_turns: int = Field(default=8, ge=1, le=50)
+    # How long Jarvis stays silent in a chat after the owner writes there.
+    jarvis_takeover_minutes: int = Field(default=120, ge=0, le=10080)
 
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"

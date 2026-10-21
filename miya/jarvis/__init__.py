@@ -5,7 +5,8 @@ Everything under this package is type-checked with mypy in strict mode
 module on. Core MIYA never imports it at startup: the bot's ``/jarvis``
 handler and the worker's ``jarvis_outbox`` job import it when they run, and
 the job exists only with JARVIS_ENABLED (rule 20); the userbot imports the
-responder only inside ``enqueue_reply``, after the JARVIS_ENABLED check.
+responder only inside ``enqueue_reply``, and ``chat_state`` only inside its
+owner-first signal handlers, after the JARVIS_ENABLED check.
 Importing this package imports nothing else.
 
 The core (JV-11):
@@ -58,4 +59,11 @@ The responder (JV-16):
 * ``costs.ask`` is the one way these calls reach a model: nothing over the
   cost cap, usage recorded as ``jarvis_intent``, ``jarvis_draft`` and
   ``jarvis_guard``.
+
+The owner first (JV-17):
+
+* ``chat_state`` — the owner's signals (read, typing, their own message)
+  and the client's (an edit, a deletion) turned into chat state and outbox
+  changes: the owner's own message cancels the chat's drafts, closes its
+  escalation and pauses the AI there for JARVIS_TAKEOVER_MINUTES.
 """

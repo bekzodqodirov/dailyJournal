@@ -23,6 +23,7 @@ behaves exactly as before.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
@@ -47,6 +48,16 @@ SPEAKER_MIYA: Final = "MIYA"
 
 # outbox_messages.channel for the Telegram account.
 CHANNEL_TELEGRAM: Final = "telegram"
+# interactions.metadata key of a Telegram message's id.
+TG_MESSAGE_KEY: Final = "tg_message_id"
+# How long after MIYA's send its echo may still arrive (JV-17, plan Q11).
+ECHO_WINDOW: Final = timedelta(minutes=2)
+# outbox_messages.state of a row on the wire (claimed, or in doubt after its
+# lease ran out) and of one sent (OUTBOX_STATES in miya.db.models).
+_ON_THE_WIRE: Final = ("sending", "unknown")
+_SENT: Final = "sent"
+# What Python's str.strip() takes off both ends, for the SQL text match.
+_BLANKS: Final = " \t\n\r\x0b\x0c"
 
 
 def _meta(row: Interaction) -> dict[str, Any]:
@@ -95,6 +106,66 @@ def ai_reply_clause() -> sa.ColumnElement[bool]:
 def owner_words_clause() -> sa.ColumnElement[bool]:
     """SQL twin of ``is_owner_words``: the one predicate for the owner's words."""
     return sa.and_(Interaction.direction == Direction.out, sa.not_(_ai_authored()))
+
+
+def is_owner_typed(row: Interaction) -> bool:
+    """Did the owner write this outgoing message themselves, rather than
+    through MIYA? ``is_owner_words`` minus every message MIYA sent (an owner
+    command's echo included): the owner taking a chat over (JV-17) is a
+    message they typed, never one MIYA delivered for them."""
+    return is_owner_words(row) and SENT_BY_KEY not in _meta(row)
+
+
+def owner_typed_clause() -> sa.ColumnElement[bool]:
+    """SQL twin of ``is_owner_typed``."""
+    # COALESCE: a row with no metadata at all was typed by the owner.
+    sent_by_miya = sa.func.coalesce(Interaction.meta.has_key(SENT_BY_KEY), sa.false())
+    return sa.and_(owner_words_clause(), sa.not_(sent_by_miya))
+
+
+def untagged_echo_clause() -> sa.ColumnElement[bool]:
+    """Is this outgoing Telegram message MIYA's own send whose echo is not
+    tagged yet (plan Q11: the echo can be stored before the outbox records
+    the sent message's id)? True when an outbox row of the same chat carries
+    its external id, or has exactly its text and was on the wire around it:
+    in flight or in doubt (``sending``/``unknown``) with a claim lease
+    reaching ECHO_WINDOW before the message, or ``sent`` within ECHO_WINDOW
+    before it. Each state is bounded in time, so an old send never hides a
+    later message the owner typed with the same words."""
+    external = sa.func.concat(
+        sa.cast(Interaction.tg_chat_id, sa.Text),
+        ":",
+        Interaction.meta[TG_MESSAGE_KEY].astext,
+    )
+    text = sa.func.btrim(Interaction.raw_text, _BLANKS)
+    since = Interaction.occurred_at - sa.literal(ECHO_WINDOW, sa.Interval())
+    return sa.exists().where(
+        OutboxMessage.channel == CHANNEL_TELEGRAM,
+        OutboxMessage.tg_chat_id == Interaction.tg_chat_id,
+        sa.or_(
+            sa.and_(
+                Interaction.meta.has_key(TG_MESSAGE_KEY),
+                OutboxMessage.external_message_id == external,
+            ),
+            sa.and_(
+                text != "",
+                sa.func.btrim(OutboxMessage.body, _BLANKS) == text,
+                sa.or_(
+                    sa.and_(
+                        OutboxMessage.state.in_(_ON_THE_WIRE),
+                        OutboxMessage.lease_until >= since,
+                    ),
+                    sa.and_(OutboxMessage.state == _SENT, OutboxMessage.sent_at >= since),
+                ),
+            ),
+        ),
+    )
+
+
+def owner_takeover_clause() -> sa.ColumnElement[bool]:
+    """The one predicate for a message the owner typed in a chat (JV-17):
+    ``owner_typed_clause`` minus MIYA's untagged echoes."""
+    return sa.and_(owner_typed_clause(), sa.not_(untagged_echo_clause()))
 
 
 def said_by_clause(direction: Direction) -> sa.ColumnElement[bool]:
@@ -191,11 +262,13 @@ __all__ = [
     "AUTHORED_BY_KEY",
     "AUTHORED_BY_OWNER",
     "CHANNEL_TELEGRAM",
+    "ECHO_WINDOW",
     "OUTBOX_ID_KEY",
     "SENT_BY_KEY",
     "SENT_BY_MIYA",
     "SPEAKER_MIYA",
     "SPEAKER_OWNER",
+    "TG_MESSAGE_KEY",
     "Author",
     "Echo",
     "ai_reply_clause",
@@ -203,10 +276,14 @@ __all__ = [
     "echo_meta",
     "find_echo",
     "is_ai_reply",
+    "is_owner_typed",
     "is_owner_words",
+    "owner_takeover_clause",
+    "owner_typed_clause",
     "owner_words_clause",
     "said_by_clause",
     "speaker_label",
     "tagged",
     "telegram_external_id",
+    "untagged_echo_clause",
 ]

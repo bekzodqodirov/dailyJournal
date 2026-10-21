@@ -77,11 +77,14 @@ async def catch_up_chat(
 
     Never reads before ``since`` (the moment the chat was switched on).
     Returns (stored, the newest message id seen); on a long FloodWait it
-    returns what it has, and the next sweep continues from there.
+    returns what it has, and the next sweep continues from there. An owner's
+    message read here takes its chat over as a live one does (JV-17), a
+    sticker or GIF included: what they sent while the reader was down still
+    cancels Jarvis's drafts.
     """
     from telethon.errors import FloodWaitError
 
-    from miya.userbot.main import ingest_message
+    from miya.userbot.main import ingest_message, note_owner_message, note_owner_sticker
 
     kwargs = {"reverse": True, "limit": limit}
     if after_id:
@@ -96,6 +99,10 @@ async def catch_up_chat(
                     continue
                 if await ingest_message(client, message):
                     stored += 1
+                    if getattr(message, "out", False):
+                        await note_owner_message(message)
+                elif getattr(message, "out", False):
+                    await note_owner_sticker(message)
                 top = max(top, message.id)
             return stored, top
         except FloodWaitError as exc:

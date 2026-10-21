@@ -80,6 +80,16 @@ UNAPPROVED_STATEMENT: Final = "unapproved_statement"
 MAX_BODY_CHARS: Final = 4096
 # How long "the owner is typing in this chat" holds an AI row back.
 COMPOSING_HOLD: Final = timedelta(seconds=60)
+# The owner-first and invalidation codes (JV-17): the owner wrote in the chat
+# after the client's message, the client edited or deleted that message, or
+# deleted an earlier message of the burst the draft answered.
+OWNER_REPLIED: Final = "owner_replied"
+OWNER_COMPOSING: Final = "owner_composing"
+OWNER_SEEN: Final = "owner_seen"
+AI_PAUSED: Final = "ai_paused"
+TRIGGER_EDITED: Final = "trigger_edited"
+TRIGGER_DELETED: Final = "trigger_deleted"
+BURST_DELETED: Final = "burst_deleted"
 
 # history ``field`` values the cards (JV-18, JV-20) write when a card shows a
 # warning; an owner-authored row passes the matching line only after it.
@@ -465,19 +475,19 @@ def _chat_state(row: Row, ctx: Context) -> Decision | None:
         # did after that tap counts against it.
         since = max(since, row.approved_at)
     if state.owner_replied_at is not None and state.owner_replied_at > since:
-        return Decision("cancel", "chat_state", "owner_replied")
+        return Decision("cancel", "chat_state", OWNER_REPLIED)
     composing = state.owner_composing_at
     if (
         composing is not None
         and composing > since
         and composing + COMPOSING_HOLD > ctx.now
     ):
-        return _hold("chat_state", "owner_composing", composing + COMPOSING_HOLD)
+        return _hold("chat_state", OWNER_COMPOSING, composing + COMPOSING_HOLD)
     if row.auto:
         if state.owner_seen_at is not None and state.owner_seen_at > since:
-            return Decision("block", "chat_state", "owner_seen")
+            return Decision("block", "chat_state", OWNER_SEEN)
         if state.ai_paused_until is not None and state.ai_paused_until > ctx.now:
-            return Decision("block", "chat_state", "ai_paused")
+            return Decision("block", "chat_state", AI_PAUSED)
     return None
 
 
@@ -488,9 +498,9 @@ def _trigger(row: Row, ctx: Context) -> Decision | None:
         return Decision("block", "trigger", NO_TRIGGER)
     if row.ai and trigger is not None:
         if trigger.deleted:
-            return Decision("cancel", "trigger", "trigger_deleted")
+            return Decision("cancel", "trigger", TRIGGER_DELETED)
         if trigger.edited_at is not None and trigger.edited_at >= row.created_at:
-            return Decision("expire", "trigger", "trigger_edited")
+            return Decision("expire", "trigger", TRIGGER_EDITED)
     if row.ai and row.trigger_interaction_id is not None and trigger is None:
         return Decision("cancel", "trigger", "trigger_missing")
     if row.expires_at is not None and row.expires_at <= ctx.now:
@@ -632,7 +642,10 @@ def evaluate(row: Row, ctx: Context) -> Decision:
 
 
 __all__ = [
+    "AI_PAUSED",
     "AUTO_INTENTS",
+    "BURST_DELETED",
+    "COMPOSING_HOLD",
     "GUARD_ERROR",
     "GUARD_FAILED",
     "GUARD_PASS",
@@ -642,8 +655,13 @@ __all__ = [
     "LINES",
     "MAX_BODY_CHARS",
     "NO_TRIGGER",
+    "OWNER_COMPOSING",
+    "OWNER_REPLIED",
+    "OWNER_SEEN",
     "PAYLOAD_NOT_TEXT",
     "SAFETY_UNREADABLE",
+    "TRIGGER_DELETED",
+    "TRIGGER_EDITED",
     "UNAPPROVED_STATEMENT",
     "WARNED_PERSONAL",
     "WARNED_SAFETY",

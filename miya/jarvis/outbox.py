@@ -179,6 +179,12 @@ ADDRESS_PREFIX: Final[Mapping[str, str]] = {
 }
 # JV-17 marks a client message the client deleted.
 DELETED_KEY: Final = "deleted_at"
+# How many times one proposal may be drafted again after client edits.
+MAX_REVISIONS: Final = 20
+# Why a pending AI row expired so that its client messages are drafted
+# again (JV-17): the client edited the message, or deleted an earlier one of
+# the burst it answered. Such a row answered nothing.
+REDRAFT_CODES: Final = (gate.TRIGGER_EDITED, gate.BURST_DELETED)
 # The advisory lock that serialises claims (hashtext of this text).
 CLAIM_LOCK: Final = "miya:outbox-claim"
 
@@ -215,11 +221,23 @@ def channel_daily_cap(channel: str) -> int | None:
 
 
 def idempotency_key(
-    *, origin: str, interaction_id: int | None, chat_key: str, body_sha256: str
+    *,
+    origin: str,
+    interaction_id: int | None,
+    chat_key: str,
+    body_sha256: str,
+    revision: int = 0,
 ) -> str:
-    """One row per (origin, trigger or command message, chat, exact body)."""
+    """One row per (origin, trigger or command message, chat, exact body).
+
+    ``revision`` counts the earlier rows of the same proposal that a client
+    edit expired (JV-17): the fresh draft for the edited message is a row of
+    its own even when its text is the same. Revision 0 is the plain key."""
     material = f"{origin}|{interaction_id if interaction_id is not None else '-'}|"
-    return hashlib.sha256(f"{material}{chat_key}|{body_sha256}".encode()).hexdigest()
+    suffix = f"|r{revision}" if revision else ""
+    return hashlib.sha256(
+        f"{material}{chat_key}|{body_sha256}{suffix}".encode()
+    ).hexdigest()
 
 
 def _iso(value: object) -> object:
@@ -612,14 +630,42 @@ async def owner_kb_texts(
         return {}
 
 
-async def _chat_state(session: AsyncSession, chat_key: str) -> gate.ChatState | None:
-    state = await session.get(JarvisChatState, chat_key)
-    if state is None:
+async def _owner_typed_at(
+    session: AsyncSession, tg_chat_id: int | None
+) -> datetime | None:
+    """The owner's latest message typed by themselves in this Telegram chat,
+    as stored: the claim never rests on the userbot's signal alone (a
+    message read by the catch-up, or a signal that failed to record). The
+    same predicate as the signal's (``authorship.owner_takeover_clause``):
+    an untagged echo of MIYA's own send is never the owner's reply."""
+    if tg_chat_id is None:
         return None
+    latest: datetime | None = await session.scalar(
+        sa.select(sa.func.max(Interaction.occurred_at)).where(
+            Interaction.tg_chat_id == tg_chat_id,
+            Interaction.source == InteractionSource.telegram_userbot,
+            authorship.owner_takeover_clause(),
+        )
+    )
+    return latest
+
+
+async def _chat_state(
+    session: AsyncSession, chat_key: str, tg_chat_id: int | None = None
+) -> gate.ChatState | None:
+    """What the owner did in the chat (JV-17): read it, typed in it, wrote
+    in it, and the takeover pause their message set."""
+    state = await session.get(JarvisChatState, chat_key, populate_existing=True)
+    typed = await _owner_typed_at(session, tg_chat_id)
+    if state is None:
+        return None if typed is None else gate.ChatState(owner_replied_at=typed)
+    replied = state.owner_replied_at
+    if typed is not None and (replied is None or typed > replied):
+        replied = typed
     return gate.ChatState(
         owner_seen_at=state.owner_seen_at,
         owner_composing_at=state.owner_composing_at,
-        owner_replied_at=state.owner_replied_at,
+        owner_replied_at=replied,
         ai_paused_until=state.ai_paused_until,
     )
 
@@ -781,17 +827,29 @@ async def create(
         raise NotPlainText(gate.PAYLOAD_NOT_TEXT)
     tg_chat_id = chatkey.tg_chat_id(chat_key)
     sha = gate.body_hash(body)
+    source_id = (
+        trigger_interaction_id
+        if trigger_interaction_id is not None
+        else command_interaction_id
+    )
+    revision = 0
     key = idempotency_key(
-        origin=origin,
-        interaction_id=(
-            trigger_interaction_id
-            if trigger_interaction_id is not None
-            else command_interaction_id
-        ),
-        chat_key=chat_key,
-        body_sha256=sha,
+        origin=origin, interaction_id=source_id, chat_key=chat_key, body_sha256=sha
     )
     existing = await _by_key(session, key)
+    while existing is not None and _edited_away(existing):
+        # A client edit expired that row (JV-17): this is the fresh draft.
+        revision += 1
+        if revision > MAX_REVISIONS:
+            raise OutboxError("too_many_revisions")
+        key = idempotency_key(
+            origin=origin,
+            interaction_id=source_id,
+            chat_key=chat_key,
+            body_sha256=sha,
+            revision=revision,
+        )
+        existing = await _by_key(session, key)
     if existing is not None:
         return existing
 
@@ -869,6 +927,12 @@ async def create(
     # Logged once the row has its id (rule 25), and only for a row stored.
     _log_guard_error(row, result)
     return row
+
+
+def _edited_away(row: OutboxMessage) -> bool:
+    """Expired because the client edited the message it answered, or
+    deleted part of its burst (JV-17)."""
+    return row.state == EXPIRED and row.last_error in REDRAFT_CODES
 
 
 async def _by_key(session: AsyncSession, key: str) -> OutboxMessage | None:
@@ -1051,6 +1115,28 @@ async def expire(
     return True
 
 
+async def expire_edited(
+    session: AsyncSession,
+    row_id: int,
+    *,
+    now: datetime,
+    code: str = gate.TRIGGER_EDITED,
+) -> bool:
+    """Expire a pending AI row whose client words changed after it was
+    drafted (JV-17): the client edited the message, or (``burst_deleted``)
+    deleted one it read; it answers words the client took back. ``code`` is
+    one of REDRAFT_CODES. The fresh draft is a new row (``create`` counts the
+    revision). False when the row is no longer pending."""
+    if code not in REDRAFT_CODES:
+        raise OutboxError(f"not a redraft code: {code}")
+    row = await _locked(session, row_id)
+    if row is None or row.state not in PENDING or row.authored_by != gate.AI:
+        return False
+    _transition(row, EXPIRED, by=BY_EXPIRY, now=now, code=code)
+    await session.flush()
+    return True
+
+
 async def expire_due(
     session: AsyncSession, *, now: datetime, limit: int = 200
 ) -> list[int]:
@@ -1184,7 +1270,7 @@ async def _context(
         trigger=trigger,
         unsafe_inbound_ids=await unsafe_inbound(session, row, trigger),
         safety_readable=safety_readable(row.channel, row.tg_chat_id),
-        chat_state=await _chat_state(session, row.chat_key),
+        chat_state=await _chat_state(session, row.chat_key, row.tg_chat_id),
         caps=gate.Caps(
             auto_sent=counters.auto_sent,
             chat_ai_sent=counters.chat_ai_sent[row.chat_key],
@@ -1251,7 +1337,10 @@ def _apply(
         row.next_attempt_at = None
         return False
     target = {"block": BLOCKED, "expire": EXPIRED, "cancel": CANCELLED}[decision.action]
-    by = {"expire": BY_EXPIRY, "cancel": BY_OWN if code == "owner_replied" else BY_GATE}
+    by = {
+        "expire": BY_EXPIRY,
+        "cancel": BY_OWN if code == gate.OWNER_REPLIED else BY_GATE,
+    }
     _transition(row, target, by=by.get(decision.action, BY_GATE), now=now, code=code)
     return False
 
@@ -1708,12 +1797,16 @@ async def unknown_untold(session: AsyncSession, *, limit: int = 20) -> list[int]
     )
 
 
-async def mark_told(session: AsyncSession, row_id: int, *, now: datetime) -> None:
-    """The owner's «❓ yuborilganmi — aniq emas» went out for this row."""
+async def mark_told(
+    session: AsyncSession, row_id: int, *, now: datetime, by: str = BY_RECONCILE
+) -> None:
+    """The owner was told about this row: «❓ yuborilganmi — aniq emas» for an
+    unknown send, or (JV-17, ``by`` ``auto:own``) that their own message or
+    the client's edit took a draft they had been shown off the table."""
     row = await _locked(session, row_id)
     if row is None:
         return
-    _note(row, TOLD_FIELD, None, row.state, by=BY_RECONCILE, now=now)
+    _note(row, TOLD_FIELD, None, row.state, by=by, now=now)
     await session.flush()
 
 
@@ -1725,9 +1818,11 @@ __all__ = [
     "EXPIRED",
     "FAILED",
     "PENDING",
+    "REDRAFT_CODES",
     "SENDING",
     "SENT",
     "SHADOW",
+    "TOLD_FIELD",
     "TRANSITIONS",
     "UNKNOWN",
     "AlreadyAnswered",
@@ -1749,6 +1844,7 @@ __all__ = [
     "create",
     "expire",
     "expire_due",
+    "expire_edited",
     "fail",
     "idempotency_key",
     "mark_told",

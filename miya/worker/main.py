@@ -17,7 +17,9 @@ Jobs:
                    (JV-07); a no-op unless SHEETS_ENABLED and configured
   * jarvis_outbox — every minute, only with JARVIS_ENABLED; expires stale
                    drafts, reconciles claimed sends whose lease ran out and
-                   tells the owner once about a send in doubt (JV-11)
+                   tells the owner once about a send in doubt (JV-11), and
+                   once about a draft card or escalation alert their own
+                   message or the client's edit took off the table (JV-17)
   * jarvis_respond — every 15 s, only with JARVIS_ENABLED; the responder
                    (JV-16): a client's private message, after the debounce and
                    the owner-first window, gets a style-cloned draft or an
@@ -97,7 +99,7 @@ from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, Message, ReplyParameters
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -150,7 +152,12 @@ log = logging.getLogger(__name__)
 
 
 async def deliver(
-    bot: Bot, text: str, *, reply_markup=None, silent: bool = False
+    bot: Bot,
+    text: str,
+    *,
+    reply_markup=None,
+    silent: bool = False,
+    reply_to: int | None = None,
 ) -> tuple[bool, Message | None]:
     """Send to the owner; retry as plain text if Telegram rejects the HTML.
 
@@ -159,14 +166,25 @@ async def deliver(
     single stray tag must not silently cost the owner his evening summary.
     ``reply_markup`` (the reminder buttons) rides along on both attempts.
     Returns (delivered, the sent message) — the message id goes into
-    question_log.
+    question_log. ``reply_to`` answers one of the bot's earlier messages (a
+    card); one deleted since is no reason to lose the text.
     """
+    extra = (
+        {
+            "reply_parameters": ReplyParameters(
+                message_id=reply_to, allow_sending_without_reply=True
+            )
+        }
+        if reply_to is not None
+        else {}
+    )
     try:
         sent = await bot.send_message(
             settings.owner_telegram_id,
             clip(text),
             reply_markup=reply_markup,
             disable_notification=silent,
+            **extra,
         )
         return True, sent
     except Exception:
@@ -178,6 +196,7 @@ async def deliver(
             parse_mode=None,
             reply_markup=reply_markup,
             disable_notification=silent,
+            **extra,
         )
         return True, sent
     except Exception:
@@ -496,7 +515,9 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
     JARVIS_DRAFT_EXPIRY_HOURS expire and are never sent; a claimed row whose
     lease ran out with no report is reconciled (an echo found is sent, none
     is unknown), and the owner is told once about each unknown row — MIYA
-    never sends it again.
+    never sends it again. Then (JV-17) the owner is told once about a draft
+    card or escalation alert that their own message or the client's edit
+    took off the table.
 
     Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
     startup (rule 20). Each step and each notice is contained on its own:
@@ -514,18 +535,27 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
                 "jarvis outbox step failed",
                 extra={"step": step.__name__, "error": type(exc).__name__},
             )
+    if await _jarvis_unknown_notices(bot, now=now):
+        await jarvis_takeover_notices(bot, now=now)
+
+
+async def _jarvis_unknown_notices(bot: Bot, *, now: datetime) -> bool:
+    """The owner hears once about each send in doubt. False when Telegram is
+    down (the rest stay untold for the next sweep)."""
+    from miya.jarvis import outbox
+
     try:
         async with session_scope() as session:
             untold = await outbox.unknown_untold(session)
     except Exception as exc:
         log.error("jarvis unknown sends unreadable", extra={"error": type(exc).__name__})
-        return
+        return True
     silent = reminders.in_quiet_hours(now)
     for row_id in untold:
         try:
             text = replies.JARVIS_SEND_UNKNOWN.format(id=row_id)
             if not await notify(bot, text, silent=silent):
-                return  # Telegram is down: the rest stay untold for the next sweep
+                return False  # Telegram is down: the rest wait for the next sweep
             async with session_scope() as session:
                 await outbox.mark_told(session, row_id, now=now)
         except Exception as exc:
@@ -533,6 +563,45 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
                 "jarvis unknown-send notice failed",
                 extra={"outbox_id": row_id, "error": type(exc).__name__},
             )
+    return True
+
+
+async def jarvis_takeover_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """JV-17: a draft card the owner's own message cancelled or the client's
+    edit replaced, and an escalation alert their own message closed, are told
+    once, silently (the owner acted themselves), as a reply to that card.
+    Each notice is contained (rule 25); returns how many went out."""
+    from miya.jarvis import chat_state
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            notices = await chat_state.untold(session, now=now)
+    except Exception as exc:
+        log.error(
+            "jarvis takeover notices unreadable", extra={"error": type(exc).__name__}
+        )
+        return 0
+    told = 0
+    for notice in notices:
+        try:
+            text = replies.jarvis_takeover_notice(notice.kind, notice.name)
+            ok, _ = await deliver(bot, text, silent=True, reply_to=notice.reply_to)
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await chat_state.mark_told(session, notice, now=now)
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis takeover notice failed",
+                extra={
+                    "kind": notice.kind,
+                    "row_id": notice.row_id,
+                    "error": type(exc).__name__,
+                },
+            )
+    return told
 
 
 # The ReminderLog kind that records "the owner was told today that the cost
