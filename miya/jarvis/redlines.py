@@ -40,6 +40,16 @@ every script (fullwidth, mathematical, circled, superscript), keycap and
 other number emoji, figures spelled out in words; so are emoji that state a
 time, money or an agreement («🕔», «💵», «🤝», «👍»).
 
+Three readings are structural rather than word by word. An AI draft
+(roles ``reply`` and ``kb``) must be Uzbek, Latin or Cyrillic, or Russian:
+one mainly in English, or in another Cyrillic alphabet, is refused whole
+(flag ``language``), so English needs no lexicon of its own there. The core
+day words are read fuzzily: one edit away, with any ending, is still the
+word («ertanga», «irtaga», «bugin», «sigodnya»). Abbreviated weekdays after
+a preposition or with a dot («до ср», «du.») are times, and holiday and
+time-of-day greetings («Navro'z muborak», «Доброе утро») are read out before
+the time words.
+
 Every doubt is a block: a false pass of a promise or a price is the worst
 failure, a false block only costs the owner an escalation. Owner-authored
 text (role ``owner``) is their own words: it is flagged for the card, never
@@ -68,7 +78,7 @@ from miya.services.text import (
 
 # Bumped whenever a lexicon or a rule changes, so a stored verdict says which
 # checker made it (outbox_messages.guard.checker_version).
-CHECKER_VERSION: Final = "redlines-3"
+CHECKER_VERSION: Final = "redlines-4"
 
 # The longest AI reply (§5.2).
 MAX_CHARS: Final = 400
@@ -97,6 +107,7 @@ Flag = Literal[
     "payment_claim",
     "digits",
     "link",
+    "language",
 ]
 Script = Literal["latin", "cyrillic", "russian"]
 Outcome = Literal["pass", "block", "flag"]
@@ -116,6 +127,7 @@ FLAGS: Final[tuple[Flag, ...]] = (
     "payment_claim",
     "digits",
     "link",
+    "language",
 )
 
 # What the owner sees on a card for each flag (JV-13 owner strings).
@@ -129,6 +141,7 @@ FLAG_LABELS: Final[Mapping[Flag, str]] = {
     "payment_claim": "to'lov tasdig'i",
     "digits": "raqam",
     "link": "havola",
+    "language": "til",
 }
 
 # Signals that open an escalation; ``injection`` only raises an alert.
@@ -159,6 +172,9 @@ _FLAG_REASON: Final[Mapping[Flag, str]] = {
     "payment_claim": "payment_claim",
     "digits": "other",
     "link": "other",
+    # escalations.reasons has no «language»: a draft in another language is
+    # «other», like a link (no migration).
+    "language": "other",
 }
 
 
@@ -329,7 +345,11 @@ TIME = Lexicon.of(
     послезавтр*, за ночь, полнедел*, полмесяц*, полгода, полсуток, ненадолго, ужин*,
     вечерк*, вечерочк*, после, числ*, bystr*, bistr*, tezlashtir*, chaqqon*, nafasda,
     ko'z ochib*, to'ydan, to'yda, to'ygacha, to'yidan, ovqatdan, bir zum*,
-    до закрытия, займёт, займет, вскорости
+    до закрытия, займёт, займет, вскорости,
+    ertanga*, ertagi kun, ertagi*, bugin*, irtaga*, sigodnya*, tez*, eng tez*,
+    полчас*, часок, часочек, часочк*, минутк*, минуточк*, секундочк*, секундк*,
+    недельк*, денёчек, денечек, chasik*, chasok*, chasochk*, polchas*, minutk*,
+    minutochk*, sekundochk*, nedelk*, denyok, denek
     """,
     english="""
     today, tomorrow, tonight, yesterday, morning, evening, noon, week*, month*, hour*,
@@ -350,6 +370,86 @@ DEADLINE = Lexicon.of(
     сразу, срочно, немедленно, успе*
     """,
 )
+
+# RL1 — the core day words, read fuzzily: a token within one edit
+# (a letter dropped, added, changed or two swapped) of one of these, or of
+# its dialect or typed form, is a time word, whatever ending follows
+# («ertanga», «irtaga», «bugin», «bugn», «erteg», «sigodnya», «ertagi»,
+# «bugungi»). Written as the word view spells them («кечқурун» is
+# «kechkurun»); the Cyrillic Uzbek and the Russian forms read the same.
+_CORE_DAYS: Final = _words(
+    """
+    ertaga, bugun, indinga, ertalab, kechqurun, kechgacha, сегодня, завтра,
+    послезавтра, эртага, бугун, индинга, эрталаб, кечқурун, кечгача, ertanga, ertege,
+    bugin, irtaga, sigodnya, sevodnya
+    """
+)
+# Words a letter away from a day word that name no time: «butun» (whole),
+# «butunlay» (completely), «tugun» (a bundle), «o'rtaga» (into the middle),
+# «bo'g'in» (a joint). Read as a prefix of the token.
+_NOT_DAY: Final = (
+    "butun",
+    "tugun",
+    "ortag",
+    "urtag",
+    "bogin",
+)
+_FUZZY_SHORTEST: Final = 4
+_ALPHABET: Final = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _one_edit(word: str) -> set[str]:
+    """Every string one edit away from ``word``: a letter dropped, added or
+    changed, or two neighbours swapped."""
+    splits = [(word[:i], word[i:]) for i in range(len(word) + 1)]
+    out = {a + b[1:] for a, b in splits if b}
+    out |= {a + b[1] + b[0] + b[2:] for a, b in splits if len(b) > 1}
+    out |= {a + c + b[1:] for a, b in splits if b for c in _ALPHABET}
+    out |= {a + c + b for a, b in splits for c in _ALPHABET}
+    return out
+
+
+# Each near form of a day word, mapped to the day word it stands for.
+_NEAR_DAYS: Final[Mapping[str, str]] = {
+    near: core
+    for core in sorted(_CORE_DAYS)
+    for near in sorted(_one_edit(core) | {core})
+    if len(near) >= _FUZZY_SHORTEST
+}
+_NEAR_LENGTHS: Final = tuple(sorted({len(near) for near in _NEAR_DAYS}))
+
+
+def _near_day(token: str) -> str | None:
+    """The day word ``token`` is a typed, dialect or misspelt form of, with
+    any ending; None when it is none («butunlay», «tugun», «ertak»)."""
+    if len(token) < _FUZZY_SHORTEST or not token.isalpha():
+        return None
+    for length in _NEAR_LENGTHS:
+        if length > len(token):
+            break
+        core = _NEAR_DAYS.get(token[:length])
+        if core is not None:
+            # «bugin» is a dialect «bugun»: «bo'g'in» is not.
+            if token.startswith(_NOT_DAY) and not token.startswith(core):
+                continue
+            return core
+    return None
+
+
+# RL1 — abbreviated weekdays: «до ср», «в пт», «к чт», «du.», «пн-пт». Read
+# after a Russian preposition in the word view, or with a dot or a range on
+# the surface.
+_WEEKDAY_ABBR: Final = frozenset({"pn", "vt", "sr", "cht", "pt", "sb", "vs"})
+_WEEKDAY_PREP: Final = frozenset(
+    {"v", "vo", "do", "k", "ko", "po", "s", "so", "na", "ot", "posle", "pered"}
+)
+_WEEKDAY_DOTTED = re.compile(
+    r"(?<![\w'-])(?:пн|вт|ср|чт|пт|сб|вс|du|dush|se|sesh|cho|chor|pa|pay|ju|sha|shan"
+    r"|ya|yak|yaksh|ду|душ|се|сеш|чо|чор|па|пай|жу|ша|шан|як|якш)"
+    r"(?:\.(?!\w)|\s?[-–—]\s?(?:пн|вт|ср|чт|пт|сб|вс|du|se|cho|chor|pa|pay|ju|sha"
+    r"|shan|ya|yak|ду|се|чо|чор|па|пай|жу|ша|шан|як)(?![\w'-]))"
+)
+
 
 # RL1 — a guarantee or an assurance.
 GUARANTEE = Lexicon.of(
@@ -396,13 +496,18 @@ GUARANTEE = Lexicon.of(
     hech qachon, hamisha*, mamnun, butun, butun-butun, odatiy*, zarar*, qopla*,
     javobgar*, mas'uliyat*, zimma*, bizni bilasiz*, oson, mumkin emas, mutlaq*,
     ko'z qorachig'*, подвод*, опаздыва*, жаловал*, не обидим, по-честному,
-    не задерж*, sinmagan, singan, buzilmagan, kafil*
+    не задерж*, sinmagan, singan, buzilmagan, kafil*,
+    eson-omon, eson omon, esonomon, omon-eson, bosh og'ri*, boshog'ri*,
+    bosh qotirmaysiz, so'zim, eng ishonchli*, eng zo'r*,
+    положитесь, положись, полагайтесь, полагайся, доверьтесь, доверься,
+    можете довериться, на нас можно, можете на нас
     """,
     english="""
     guarante*, sure, surely, definitely, certainly, of course, no problem*,
     no worries, dont worry, trust me, insured, absolutely, no doubt, rest assured,
     count on, covered, its fine, safe, nothing to worry, worry, been late,
-    clockwork
+    clockwork, my word, let you down, piece of cake, easy peasy, no sweat,
+    leave it with us
     """,
 )
 
@@ -454,13 +559,13 @@ PROMISE = Lexicon.of(
     shu jumladan, ham ichida, haqi ichida, narxi ichida, tamojnya ichida,
     bilan birga, ustiga hech*, от нас, учтен*, учтён*, решён, решено, решена,
     будут, будете, еду, везу, беру, дадим, дадут, возьму, решаем*, to'g'ri,
-    zakinu, vozmu, ничего не меняется
+    zakinu, vozmu, ничего не меняется, tamom*, tamam*, тамом*
     """,
     english="""
     promise*, will, shall, gonna, we can, i can, deliver*, sent, shipped,
     on the way, agreed, deal, done, ready, okay, yes, yep, yeah, yup, well, ill, itll,
     on it, handle*, arriv*, coming, came in, got it, its in, landed, showing,
-    cleared, left the, should be
+    cleared, left the, should be, already, probably, by now, sorted
     """,
 )
 
@@ -513,7 +618,8 @@ MONEY = Lexicon.of(
     по-божески, po-bojeski, по-братски, po-bratski, разорит*, переплач*, доплат*,
     доплач*, вдвое, втрое, вполцен*, средств*, бюджет*, deshov*, deshev*, nedarag*,
     nedorag*, darog*, cho'ntag*, arzimagan, prosent*, pratsent*, prasent*, лямчик*,
-    тыщи, тысчонк*, стольник*, чирик*, червон*, четвертак*, соточк*, косых
+    тыщи, тысчонк*, стольник*, чирик*, червон*, четвертак*, соточк*, косых,
+    bir ko'k, yarim ko'k, ko'k pul*, ko'klar*, ko'kka
     """,
     english="""
     price*, cost*, cheap*, expensive, free, cent, cents, fee, fees, tariff*, bucks,
@@ -573,7 +679,9 @@ PAYMENT_TERMS = Lexicon.of(
     kelganda, avval tashla*, oldin tashla*, oldin to'la*, avval to'la*, tashlasangiz,
     avvaldan, bir qismi*, keyin hisob*, hisobda, eski hisob*, расплат*, отдадите,
     частичн*, вперёд, вперед, реализац*, отсроч*, потом бабки, сначала груз,
-    keyin to'la*
+    keyin to'la*, uzum orqali, uzum bank*, uzumbank*, uzum nasiya*, uzum kart*,
+    uzum pay*, qo'lma-qo'l, qo'lma qo'l, qo'ldan-qo'lga, qo'lga naqd*, из рук в руки,
+    на руки, постоплат*, пост-оплат*, postoplat*, задаток, задатк*, zadatok, zadatk*
     """,
     english="""
     prepay*, cash, card, invoice*, installment*, payment*, pay, transfer*, upfront,
@@ -594,7 +702,9 @@ PAYMENT_CLAIM = Lexicon.of(
     дошёл, упали, упало, на счету, подтвержден*, подтвердили,
     hammasi to'g'ri, skrin*, скрин*, to'liq ekan, kam emas, ortig'i bilan, yetarli,
     kifoya, hisob to'g'ri, hisobingiz toza, hisob yopiq, видно, видим,
-    средства у нас, ko'rinib turibdi, ko'rinib qoldi, kirdi, kiribdi, kepti
+    средства у нас, ko'rinib turibdi, ko'rinib qoldi, kirdi, kiribdi, kepti,
+    ничего не долж*, не долж* ничего, долгов нет, qarzingiz yo'q, qarzingiz qolmadi,
+    qarzdor emassiz
     """,
     english="""
     paid, received, money arrived, funds, credited, came through, money came,
@@ -638,7 +748,19 @@ GREETINGS = Lexicon.of(
     хороших выходных, приятных выходных, будем рады помочь, рады помочь,
     ma'lumot yetarli, ma'lumotlar yetarli, для расчёта, для расчета,
     yaxshi o'tsin, omad yor bo'lsin, rozi bo'lsin, baraka topsin, baraka bersin,
-    salomat bo'lsin
+    salomat bo'lsin,
+    hayit muborak, hayiti muborak, hayitingiz muborak, hayit bayrami muborak,
+    hayit bayramingiz muborak, qurbon hayiti muborak, qurbon hayitingiz muborak,
+    ramazon hayiti muborak, ramazon hayitingiz muborak, ro'za hayiti muborak,
+    ro'za hayitingiz muborak, navro'z muborak, navro'zingiz muborak,
+    navro'z bayrami muborak, navro'z bayramingiz muborak, navro'z bayramingiz bilan,
+    juma ayyomingiz muborak, juma ayyomi muborak, juma ayyomingiz bilan,
+    muborak juma, ramazon oyi muborak, ramazon oyingiz muborak, muborak ramazon,
+    yangi yil bilan, xayrli kech, xayrli tong, tug'ilgan kuningiz muborak,
+    tug'ilgan kuningiz bilan, с днём рождения, с днем рождения, с наврузом,
+    с праздником навруз, с курбан хайитом, с рамазан хайитом, с курбан байрамом,
+    с рамадан байрамом, рамадан мубарак, рамазан мубарак, хайит мубарак,
+    с праздником курбан, с наступающим новым годом, хорошего утра, доброго утра
     """,
 )
 
@@ -666,7 +788,9 @@ HELP_OFFERS = Lexicon.of(
 # «по цене уточню»), never as a statement («narxi o'zgarmagan»).
 _TOPIC_RAW: Final[Mapping[Flag, str]] = {
     "price": """
-        narx*, narh*, baho, bahosi, bahosini, baxo*, qiymat*, tarif*, prays*, pul*, цена,
+        narx*, narh*, baho, bahosi, bahosini, bahoni, bahoga, bahodan, bahosiga,
+        bahosidan, bahola*, qiymat*, tarif*, prays*, pul, puli, pulni, pulga, pulda,
+        puldan, pulim*, pulin*, pulla*, pulli*, pulid*, pulig*, pulsiz*, puldor*, цена,
         цены, цену, цене, ценой, ценам, ценах, ценник*, стоимост*, mablag'*, деньги,
         денег, деньгам, деньгами, деньгах, stavk*, ставк*, расценк*, rate*
         """,
@@ -1033,7 +1157,9 @@ def _foreign(ch: str) -> bool:
     it. Uzbek Latin needs none of them once the apostrophes are folded."""
     if not ch.isalpha() or ch.isascii():
         return False
-    return not 0x0400 <= ord(ch) <= 0x04FF
+    # A Cyrillic letter neither Russian nor Uzbek has («і», «ә»): another
+    # language, or a look-alike splitting a word.
+    return not 0x0400 <= ord(ch) <= 0x04FF or ch.casefold() not in _OWN_CYRILLIC
 
 
 def _enclosed(ch: str) -> bool:
@@ -1268,6 +1394,8 @@ def _surface_hits(
         hits.add("deadline", "time:date")
     if when.parse_time(masked) is not None:
         hits.add("deadline", "time:phrase")
+    if _WEEKDAY_DOTTED.search(fold_apostrophes(masked).casefold()):
+        hits.add("deadline", "time:weekday")
     if any(_numeric(ch) for ch in masked):
         hits.add("digits", "digits")
     if any(_numeric(ch) and not ch.isascii() for ch in raw):
@@ -1423,20 +1551,42 @@ def _stall_at(tokens: list[str], j: int) -> bool:
     )
 
 
+def _topical(token: str) -> bool:
+    return any(lexicon.hit(token) for _flag, lexicon in TOPICS)
+
+
 def _deferral(tokens: list[str], i: int) -> bool:
     """Is the topic at ``i`` the subject of a deferral («narx bo'yicha hozir
-    aniqlashtirib», «по цене уточню», «narxini aniqlashtirib»)? The stall verb
-    must follow in the same segment: «narx bo'yicha o'zgarish yo'q, …» and
-    «по скидке есть, уточню» state something about the topic first."""
-    before = tokens[i - 1] if i > 0 else ""
-    if _stall_verb(before):
+    aniqlashtirib», «по цене уточню», «narxini aniqlashtirib», «уточню по
+    сроку», «narx va muddat bo'yicha aniqlab»)? The stall verb must follow in
+    the same segment, or come just before the topic: «narx bo'yicha o'zgarish
+    yo'q, …» and «по скидке есть, уточню» state something about the topic
+    first."""
+    k = i - 1
+    while (
+        k >= 0
+        and i - k <= 3
+        and (tokens[k] in _REGARDING_BEFORE or tokens[k] in _FILLERS)
+    ):
+        k -= 1
+    if k >= 0 and _stall_verb(tokens[k]) and not _vouching(tokens, k):
         return True
     j = _past_fillers(tokens, i + 1)
+    # «narx va muddat bo'yicha», «по цене и срокам»: one deferral of both.
+    while j + 1 < len(tokens) and tokens[j] in _AND and _topical(tokens[j + 1]):
+        j = _past_fillers(tokens, j + 2)
     if _stall_at(tokens, j):
         return True
     if j < len(tokens) and tokens[j] in _REGARDING_AFTER:
         return _stall_at(tokens, _past_fillers(tokens, j + 1))
     return False
+
+
+_AND = _words(
+    """
+    va, hamda, yoki, и, или
+    """
+)
 
 
 # A stall verb's past or passive is a report, not a deferral: «tekshirdim»
@@ -1475,6 +1625,9 @@ def _committing(
         return False
     pair = " ".join(tokens[max(i - 1, 0) : i + 1])
     if _token_in(token, NEUTRAL_VERBS) or _token_in(pair, NEUTRAL_VERBS):
+        return False
+    # «qulaymi?» (is it convenient?) asks what «qulay» says.
+    if token.endswith("mi") and _token_in(token[:-2], NEUTRAL_VERBS):
         return False
     if _stall_verb(token):
         return False
@@ -1576,12 +1729,16 @@ def _led(tokens: list[str], i: int, *, primed: bool = False) -> bool:
     javob beramiz»: we answer for it), nor «qarab beramiz» for someone
     («siz uchun alohida qarab beramiz»). A weak lead («yozib qo'yaman»)
     counts once a stall verb came before it in the sentence (``primed``)."""
-    before = tokens[i - 1] if i > 0 else ""
+    # «javobini o'zim beraman»: a filler may stand between.
+    k = i - 1
+    while k > 0 and i - k <= 2 and tokens[k] in _FILLERS:
+        k -= 1
+    before = tokens[k] if k >= 0 else ""
     if primed and _token_in(before, WEAK_LEADS):
         return True
     if not _token_in(before, STALL_LEADS):
         return False
-    return not _vouching(tokens, i - 1)
+    return not _vouching(tokens, k)
 
 
 _FOR = _words(
@@ -1760,6 +1917,47 @@ def _join_hits(words: str, hits: _Hits, *, kb: bool) -> None:
                 hits.add("digits", "digits:number_word")
 
 
+# PROMISE_THIRD entries a yes-or-no question asks the client about.
+_ASKED_READY: Final = frozenset({"готов*", "tayyor"})
+# «Uzum orqali tashlang», «Click orqali o'tkazing»: how to pay.
+_PAY_VERBS: Final = ("tashla", "otkaz", "utkaz", "tola", "tula")
+
+
+def _paying_via(tokens: list[str], i: int) -> bool:
+    return tokens[i] == "orkali" and any(
+        t.startswith(_PAY_VERBS) for t in tokens[i + 1 : i + 3]
+    )
+
+
+def _sentence_hits(text: str, hits: _Hits) -> None:
+    """Phrases read across a comma or a dash inside one sentence («So'zim —
+    so'z», «Gapim, gap»): a segment boundary does not split an entry of
+    several words."""
+    for match in _CLAUSE.finditer(text):
+        words = _polite(_unglue(normalise_for_search(match.group(0))))
+        if _ANY_PHRASE.search(words) is None:
+            continue
+        for lexicon, flag, phrases in _PHRASES:
+            for entry, pattern in phrases:
+                if pattern.search(words) is not None:
+                    hits.add(flag, f"{lexicon.name}:{entry}")
+
+
+# The entries of several words, per red-line lexicon, and all of them in one
+# pattern.
+_PHRASES: Final = tuple(
+    (
+        lexicon,
+        flag,
+        tuple((e, p) for e, p in lexicon.patterns if " " in e.strip()),
+    )
+    for lexicon, flag in _RED_LINES
+)
+_ANY_PHRASE: Final = re.compile(
+    "|".join(f"(?:{p.pattern})" for _lex, _flag, ps in _PHRASES for _e, p in ps)
+)
+
+
 def _polite(words: str) -> str:
     """``words`` without the greetings and the offers of help."""
     return _blank(_blank(words, GREETINGS), HELP_OFFERS)
@@ -1776,6 +1974,8 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
     if role != "owner":
         _join_hits(_polite(normalise_for_search(clean_masked)), hits, kb=kb)
     infinitives = _infinitives(clean_masked) if russian else frozenset()
+    if not kb:
+        _sentence_hits(clean_masked, hits)
     primed = False
     for clause in _clauses(clean_masked):
         words = _polite(clause.words)
@@ -1801,9 +2001,19 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
             hits.add("deadline", f"deadline:{entry}")
             time_hit = True
         for lexicon, flag in _RED_LINES:
-            for entry, _span in lexicon.hits(words):
+            for entry, (start, _end) in lexicon.hits(words):
+                if (
+                    lexicon is PROMISE
+                    and not said(start)
+                    and tokens[_token_at(words, start)] in infinitives
+                ):
+                    # «Откуда забирать?» asks where to collect from.
+                    continue
                 hits.add(flag, f"{lexicon.name}:{entry}")
         for entry, (start, _end) in PROMISE_THIRD.hits(words):
+            if clause.question and clause.final and entry in _ASKED_READY:
+                # «Груз готов?», «Tayyor?»: the client is asked.
+                continue
             if said(start):
                 hits.add("promise", f"promise:{entry}")
         if not clause.question:
@@ -1852,8 +2062,19 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
             if not kb and told and (_until(token) or _time_clause(tokens, i)):
                 hits.add("deadline", "deadline:gacha")
                 time_hit = True
+            if not kb and told:
+                day = _near_day(token)
+                if day is not None:
+                    hits.add("deadline", f"time:near:{day}")
+                    time_hit = True
+                if token in _WEEKDAY_ABBR and i and tokens[i - 1] in _WEEKDAY_PREP:
+                    hits.add("deadline", "time:weekday")
+                    time_hit = True
+            if _paying_via(tokens, i):
+                hits.add("payment_terms", "payment_terms:via")
             for flag, lexicon in TOPICS:
-                if lexicon is INSURANCE and clause.question:
+                # «Sug'urta kerakmi?», «Kontraktingiz bormi?»: a detail asked.
+                if (lexicon is INSURANCE or flag == "promise") and clause.question:
                     continue
                 for entry, _span in lexicon.hits(token):
                     if not _deferral(tokens, i):
@@ -1957,6 +2178,118 @@ def _family(script: Script) -> str:
     return "latin" if script == "latin" else "cyrillic"
 
 
+# --- the language allowlist -------------------------------------------------------------
+#
+# An AI draft (roles ``reply`` and ``kb``) is written in Uzbek, Latin or
+# Cyrillic, or in Russian. The lexicons are Uzbek and Russian: a draft in
+# English («It's on its way.», «Sorted.», «Driver has it.») or in any other
+# language reads past them, so it is refused whole, whatever it says. A
+# word is English by its spelling («th», «wh», «ph», «ck», a «w», a «c»
+# outside «ch», «-tion»: Uzbek Latin and Russian typed in Latin have none),
+# by a contraction («it's», «won't», «we'll») or by being one of the common
+# English words below. Words both languages share («men», «my», «no», «to»,
+# «on», «bank», «dollar») are not counted. A draft whose words are as many
+# English as not, words of address aside («Aka, sorted.»), is English.
+
+_EN_WORDS: Final = frozenset(
+    """
+    a about above after again against ago all almost along already also always am
+    arrive arrived arriving booked border crossing deliver delivered delivery
+    dispatched fixed freight friday guaranteed handled insured monday noon pallet
+    port promised released route saturday settled shipping shipment solved stored
+    storage sunday tuesday transit unload unloaded zero
+    an and another any anything anyway are around as ask asked at away back bad be
+    because been before being best better big both bought break bring brought but
+    buy by cake call came can cant care cargo case cheap check come comes coming cost
+    could covered day days dear deal did do does doing done down drive driver drop
+    each easy else end enough even evening ever every everything fast few find fine
+    first for free from full get gets getting give given glad go goes going gone good
+    got great had half hand handle handled happy hard has have having he hello help
+    her here hey hi him hold home hope hour hours how if in into is it its just
+    keep kind know last late later leave left less like little load loaded long look
+    lot lots love made make many maybe me mean meet mind minute minutes money month
+    much must need never new next nice night nothing now of off ok okay old once one
+    only open or other our out over paid part pay peasy per pick piece place please
+    pleasure price probably put quick quite ready real really reasonable receipt rest
+    right safe said same say see seen sealed send sent set she ship shipped should show
+    since small so some something soon sorry sorted sound start still stuff such sure
+    sweat take taken tell than thank thanks that the their them then there these they
+    thing things think this those though through time today told tomorrow tonight too
+    took truck trust try under until up upon us use very wait want was way we week
+    weekend well went were what when where which while who why will wire wish with
+    within without word work would yeah yes you your yours
+    """.split()
+)
+# Shared with Uzbek or with Russian typed in Latin, or a name a draft may
+# carry: never counted English.
+_NOT_EN_WORDS: Final = frozenset(
+    """
+    a am an do i in men more most my no ok old on one or so to tut net wa
+    mohammed muhammed
+    """.split()
+)
+_EN_SHAPE = re.compile(
+    r"th|wh|ph|ck|w|c(?!h)|tion$"
+    # «unloaded», «safely», «careful», «affordable»
+    r"|^[a-z]{4,}(?:ed|ly)$|^[a-z]{3,}(?:ful|able)$"
+)
+_EN_CONTRACTION = re.compile(
+    r"^[a-z]+'(?:s|ll|re|ve)$|^[a-z]+n't$|^(?:i|you|we|they|he|she)'d$|^i'm$"
+)
+# Places and brands an Uzbek draft names: their spelling is not English.
+_NOT_EN_NAMES: Final = (
+    "whatsapp",
+    "wechat",
+    "yiwu",
+    "wuhan",
+    "wenzhou",
+    "weifang",
+    "wuxi",
+    "huawei",
+    "iphone",
+)
+# Words of address and thanks: they say nothing about the language.
+_COURTESY: Final = frozenset(
+    """
+    aka opa uka akajon opajon ukajon brat bratan xonim janob rahmat raxmat salom
+    salam assalomu assalom assalamu assalam alaykum aleykum alaikum waalaykum
+    walaykum vaalaykum ака опа ука акажон опажон брат раҳмат рахмат салом салам
+    ассалому ассалом ассаламу алайкум алейкум ваалайкум
+    """.split()
+)
+_WORD: Final = re.compile(r"[^\W\d_]+(?:'[^\W\d_]+)*")
+# Letters of Russian and of Uzbek Cyrillic: any other Cyrillic letter
+# («і», «ї», «є», «ә», «ө», «ү», «ң») writes another language.
+_OWN_CYRILLIC: Final = frozenset("абвгдеёжзийклмнопрстуфхцчшщъыьэюяўқғҳ")
+
+
+def _english_word(word: str) -> bool:
+    if not word.isascii() or word in _NOT_EN_WORDS:
+        return False
+    if _EN_CONTRACTION.match(word) and not word.startswith(("o'", "g'")):
+        return True
+    bare = word.replace("'", "")
+    if bare in _EN_WORDS:
+        return True
+    if bare.startswith(_NOT_EN_NAMES):
+        return False
+    return "'" not in word and _EN_SHAPE.search(bare) is not None
+
+
+def _language_hits(clean: str, hits: _Hits) -> None:
+    """A draft in another language than Uzbek or Russian (see above)."""
+    folded = fold_apostrophes(clean).casefold()
+    if any(
+        "\u0400" <= ch <= "\u04ff" and ch.isalpha() and ch not in _OWN_CYRILLIC
+        for ch in folded
+    ):
+        hits.add("language", "language:cyrillic")
+    words = [w for w in _WORD.findall(folded) if w not in _COURTESY]
+    english = sum(1 for w in words if _english_word(w))
+    if english and english * 2 >= len(words):
+        hits.add("language", "language:english")
+
+
 # --- the verdict ------------------------------------------------------------------------
 
 
@@ -2029,6 +2362,9 @@ def check_outbound(
         hits.add("digits", "digits:unknown_code")
     _surface_hits(raw, clean, masked, hits, role=role)
     _word_hits(masked, hits, role=role)
+    if role in ("reply", "kb"):
+        # AI-authored text: Uzbek or Russian only.
+        _language_hits(masked, hits)
     if role != "owner":
         _names_hits(normalise_for_search(masked), allowed_names, other_names, hits)
         written = script_of(clean)
@@ -2061,7 +2397,8 @@ _IN_PRICE = Lexicon.of(
     "price",
     """
     narx*, narh*, necha pul, nechpul, nech pul, qancha turadi, qanchaga, qanchadan,
-    qancha bo'ladi, qancha so'm, qancha pul, qancha, qanaqa narx, baho*, qiymat*,
+    qancha bo'ladi, qancha so'm, qancha pul, qancha, qanaqa narx, baho, bahosi*,
+    bahoni, bahoga, bahodan, bahol*, qiymat*,
     tarif*, prays*, hisoblab ber*, hisobla*, цена, цены, цену, цене, ценой, ценам,
     ценах, ценник*, стоимост*, сколько стоит, сколько будет, почем, почём, по чем,
     прайс*, тариф*, посчитай*
@@ -2136,7 +2473,8 @@ _HOW_MUCH = _forms("qancha, qanchadan")
 _PRICE_CONTEXT = Lexicon.of(
     "price",
     """
-    narx*, narh*, baho*, pul*, qiymat*, tarif*, prays*, turadi, so'm*, kilo*, kg,
+    narx*, narh*, baho, bahosi*, bahoni, bahoga, bahol*, pul*, qiymat*, tarif*, prays*,
+    turadi, so'm*, kilo*, kg,
     kub*, tonna*, metr*, dona*, gramm*, litr*
     """,
 )
@@ -2344,6 +2682,12 @@ def classify_inbound(text: str) -> frozenset[Signal]:
         TIME.hit(words)
         or DEADLINE.hit(words)
         or _IN_NOW.hit(words)
+        or any(_near_day(t) is not None for t in tokens)
+        or any(
+            t in _WEEKDAY_ABBR and i and tokens[i - 1] in _WEEKDAY_PREP
+            for i, t in enumerate(tokens)
+        )
+        or _WEEKDAY_DOTTED.search(fold_apostrophes(clean).casefold()) is not None
         or _CLOCK.search(clean) is not None
         or when.parse_time(clean) is not None
     )

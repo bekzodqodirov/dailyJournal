@@ -31,12 +31,18 @@ from tests.fixtures import redline_corpus as corpus
 ROOT = Path(__file__).resolve().parents[1]
 TOKENS = corpus.ALLOWED_TOKENS
 
-ALL_BLOCK = [*corpus.OUTBOUND_BLOCK, *corpus.HOLDOUT_BLOCK, *corpus.REDTEAM3_BLOCK]
+ALL_BLOCK = [
+    *corpus.OUTBOUND_BLOCK,
+    *corpus.HOLDOUT_BLOCK,
+    *corpus.REDTEAM3_BLOCK,
+    *corpus.REDTEAM4_BLOCK,
+]
 ALL_PASS = [
     *corpus.OUTBOUND_PASS,
     *corpus.SAFE_MORE,
     *corpus.HOLDOUT_PASS,
     *corpus.REDTEAM3_PASS,
+    *corpus.REDTEAM4_PASS,
 ]
 
 
@@ -119,6 +125,105 @@ def test_redteam3_stall_role():
     assert set(corpus.REDTEAM3_STALL) <= blocked | {
         c.text for c in [*corpus.OUTBOUND_BLOCK, *corpus.HOLDOUT_BLOCK]
     }
+
+
+def test_redteam4_stall_role():
+    """The fourth red team's stalls with a time, a status or a promise in them
+    are refused in the stall role, «минутку» too; the spec's stall wording
+    passes there."""
+    latin_only = {c.text for c in corpus.REDTEAM4_BLOCK if c.latin_only}
+    for text in corpus.REDTEAM4_STALL:
+        assert not _verdict(text, "stall").passed, text
+        cyrillic = None if text in latin_only else _cyrillic(text)
+        if cyrillic is not None:
+            assert not _verdict(cyrillic, "stall").passed, cyrillic
+    for text in corpus.REDTEAM4_STALL_PASS:
+        assert _verdict(text, "stall").passed, (text, _verdict(text, "stall"))
+        cyrillic = _cyrillic(text)
+        if cyrillic is not None:
+            assert _verdict(cyrillic, "stall").passed, cyrillic
+
+
+def test_language_allowlist():
+    """An AI draft (reply, kb) is Uzbek or Russian: English, or another
+    Cyrillic alphabet, is refused whole; the stall role, the owner and the
+    inbound reading keep English."""
+    for case in corpus.REDTEAM4_BLOCK:
+        if "language" not in case.flags:
+            continue
+        for role in ("reply", "kb"):
+            verdict = _verdict(case.text, role)
+            assert "language" in verdict.flags, (case.text, role, verdict)
+    # Words of address do not make a draft Uzbek; a loanword does not make
+    # one English, nor does Russian typed in Latin letters.
+    assert "language" in _verdict("Aka, rahmat, all set.").flags
+    for text in (
+        "Aka, packing listni yuboring.",
+        "Utochnyu i napishu.",
+        "Yiwudan yuk bormi?",
+        "WhatsAppdan yozing, aka.",
+        "Rahmat, aka!",
+        "Ok, aka.",
+    ):
+        assert "language:english" not in _verdict(text).hits, text
+    # The stall role and the owner's words are not language-checked.
+    assert _verdict("Let me check and get back to you.", "stall").passed
+    assert "language" not in _verdict("Sorted, thanks.", "owner").flags
+    # Every fixed template is Uzbek or Russian and passes.
+    for _reason, script, _form, text in stalls.all_templates():
+        assert redlines.check_outbound(text, "stall", client_script=script).passed
+    # English inbound is still read.
+    assert "price" in redlines.classify_inbound("How much is it?")
+    assert "identity" in redlines.classify_inbound("Are you a bot?")
+
+
+def test_near_day_words():
+    """A day word one edit away, with any ending, is a time; a word a letter
+    from one that names no time is not."""
+    near = {
+        "ertanga": "ertaga",
+        "irtaga": "ertaga",
+        "ertagi": "ertaga",
+        "bugin": "bugin",
+        "bugn": "bugun",
+        "bugungi": "bugun",
+        "erteg": "ertege",
+        "sigodnya": "sigodnya",
+        "segodnya": "segodnya",
+        "zavtar": "zavtra",
+        "ertalb": "ertalab",
+        "kechkurn": "kechkurun",
+        "irtagacha": "ertaga",
+    }
+    for token, core in near.items():
+        assert redlines._near_day(token) is not None, token
+        assert redlines._near_day(token) in {core, "irtaga", "ertanga"}, token
+    # Near misses that are words of their own: whole, completely, a bundle,
+    # into the middle, a joint, a fairy tale (blocking «ertak» would be fine,
+    # but it is two edits from «ertaga» and reads as itself).
+    for token in ("butun", "butunlay", "tugun", "tugunlar", "ortaga", "bogin", "ertak"):
+        assert redlines._near_day(token) is None, token
+    # Too short to read fuzzily.
+    assert redlines._near_day("bug") is None
+    assert "time:near:bugun" not in _verdict("Tugunlar sonini aniqlab, yozaman.").hits
+
+
+def test_weekdays_spans_and_greetings():
+    for text in ("До ср.", "В пт.", "В чт отправка.", "Пн-пт.", "Du.", "Du-Ju."):
+        assert "time:weekday" in _verdict(text).hits, text
+    # Office hours in a KB entry may name the days.
+    assert _verdict("Ofisimiz Du-Sha ishlaydi.", "kb").passed
+    # A word that only looks like one is not one.
+    assert "time:weekday" not in _verdict("Aka, sertifikat bormi?").hits
+    for text in ("Полчасика.", "Часик.", "Денёк.", "Минутку."):
+        assert "deadline" in _verdict(text).flags, text
+    # Greetings are greetings, read out before the time words, but a time
+    # beside one is still a time.
+    for text in ("Navro'z muborak!", "Xayrli tong!", "Доброе утро!", "Hayit muborak!"):
+        assert _verdict(text).passed, text
+        assert _verdict(text, "stall").passed, text
+    assert not _verdict("Hayit muborak! Ertaga yozaman.").passed
+    assert not _verdict("Xayrli tong! Bugun aniqlab yozaman.", "stall").passed
 
 
 def test_redteam3_long_text_is_fast():
@@ -327,10 +432,13 @@ def test_flag_labels_are_the_owner_strings():
         "payment_claim": "to'lov tasdig'i",
         "digits": "raqam",
         "link": "havola",
+        "language": "til",
     }
     verdict = _verdict("Ertaga 100 dollar, https://example.uz")
     assert verdict.labels == ("muddat", "narx", "raqam", "havola")
     assert verdict.reasons() == ("deadline", "price", "other")
+    english = _verdict("Very reasonable.")
+    assert english.labels == ("til",) and english.reasons() == ("other",)
 
 
 # Names and codes that are only ever written in Latin letters.
