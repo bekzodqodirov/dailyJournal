@@ -20,6 +20,8 @@ from miya.bot.formatting import (
     debt_line,
     escape,
     full_date,
+    jarvis_day_lines,
+    jarvis_intent_label,
     missed_line,
     money,
     new_record_lines,
@@ -123,7 +125,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
 /uslub [yukla] — yozish uslubingiz (yukla — eski yozishmalardan o'rganish)
 /bilim [qo'sh|tuzat|o'chir|taklif] — bilimlar bazasi: mijozlarga umumiy javoblar
-/qoralamalar — Jarvis kuzatuv rejimida tayyorlagan javoblar (yuborilmagan)
+/qoralamalar — tasdiq kutayotgan qoralamalar va kuzatuv rejimidagi javoblar
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -170,7 +172,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
     ("uslub", "Yozish uslubingiz"),
     ("bilim", "Bilimlar bazasi: umumiy javoblar"),
-    ("qoralamalar", "Jarvis kuzatuv qoralamalari"),
+    ("qoralamalar", "Kutayotgan va kuzatuv qoralamalari"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -540,6 +542,8 @@ SHEETS_TASK_STATUS = {
 # Javobsiz: "ha · <when they asked>", else "yo'q".
 SHEETS_UNANSWERED_YES = "ha · {vaqt}"
 SHEETS_UNANSWERED_NO = "yo'q"
+# Ochiq eskalatsiya (JV-22): why the client waits for the owner, since when.
+SHEETS_ESCALATION_OPEN = "{sabab} · {vaqt} dan beri"
 # Kanal of a receipt: the bot, a group's title, or Telegram for a private chat.
 SHEETS_BOT_CHANNEL = RECEIPT_BOT_CHANNEL
 SHEETS_PRIVATE_CHANNEL = PRIVATE_CHAT_LABEL
@@ -2247,7 +2251,8 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     system = _brief_system_line(brief)
     unsafe = _brief_unsafe_line(brief)
     if brief.is_empty():
-        tail = [line for line in (unsafe, system) if line]
+        # Yesterday's Jarvis activity alone is not a reason to say more.
+        tail = [line for line in (_brief_jarvis(brief), unsafe, system) if line]
         return "\n\n".join([*parts, BRIEF_ALL_CLEAR, *tail])
 
     if brief.events:
@@ -2303,9 +2308,9 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     if getattr(brief, "code_suggestions", 0):
         # Pulled, never pushed (WP-33): a count, no buttons, not a question.
         parts.append(CODE_SUGGESTIONS_LINE.format(n=brief.code_suggestions))
-    jarvis = jarvis_brief_lines(getattr(brief, "jarvis", None))
+    jarvis = _brief_jarvis(brief)
     if jarvis:
-        parts.append("\n".join(jarvis))
+        parts.append(jarvis)
     if unsafe:
         parts.append(unsafe)
     line = queue_line(getattr(brief, "queue", None))
@@ -2315,6 +2320,15 @@ def _morning_brief_text(brief: MorningBrief) -> str:
         parts.append(system)
 
     return "\n\n".join(parts)
+
+
+def _brief_jarvis(brief: MorningBrief) -> str | None:
+    """The Jarvis section (JV-18, JV-22); None with Jarvis off, when its
+    reads failed, or when there is nothing to say."""
+    lines = jarvis_brief_lines(
+        getattr(brief, "jarvis", None), getattr(brief, "jarvis_day", None)
+    )
+    return "\n".join(lines) if lines else None
 
 
 def _brief_unsafe_line(brief: MorningBrief) -> str | None:
@@ -3747,11 +3761,20 @@ JARVIS_DRAFT_CAP = (
 # a line per escalation.
 JARVIS_ALERT_FOLD = "⚠️ Bugungi eskalatsiya limiti tugadi ({cap}). Qolganlari:"
 JARVIS_CANCELLED = "✖️ Bekor qilindi"
-# The morning brief's lines (JV-22 wording) for what the cards left to it:
-# escalations the snooze limit sent there, chats whose drafts came over the cap.
+# The morning brief's Jarvis section (JV-22): yesterday's activity, then what
+# the cards leave to it (cards.BriefItems): the drafts waiting for a tap, the
+# chats nobody answered, the escalations still open.
+JARVIS_BRIEF_ACTIVITY = (
+    "🤖 Jarvis (kecha): {y} ta javob yuborildi ({a} tasi avtomatik, {t} tasi siz "
+    "tasdiqlagan), {e} ta eskalatsiya ({o} tasi ochiq)"
+)
+JARVIS_BRIEF_WAITING = "✍️ Kutayotgan qoralamalar: {n} — /qoralamalar"
 JARVIS_BRIEF_ESCALATIONS = "⚠️ Ochiq eskalatsiyalar: {items}"
 JARVIS_BRIEF_ESCALATION = "{ism} ({sabab}, {qachondan})"
 JARVIS_BRIEF_UNANSWERED = "📨 Javobsiz chatlar: {n} — {ismlar}"
+# How many names one brief line lists; the rest are counted.
+JARVIS_BRIEF_NAMES_MAX = 10
+JARVIS_BRIEF_MORE = "… va yana {n} ta"
 # How much of one client message a card quotes.
 JARVIS_CLIENT_SHOWN_CHARS = 300
 # The room a card leaves under TELEGRAM_LIMIT for what joins it later: the
@@ -3939,26 +3962,41 @@ def jarvis_fold(cards, cap: int) -> str:
     return clip("\n".join(lines))
 
 
-def jarvis_brief_lines(items) -> list[str]:
-    """The morning brief's lines for cards.BriefItems."""
+def _brief_names(names: list[str], separator: str) -> str:
+    """At most JARVIS_BRIEF_NAMES_MAX names, the rest counted."""
+    shown = separator.join(names[:JARVIS_BRIEF_NAMES_MAX])
+    extra = len(names) - JARVIS_BRIEF_NAMES_MAX
+    return (
+        f"{shown}{separator}{JARVIS_BRIEF_MORE.format(n=extra)}" if extra > 0 else shown
+    )
+
+
+def jarvis_brief_lines(items, day=None) -> list[str]:
+    """The morning brief's Jarvis section: yesterday's activity
+    (status.DayReport, ``day``) and the lines of cards.BriefItems (``items``).
+    Names a counterparty chose are shown through _shown."""
+    lines = jarvis_day_lines(day, JARVIS_BRIEF_ACTIVITY)
     if items is None:
-        return []
-    lines: list[str] = []
+        return lines
+    if getattr(items, "waiting", 0):
+        lines.append(JARVIS_BRIEF_WAITING.format(n=items.waiting))
+    if items.unanswered:
+        names = [_jarvis_name(n) for n in items.unanswered]
+        lines.append(
+            JARVIS_BRIEF_UNANSWERED.format(
+                n=len(items.unanswered), ismlar=_brief_names(names, ", ")
+            )
+        )
     if items.escalations:
-        shown = "; ".join(
+        shown = [
             JARVIS_BRIEF_ESCALATION.format(
                 ism=_jarvis_name(e.name),
                 sabab=jarvis_reasons(e.reasons),
                 qachondan=_card_when(e.since),
             )
             for e in items.escalations
-        )
-        lines.append(JARVIS_BRIEF_ESCALATIONS.format(items=shown))
-    if items.unanswered:
-        names = ", ".join(_jarvis_name(n) for n in items.unanswered)
-        lines.append(
-            JARVIS_BRIEF_UNANSWERED.format(n=len(items.unanswered), ismlar=names)
-        )
+        ]
+        lines.append(JARVIS_BRIEF_ESCALATIONS.format(items=_brief_names(shown, "; ")))
     return lines
 
 
@@ -4105,32 +4143,13 @@ JARVIS_SHADOW_STRAYED = "Erkin gapli qoralamalar (o'zi yuborilmasdi): {items}"
 JARVIS_COST_STOP = health.JARVIS_COST_CAP
 SHADOW_DRAFTS_HEADER = "🧪 Kuzatuv qoralamalari:"
 SHADOW_DRAFT_LINE = "{i}. {ism}: «{mijoz}» → «{qoralama}» [{intent}]"
-SHADOW_DRAFTS_EMPTY = "🧪 Kuzatuv qoralamalari hali yo'q."
+SHADOW_DRAFTS_EMPTY = "✍️ Kutayotgan va kuzatuv qoralamalari hali yo'q."
+# The drafts waiting for a tap (JV-22), above the observation drafts: the
+# morning brief points here for them; j{id} is the card's own ref.
+WAITING_DRAFTS_HEADER = "✍️ Kutayotgan qoralamalar:"
+WAITING_DRAFT_LINE = "{i}. j{id} · {ism}: «{mijoz}» → «{qoralama}» [{intent}]"
 # How much of a client's message and of a draft a list line shows.
 SHADOW_SHOWN_CHARS = 120
-# A reply's kind (intent) in the owner's words.
-JARVIS_INTENT_LABELS = {
-    "greeting": "salomlashish",
-    "info_gathering": "ma'lumot so'rash",
-    "general_question": "umumiy savol",
-    "stall": "kutib turish javobi",
-    "other": "boshqa",
-    "price": "narx",
-    "discount": "chegirma",
-    "payment_terms": "to'lov sharti",
-    "deadline": "muddat",
-    "promise": "va'da",
-    "guarantee": "kafolat",
-    "payment_claim": "to'lov",
-    "identity": "kimligi",
-    "complaint": "shikoyat",
-    "legal": "huquqiy",
-    "other_people": "boshqa odamlar",
-}
-
-
-def jarvis_intent_label(intent: str | None) -> str:
-    return JARVIS_INTENT_LABELS.get(intent or "other", intent or "boshqa")
 
 
 def _shadow_text(text: str | None) -> str:
@@ -4140,22 +4159,36 @@ def _shadow_text(text: str | None) -> str:
     return _shown(value)
 
 
-def shadow_drafts(drafts) -> str:
-    """`/qoralamalar`: the newest observation drafts (status.ShadowDraft).
-    The client's words, their name and the draft are shown through _shown."""
-    if not drafts:
+def _draft_list_line(i: int, item, line: str = SHADOW_DRAFT_LINE) -> str:
+    return line.format(
+        i=i,
+        id=item.id,
+        ism=_shown(item.name or "Nomaʼlum"),
+        mijoz=_shadow_text(item.client_text),
+        qoralama=_shadow_text(item.body),
+        intent=escape(jarvis_intent_label(item.intent)),
+    )
+
+
+def shadow_drafts(drafts, waiting=()) -> str:
+    """`/qoralamalar`: the drafts waiting for the owner's tap (JV-22, the
+    brief's «✍️ Kutayotgan qoralamalar»), then the newest observation drafts
+    (status.ShadowDraft both). The client's words, their name and the draft
+    are shown through _shown."""
+    if not drafts and not waiting:
         return SHADOW_DRAFTS_EMPTY
-    lines = [SHADOW_DRAFTS_HEADER]
-    for i, item in enumerate(drafts, start=1):
-        lines.append(
-            SHADOW_DRAFT_LINE.format(
-                i=i,
-                ism=_shown(item.name or "Nomaʼlum"),
-                mijoz=_shadow_text(item.client_text),
-                qoralama=_shadow_text(item.body),
-                intent=escape(jarvis_intent_label(item.intent)),
-            )
-        )
+    lines: list[str] = []
+    if waiting:
+        lines.append(WAITING_DRAFTS_HEADER)
+        lines += [
+            _draft_list_line(i, item, WAITING_DRAFT_LINE)
+            for i, item in enumerate(waiting, start=1)
+        ]
+    if drafts:
+        if lines:
+            lines.append("")
+        lines.append(SHADOW_DRAFTS_HEADER)
+        lines += [_draft_list_line(i, item) for i, item in enumerate(drafts, start=1)]
     return clip("\n".join(lines))
 
 

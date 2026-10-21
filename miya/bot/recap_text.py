@@ -15,6 +15,7 @@ from miya.bot.formatting import (
     clock,
     escape,
     full_date,
+    jarvis_day_lines,
     minutes_label,
     missed_line,
     money,
@@ -108,6 +109,22 @@ def receipts_line(day) -> str | None:
     return RECEIPTS_LINE.format(
         n=day.total, k=day.confirmed, m=day.waiting, s=day.suspicious
     )
+
+
+# JV-22: Jarvis's day, its own section before the footer, counted in SQL
+# (status.day_report); the lines under the headline are formatting's, shared
+# with the morning brief.
+JARVIS_EVENING_ACTIVITY = (
+    "🤖 Bugun Jarvis: {y} ta javob yuborildi ({a} tasi avtomatik, {t} tasi siz "
+    "tasdiqlagan), {e} ta eskalatsiya ({o} tasi ochiq)"
+)
+
+
+def jarvis_section(report) -> str | None:
+    """Jarvis's section, or None with Jarvis off, a failed read, or a day
+    Jarvis did nothing."""
+    lines = jarvis_day_lines(report, JARVIS_EVENING_ACTIVITY)
+    return "\n".join(lines) if lines else None
 
 
 # Where a booked payment came from, in the owner's words.
@@ -304,10 +321,12 @@ def evening_parts(
     auto_resolved: int = 0,
     system: list[str] | None = None,
     receipts=None,
+    jarvis=None,
 ) -> list[str]:
     """The recap as Telegram messages, sections in order, empty ones left out
     (except 💰 Pul). ``receipts`` is recaps.receipt_day's count, shown as one
-    line under the money."""
+    line under the money; ``jarvis`` is status.day_report's (JV-22), shown
+    as its own section after tomorrow's."""
     codes = codes or {}
     header = EVENING_HEADER.format(full_date=full_date(day))
     if partial_until is not None:
@@ -326,7 +345,14 @@ def evening_parts(
     open_items = activity.questions_open or activity.missed_open
     tomorrow_lines = _tomorrow_lines(tomorrow)
     receipt_line = receipts_line(receipts)
-    if activity.is_empty() and not open_items and not tomorrow_lines and not receipt_line:
+    jarvis_text = jarvis_section(jarvis)
+    if (
+        activity.is_empty()
+        and not open_items
+        and not tomorrow_lines
+        and not receipt_line
+        and not jarvis_text
+    ):
         body = "\n\n".join(
             [header, EVENING_EMPTY, *(["\n".join(footer)] if footer else [])]
         )
@@ -402,6 +428,8 @@ def evening_parts(
         sections.append(
             _section(RECAP_TOMORROW, [f"• {x}" for x in tomorrow_lines] + [TOMORROW_TAIL])
         )
+    if jarvis_text:
+        sections.append(jarvis_text)
 
     if any_prose:
         footer.append(PROSE_LABEL)

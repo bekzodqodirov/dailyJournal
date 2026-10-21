@@ -57,9 +57,11 @@ from miya.bot.formatting import SOURCE_WORD, ref
 from miya.config import settings
 from miya.db.enums import ChatType, InteractionSource, PromiseMadeBy, PromiseStatus
 from miya.db.models import (
+    ESCALATION_OPEN_STATES,
     SHEET_TABS,
     ChatMonitor,
     ClientCode,
+    Escalation,
     Interaction,
     Person,
     Promise,
@@ -370,6 +372,20 @@ class _Client:
     asked_at: datetime | None = None
     last_at: datetime | None = None
     channel: str = ""
+    # The oldest open escalation's reasons and since when (JV-22).
+    escalation: tuple[tuple[str, ...], datetime] | None = None
+
+
+def escalation_text(escalation: tuple[tuple[str, ...], datetime] | None) -> str:
+    """'narx so'rayapti · 2026-10-20 14:05 dan beri': the reason and the
+    moment it opened (its age, written as a moment so the row is not
+    rewritten every minute), or blank."""
+    if escalation is None:
+        return ""
+    reasons, since = escalation
+    return replies.SHEETS_ESCALATION_OPEN.format(
+        sabab=replies.jarvis_reasons(reasons), vaqt=stamp(since)
+    )
 
 
 def followup_cells(person_id: int, client: _Client) -> tuple[Cell, ...]:
@@ -385,17 +401,51 @@ def followup_cells(person_id: int, client: _Client) -> tuple[Cell, ...]:
         client.channel,
         stamp(client.last_at),
         unanswered,
-        # Open escalations arrive with the Jarvis core (JV-11, JV-22).
-        "",
+        escalation_text(client.escalation),
         client.open_promises,
         due_text(*client.next_due) if client.next_due else "",
     )
 
 
+async def _open_escalations(
+    session: AsyncSession,
+) -> dict[int, tuple[tuple[str, ...], datetime]]:
+    """Each client's oldest open escalation the owner was shown (JV-22): its
+    reasons and since when. Empty with Jarvis off: miya.jarvis is imported
+    only when JARVIS_ENABLED (rule 20). A failed read, in its own savepoint,
+    blanks only that column for the run; the tab's core rows still sync."""
+    if not settings.jarvis_enabled:
+        return {}
+    found: dict[int, tuple[tuple[str, ...], datetime]] = {}
+    try:
+        from miya.jarvis import cards
+
+        async with session.begin_nested():
+            for person_id, reasons, since in await session.execute(
+                sa.select(Escalation.person_id, Escalation.reasons, Escalation.created_at)
+                .where(
+                    Escalation.person_id.is_not(None),
+                    Escalation.state.in_(ESCALATION_OPEN_STATES),
+                    cards.shown_escalation(),
+                )
+                .order_by(Escalation.person_id, Escalation.created_at, Escalation.id)
+            ):
+                found.setdefault(person_id, (tuple(reasons or ()), since))
+    except Exception as exc:
+        log.warning(
+            "the follow-ups' Jarvis escalations failed: %s",
+            type(exc).__name__,
+            extra={"error": type(exc).__name__, "tab": TAB_FOLLOWUPS},
+        )
+        return {}
+    return found
+
+
 async def build_followups(session: AsyncSession, now: datetime) -> Built:
     """One row per client worth following up: anyone holding an active
-    client code, with an open promise either way, or with a question the
-    owner has not answered (loops.unanswered_questions)."""
+    client code, with an open promise either way, with a question the owner
+    has not answered (loops.unanswered_questions), or with an open Jarvis
+    escalation (JV-22, ``Ochiq eskalatsiya``)."""
     built = Built(TAB_FOLLOWUPS)
     codes: dict[int, list[str]] = {}
     for person_id, code in await session.execute(
@@ -419,7 +469,9 @@ async def build_followups(session: AsyncSession, now: datetime) -> Built:
         if earlier is None or question.asked_at < earlier:
             asked[question.person.id] = question.asked_at
 
-    ids = set(codes) | {row.person_id for row in open_rows} | set(asked)
+    escalated = await _open_escalations(session)
+
+    ids = set(codes) | {row.person_id for row in open_rows} | set(asked) | set(escalated)
     if not ids:
         return built
     clients = {
@@ -443,6 +495,9 @@ async def build_followups(session: AsyncSession, now: datetime) -> Built:
     for person_id, at in asked.items():
         if person_id in clients:
             clients[person_id].asked_at = at
+    for person_id, escalation in escalated.items():
+        if person_id in clients:
+            clients[person_id].escalation = escalation
 
     last = (
         await session.execute(

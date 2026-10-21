@@ -59,7 +59,7 @@ from typing import Any, Final, Literal, Protocol
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import InstrumentedAttribute
+from sqlalchemy.orm import InstrumentedAttribute, aliased
 
 from miya.config import settings
 from miya.db.enums import Currency, DebtDirection, Direction
@@ -364,6 +364,12 @@ def _created_mode_clause() -> sa.ColumnElement[str]:
         Escalation.history[0]["mode"].astext, ""
     )
     return mode
+
+
+def shown_escalation() -> sa.ColumnElement[bool]:
+    """SQL: an escalation opened in a mode the owner is shown escalations in
+    (``draft`` or ``auto``). One opened in ``shadow`` is only counted."""
+    return _created_mode_clause().in_(SHOWN_MODES)
 
 
 def _created_code(history: Sequence[object] | None) -> str | None:
@@ -1190,7 +1196,7 @@ async def sweep(presenter: Presenter, *, now: datetime) -> SweepResult:
                 Escalation.state.in_(ESCALATION_OPEN_STATES),
                 Escalation.created_at >= lookback,
                 # Shadow escalations are never alerted: they never fill the batch.
-                _created_mode_clause().in_(SHOWN_MODES),
+                shown_escalation(),
             )
             .order_by(Escalation.created_at, Escalation.id)
             .limit(SWEEP_BATCH)
@@ -1798,33 +1804,80 @@ class BriefEscalation:
 
 @dataclass(frozen=True, slots=True)
 class BriefItems:
-    """What the cards left to the morning brief: escalations the snooze
-    limit sent there, and the chats whose drafts came over the daily cap
-    and were never shown."""
+    """What the cards leave to the morning brief (JV-18, widened in JV-22):
+    every escalation still open that the owner was shown (the ones the
+    snooze limit sent there among them), the chats whose drafts of the last
+    day nobody answered, and how many drafts wait for the owner's tap now."""
 
     escalations: tuple[BriefEscalation, ...] = ()
     unanswered: tuple[str | None, ...] = ()
+    waiting: int = 0
 
     def is_empty(self) -> bool:
-        return not (self.escalations or self.unanswered)
+        return not (self.escalations or self.unanswered or self.waiting)
+
+
+def waiting_draft(now: datetime) -> sa.ColumnElement[bool]:
+    """An AI draft the owner can still send: a ``draft`` row of the
+    responder's that has not run out (``/qoralamalar`` lists them)."""
+    return sa.and_(
+        OutboxMessage.state == outbox.DRAFT,
+        OutboxMessage.origin == DRAFT_ORIGIN,
+        sa.or_(OutboxMessage.expires_at.is_(None), OutboxMessage.expires_at > now),
+    )
+
+
+def _chat_title_join() -> sa.ColumnElement[bool]:
+    """An escalation's Telegram chat, for its title when no person is known."""
+    prefix = f"{chatkey.PREFIX[chatkey.TELEGRAM]}:"
+    return sa.func.concat(prefix, ChatMonitor.tg_chat_id) == Escalation.chat_key
 
 
 async def brief_items(session: AsyncSession, *, now: datetime) -> BriefItems:
-    """The brief's Jarvis lines, from SQL. The capped drafts are those of
-    the last day that were never answered: still waiting, or expired
-    unanswered overnight (JARVIS_DRAFT_EXPIRY_HOURS ends most of them
-    before the brief), in a chat the owner has not written in since. A
-    chat with no person reads as its own title."""
+    """The brief's Jarvis lines, from SQL.
+
+    The escalations are every one still open (open, snoozed, or waiting for
+    the owner who said they would write) that was opened in a mode whose
+    escalations are shown, oldest first. The unanswered chats are those
+    with a draft of the last day that was never answered: still waiting, or
+    expired unanswered overnight (JARVIS_DRAFT_EXPIRY_HOURS ends most of them
+    before the brief), shown on a card or held over the daily cap, in a chat
+    the owner has not written in since, that got no reply sent since (a
+    later draft the owner sent) and that is not named among the open
+    escalations already. A chat with no person reads as its own title."""
     escalations = await session.execute(
-        sa.select(Escalation.reasons, Escalation.created_at, Person.display_name)
-        .outerjoin(Person, Person.id == Escalation.person_id)
-        .where(
-            Escalation.state == SNOOZED,
-            Escalation.snooze_count >= settings.jarvis_snooze_max,
+        sa.select(
+            Escalation.reasons,
+            Escalation.created_at,
+            sa.func.coalesce(Person.display_name, ChatMonitor.title),
         )
-        .order_by(Escalation.created_at)
+        .outerjoin(Person, Person.id == Escalation.person_id)
+        .outerjoin(ChatMonitor, _chat_title_join())
+        .where(Escalation.state.in_(ESCALATION_OPEN_STATES), shown_escalation())
+        .order_by(Escalation.created_at, Escalation.id)
     )
-    capped = await session.execute(
+    open_here = (
+        sa.select(Escalation.id)
+        .where(
+            Escalation.chat_key == OutboxMessage.chat_key,
+            Escalation.state.in_(ESCALATION_OPEN_STATES),
+            shown_escalation(),
+        )
+        .exists()
+    )
+    # A reply that went into the chat after the draft was made (a later
+    # draft the owner sent, say) answered it: nothing cancels the older one.
+    later = aliased(OutboxMessage)
+    answered_since = (
+        sa.select(later.id)
+        .where(
+            later.chat_key == OutboxMessage.chat_key,
+            later.state == outbox.SENT,
+            later.sent_at > OutboxMessage.created_at,
+        )
+        .exists()
+    )
+    unanswered = await session.execute(
         sa.select(
             OutboxMessage.chat_key,
             OutboxMessage.person_id,
@@ -1842,25 +1895,29 @@ async def brief_items(session: AsyncSession, *, now: datetime) -> BriefItems:
                 ),
             ),
             OutboxMessage.origin == DRAFT_ORIGIN,
-            OutboxMessage.card_tg_message_id.is_(None),
             OutboxMessage.created_at >= now - timedelta(days=1),
-            _capped_clause(),
             sa.or_(
                 JarvisChatState.owner_replied_at.is_(None),
                 JarvisChatState.owner_replied_at < OutboxMessage.created_at,
             ),
+            ~open_here,
+            ~answered_since,
         )
         .order_by(OutboxMessage.created_at, OutboxMessage.id)
     )
     names: dict[object, str | None] = {}
-    for chat_key, person_id, name in capped:
+    for chat_key, person_id, name in unanswered:
         names.setdefault(person_id if person_id is not None else chat_key, name)
+    waiting = await session.scalar(
+        sa.select(sa.func.count()).select_from(OutboxMessage).where(waiting_draft(now))
+    )
     return BriefItems(
         escalations=tuple(
             BriefEscalation(name, tuple(reasons or ()), since)
             for reasons, since, name in escalations
         ),
         unanswered=tuple(names.values()),
+        waiting=int(waiting or 0),
     )
 
 
@@ -1902,9 +1959,11 @@ __all__ = [
     "realert",
     "recarded",
     "record_shown",
+    "shown_escalation",
     "silent_at",
     "sweep",
     "tap_command",
     "tap_draft",
     "tap_escalation",
+    "waiting_draft",
 ]

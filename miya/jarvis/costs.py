@@ -65,19 +65,25 @@ class Spend:
     unpriced: int
 
 
-async def spend_today(session: AsyncSession, now: datetime) -> Spend:
+async def _spend(session: AsyncSession, *where: sa.ColumnElement[bool]) -> Spend:
     row = (
         await session.execute(
             sa.select(
                 sa.func.coalesce(sa.func.sum(UsageLog.cost_usd), 0),
                 sa.func.count().filter(UsageLog.cost_usd.is_(None)),
-            ).where(
-                UsageLog.operation.in_(JARVIS_OPERATIONS),
-                UsageLog.created_at >= day_start(now),
-            )
+            ).where(UsageLog.operation.in_(JARVIS_OPERATIONS), *where)
         )
     ).one()
     return Spend(usd=Decimal(row[0]), unpriced=int(row[1] or 0))
+
+
+async def spend_today(session: AsyncSession, now: datetime) -> Spend:
+    return await _spend(session, UsageLog.created_at >= day_start(now))
+
+
+async def spend_between(session: AsyncSession, start: datetime, end: datetime) -> Spend:
+    """The Jarvis spend recorded in ``[start, end)``: a report's day."""
+    return await _spend(session, UsageLog.created_at >= start, UsageLog.created_at < end)
 
 
 def cap_reached(spend: Spend, cap: Decimal) -> bool:
@@ -217,5 +223,6 @@ __all__ = [
     "ask",
     "cap_reached",
     "over_cap",
+    "spend_between",
     "spend_today",
 ]

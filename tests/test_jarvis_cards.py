@@ -1137,7 +1137,11 @@ async def test_draft_cap_told_once_and_left_to_brief(session, on, monkeypatch):
     assert (await _reload_row(session, row.id)).card_tg_message_id is None
     items = await cards.brief_items(session, now=t0 + timedelta(hours=1))
     assert items.unanswered == ("Akmal",)
-    assert replies.jarvis_brief_lines(items) == ["📨 Javobsiz chatlar: 1 — Akmal"]
+    # JV-22: the capped draft still waits for a tap (/qoralamalar lists it).
+    assert replies.jarvis_brief_lines(items) == [
+        "✍️ Kutayotgan qoralamalar: 1 — /qoralamalar",
+        "📨 Javobsiz chatlar: 1 — Akmal",
+    ]
     # Capped at noon, the draft has expired unanswered by the next morning's
     # brief: the brief still names the chat.
     morning = cards.next_brief(t0)

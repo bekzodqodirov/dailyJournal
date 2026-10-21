@@ -1262,7 +1262,7 @@ async def test_shadow_status_and_drafts_command(session, on, monkeypatch):
     ), listing
     assert "‮" not in listing
     assert any(line.endswith("[kutib turish javobi]") for line in lines)
-    assert replies.shadow_drafts([]) == "🧪 Kuzatuv qoralamalari hali yo'q."
+    assert replies.shadow_drafts([]) == "✍️ Kutayotgan va kuzatuv qoralamalari hali yo'q."
 
 
 # --- configuration -----------------------------------------------------------------

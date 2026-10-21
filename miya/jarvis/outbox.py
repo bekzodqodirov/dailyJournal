@@ -1937,7 +1937,7 @@ async def reconcile(
                 else:
                     # The lease stays: its claim moment is when the row went on
                     # the wire, and every cap counts an unknown row from it
-                    # (caps._wire_moment). ix_outbox_messages_lease covers only
+                    # (caps.wire_moment). ix_outbox_messages_lease covers only
                     # 'sending'; complete() and fail() clear it.
                     _transition(
                         row, UNKNOWN, by=BY_RECONCILE, now=now, code="lease_expired"

@@ -962,6 +962,31 @@ async def receipt_day(
     )
 
 
+async def jarvis_day(session: AsyncSession, start: datetime, end: datetime) -> Any:
+    """Jarvis's day for the recap (JV-22, ``status.day_report``); None with
+    Jarvis off (miya.jarvis is never imported then, rule 20) or when the read
+    fails, so the recap goes out without the section rather than not at all."""
+    if not settings.jarvis_enabled:
+        return None
+    try:
+        from miya.jarvis import status
+
+        async with session.begin_nested():
+            return await status.day_report(session, start, end)
+    except Exception as exc:
+        log.warning(
+            "the recap's Jarvis section failed: %s",
+            type(exc).__name__,
+            extra={
+                "error": type(exc).__name__,
+                "window_start": start.isoformat(),
+                "window_end": end.isoformat(),
+            },
+            exc_info=True,
+        )
+        return None
+
+
 async def build_evening(
     session: AsyncSession, day, *, now: datetime, store: bool
 ) -> RecapResult:
@@ -1021,6 +1046,7 @@ async def build_evening(
         auto_resolved=auto,
         system=await _system_lines(session, now),
         receipts=await receipt_day(session, start, end),
+        jarvis=await jarvis_day(session, start, end),
     )
     stats = _stats(activity, prose, queue, parts)
     if store:

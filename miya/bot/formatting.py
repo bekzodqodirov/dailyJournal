@@ -788,3 +788,100 @@ WEEKDAYS_UZ = [
     "shanba",
     "yakshanba",
 ]
+
+
+# --- Jarvis in the 09:00 brief and the 20:00 recap (JV-22) ---------------------------
+#
+# Here, not in replies: the recap renderer imports only this module. Each
+# report has its own headline (the brief's «🤖 Jarvis (kecha)», the recap's
+# «🤖 Bugun Jarvis»); the lines under it are the same in both. The values are
+# miya.jarvis.status.DayReport's, read by attribute: nothing here imports
+# miya.jarvis (rule 20).
+
+# A reply's kind (intent) in the owner's words.
+JARVIS_INTENT_LABELS = {
+    "greeting": "salomlashish",
+    "info_gathering": "ma'lumot so'rash",
+    "general_question": "umumiy savol",
+    "stall": "kutib turish javobi",
+    "other": "boshqa",
+    "price": "narx",
+    "discount": "chegirma",
+    "payment_terms": "to'lov sharti",
+    "deadline": "muddat",
+    "promise": "va'da",
+    "guarantee": "kafolat",
+    "payment_claim": "to'lov",
+    "identity": "kimligi",
+    "complaint": "shikoyat",
+    "legal": "huquqiy",
+    "other_people": "boshqa odamlar",
+}
+
+JARVIS_DAY_COMMANDS = "📤 Buyrug'ingiz bilan yuborildi: {n} ta"
+JARVIS_DAY_UNKNOWN = "❓ {n} ta xabar yuborilganmi — aniq emas (/holat)"
+JARVIS_DAY_OBSERVED = "🧪 Kuzatuv rejimida {n} ta xabar sizga yo'naltirilardi"
+JARVIS_DAY_COST = "💸 Jarvis xarajati: {x} / {cap}"
+JARVIS_DAY_UNPRICED = " · narxi noma'lum: {n} ta chaqiruv"
+# The day's drafts per kind: how the owner treated them, and how many strayed
+# from the approved shapes (never sent on their own).
+JARVIS_DAY_QUALITY = "🧪 Qoralamalar sifati:"
+JARVIS_DAY_INTENT = "• {intent}: {n} ta qoralama"
+JARVIS_DAY_UNCHANGED = "{n} tasi o'zgartirilmasdan tasdiqlandi"
+JARVIS_DAY_EDITED = "{n} tasi tahrirlandi"
+JARVIS_DAY_STRAYED = "{n} tasi erkin gapli (o'zi yuborilmasdi)"
+
+
+def jarvis_intent_label(intent: str | None) -> str:
+    return JARVIS_INTENT_LABELS.get(intent or "other", intent or "boshqa")
+
+
+def _intent_quality_line(quality) -> str:
+    line = JARVIS_DAY_INTENT.format(
+        intent=escape(jarvis_intent_label(quality.intent)), n=quality.drafts
+    )
+    parts = [
+        template.format(n=count)
+        for template, count in (
+            (JARVIS_DAY_UNCHANGED, quality.unchanged),
+            (JARVIS_DAY_EDITED, quality.edited),
+            (JARVIS_DAY_STRAYED, quality.unapproved),
+        )
+        if count
+    ]
+    return f"{line} — {', '.join(parts)}" if parts else line
+
+
+def jarvis_day_lines(report, headline: str) -> list[str]:
+    """Jarvis's section of a report: ``headline`` filled with the replies
+    sent and the escalations, then the owner's commanded sends, the sends in
+    doubt, what observation mode would have escalated, the spend and a line
+    per intent. Empty for a report without Jarvis (None) or a quiet day."""
+    if report is None or report.is_empty():
+        return []
+    lines = [
+        headline.format(
+            y=report.sent,
+            a=report.auto,
+            t=report.approved,
+            e=report.escalations,
+            o=report.escalations_open,
+        )
+    ]
+    if report.commands:
+        lines.append(JARVIS_DAY_COMMANDS.format(n=report.commands))
+    if report.unknown:
+        lines.append(JARVIS_DAY_UNKNOWN.format(n=report.unknown))
+    if report.shadow_escalations:
+        lines.append(JARVIS_DAY_OBSERVED.format(n=report.shadow_escalations))
+    if report.cost_usd or report.cost_unpriced:
+        cost = JARVIS_DAY_COST.format(
+            x=usd(report.cost_usd), cap=usd(report.cost_cap_usd)
+        )
+        if report.cost_unpriced:
+            cost += JARVIS_DAY_UNPRICED.format(n=report.cost_unpriced)
+        lines.append(cost)
+    if report.quality:
+        lines.append(JARVIS_DAY_QUALITY)
+        lines += [_intent_quality_line(q) for q in report.quality]
+    return lines

@@ -264,7 +264,7 @@ ledger only ever has the bank's own record and your own words.
 | `/guruhai <guruh>` | AI replies in one group: on after a confirm tap, and then only as drafts for your tap and only to messages addressed to you; off at once. Groups get no AI reply until switched on; `/guruhai` alone lists the groups that are on |
 | `/uslub [yukla]` | Your texting style as MIYA learned it: greetings, how you address people, message length, frequent phrases, emoji, script and Russian words, with a few of your own replies as examples; «✅ Faollashtirish» makes it the one Jarvis drafts with, «🔄 Qayta tuzish» builds it again. `yukla` reads your older private chats (read-only) to learn from more messages (media is not downloaded) and, with `JARVIS_ENABLED`, tells you when the profile is ready; without it, open `/uslub` again in a few minutes |
 | `/bilim [qo'sh\|tuzat\|o'chir\|taklif]` | Your business knowledge base, the facts and answers Jarvis may give clients: `/bilim` lists the active ones (`b12`), `/bilim qo'sh Savol \| Javob` adds one (without «\|», a fact), `/bilim tuzat b12 Savol \| Javob` corrects one, `/bilim o'chir b12` retires one. A price, discount, payment term, deadline, promise or a client's personal data is never stored. `/bilim taklif` shows what MIYA suggested from your own past answers to questions several clients asked (weekly, with `JARVIS_ENABLED`); each needs your «✅ Qo'shish», «✖️ Kerak emas» drops it |
-| `/qoralamalar` | Jarvis's latest drafts in observation (`shadow`) mode, stored and never sent: who wrote, what they wrote, the reply Jarvis would have given and its kind; `/jarvis` shows how many replies it would have prepared today and how many of them it would have forwarded to you |
+| `/qoralamalar` | First the drafts waiting for your tap (`j12` · who wrote, what they wrote, the draft, its kind), including drafts held over `JARVIS_DRAFT_DAILY_CAP` that have no card (the morning brief's «✍️ Kutayotgan qoralamalar» points here); then Jarvis's latest drafts in observation (`shadow`) mode, stored and never sent: who wrote, what they wrote, the reply Jarvis would have given and its kind; `/jarvis` shows how many replies it would have prepared today and how many of them it would have forwarded to you |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
@@ -403,7 +403,11 @@ the day's money per currency, repayments and what the phone booked (with
 suspicious, counted in SQL), new and closed records, then a block per person —
 messages, calls, what they asked and whether it was answered, claims and refs — and per
 group, the calls, what was aimed at the owner in groups, what is still open,
-and tomorrow. Every figure comes from SQL (`services/recaps.py`); one capped
+and tomorrow; with `JARVIS_ENABLED`, Jarvis's day («🤖 Bugun Jarvis»: replies
+sent on their own and on your tap, escalations and how many are still open,
+sends you commanded, sends in doubt, the spend against
+`JARVIS_DAILY_COST_CAP_USD`, and per reply kind how many drafts you approved
+unchanged, rewrote, or that strayed from the approved shapes). Every figure comes from SQL (`services/recaps.py`); one capped
 model call adds at most a labelled sentence or two per person and group, with
 any digit or currency word refused, and the recap arrives complete without it
 when the model is down. It is stored in `daily_reports`, split into at most
@@ -418,8 +422,14 @@ prose (no new model call), and a block for everything since the evening
 cutoff — so nothing between 20:00 and 09:00 goes untold. When the evening
 recap never reached the owner, the whole of yesterday is told here instead.
 Then the brief with its buttons — after the meetings it lists today's
-deadlines that name a time of day, by that time («⏰ Bugungi muddatlar») —
-then at most the brief's questions.
+deadlines that name a time of day, by that time («⏰ Bugungi muddatlar»), and
+with `JARVIS_ENABLED` Jarvis's section: yesterday's activity in the evening
+recap's words («🤖 Jarvis (kecha)»), the drafts waiting for your tap
+(«✍️ Kutayotgan qoralamalar», listed by `/qoralamalar`), the chats whose
+drafts nobody answered («📨 Javobsiz chatlar») and every escalation still
+open, with its reason and since when («⚠️ Ochiq eskalatsiyalar») — then at
+most the brief's questions. Each Jarvis part is read on its own; one that
+fails is left out and the brief still goes out.
 `/kecha` shows the morning recap on demand; `/ertalab` shows both.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
@@ -440,8 +450,9 @@ quiet no-ops.
 **Google Sheets mirror.** A one-way copy of the ledger's lists in your own
 spreadsheet, at most a minute behind: `Tasks_Promises` (every promise and
 task, who to whom, deadline with its time, status, where and when it was
-said), `Client_FollowUps` (each client with an active code, an open promise or
-an unanswered question: last contact, open promises, next deadline) and
+said), `Client_FollowUps` (each client with an active code, an open promise,
+an unanswered question or an open Jarvis escalation: last contact, the
+escalation's reason and since when, open promises, next deadline) and
 `Receipts` (what each receipt image says, who sent it, and, in its own
 columns, the bank's cross-check and the bank's own record). Setup: in Google
 Cloud Console enable the Sheets API, create a service account, download its

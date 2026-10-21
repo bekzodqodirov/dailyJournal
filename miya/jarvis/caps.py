@@ -39,7 +39,8 @@ SHADOW_STATE: Final = "shadow"
 DRAFT_CAP_CODE: Final = "draft_cap"
 
 
-def _wire_moment() -> sa.ColumnElement[datetime]:
+def wire_moment() -> sa.ColumnElement[datetime]:
+    """When a row went on the wire: ``sent_at``, else its claim."""
     return sa.func.coalesce(
         OutboxMessage.sent_at,
         OutboxMessage.lease_until - sa.literal(SEND_LEASE, sa.Interval()),
@@ -47,7 +48,7 @@ def _wire_moment() -> sa.ColumnElement[datetime]:
 
 
 def _on_wire_since(start: datetime) -> sa.ColumnElement[bool]:
-    return sa.and_(OutboxMessage.state.in_(WIRE_STATES), _wire_moment() >= start)
+    return sa.and_(OutboxMessage.state.in_(WIRE_STATES), wire_moment() >= start)
 
 
 async def _count(session: AsyncSession, *where: sa.ColumnElement[bool]) -> int:
@@ -84,7 +85,7 @@ async def day_counts(session: AsyncSession, now: datetime) -> DayCounts:
     )
     return DayCounts(
         drafts=await _count(
-            session, ai_today, sa.or_(_became(DRAFT_STATE), _became(SHADOW_STATE))
+            session, ai_today, sa.or_(became(DRAFT_STATE), became(SHADOW_STATE))
         ),
         draft_cards=await _count(session, ai_today, _is_card()),
         sent=await _count(session, _on_wire_since(start)),
@@ -95,7 +96,7 @@ async def day_counts(session: AsyncSession, now: datetime) -> DayCounts:
     )
 
 
-def _became(state: str) -> sa.ColumnElement[bool]:
+def became(state: str) -> sa.ColumnElement[bool]:
     """The row's history has a transition into ``state``."""
     return OutboxMessage.history.op("@>")(
         sa.cast(sa.literal([{"field": "state", "new": state}], JSONB), JSONB)
@@ -108,7 +109,7 @@ def _is_card() -> sa.ColumnElement[bool]:
     never changes, not from the mutable ``last_error``; ``create`` always
     writes the creation entry first."""
     return sa.and_(
-        _became(DRAFT_STATE),
+        became(DRAFT_STATE),
         sa.func.coalesce(OutboxMessage.history[0]["code"].astext, "") != DRAFT_CAP_CODE,
     )
 
@@ -145,7 +146,7 @@ async def last_send_at(
     (0029) each channel has one account, so ``account`` narrows only when the
     adapter names one in ``claimed_by``.
     """
-    query = sa.select(sa.func.max(_wire_moment())).where(
+    query = sa.select(sa.func.max(wire_moment())).where(
         OutboxMessage.state.in_(WIRE_STATES), OutboxMessage.channel == channel
     )
     if account is not None:
@@ -173,6 +174,7 @@ __all__ = [
     "SEND_LEASE",
     "WIRE_STATES",
     "DayCounts",
+    "became",
     "channel_sent_today",
     "chat_ai_sent_today",
     "day_counts",
@@ -180,4 +182,5 @@ __all__ = [
     "gap_until",
     "last_send_at",
     "next_day",
+    "wire_moment",
 ]

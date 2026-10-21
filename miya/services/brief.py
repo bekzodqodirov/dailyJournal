@@ -9,10 +9,12 @@ commitments that have been sitting, counterparties who went quiet with
 something open, one line counting what still waits for the owner's tap
 (WP-19: the brief tells; the numbered question batch after it asks), and
 one counting yesterday's spam and scam that MIYA left alone (JV-09), and
-with JARVIS_ENABLED what the cards left to it (JV-18): escalations the owner
-snoozed JARVIS_SNOOZE_MAX times, and the chats whose drafts came over
-JARVIS_DRAFT_DAILY_CAP. miya.jarvis is imported only then (rule 20), and a
-failure there never costs the brief.
+with JARVIS_ENABLED Jarvis's section (JV-18, JV-22): yesterday's replies,
+escalations, commanded sends, sends in doubt, spend and draft quality per
+intent (``status.day_report``), the drafts waiting for the owner's tap, the
+chats nobody answered and every escalation still open (``cards.brief_items``).
+miya.jarvis is imported only then (rule 20); each Jarvis read runs in its own
+savepoint, and a failure there costs the brief only that part.
 
 Rendering is replies.morning_brief; this module only gathers.
 """
@@ -67,6 +69,9 @@ class MorningBrief:
     # What the Jarvis cards left to the brief (JV-18, cards.BriefItems);
     # None with Jarvis off.
     jarvis: Any = None
+    # Yesterday's Jarvis activity (JV-22, status.DayReport): told, and on its
+    # own not a reason to send the brief; None with Jarvis off.
+    jarvis_day: Any = None
 
     @property
     def day(self) -> date:
@@ -104,6 +109,7 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         system_problems=await _system_problems(session, now),
         unsafe_ignored=await _unsafe_yesterday(session, day),
         jarvis=await _jarvis_items(session, now),
+        jarvis_day=await _jarvis_day(session, day),
     )
 
 
@@ -188,6 +194,27 @@ async def _jarvis_items(session: AsyncSession, now: datetime) -> Any:
             "the brief's Jarvis lines failed: %s",
             type(exc).__name__,
             extra={"error": type(exc).__name__},
+        )
+        return None
+
+
+async def _jarvis_day(session: AsyncSession, day: date) -> Any:
+    """Yesterday's Jarvis activity (JV-22); None with Jarvis off or when the
+    read fails, so the brief still goes out."""
+    if not settings.jarvis_enabled:
+        return None
+    start, end = queries.day_bounds(day - timedelta(days=1))
+    try:
+        from miya.jarvis import status
+
+        async with session.begin_nested():
+            return await status.day_report(session, start, end)
+    except Exception as exc:
+        log.warning(
+            "the brief's Jarvis activity failed: %s",
+            type(exc).__name__,
+            extra={"error": type(exc).__name__, "day": day.isoformat()},
+            exc_info=True,
         )
         return None
 

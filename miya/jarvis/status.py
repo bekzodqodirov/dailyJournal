@@ -16,6 +16,13 @@ is ``/qoralamalar``.
 channel's switch, pause and breaker, and the send queue: rows waiting for an
 adapter, rows no adapter took although their channel should be sending, and
 claimed rows whose lease ran out without a reconcile.
+
+``day_report`` is Jarvis's section of the 09:00 brief (yesterday) and of the
+20:00 recap (today, JV-22): the replies sent (on their own or on the owner's
+tap), the escalations the owner was shown and how many of them are still
+open, the sends the owner commanded, the sends in doubt, the spend, and per
+intent how the drafts fared. Every figure is SQL over ``outbox_messages``,
+``escalations`` and ``usage_log`` in the report's window.
 """
 
 from __future__ import annotations
@@ -23,14 +30,18 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import InstrumentedAttribute
 
 from miya.config import settings
 from miya.db.models import (
+    ESCALATION_OPEN_STATES,
+    ChatMonitor,
     Escalation,
     Interaction,
     JarvisPolicy,
@@ -38,7 +49,7 @@ from miya.db.models import (
     Person,
     ReplyRule,
 )
-from miya.jarvis import caps, chatkey, costs, gate, outbox, policy
+from miya.jarvis import caps, cards, chatkey, costs, gate, outbox, policy
 from miya.jarvis.policy import Mode
 from miya.services import health
 from miya.services.reminders import day_start
@@ -282,12 +293,9 @@ async def shadow_counts(session: AsyncSession, now: datetime) -> ShadowCounts:
         .select_from(Escalation)
         .where(Escalation.created_at >= start, _shadow_escalation())
     )
-    strayed = OutboxMessage.guard["flags"].op("@>")(
-        sa.cast(sa.literal([gate.UNAPPROVED_STATEMENT], JSONB), JSONB)
-    )
     per_intent = await session.execute(
         sa.select(OutboxMessage.intent, sa.func.count())
-        .where(shadow_reply, strayed)
+        .where(shadow_reply, _strayed())
         .group_by(OutboxMessage.intent)
         .order_by(OutboxMessage.intent)
     )
@@ -300,9 +308,172 @@ async def shadow_counts(session: AsyncSession, now: datetime) -> ShadowCounts:
 
 
 @dataclass(frozen=True, slots=True)
+class IntentQuality:
+    """One intent's AI drafts in a report's window (JV-22): how many the
+    responder made (drafts and observation drafts alike), how many the owner
+    approved with the AI's words unchanged, how many they rewrote, and how
+    many strayed from the approved shapes (``unapproved_statement``: never
+    sent on their own). A rewritten draft is judged by the owner's words
+    from then on, so its AI text is not counted as strayed any more."""
+
+    intent: str
+    drafts: int
+    unchanged: int = 0
+    edited: int = 0
+    unapproved: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class DayReport:
+    """Jarvis in one report's window ``[start, end)`` (JV-22), plain values
+    (the renderers never import miya.jarvis).
+
+    ``sent`` are the replies to clients that went out (``auto`` of them on
+    their own, ``approved`` on the owner's tap); ``escalations`` the ones the
+    owner was shown, ``escalations_open`` of them still open now, and
+    ``shadow_escalations`` the ones observation mode only counted;
+    ``commands`` the sends the owner commanded; ``unknown`` the sends in
+    doubt (claimed, never confirmed)."""
+
+    sent: int = 0
+    auto: int = 0
+    approved: int = 0
+    escalations: int = 0
+    escalations_open: int = 0
+    shadow_escalations: int = 0
+    commands: int = 0
+    unknown: int = 0
+    cost_usd: Decimal = Decimal("0")
+    cost_cap_usd: Decimal = Decimal("0")
+    cost_unpriced: int = 0
+    quality: tuple[IntentQuality, ...] = ()
+
+    def is_empty(self) -> bool:
+        return not (
+            self.sent
+            or self.escalations
+            or self.shadow_escalations
+            or self.commands
+            or self.unknown
+            or self.quality
+            or self.cost_usd
+            or self.cost_unpriced
+        )
+
+
+def _between(
+    column: sa.ColumnElement[Any] | InstrumentedAttribute[Any],
+    start: datetime,
+    end: datetime,
+) -> sa.ColumnElement[bool]:
+    return sa.and_(column >= start, column < end)
+
+
+def _strayed() -> sa.ColumnElement[bool]:
+    """The bound verdict carries the ``unapproved_statement`` flag."""
+    return OutboxMessage.guard["flags"].op("@>")(
+        sa.cast(sa.literal([gate.UNAPPROVED_STATEMENT], JSONB), JSONB)
+    )
+
+
+async def day_report(session: AsyncSession, start: datetime, end: datetime) -> DayReport:
+    """Jarvis's activity in ``[start, end)``, counted in SQL.
+
+    A reply is counted when it was sent in the window (``sent_at``), a send
+    in doubt by the moment it was claimed, an escalation and a draft by when
+    they were made; ``escalations_open`` is their state now."""
+    is_command = OutboxMessage.origin == outbox.OWNER_COMMAND_ORIGIN
+    sent, auto, commands = (
+        await session.execute(
+            sa.select(
+                sa.func.count().filter(~is_command),
+                sa.func.count().filter(
+                    ~is_command, OutboxMessage.approved_by == caps.AUTO_APPROVER
+                ),
+                sa.func.count().filter(is_command),
+            ).where(
+                OutboxMessage.state == outbox.SENT,
+                _between(OutboxMessage.sent_at, start, end),
+            )
+        )
+    ).one()
+    unknown = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(OutboxMessage)
+        .where(
+            OutboxMessage.state == outbox.UNKNOWN,
+            _between(caps.wire_moment(), start, end),
+        )
+    )
+    shown = cards.shown_escalation()
+    escalations, still_open, observed = (
+        await session.execute(
+            sa.select(
+                sa.func.count().filter(shown),
+                sa.func.count().filter(
+                    shown, Escalation.state.in_(ESCALATION_OPEN_STATES)
+                ),
+                sa.func.count().filter(_shadow_escalation()),
+            ).where(_between(Escalation.created_at, start, end))
+        )
+    ).one()
+    # Every AI row keeps its words in ``ai_body`` from the start; a rewrite
+    # is told by the row turning the owner's (``outbox.owner_text``).
+    edited = OutboxMessage.authored_by == gate.OWNER
+    approved_unchanged = sa.and_(
+        OutboxMessage.approved_by.is_not(None),
+        OutboxMessage.approved_by != caps.AUTO_APPROVER,
+        OutboxMessage.authored_by == gate.AI,
+    )
+    per_intent = await session.execute(
+        sa.select(
+            OutboxMessage.intent,
+            sa.func.count(),
+            sa.func.count().filter(approved_unchanged),
+            sa.func.count().filter(edited),
+            sa.func.count().filter(OutboxMessage.authored_by == gate.AI, _strayed()),
+        )
+        .where(
+            OutboxMessage.origin == cards.DRAFT_ORIGIN,
+            _between(OutboxMessage.created_at, start, end),
+            sa.or_(caps.became(outbox.DRAFT), caps.became(outbox.SHADOW)),
+        )
+        .group_by(OutboxMessage.intent)
+        .order_by(sa.func.count().desc(), OutboxMessage.intent)
+    )
+    spend = await costs.spend_between(session, start, end)
+    sent_n = int(sent or 0)
+    auto_n = int(auto or 0)
+    return DayReport(
+        sent=sent_n,
+        auto=auto_n,
+        approved=sent_n - auto_n,
+        escalations=int(escalations or 0),
+        escalations_open=int(still_open or 0),
+        shadow_escalations=int(observed or 0),
+        commands=int(commands or 0),
+        unknown=int(unknown or 0),
+        cost_usd=spend.usd,
+        cost_cap_usd=settings.jarvis_daily_cost_cap_usd,
+        cost_unpriced=spend.unpriced,
+        quality=tuple(
+            IntentQuality(
+                intent=str(kind or "other"),
+                drafts=int(n),
+                unchanged=int(k or 0),
+                edited=int(r or 0),
+                unapproved=int(u or 0),
+            )
+            for kind, n, k, r, u in per_intent
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class ShadowDraft:
-    """One observation draft as ``/qoralamalar`` shows it (plain values:
-    replies.py never imports miya.jarvis)."""
+    """One draft as ``/qoralamalar`` shows it, an observation draft or one
+    waiting for the owner's tap (plain values: replies.py never imports
+    miya.jarvis)."""
 
     id: int
     name: str | None
@@ -312,15 +483,13 @@ class ShadowDraft:
     origin: str
 
 
-async def shadow_drafts(
-    session: AsyncSession, *, limit: int = SHADOW_LIST
+async def _drafts(
+    session: AsyncSession, where: sa.ColumnElement[bool], limit: int
 ) -> list[ShadowDraft]:
-    """The newest ``shadow`` rows, newest first: who wrote, what they wrote,
-    what MIYA would have answered."""
     rows = await session.execute(
         sa.select(
             OutboxMessage.id,
-            Person.display_name,
+            sa.func.coalesce(Person.display_name, ChatMonitor.title),
             Interaction.raw_text,
             Interaction.transcript,
             OutboxMessage.body,
@@ -329,8 +498,9 @@ async def shadow_drafts(
         )
         .select_from(OutboxMessage)
         .outerjoin(Person, Person.id == OutboxMessage.person_id)
+        .outerjoin(ChatMonitor, ChatMonitor.tg_chat_id == OutboxMessage.tg_chat_id)
         .outerjoin(Interaction, Interaction.id == OutboxMessage.trigger_interaction_id)
-        .where(OutboxMessage.state == outbox.SHADOW)
+        .where(where)
         .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
         .limit(limit)
     )
@@ -345,6 +515,23 @@ async def shadow_drafts(
         )
         for row_id, name, raw, transcript, body, kind, origin in rows
     ]
+
+
+async def shadow_drafts(
+    session: AsyncSession, *, limit: int = SHADOW_LIST
+) -> list[ShadowDraft]:
+    """The newest ``shadow`` rows, newest first: who wrote, what they wrote,
+    what MIYA would have answered."""
+    return await _drafts(session, OutboxMessage.state == outbox.SHADOW, limit)
+
+
+async def waiting_drafts(
+    session: AsyncSession, *, now: datetime, limit: int = SHADOW_LIST
+) -> list[ShadowDraft]:
+    """The drafts waiting for the owner's tap now, newest first (JV-22: the
+    morning brief counts them and points here). Those held over the daily
+    cap have no card, so this list is where the owner finds them."""
+    return await _drafts(session, cards.waiting_draft(now), limit)
 
 
 # Which table an audit entry comes from; replies.py renders the reference
@@ -431,15 +618,19 @@ __all__ = [
     "UNKNOWN_LOOKBACK",
     "Action",
     "ChannelState",
+    "DayReport",
+    "IntentQuality",
     "RefKind",
     "ShadowCounts",
     "ShadowDraft",
     "Status",
     "channel_state",
+    "day_report",
     "gather",
     "global_mode",
     "health_facts",
     "recent_actions",
     "shadow_counts",
     "shadow_drafts",
+    "waiting_drafts",
 ]

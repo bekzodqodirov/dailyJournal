@@ -2246,6 +2246,42 @@ tasdiqlagan), {e} ta eskalatsiya ({o} tasi ochiq)" · "✍️ Kutayotgan qoralam
 
 **Acceptance.** Green; lines appear on real days.
 
+**As built.** `miya/jarvis/status.day_report(start, end)` (mypy strict) counts a report's window
+in SQL: replies sent (`state='sent'`, `sent_at` in the window; `{a}` approved `auto:policy`,
+`{t}` the rest, the owner's own escalation replies among them), the escalations the owner was
+shown (created in `draft` or `auto` mode, `cards.shown_escalation`) and of those how many are
+open now, the observation-mode escalations apart, the sends the owner commanded, the sends in
+doubt (`unknown`, by their claim moment), the spend (`costs.spend_between` over the Jarvis
+operations) and, per intent, the drafts and observation drafts made (`caps.became`), how many
+the owner approved with the AI's words, how many they rewrote (the row turned the owner's,
+`authored_by`; every AI row keeps `ai_body` from the start) and how many strayed (`unapproved_statement`; a rewritten draft is judged by the owner's words). The brief
+gathers yesterday's, the recap today's (`recaps.jarvis_day`), each only with JARVIS_ENABLED and
+in its own savepoint: a failed read logs its error class and leaves that part out, never the
+report. The lines under the headline are shared (`formatting.jarvis_day_lines`, since
+`recap_text` imports only formatting): «📤 Buyrug'ingiz bilan yuborildi: {n} ta», «❓ {n} ta
+xabar yuborilganmi — aniq emas (/holat)», «🧪 Kuzatuv rejimida {n} ta xabar sizga
+yo'naltirilardi», «💸 Jarvis xarajati: {x} / {cap}», «🧪 Qoralamalar sifati:» and «• {intent}:
+{n} ta qoralama — {k} tasi o'zgartirilmasdan tasdiqlandi, {r} tasi tahrirlandi, {s} tasi erkin
+gapli (o'zi yuborilmasdi)» (zero parts left out). The evening's «🤖 Bugun Jarvis: …» repeats the
+brief's sentence for today and is its own section after «📅 Ertaga»; yesterday's activity alone
+does not turn the brief's «✅ Hammasi joyida» into a full brief. `cards.brief_items` widens JV-18's
+lines: every open, snoozed or owner-replying escalation that was shown (not only the snooze
+limit's), named by person or chat title, and the unanswered chats are any draft of the last
+day still waiting or expired unanswered (card or not) in a chat the owner has not written in
+since and no reply was sent into since (a later draft the owner sent answers an older one),
+leaving out chats already named among the open escalations. Lists show ten names, then
+«… va yana {n} ta». «✍️ Kutayotgan qoralamalar» counts `draft` rows not run out, and
+`/qoralamalar` now lists them («✍️ Kutayotgan qoralamalar:», «{i}. j{id} · {ism}: «{mijoz}» →
+«{qoralama}» [{intent}]») above the observation drafts, since capped drafts have no card; its
+help line reads «/qoralamalar — tasdiq kutayotgan qoralamalar va kuzatuv rejimidagi
+javoblar», its menu entry «Kutayotgan va kuzatuv qoralamalari», and with
+neither it says «✍️ Kutayotgan va kuzatuv qoralamalari hali yo'q.».
+`Ochiq eskalatsiya` in Client_FollowUps is the client's oldest open shown escalation as
+«{sabab} · {vaqt} dan beri»: its age is written as the moment it opened, so the row is not
+rewritten every minute; a client with only an open escalation gets a row, and with Jarvis off
+the column stays blank. The intent labels moved from `replies.py` to `formatting.py`
+(`replies.jarvis_intent_label` still works).
+
 ---
 
 #### JV-23 — Rollout controller: per-intent graduation, auto mode, demotion
