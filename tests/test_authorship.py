@@ -551,22 +551,36 @@ async def test_ingest_without_an_outbox_leaves_outgoing_rows_as_they_were(sessio
     assert authorship.is_owner_words(row)
 
 
+def _sent_row(
+    row_id: int, channel: str, external_id: str, author: str
+) -> m.OutboxMessage:
+    return m.OutboxMessage(
+        id=row_id,
+        channel=channel,
+        chat_key=f"tg:{DM}" if channel == "telegram" else "mail:t1",
+        tg_chat_id=DM if channel == "telegram" else None,
+        origin="owner_command" if author == "owner" else "auto_reply",
+        authored_by=author,
+        body="rahmat",
+        body_sha256="0" * 64,
+        guard={"verdict": "pass"},
+        state="sent",
+        approved_by="button",
+        external_message_id=external_id,
+        idempotency_key=f"k{row_id}",
+    )
+
+
 async def test_find_echo_reads_the_outbox_row(session):
-    # A temporary table shadows the real one (pg_temp is searched first), so
-    # this holds before and after the Jarvis core migration creates it.
-    await session.execute(
-        sa.text(
-            "CREATE TEMP TABLE outbox_messages (id bigint, channel text, "
-            "external_message_id text, authored_by text) ON COMMIT DROP"
-        )
+    # JV-11: the lookup reads the real outbox_messages table through its model.
+    session.add_all(
+        [
+            _sent_row(5, "telegram", "6101:77", "owner"),
+            _sent_row(6, "telegram", "6101:78", "ai"),
+            _sent_row(7, "gmail", "6101:79", "ai"),
+        ]
     )
-    await session.execute(
-        sa.text(
-            "INSERT INTO outbox_messages VALUES "
-            "(5, 'telegram', '6101:77', 'owner'), (6, 'telegram', '6101:78', 'ai'), "
-            "(7, 'gmail', '6101:79', 'ai')"
-        )
-    )
+    await session.flush()
 
     def find(external_id):
         return authorship.find_echo(session, channel="telegram", external_id=external_id)

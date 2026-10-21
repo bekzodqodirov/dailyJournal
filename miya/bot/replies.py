@@ -117,6 +117,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
 /holat — MIYA'ning ahvoli
+/jarvis — Jarvis holati (toxtat — to'xtatish, yoq [kanal] — yoqish, tarix)
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -157,6 +158,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("chats", "Qaysi chatlar o'qilishi"),
     ("xarajat", "MIYA'ning API xarajati"),
     ("holat", "MIYA'ning ahvoli"),
+    ("jarvis", "Jarvis holati, to'xtatish va yoqish"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -1977,6 +1979,8 @@ _COUNT_LABEL = {
     "person_card": "odam kartasi (ism, telefon, taxalluslar)",
     "reports": "kunlik xulosa",
     "digests": "AI xulosa",
+    "outbox": "Jarvis xabari (qoralama yoki yuborilgan)",
+    "escalations": "Jarvis eskalatsiyasi",
 }
 PURGE_REPORTS_NOTE = (
     "<i>O'sha kunlarning saqlangan kunlik xulosalari butunlay o'chadi (boshqa "
@@ -3291,3 +3295,178 @@ def who_wrote_report(items, *, day, days_ago: int, total: int | None = None) -> 
         )
     header = WHO_WROTE_HEADER.format(kun=kun, n=total)
     return _owner_day_report(header, lines, total, newest=True)
+
+
+# --- /jarvis (JV-11) ----------------------------------------------------------------
+#
+# The values come from miya.jarvis.status, passed in plainly: this module is
+# imported at startup and must not import miya.jarvis (rule 20).
+
+JARVIS_MODE_LABELS = {
+    "off": "o'chiq",
+    "shadow": "kuzatuv (faqat yozib boradi)",
+    "draft": "qoralama (har javobni siz tasdiqlaysiz)",
+    "auto": "avtomatik",
+}
+JARVIS_CHANNEL_STATES = {
+    "working": "ishlayapti",
+    "limited": "cheklangan",
+    "paused": "to'xtatilgan",
+    "not_connected": "ulanmagan",
+}
+JARVIS_STATUS = (
+    "🤖 Jarvis: {rejim}\n"
+    "Bugun: {q} ta qoralama · {y} ta yuborildi · {e} ta eskalatsiya\n"
+    "Limit: {used}/{cap}\n"
+    "Kanallar: Telegram {telegram} · WhatsApp {whatsapp} · Gmail {gmail}"
+)
+JARVIS_PAUSED = (
+    "⛔ Jarvis to'xtatildi. Hech qanday xabar yuborilmaydi. Qayta yoqish: /jarvis yoq"
+)
+JARVIS_RESUMED = "✅ Jarvis yoqildi ({rejim} rejimi)."
+JARVIS_USAGE = (
+    "<code>/jarvis</code> — holat · <code>/jarvis toxtat</code> — hammasini "
+    "to'xtatish · <code>/jarvis yoq [kanal]</code> — qayta yoqish · "
+    "<code>/jarvis tarix</code> — oxirgi 20 ta amal"
+)
+JARVIS_UNKNOWN_CHANNEL = "Kanal nomi: telegram, whatsapp yoki gmail."
+JARVIS_FAILED = (
+    "⚠️ Jarvis buyrug'ini bajarib bo'lmadi — hech narsa o'zgarmadi. "
+    "Birozdan keyin qayta urinib ko'ring."
+)
+JARVIS_HISTORY_HEADER = "🧾 Jarvis tarixi (oxirgi {n} ta):"
+JARVIS_HISTORY_EMPTY = "🧾 Jarvis tarixi hali bo'sh."
+# `/jarvis tarix` speaks Uzbek: the stored history keys and values are
+# rendered through these, and only a value with no label is shown as stored.
+JARVIS_FIELD_LABELS = {
+    "state": "holat",
+    "pause": "to'xtatish",
+    "breaker": "cheklov",
+    "mode": "rejim",
+    "guard": "tekshiruv",
+    "hold": "kutish",
+    "owner_told": "sizga aytildi",
+    "person_id": "shaxs",
+    "warned_personal": "shaxsiy chat ogohlantirishi",
+    "warned_safety": "xavf ogohlantirishi",
+}
+JARVIS_STATE_LABELS = {
+    "shadow": "kuzatuv",
+    "draft": "qoralama",
+    "approved": "tasdiqlandi",
+    "sending": "yuborilmoqda",
+    "sent": "yuborildi",
+    "failed": "yuborilmadi",
+    "unknown": "aniq emas",
+    "cancelled": "bekor qilindi",
+    "expired": "muddati o'tdi",
+    "blocked": "bloklandi",
+    "active": "faol",
+    "proposed": "taklif",
+    "revoked": "bekor qilindi",
+    "open": "ochiq",
+    "snoozed": "keyinga qoldirildi",
+    "owner_replying": "siz javob yozyapsiz",
+    "resolved": "hal qilindi",
+}
+JARVIS_BY_LABELS = {
+    "button": "siz",
+    "reply": "siz (javob)",
+    "command": "buyruq",
+    "auto:own": "o'zingiz yozdingiz",
+    "auto:policy": "avtomatik",
+    "auto:expiry": "muddat",
+    "auto:spam": "spam",
+    "rule:group": "guruh qoidasi",
+    "gate": "tekshiruv",
+    "adapter": "yuboruvchi",
+    "reconcile": "qayta tekshiruv",
+}
+JARVIS_PAUSE_REASON_LABELS = {"owner": "siz"}
+JARVIS_SCOPE_LABELS = {
+    "global": "Jarvis",
+    "channel:telegram": "Telegram",
+    "channel:whatsapp": "WhatsApp",
+    "channel:gmail": "Gmail",
+}
+# A send whose outcome is not known (JV-19 wording): never sent again.
+JARVIS_SEND_UNKNOWN = (
+    "❓ j{id} yuborilganmi — aniq emas. Chatni tekshiring; MIYA qayta yubormaydi."
+)
+
+
+def jarvis_mode_label(mode: str) -> str:
+    return JARVIS_MODE_LABELS.get(mode, JARVIS_MODE_LABELS["off"])
+
+
+def jarvis_status(status) -> str:
+    """`/jarvis`: the mode, today's counts from SQL, the limit, the channels."""
+    states = {
+        channel: JARVIS_CHANNEL_STATES.get(state, JARVIS_CHANNEL_STATES["not_connected"])
+        for channel, state in status.channels
+    }
+    body = JARVIS_STATUS.format(
+        rejim=jarvis_mode_label(status.mode),
+        q=status.counts.drafts,
+        y=status.counts.sent,
+        e=status.counts.escalations,
+        used=status.limit_used,
+        cap=status.limit_cap,
+        telegram=states.get("telegram", JARVIS_CHANNEL_STATES["not_connected"]),
+        whatsapp=states.get("whatsapp", JARVIS_CHANNEL_STATES["not_connected"]),
+        gmail=states.get("gmail", JARVIS_CHANNEL_STATES["not_connected"]),
+    )
+    return f"{body}\n{JARVIS_PAUSED}" if status.paused else body
+
+
+def jarvis_resumed(mode: str) -> str:
+    """The mode's short name: «qoralama rejimi», not the whole explanation."""
+    return JARVIS_RESUMED.format(rejim=jarvis_mode_label(mode).split(" (")[0])
+
+
+def _jarvis_ref(kind: str, ref: str) -> str:
+    """j12 (an outbox row), e3 (an escalation), «qoida 5», Jarvis or a channel."""
+    if kind == "outbox":
+        return f"j{ref}"
+    if kind == "escalation":
+        return f"e{ref}"
+    if kind == "rule":
+        return f"qoida {ref}"
+    return JARVIS_SCOPE_LABELS.get(ref, ref)
+
+
+def _jarvis_value(field: str, value: str | None) -> str:
+    if value is None:
+        return "—"
+    if field in ("state", "owner_told"):
+        return JARVIS_STATE_LABELS.get(value, value)
+    if field == "mode" and value in JARVIS_MODE_LABELS:
+        return jarvis_mode_label(value).split(" (")[0]
+    if field == "pause":
+        return JARVIS_PAUSE_REASON_LABELS.get(value, value)
+    return value
+
+
+def jarvis_history(actions) -> str:
+    """`/jarvis tarix`: the last actions, newest first. Fields, states and who
+    acted are in Uzbek; a code stays a code, in brackets."""
+    if not actions:
+        return JARVIS_HISTORY_EMPTY
+    lines = [JARVIS_HISTORY_HEADER.format(n=len(actions))]
+    for action in actions:
+        old = _jarvis_value(action.field, action.old)
+        new = _jarvis_value(action.field, action.new)
+        change = f"{escape(old)} → {escape(new)}"
+        code = f" [{escape(action.code)}]" if action.code else ""
+        by = (
+            f" ({escape(JARVIS_BY_LABELS.get(action.by, action.by))})"
+            if action.by
+            else ""
+        )
+        field = JARVIS_FIELD_LABELS.get(action.field, action.field)
+        lines.append(
+            f"• {short_date(action.at.astimezone(settings.tz).date())} "
+            f"{clock(action.at)} · {escape(_jarvis_ref(action.kind, action.ref))} · "
+            f"{escape(field)}: {change}{code}{by}"
+        )
+    return clip("\n".join(lines))

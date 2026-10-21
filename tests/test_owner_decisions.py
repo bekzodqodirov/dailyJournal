@@ -50,3 +50,16 @@ def test_the_owners_username_is_never_written_here():
     for line in text.splitlines():
         if "@" in line and "Owner's words" in line:
             assert "@‹username›" in line, line
+
+
+def test_the_2026_10_20_jarvis_answers_are_recorded():
+    # JV-11: the owner's four Jarvis answers, verbatim.
+    text = " ".join(_text().split())
+    for quote in (
+        "«Promptdagidek»",
+        "«hammaga yoza olsin faqat men belgilagan chatlarga yozmasin shaxsiy chatlarga»",
+        "«hammasida yozsin legin apk fillarni ochmasin va spammlardan ehtiyot bolsin»",
+        "«Ehtiyot bo'lib boramiz»",
+    ):
+        assert quote in text, quote
+    assert "Telegram, WhatsApp, Gmail, Google Sheets" in text

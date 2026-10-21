@@ -1,4 +1,4 @@
-# Owner decisions (2026-09-15, updated 2026-09-25)
+# Owner decisions (2026-09-15, updated 2026-09-25 and 2026-10-20)
 
 The 2026-09-25 answers replace earlier ones where they differ; see docs/handoff-plan.md §1.5.
 Lines marked 'Design default' are implementation choices, not the owner's words.
@@ -72,6 +72,31 @@ owner's words may not be contradicted.
 - Context (not the owner's words): the code, e.g. GS367, is printed on carton stickers next to
   a waybill number such as YW26-004715. Design default (handoff-plan §5 Q39): a code is exact
   and never fuzzy-matched.
+
+## Jarvis: replies in the owner's name (2026-10-20, docs/jarvis-plan.md)
+- Owner's words (2026-10-20), on autonomy: «Promptdagidek» — as the Jarvis spec says: greetings,
+  asking how to help, gathering the shipment details and general questions are answered by MIYA;
+  a price, a discount, payment terms, a deadline, a promise or a guarantee is never answered by
+  it: a polite stall goes to the client and the owner is alerted at once.
+- Owner's words (2026-10-20), on who MIYA may write to: «hammaga yoza olsin faqat men belgilagan
+  chatlarga yozmasin shaxsiy chatlarga» — MIYA may write to everyone, except the personal chats
+  the owner marks.
+- Owner's words (2026-10-20), on channels — Telegram, WhatsApp, Gmail, Google Sheets: «hammasida
+  yozsin legin apk fillarni ochmasin va spammlardan ehtiyot bolsin» — write on all of them, but
+  never open APK files, and beware of spam.
+- Owner's words (2026-10-20), on risk: «Ehtiyot bo'lib boramiz» — we go carefully.
+- Design default (change if the owner disagrees — docs/jarvis-plan.md §6): everything starts
+  switched off (`JARVIS_ENABLED=false`); once on, Jarvis first only stores what it would have
+  written (`shadow`), then every reply is a card the owner approves (`draft`, the ceiling
+  `JARVIS_MODE=draft`), with daily caps; a kind of reply becomes automatic only after the
+  graduation numbers and the owner's own «Ha», and never for money, deadlines or promises.
+  Groups get no AI reply unless the owner enables one; MIYA never writes first and never denies
+  being an AI.
+- Implemented in JV-11: every message MIYA may send is a row in `outbox_messages` that only
+  `miya/jarvis/outbox.py` changes, and every send re-runs the whole gate when it is claimed (the
+  kill switches, `/jarvis toxtat`, the personal-chat rules, the spam and file shield, the
+  red-line guard, the caps and the cost cap). The rest of MIYA never loads Jarvis and works the
+  same with it off.
 
 ## Dangerous files (owner rule 4, docs/jarvis-plan.md decision 4)
 - The owner's decision of 2026-10-20 (docs/jarvis-plan.md §8.1): MIYA never downloads,

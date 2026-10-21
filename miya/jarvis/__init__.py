@@ -2,5 +2,20 @@
 
 Everything under this package is type-checked with mypy in strict mode
 (``make typecheck``) and held to the no-placeholder rule from its first
-module on. Core MIYA never imports it.
+module on. Core MIYA never imports it at startup: the bot's ``/jarvis``
+handler and the worker's ``jarvis_outbox`` job import it when they run, and
+the job exists only with JARVIS_ENABLED (rule 20). Importing this package
+imports nothing else.
+
+The core (JV-11):
+
+* ``chatkey`` — channel-agnostic chat keys (``tg:``, ``wa:``, ``mail:``).
+* ``policy`` — modes, pauses and breakers (``jarvis_policy``), reply rules
+  and hard exclusions.
+* ``caps`` and ``costs`` — the daily caps and the cost cap, counted in SQL.
+* ``gate`` — the pure decision every outbox row passes when it is claimed,
+  and the red-line guard interface (fails closed until JV-13 registers one).
+* ``outbox`` — the one outbound chokepoint: the only code that creates
+  ``outbox_messages`` rows or changes their state.
+* ``status`` — what ``/jarvis`` shows.
 """

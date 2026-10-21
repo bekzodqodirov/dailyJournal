@@ -29,7 +29,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.db.enums import Direction
-from miya.db.models import Interaction
+from miya.db.models import Interaction, OutboxMessage
 
 Author = Literal["ai", "owner"]
 
@@ -47,10 +47,6 @@ SPEAKER_MIYA: Final = "MIYA"
 
 # outbox_messages.channel for the Telegram account.
 CHANNEL_TELEGRAM: Final = "telegram"
-
-# The outbox table the echo lookup reads. It is created by the Jarvis core
-# migration; until then no row can match and the lookup says so.
-OUTBOX_TABLE: Final = "outbox_messages"
 
 
 def _meta(row: Interaction) -> dict[str, Any]:
@@ -169,25 +165,20 @@ async def find_echo(
     """The outbox row that sent the message ``external_id`` on ``channel``.
 
     Ingest calls this for every outgoing message it stores; it tags the row
-    only when the outbox row already carries ``external_message_id`` (e.g.
-    after a reconcile). A row ingested before ``outbox.complete`` records the
-    id is stored untagged, and ``outbox.complete`` must tag that existing row
-    (the IntegrityError on the ``ux_interactions_tg_message`` path in JV-19).
-    Before the outbox table exists nothing can match.
+    only when the outbox row already carries ``external_message_id``. A
+    message ingested before ``outbox.complete`` records the id is stored
+    untagged, and ``outbox.complete`` tags that existing row itself (JV-11),
+    so whichever side stores the echo first, it ends up tagged once.
     """
-    present = await session.scalar(
-        sa.text("SELECT to_regclass(:table) IS NOT NULL"), {"table": OUTBOX_TABLE}
-    )
-    if not present:
-        return None
     row = (
         await session.execute(
-            sa.text(
-                f"SELECT id, authored_by FROM {OUTBOX_TABLE} "
-                "WHERE channel = :channel AND external_message_id = :external_id "
-                "ORDER BY id LIMIT 1"
-            ),
-            {"channel": channel, "external_id": external_id},
+            sa.select(OutboxMessage.id, OutboxMessage.authored_by)
+            .where(
+                OutboxMessage.channel == channel,
+                OutboxMessage.external_message_id == external_id,
+            )
+            .order_by(OutboxMessage.id)
+            .limit(1)
         )
     ).first()
     if row is None:

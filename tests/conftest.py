@@ -81,6 +81,14 @@ async def _truncate(session) -> None:
     # The Sheets mirror's bookkeeping references nothing either (JV-07).
     await session.execute(sa.delete(m.SheetRow))
     for model in (
+        # The Jarvis core (JV-11): outbox rows reference escalations,
+        # interactions and people; escalations, chat states and reply rules
+        # reference interactions and people; the policy references nothing.
+        m.OutboxMessage,
+        m.Escalation,
+        m.JarvisChatState,
+        m.ReplyRule,
+        m.JarvisPolicy,
         # Receipts reference interactions, people, transactions and claims.
         m.Receipt,
         # Claims reference interactions and people, so they go before both.

@@ -15,6 +15,9 @@ Jobs:
   * sheets_sync  — every SHEETS_SYNC_SECONDS; the one-way Google Sheets mirror
                    of promises, tasks, followed-up clients and receipts
                    (JV-07); a no-op unless SHEETS_ENABLED and configured
+  * jarvis_outbox — every minute, only with JARVIS_ENABLED; expires stale
+                   drafts, reconciles claimed sends whose lease ran out and
+                   tells the owner once about a send in doubt (JV-11)
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -471,6 +474,50 @@ async def sheets_sync_job() -> None:
     owner's spreadsheet. A no-op while SHEETS_ENABLED is false; it never
     raises, and nothing else in MIYA waits on it."""
     await sheets_sync.run()
+
+
+async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The outbox's own housekeeping (JV-11): drafts past
+    JARVIS_DRAFT_EXPIRY_HOURS expire and are never sent; a claimed row whose
+    lease ran out with no report is reconciled (an echo found is sent, none
+    is unknown), and the owner is told once about each unknown row — MIYA
+    never sends it again.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
+    startup (rule 20). Each step and each notice is contained on its own:
+    one failure is logged with its ids and the rest go on (rule 25).
+    """
+    from miya.jarvis import outbox
+
+    now = now or datetime.now(settings.tz)
+    for step in (outbox.expire_due, outbox.reconcile):
+        try:
+            async with session_scope() as session:
+                await step(session, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis outbox step failed",
+                extra={"step": step.__name__, "error": type(exc).__name__},
+            )
+    try:
+        async with session_scope() as session:
+            untold = await outbox.unknown_untold(session)
+    except Exception as exc:
+        log.error("jarvis unknown sends unreadable", extra={"error": type(exc).__name__})
+        return
+    silent = reminders.in_quiet_hours(now)
+    for row_id in untold:
+        try:
+            text = replies.JARVIS_SEND_UNKNOWN.format(id=row_id)
+            if not await notify(bot, text, silent=silent):
+                return  # Telegram is down: the rest stay untold for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_told(session, row_id, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis unknown-send notice failed",
+                extra={"outbox_id": row_id, "error": type(exc).__name__},
+            )
 
 
 async def window_job(bot: Bot) -> None:
@@ -1838,6 +1885,16 @@ async def run() -> None:
         max_instances=1,
         coalesce=True,
     )
+    if settings.jarvis_enabled:
+        # Rule 20: with Jarvis off no Jarvis job exists at all.
+        scheduler.add_job(
+            jarvis_outbox_job,
+            IntervalTrigger(minutes=1),
+            args=[bot],
+            id="jarvis_outbox",
+            max_instances=1,
+            coalesce=True,
+        )
     # Userbot pipeline. These jobs are harmless with the userbot switched off:
     # with no messages there is nothing to window and nothing to submit.
     scheduler.add_job(

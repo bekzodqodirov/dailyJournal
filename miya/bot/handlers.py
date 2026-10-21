@@ -954,6 +954,71 @@ async def cmd_status(message: Message) -> None:
     )
 
 
+JARVIS_PAUSE_WORDS = {"toxtat", "to'xtat", "stop"}
+JARVIS_RESUME_WORDS = {"yoq", "yoqish", "start"}
+JARVIS_HISTORY_WORDS = {"tarix"}
+
+
+@router.message(Command("jarvis"))
+async def cmd_jarvis(message: Message, command: CommandObject) -> None:
+    """`/jarvis` status · `toxtat` pauses everything · `yoq [kanal]` resumes ·
+    `tarix` lists the last 20 actions (JV-11).
+
+    miya.jarvis is imported here, on the owner's command, never at startup
+    (rule 20). A pause is checked at claim time, so it holds the moment this
+    commits; when the database does not answer, the owner is told that
+    nothing changed rather than shown a pause that did not happen.
+    """
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+    from miya.jarvis import status as jarvis_status
+
+    words = (command.args or "").split()
+    sub = fold_apostrophes(words[0]).casefold() if words else ""
+    now = datetime.now(settings.tz)
+    scope = jarvis_policy.GLOBAL
+    if sub in JARVIS_RESUME_WORDS and len(words) > 1:
+        channel = jarvis_chatkey.channel_word(words[1])
+        if channel is None:
+            await _safe_answer(message, replies.JARVIS_UNKNOWN_CHANNEL)
+            return
+        scope = jarvis_policy.channel_scope(channel)
+    if sub and sub not in JARVIS_PAUSE_WORDS | JARVIS_RESUME_WORDS | JARVIS_HISTORY_WORDS:
+        await _safe_answer(message, replies.JARVIS_USAGE)
+        return
+    try:
+        async with session_scope() as session:
+            if sub in JARVIS_PAUSE_WORDS:
+                await jarvis_policy.pause(session, by=records.BY_COMMAND, now=now)
+                body = replies.JARVIS_PAUSED
+            elif sub in JARVIS_RESUME_WORDS:
+                await jarvis_policy.resume(
+                    session, scope=scope, by=records.BY_COMMAND, now=now
+                )
+                state = await jarvis_status.gather(session, now)
+                # «yoqildi» only when something can send now: with Jarvis
+                # off, or the global pause still holding after a channel
+                # resume, the owner sees the status, which says so.
+                body = (
+                    replies.jarvis_resumed(state.mode)
+                    if state.mode != "off" and not state.paused
+                    else replies.jarvis_status(state)
+                )
+            elif sub in JARVIS_HISTORY_WORDS:
+                body = replies.jarvis_history(
+                    await jarvis_status.recent_actions(session, limit=20)
+                )
+            else:
+                body = replies.jarvis_status(await jarvis_status.gather(session, now))
+    except Exception as exc:
+        log.error(
+            "/jarvis failed",
+            extra={"command": sub or "status", "error": type(exc).__name__},
+        )
+        body = replies.JARVIS_FAILED
+    await _safe_answer(message, body)
+
+
 @router.message(Command("unut"))
 async def cmd_purge(message: Message, command: CommandObject) -> None:
     """`/unut` — destructive, so it only ever shows a plan and asks first."""

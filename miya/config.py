@@ -225,6 +225,26 @@ class Settings(BaseSettings):
     # archive behind one is still refused.
     safety_extra_safe_domains: str = ""
 
+    # --- Jarvis core (JV-11) ------------------------------------------------
+    # The act layer's master switch. Off: no Jarvis job is registered, no row
+    # is created or claimed, and core MIYA never imports miya.jarvis.
+    jarvis_enabled: bool = False
+    # The ceiling on the rollout mode: whatever jarvis_policy resolves to is
+    # never above it, so autonomy needs this raised as well as the owner's tap.
+    jarvis_mode: Literal["off", "shadow", "draft", "auto"] = "draft"
+    # Caps, counted in SQL from the start of the owner's day: draft cards,
+    # autonomous sends, AI sends to one chat, and the gap between two sends
+    # from one account (the owner's own approved texts count towards the gap).
+    jarvis_draft_daily_cap: int = Field(default=40, ge=0, le=1000)
+    jarvis_auto_daily_cap: int = Field(default=20, ge=0, le=1000)
+    jarvis_per_chat_daily_cap: int = Field(default=6, ge=0, le=100)
+    jarvis_send_min_gap_seconds: int = Field(default=20, ge=0, le=3600)
+    # A draft older than this is never sent.
+    jarvis_draft_expiry_hours: int = Field(default=12, ge=1, le=168)
+    # Jarvis's own model spend per day in USD (usage_log, priced from
+    # config); above it Jarvis only escalates and makes no model call.
+    jarvis_daily_cost_cap_usd: Decimal = Field(default=Decimal("3.00"), ge=0)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

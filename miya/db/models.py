@@ -971,10 +971,14 @@ __all__ = [
     "DailyReport",
     "Debt",
     "DebtPayment",
+    "Escalation",
     "Event",
     "Heartbeat",
     "Interaction",
+    "JarvisChatState",
+    "JarvisPolicy",
     "Memory",
+    "OutboxMessage",
     "Passage",
     "Person",
     "Promise",
@@ -982,6 +986,7 @@ __all__ = [
     "RecapDigest",
     "Receipt",
     "ReminderLog",
+    "ReplyRule",
     "SheetRow",
     "Task",
     "Transaction",
@@ -1345,5 +1350,420 @@ class SheetRow(Base):
             "ix_sheet_rows_due",
             "next_attempt_at",
             postgresql_where=sa.text("state IN ('pending', 'failed', 'tombstone')"),
+        ),
+    )
+
+
+# --- Jarvis core (JV-11, 0025) -----------------------------------------------------
+#
+# The values the 0025 CHECKs allow. The migration keeps its own frozen copy;
+# tests/test_outbox.py holds the two equal.
+JARVIS_CHANNELS = ("telegram", "whatsapp", "gmail")
+JARVIS_MODES = ("off", "shadow", "draft", "auto")
+REPLY_RULE_SUBJECTS = ("person", "chat", "address")
+REPLY_RULE_MODES = ("never", "draft", "auto")
+REPLY_RULE_REASONS = ("personal", "group", "spam", "bot", "owner")
+REPLY_RULE_STATES = ("active", "proposed", "revoked")
+ESCALATION_REASONS = (
+    "price",
+    "discount",
+    "payment_terms",
+    "deal",
+    "deadline",
+    "promise",
+    "guarantee",
+    "payment_claim",
+    "identity",
+    "complaint",
+    "legal",
+    "other_people",
+    "other",
+)
+ESCALATION_STATES = (
+    "open",
+    "snoozed",
+    "owner_replying",
+    "resolved",
+    "expired",
+    "cancelled",
+)
+# The states that hold a chat's one open escalation (ux_escalations_open_chat).
+ESCALATION_OPEN_STATES = ("open", "snoozed", "owner_replying")
+ESCALATION_RESOLUTIONS = ("sent", "owner_replied", "expired", "cancelled")
+OUTBOX_ORIGINS = ("auto_reply", "stall", "owner_command", "escalation")
+OUTBOX_AUTHORS = ("ai", "owner")
+OUTBOX_STATES = (
+    "shadow",
+    "draft",
+    "approved",
+    "sending",
+    "sent",
+    "failed",
+    "unknown",
+    "cancelled",
+    "expired",
+    "blocked",
+)
+OUTBOX_APPROVERS = ("button", "reply", "command", "auto:policy")
+# global | channel:<c> | intent:<i> | channel:<c>:intent:<i>
+JARVIS_SCOPE_PATTERN = (
+    "^(global|channel:[a-z]+|intent:[a-z_]+|channel:[a-z]+:intent:[a-z_]+)$"
+)
+
+
+def _history_column():
+    """``history JSONB NOT NULL DEFAULT '[]'``: {at, field, old, new, by} entries."""
+    return mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
+
+
+class JarvisPolicy(Base):
+    """The rollout mode, pauses and breakers of one Jarvis scope (JV-11, 0025).
+
+    ``scope`` is ``global``, ``channel:<c>``, ``intent:<i>`` or
+    ``channel:<c>:intent:<i>``; a NULL ``mode`` inherits from the next less
+    specific scope, and the env ceiling JARVIS_MODE caps whatever resolves.
+    A pause with no ``paused_until`` lasts until the owner resumes it; a
+    breaker (a platform limit, the cost cap) always has an end.
+    """
+
+    __tablename__ = "jarvis_policy"
+
+    scope: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    mode: Mapped[str | None] = mapped_column(sa.String(8))
+    paused_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    pause_reason: Mapped[str | None] = mapped_column(sa.String(32))
+    breaker_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    breaker_reason: Mapped[str | None] = mapped_column(sa.String(32))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"mode IN ({_sql_list(JARVIS_MODES)})", name="ck_jarvis_policy_mode"
+        ),
+        sa.CheckConstraint(
+            f"scope ~ '{JARVIS_SCOPE_PATTERN}'", name="ck_jarvis_policy_scope"
+        ),
+    )
+
+
+class ReplyRule(Base):
+    """Who the AI may write to (JV-11 table, JV-12 commands): the owner's
+    personal deny-list and the group reply policy.
+
+    ``address`` is channel-qualified (``tg:<user id>``, ``wa:<jid>``,
+    ``mail:<addr>``) and snapshotted when the rule is set, so forgetting or
+    merging the person never reopens a personal chat.
+    """
+
+    __tablename__ = "reply_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    chat_key: Mapped[str | None] = mapped_column(sa.Text)
+    address: Mapped[str | None] = mapped_column(sa.Text)
+    mode: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    reason: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="active"
+    )
+    set_by: Mapped[str | None] = mapped_column(sa.String(16))
+    note: Mapped[str | None] = mapped_column(sa.Text)
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"subject IN ({_sql_list(REPLY_RULE_SUBJECTS)})",
+            name="ck_reply_rules_subject",
+        ),
+        sa.CheckConstraint(
+            f"mode IN ({_sql_list(REPLY_RULE_MODES)})", name="ck_reply_rules_mode"
+        ),
+        sa.CheckConstraint(
+            f"reason IN ({_sql_list(REPLY_RULE_REASONS)})", name="ck_reply_rules_reason"
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(REPLY_RULE_STATES)})", name="ck_reply_rules_state"
+        ),
+        sa.CheckConstraint(
+            "num_nonnulls(person_id, chat_key, address) >= 1",
+            name="ck_reply_rules_target",
+        ),
+        sa.Index("ix_reply_rules_person", "person_id"),
+        sa.Index(
+            "ux_reply_rules_active_chat",
+            "chat_key",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+        sa.Index(
+            "ux_reply_rules_active_address",
+            "address",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+        sa.Index(
+            "ux_reply_rules_active_person",
+            "person_id",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+    )
+
+
+class JarvisChatState(Base):
+    """One chat's reply bookkeeping (JV-11, 0025): when the client last wrote,
+    when the responder may look at it, and what the owner did since."""
+
+    __tablename__ = "jarvis_chat_state"
+
+    chat_key: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    last_inbound_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    last_inbound_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    respond_after: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    owner_seen_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    owner_composing_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    owner_replied_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    ai_paused_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_ai_sent_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    ai_turns_since_client: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})",
+            name="ck_jarvis_chat_state_channel",
+        ),
+        sa.Index("ix_jarvis_chat_state_person", "person_id"),
+        sa.Index("ix_jarvis_chat_state_last_inbound", "last_inbound_interaction_id"),
+        sa.Index(
+            "ix_jarvis_chat_state_due",
+            "respond_after",
+            postgresql_where=sa.text("respond_after IS NOT NULL"),
+        ),
+    )
+
+
+class Escalation(Base):
+    """A client message only the owner may answer (JV-11, 0025): a price, a
+    deadline, a promise, an identity question. One open row per chat;
+    repeats append to ``history``. ``summary`` is digit-free prose: the
+    figures on the owner's card come from SQL when it is rendered."""
+
+    __tablename__ = "escalations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    chat_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    summary: Mapped[str | None] = mapped_column(sa.Text)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="open"
+    )
+    snoozed_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    snooze_count: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    alerted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    alert_count: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    alert_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    answered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    answered_by: Mapped[str | None] = mapped_column(sa.String(16))
+    resolution: Mapped[str | None] = mapped_column(sa.String(16))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})", name="ck_escalations_channel"
+        ),
+        sa.CheckConstraint(
+            f"reasons <@ ARRAY[{_sql_list(ESCALATION_REASONS)}]::text[]",
+            name="ck_escalations_reasons",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(ESCALATION_STATES)})", name="ck_escalations_state"
+        ),
+        sa.CheckConstraint(
+            f"resolution IN ({_sql_list(ESCALATION_RESOLUTIONS)})",
+            name="ck_escalations_resolution",
+        ),
+        sa.Index("ix_escalations_interaction", "interaction_id"),
+        sa.Index("ix_escalations_person", "person_id"),
+        sa.Index(
+            "ux_escalations_open_chat",
+            "chat_key",
+            unique=True,
+            postgresql_where=sa.text(f"state IN ({_sql_list(ESCALATION_OPEN_STATES)})"),
+        ),
+        sa.Index(
+            "ix_escalations_snoozed",
+            "snoozed_until",
+            postgresql_where=sa.text("state = 'snoozed'"),
+        ),
+        sa.Index(
+            "ix_escalations_unalerted",
+            "created_at",
+            postgresql_where=sa.text("alerted_at IS NULL"),
+        ),
+    )
+
+
+class OutboxMessage(Base):
+    """One message MIYA may send from the owner's account (JV-11, 0025): the
+    one outbound chokepoint.
+
+    Only ``miya/jarvis/outbox.py`` creates these rows or changes their state,
+    and an adapter gets one only through ``outbox.claim_ready``, which re-runs
+    the whole gate. The body is plain text and nothing else. ``guard`` is the
+    red-line verdict bound to ``body_sha256``; a DB CHECK keeps AI text that
+    did not pass it from ever being approved, claimed or sent.
+    """
+
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    chat_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    tg_chat_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    to_address: Mapped[str | None] = mapped_column(sa.Text)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    # Purging the client's message takes the draft with it.
+    trigger_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    command_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    sent_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    escalation_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("escalations.id", ondelete="SET NULL")
+    )
+    reply_to_external_id: Mapped[str | None] = mapped_column(sa.Text)
+    origin: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    intent: Mapped[str | None] = mapped_column(sa.String(24))
+    authored_by: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    body: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # The AI's text before the owner edited it.
+    ai_body: Mapped[str | None] = mapped_column(sa.Text)
+    body_sha256: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    # {verdict, flags, det_hits, model_verdict, body_sha256, checker_version}
+    guard: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(sa.String(16))
+    approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # A scheduled send never leaves before this.
+    not_before: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    card_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    lease_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(sa.String(32))
+    attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # A code, never text.
+    last_error: Mapped[str | None] = mapped_column(sa.String(64))
+    external_message_id: Mapped[str | None] = mapped_column(sa.Text)
+    read_ack_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    idempotency_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})",
+            name="ck_outbox_messages_channel",
+        ),
+        sa.CheckConstraint(
+            f"origin IN ({_sql_list(OUTBOX_ORIGINS)})", name="ck_outbox_messages_origin"
+        ),
+        sa.CheckConstraint(
+            f"authored_by IN ({_sql_list(OUTBOX_AUTHORS)})",
+            name="ck_outbox_messages_authored_by",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(OUTBOX_STATES)})", name="ck_outbox_messages_state"
+        ),
+        sa.CheckConstraint(
+            f"approved_by IN ({_sql_list(OUTBOX_APPROVERS)})",
+            name="ck_outbox_messages_approved_by",
+        ),
+        sa.CheckConstraint(
+            "state <> 'sent' OR approved_by IS NOT NULL",
+            name="ck_outbox_messages_sent_approved",
+        ),
+        # COALESCE: a CHECK passes when its expression is NULL, and an empty
+        # guard makes ``guard->>'verdict'`` NULL.
+        sa.CheckConstraint(
+            "state NOT IN ('approved', 'sending', 'sent') OR authored_by = 'owner' "
+            "OR COALESCE(guard->>'verdict', '') = 'pass'",
+            name="ck_outbox_messages_guarded",
+        ),
+        sa.Index("ux_outbox_messages_idempotency", "idempotency_key", unique=True),
+        sa.Index("ix_outbox_messages_person", "person_id"),
+        sa.Index("ix_outbox_messages_trigger", "trigger_interaction_id"),
+        sa.Index("ix_outbox_messages_command", "command_interaction_id"),
+        sa.Index("ix_outbox_messages_sent_interaction", "sent_interaction_id"),
+        sa.Index("ix_outbox_messages_escalation", "escalation_id"),
+        sa.Index(
+            "ix_outbox_messages_ready",
+            "channel",
+            "next_attempt_at",
+            postgresql_where=sa.text("state = 'approved'"),
+        ),
+        sa.Index(
+            "ix_outbox_messages_sent_at",
+            "sent_at",
+            postgresql_where=sa.text("sent_at IS NOT NULL"),
+        ),
+        sa.Index(
+            "ux_outbox_messages_external",
+            "channel",
+            "external_message_id",
+            unique=True,
+            postgresql_where=sa.text("external_message_id IS NOT NULL"),
+        ),
+        sa.Index("ix_outbox_messages_chat_state", "chat_key", "state"),
+        sa.Index(
+            "ix_outbox_messages_lease",
+            "lease_until",
+            postgresql_where=sa.text("state = 'sending'"),
         ),
     )

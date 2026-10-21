@@ -665,7 +665,68 @@ def _fk_columns():
         ("codes", m.ClientCode, m.ClientCode.person_id),
         ("passages", m.Passage, m.Passage.speaker_person_id),
         ("passages_chat", m.Passage, m.Passage.chat_person_id),
+        # The Jarvis rows (JV-11): only the person link moves; an outbox
+        # row's state is never touched here (outbox.py alone changes it).
+        ("outbox", m.OutboxMessage, m.OutboxMessage.person_id),
+        ("escalations", m.Escalation, m.Escalation.person_id),
+        ("chat_state", m.JarvisChatState, m.JarvisChatState.person_id),
+        ("reply_rules", m.ReplyRule, m.ReplyRule.person_id),
     )
+
+
+# The stricter of two reply rules wins a merge: never, then draft, then auto.
+RULE_STRICTNESS = {"never": 0, "draft": 1, "auto": 2}
+
+
+async def _merge_reply_rules(
+    session: AsyncSession, source: Person, target: Person, *, by: str
+) -> None:
+    """A person holds at most one active reply rule
+    (``ux_reply_rules_active_person``). When both sides of a merge hold one,
+    the stricter stays the person's. The other one keeps guarding what it
+    names itself: a rule with its own chat or address snapshot stays active
+    and only loses the person link (as ``/unut`` does), so no later purge of
+    the merged person can reopen that chat; a rule that names only the
+    person is revoked."""
+    from miya.db import models as m
+
+    active = {
+        rule.person_id: rule
+        for rule in await session.scalars(
+            sa.select(m.ReplyRule).where(
+                m.ReplyRule.person_id.in_([source.id, target.id]),
+                m.ReplyRule.state == "active",
+            )
+        )
+    }
+    kept, other = active.get(target.id), active.get(source.id)
+    if kept is None or other is None:
+        return
+    if RULE_STRICTNESS.get(other.mode, 0) < RULE_STRICTNESS.get(kept.mode, 0):
+        kept, other = other, kept
+    entry = {"at": datetime.now(settings.tz).isoformat(), "by": by[:16], "code": "merged"}
+    if other.chat_key or other.address:
+        # One UPDATE: the person link goes, the snapshot stays active.
+        values: dict[str, object] = {
+            "person_id": None,
+            "history": [
+                *(other.history or []),
+                {**entry, "field": "person_id", "old": other.person_id, "new": None},
+            ],
+        }
+    else:
+        # One UPDATE: the rule's state, with its history entry.
+        values = {
+            "state": "revoked",
+            "history": [
+                *(other.history or []),
+                {**entry, "field": "state", "old": "active", "new": "revoked"},
+            ],
+        }
+    await session.execute(
+        sa.update(m.ReplyRule).where(m.ReplyRule.id == other.id).values(values)
+    )
+    await session.flush()
 
 
 async def merge_plan(session: AsyncSession, source: Person, target: Person) -> dict:
@@ -722,6 +783,7 @@ async def merge_into(
                 m.ClientCode.person_id == source.id, m.ClientCode.code.in_(target_codes)
             )
         )
+    await _merge_reply_rules(session, source, target, by=by)
     for _key, model, column in _fk_columns():
         await session.execute(
             sa.update(model).where(column == source.id).values({column.key: target.id})
