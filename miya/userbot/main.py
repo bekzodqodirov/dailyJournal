@@ -26,8 +26,10 @@ Safety properties, all deliberate:
     editing or deleting a message. Those handlers only write MIYA's own
     database; none of them writes to Telegram.
   * A Telegram flood wait never ends the process: Telethon sleeps through
-    one up to USERBOT_FLOOD_SLEEP_SECONDS, the dialog sync waits out a short
-    one and skips a long one (JV-19), and the sweeps contain their own.
+    one up to 60 s, or only up to USERBOT_FLOOD_SLEEP_SECONDS while the
+    sender runs; the dialog sync waits out a short one and skips a long one
+    (JV-19), a media download or re-read waits out a short one itself, and
+    the sweeps contain their own.
 """
 
 from __future__ import annotations
@@ -39,14 +41,16 @@ import signal
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 import sqlalchemy as sa
 from telethon import TelegramClient, events
 from telethon import utils as tg_utils
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodPremiumWaitError, FloodWaitError
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     Channel,
@@ -187,8 +191,44 @@ class MediaOutcome:
     risk: safety.Verdict | None = None
 
 
+# Telethon's own default: a flood wait up to this long is slept through. The
+# reader keeps it; only the sender wants a shorter one (JV-19).
+READER_FLOOD_SLEEP_SECONDS = 60
+# A multi-chunk download can meet a wait on more than one of its chunks.
+READER_FLOOD_RETRIES = 3
+# The plain flood wait, and the download-speed one Telegram gives an account
+# without Premium (FLOOD_PREMIUM_WAIT_X): siblings, neither a subclass.
+READER_FLOOD_ERRORS = (FloodWaitError, FloodPremiumWaitError)
+
+
+async def _reader_call[T](call: Callable[[], Awaitable[T]]) -> T:
+    """One read from Telegram (a media download, an approved re-read) that
+    waits out a flood wait the client did not, up to READER_FLOOD_RETRIES
+    times, each no longer than Telethon's default: with the sender on, the
+    client sleeps only USERBOT_FLOOD_SLEEP_SECONDS, and the reader must not
+    lose a voice note over a 20 s wait. A longer one, or one more, is raised."""
+    for attempt in range(READER_FLOOD_RETRIES + 1):
+        try:
+            return await call()
+        except READER_FLOOD_ERRORS as exc:
+            seconds = int(exc.seconds or 0)
+            if seconds > READER_FLOOD_SLEEP_SECONDS or attempt == READER_FLOOD_RETRIES:
+                raise
+            log.warning(
+                "reader waits out a flood wait",
+                extra={"seconds": seconds, "attempt": attempt + 1},
+            )
+            await asyncio.sleep(seconds + 1)
+    raise AssertionError("unreachable")
+
+
 async def fetch_media(
-    client: TelegramClient, message: object, plan: MediaPlan, suffix: str
+    client: TelegramClient,
+    message: object,
+    plan: MediaPlan,
+    suffix: str,
+    *,
+    pause_on_flood: bool = False,
 ) -> MediaOutcome:
     """Download and process media **outside any transaction**.
 
@@ -197,14 +237,23 @@ async def fetch_media(
     person-resolution advisory lock the whole time, stalling every other
     writer in the system. So the slow work happens here, with nothing held,
     and only the results are persisted afterwards.
+
+    ``pause_on_flood``: a flood wait the reader did not wait out is raised
+    instead of ending as a failure, so an approved file stays approved for
+    the next pass (``fetch_approved``).
     """
     if not plan.download:
         return MediaOutcome(skip_reason=plan.skip_reason, risk=plan.risk)
 
     path = _media_path(suffix)
     try:
-        await client.download_media(message, file=str(path))
-    except Exception:
+        await _reader_call(partial(client.download_media, message, file=str(path)))
+    except Exception as exc:
+        # No partial file is left behind: purge_old_media knows only the
+        # files an interaction points to.
+        path.unlink(missing_ok=True)
+        if pause_on_flood and isinstance(exc, READER_FLOOD_ERRORS):
+            raise
         log.exception(
             "could not download media for message %s", getattr(message, "id", "?")
         )
@@ -1373,6 +1422,14 @@ def _message_meta(message: object, monitor: ChatMonitor) -> dict:
 APPROVED_POLL_SECONDS = 60
 
 
+def _approved_paused(exc: Exception, interaction_id: int) -> None:
+    seconds = int(getattr(exc, "seconds", 0) or 0)
+    log.warning(
+        "approved media fetch paused: Telegram asked for a wait",
+        extra={"seconds": seconds, "interaction": interaction_id},
+    )
+
+
 async def fetch_approved(client: TelegramClient) -> int:
     """Download and process everything the owner has said yes to."""
     async with session_scope() as session:
@@ -1391,7 +1448,14 @@ async def fetch_approved(client: TelegramClient) -> int:
         kind = MediaKind(media.get("type", MediaKind.other.value))
         filename = media.get("filename")
         try:
-            message = await client.get_messages(chat_id, ids=message_id)
+            message = await _reader_call(
+                partial(client.get_messages, chat_id, ids=message_id)
+            )
+        except READER_FLOOD_ERRORS as exc:
+            # A long wait is no proof the message is gone: it and the rest of
+            # this pass stay approved, and the next pass tries them again.
+            _approved_paused(exc, interaction_id)
+            break
         except Exception:
             log.exception("could not re-read approved message %s", message_id)
             message = None
@@ -1407,7 +1471,13 @@ async def fetch_approved(client: TelegramClient) -> int:
             continue
 
         plan = forced_plan(kind, filename, mime=media.get("mime"))
-        outcome = await fetch_media(client, message, plan, _suffix_for(kind, filename))
+        try:
+            outcome = await fetch_media(
+                client, message, plan, _suffix_for(kind, filename), pause_on_flood=True
+            )
+        except READER_FLOOD_ERRORS as exc:
+            _approved_paused(exc, interaction_id)
+            break
 
         async with session_scope() as session:
             interaction = await session.get(Interaction, interaction_id)
@@ -1907,18 +1977,25 @@ async def run() -> None:
             "paste, then re-run miya.tools.userbot_login if it is lost."
         ) from exc
 
+    sending = sender_wanted()
     client = TelegramClient(
         session,
         settings.telethon_api_id,
         settings.telethon_api_hash,
-        # Telethon sleeps through a flood wait only this short by itself; a
-        # longer one reaches the code, so a send never blocks silently (JV-19).
-        flood_sleep_threshold=settings.userbot_flood_sleep_seconds,
+        # With the sender on, Telethon sleeps through a flood wait only this
+        # short by itself; a longer one reaches the code, so a send never
+        # blocks silently (JV-19). With it off the reader keeps Telethon's
+        # own 60 s, as before Jarvis.
+        flood_sleep_threshold=(
+            settings.userbot_flood_sleep_seconds
+            if sending
+            else READER_FLOOD_SLEEP_SECONDS
+        ),
         # After its own retries of an internal Telegram error, Telethon raises
         # that error, not a bare ValueError, so the sender can tell "already
         # sent" (RANDOM_ID_DUPLICATE) and "outcome unknown" (a -503 timeout)
         # apart from a chat missing from the session cache (JV-19).
-        raise_last_call_error=True,
+        raise_last_call_error=sending,
     )
     # connect(), not start(): start() would prompt for a phone number on stdin
     # if the session were invalid, which in a container never returns.

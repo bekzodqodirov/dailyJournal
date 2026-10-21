@@ -462,6 +462,17 @@ async def report_job(bot: Bot, *, now: datetime | None = None) -> None:
     now = now or datetime.now(settings.tz)
     day = now.astimezone(settings.tz).date()
     async with session_scope() as session:
+        delivered_at = await session.scalar(
+            sa.select(DailyReport.delivered_at).where(
+                DailyReport.report_date == day, DailyReport.kind == reports.EVENING
+            )
+        )
+        if delivered_at is not None:
+            # Already out today: REPORT_TIME moved later after it went (the
+            # 19:00 → 20:00 update). Not rebuilt, and the evening questions
+            # are not asked twice.
+            log.info("report for %s already delivered; not rebuilt", day)
+            return
         await reports.generate_report(session, day, now=now)
         await session.commit()
     if reminders.in_quiet_hours(now):

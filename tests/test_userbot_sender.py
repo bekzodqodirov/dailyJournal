@@ -1098,10 +1098,18 @@ async def test_sender_crash_restarts_and_reader_continues(session, jarvis, monke
 # --- the process ----------------------------------------------------------------------
 
 
-async def test_startup_floodwait_does_not_exit(monkeypatch):
+@pytest.mark.parametrize(
+    ("sending", "client_kwargs"),
+    [
+        (True, {"flood_sleep_threshold": 7, "raise_last_call_error": True}),
+        (False, {"flood_sleep_threshold": 60, "raise_last_call_error": False}),
+    ],
+)
+async def test_startup_floodwait_does_not_exit(monkeypatch, sending, client_kwargs):
     """A long FloodWait on the startup dialog sync no longer ends run(): the
     handlers are registered, the sender starts with both switches on, and the
-    client's flood_sleep_threshold is USERBOT_FLOOD_SLEEP_SECONDS."""
+    client's flood_sleep_threshold is USERBOT_FLOOD_SLEEP_SECONDS. With
+    sending off the reader keeps Telethon's defaults (60 s, no last error)."""
     made: dict = {}
     ran: list[str] = []
 
@@ -1155,7 +1163,7 @@ async def test_startup_floodwait_does_not_exit(monkeypatch):
     monkeypatch.setattr(settings, "telethon_api_hash", "hash")
     monkeypatch.setattr(settings, "telethon_session", "1session")
     monkeypatch.setattr(settings, "jarvis_enabled", True)
-    monkeypatch.setattr(settings, "telegram_send_enabled", True)
+    monkeypatch.setattr(settings, "telegram_send_enabled", sending)
     monkeypatch.setattr(settings, "userbot_flood_sleep_seconds", 7)
     monkeypatch.setattr(userbot, "StringSession", lambda value: object())
     monkeypatch.setattr(userbot, "TelegramClient", _Client)
@@ -1166,9 +1174,48 @@ async def test_startup_floodwait_does_not_exit(monkeypatch):
     monkeypatch.setattr(userbot, "setup_logging", lambda component: None)
     monkeypatch.setattr(tg_sender, "start", _start)
     await userbot.run()
-    assert made == {"flood_sleep_threshold": 7, "raise_last_call_error": True}
+    assert made == client_kwargs
     assert ran == ["listening", "disconnected"]
-    assert started == [ACCOUNT, "cancelled"]
+    assert started == ([ACCOUNT, "cancelled"] if sending else [])
+
+
+@pytest.mark.parametrize("error", [errors.FloodWaitError, errors.FloodPremiumWaitError])
+async def test_the_reader_waits_out_short_flood_waits(monkeypatch, error):
+    """With the sender's short client threshold a 20 s wait reaches the
+    reader, a plain one or the download-speed one of an account without
+    Premium: it sleeps it out and reads again, a bounded number of times; a
+    longer one is raised at once."""
+    slept: list[float] = []
+
+    async def _sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(userbot.asyncio, "sleep", _sleep)
+    calls: list[int] = []
+
+    async def _download():
+        calls.append(1)
+        if len(calls) <= 2:
+            raise error(request=None, capture=20)
+        return "file"
+
+    assert await userbot._reader_call(_download) == "file"
+    assert len(calls) == 3 and slept == [21, 21]
+
+    async def _long():
+        raise error(request=None, capture=3600)
+
+    slept.clear()
+    with pytest.raises(error):
+        await userbot._reader_call(_long)
+    assert slept == []
+
+    async def _always():
+        raise error(request=None, capture=20)
+
+    with pytest.raises(error):
+        await userbot._reader_call(_always)
+    assert slept == [21] * userbot.READER_FLOOD_RETRIES
 
 
 async def test_sigterm_stops_the_sender_before_the_client_goes(monkeypatch):

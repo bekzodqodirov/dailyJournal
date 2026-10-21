@@ -14,7 +14,7 @@ env: ## Create .env from .env.example if it does not exist
 # --- Docker -----------------------------------------------------------------
 doctor: ## Check .env and the server before make up
 	$(COMPOSE) build api
-	$(COMPOSE) run --rm --no-deps api python -m miya.tools.doctor
+	$(COMPOSE) run --rm --no-deps -e MIYA_IN_UPDATE=$(IN_UPDATE) api python -m miya.tools.doctor
 
 up: env $(if $(SKIP_DOCTOR),,doctor) ## Build and start everything, then run migrations (SKIP_DOCTOR=1 to skip the check)
 	$(COMPOSE) up -d --build db api
@@ -30,7 +30,7 @@ update: ## Backup, pull, rebuild, prune
 	@# first: a running worker would re-write rows a migration just removed.
 	SYNC=$$($(COMPOSE) --profile syncthing ps -q syncthing 2>/dev/null); \
 	$(COMPOSE) stop bot worker userbot && \
-	$(MAKE) up && \
+	$(MAKE) up IN_UPDATE=1 && \
 	if [ -n "$$SYNC" ]; then \
 		$(COMPOSE) --profile syncthing up -d syncthing && \
 		echo "Syncthing ishlayotgan edi — qo'ng'iroq yozuvlari to'xtamasligi uchun qayta yoqildi (--profile syncthing)."; \
@@ -115,10 +115,11 @@ backup-key: ## Create the backup key and print the .env line
 backup-key-show: ## Print the secret backup key (store it off the server)
 	$(COMPOSE) run --rm --no-deps worker cat /app/secrets/backup-key.txt
 
-backup: ## Run the encrypted database backup now
+backup: ## Run the encrypted database backup now (fails when the backup does, so make update stops)
 	$(COMPOSE) run --rm --no-deps worker python -c \
-		"import asyncio; from miya.services.backup import create_backup; \
-		 print(asyncio.run(create_backup()))"
+		"import asyncio, sys; from miya.services.backup import create_backup; \
+		 result = asyncio.run(create_backup()); print(result); \
+		 sys.exit(0 if result.ok else 1)"
 
 restore: ## Restore a backup: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]
 	@test -n "$(FILE)" || (echo "usage: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]" && exit 1)

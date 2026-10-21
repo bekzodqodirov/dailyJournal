@@ -13,6 +13,8 @@
    ssh-keygen -t ed25519 -f ~/.ssh/miya_deploy -N ''
    ~/.ssh/miya_deploy.pub ni GitHub → repo Settings → Deploy keys → Add (faqat o'qish) ga qo'y.
    GIT_SSH_COMMAND='ssh -i ~/.ssh/miya_deploy' git clone git@github.com:bekzodqodirov/dailyJournal.git miya && cd miya
+   Keyingi make update'dagi git pull ham shu kalitni ishlatsin:
+   git config core.sshCommand "ssh -i $HOME/.ssh/miya_deploy -o IdentitiesOnly=yes"
 3) .env: cp .env.example .env && chmod 600 .env — keyin to'ldir:
    POSTGRES_PASSWORD=<openssl rand -hex 24> va DATABASE_URL'dagi change-me o'rniga xuddi shu parol (birinchi make up'dan OLDIN)
    ANTHROPIC_API_KEY=<MIYA kaliti>
@@ -45,9 +47,10 @@
 
 ## Ishlab turgan serverni yangilash
 
-1) Serverda: cd miya && git status → o'zgarish yo'q; git branch → * master.
-2) make update → zaxira oladi, kodni tortadi, bot/worker/userbot'ni to'xtatib migratsiyalarni qo'llaydi va hammasini qayta yoqadi. Yarim yo'lda make doctor'dagi ❌ bilan to'xtasa, bot/worker/userbot to'xtagan holda qoladi: ❌ ni tuzat, keyin make up.
-3) make doctor → ❌ qolmasin. Yangi sozlamalar .env'ga yozilmasa ham standart qiymat bilan ishlaydi; ro'yxati .env.example'da («.env faylida N ta yangi sozlama yo'q» degan ⚠️ qator — normal). Hech qanday SQL kerak emas: bazani make update o'zi yangilaydi.
+1) Serverda: cd miya && git status → o'zgarish yo'q; git branch → * master; git rev-parse --short HEAD → chiqqan kodni yozib ol (hozirgi versiya); git fetch → xatosiz. «Permission denied (publickey)» desa, bir marta: git config core.sshCommand "ssh -i $HOME/.ssh/miya_deploy -o IdentitiesOnly=yes", keyin yana git fetch.
+1b) Avval zaxirani alohida: make backup → oxiri error=None bo'lsin. Bo'lmasa yangilashni boshlama: error='no_recipient' bo'lsa — yuqoridagi o'rnatishning 4-qadami (make backup-key → BACKUP_AGE_RECIPIENT=… qatorini .env'ga yoz), keyin yana make backup; boshqa xato bo'lsa, matnini dasturchiga yubor.
+2) make update → zaxira oladi, kodni tortadi, bot/worker/userbot'ni to'xtatib migratsiyalarni qo'llaydi va hammasini qayta yoqadi. O'rtada doctor «✅ Hammasi joyida …» desa, hech narsa yozma — davom etadi. «Stopped» qatorlaridan oldin to'xtasa (zaxira yoki git pull xatosi), MIYA eski versiyada ishlayapti: xatoni tuzat va yana make update. «Stopped» qatorlaridan keyin istalgan xato bilan to'xtasa (doctor ❌, yig'ish yoki migratsiya xatosi), bot/worker/userbot to'xtagan holda qoladi: xatoni tuzat, keyin make up. Migratsiya xatosida baza eski holatida qoladi; eski versiyaga qaytish: git checkout <1-qadamdagi kod> && make up, xatoni dasturchiga yubor; tuzatilgandan keyin git checkout master && make update.
+3) make doctor → ❌ qolmasin. Yangi sozlamalar .env'ga yozilmasa ham standart qiymat bilan ishlaydi; ro'yxati .env.example'da («.env faylida N ta yangi sozlama yo'q» degan ⚠️ qator — normal). Hech qanday SQL kerak emas: bazani make update o'zi yangilaydi. Loglar endi JSON qatorlar; o'qishga qulay bo'lsin desang .env'da LOG_FORMAT=text, keyin make reload.
 4) .env'da REPORT_TIME=19:00 bo'lsa, REPORT_TIME=20:00 ga o'zgartir (yoki qatorni o'chir), keyin make reload → kechki xulosa 20:00 da keladi.
 5) Botda /holat → hamma qator ✅. /ertalab → ertalabki xulosa chiqsin.
 6) Standartda o'chiq, xohlasang .env'da yoq: CODE_PLACEHOLDERS, TRANSCRIBE_DIARIZE_CALLS, MEDIA_RETENTION_DAYS, VIDEO_RETENTION_DAYS.

@@ -1024,6 +1024,52 @@ async def test_an_approved_installer_is_still_never_fetched(session, media_in_tm
     assert row.meta["safety_notice"] == "dangerous_file"
 
 
+async def test_a_long_flood_wait_leaves_an_approved_file_queued(session, media_in_tmp):
+    """A flood wait on the re-read is no proof the message is gone: the row
+    stays approved for the next pass, not DONE with error 'gone'."""
+    from telethon.errors import FloodPremiumWaitError, FloodWaitError
+
+    session.add(
+        m.Interaction(
+            source=InteractionSource.telegram_userbot,
+            direction=Direction.in_,
+            tg_chat_id=CHAT,
+            occurred_at=datetime.now(TZ) - timedelta(minutes=5),
+            media={
+                "type": "document",
+                "filename": "hisob.pdf",
+                "size": 90_000_000,
+                "processed": False,
+                "approval": {"state": approvals.APPROVED, "reason": "too_large"},
+            },
+            meta={"tg_message_id": 15},
+        )
+    )
+    await session.commit()
+
+    class _WaitingClient(_Client):
+        async def get_messages(self, chat_id, ids):
+            raise FloodWaitError(request=None, capture=3600)
+
+    assert await userbot.fetch_approved(_WaitingClient()) == 0
+    row = await _row(session, 15)
+    assert approvals.state_of(row) == approvals.APPROVED
+    assert not row.needs_review
+
+    # The same for a long wait on the download itself.
+    class _SlowDownload(_Client):
+        async def get_messages(self, chat_id, ids):
+            return _tg_document(ids, "hisob.pdf")
+
+        async def download_media(self, message, file=None):
+            raise FloodPremiumWaitError(request=None, capture=3600)
+
+    assert await userbot.fetch_approved(_SlowDownload()) == 0
+    row = await _row(session, 15)
+    assert approvals.state_of(row) == approvals.APPROVED
+    assert not row.needs_review
+
+
 async def test_a_warning_shows_a_spoofed_name_as_it_really_is(session):
     await _queued(session, name="Rasm\u202egpj\u200b.apk")
     bot = _Bot()

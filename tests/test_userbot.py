@@ -138,6 +138,15 @@ def _calls_by_function(source: str) -> dict[str | None, set[str]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             found.setdefault(owner.get(id(node)), set()).add(node.func.attr)
+        # partial(client.get_messages, …) is a call too, made later.
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "partial"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+        ):
+            found.setdefault(owner.get(id(node)), set()).add(node.args[0].attr)
     return found
 
 
@@ -535,6 +544,50 @@ async def test_a_transcription_failure_is_carried_back_not_raised(monkeypatch, t
     assert outcome.transcript is None
 
 
+async def test_a_broken_download_leaves_no_partial_file(monkeypatch, tmp_path):
+    from miya.services.media_policy import MediaPlan
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(b"half a voice note")
+            raise ConnectionError("dropped")
+
+    outcome = await ub.fetch_media(
+        _Client(),
+        SimpleNamespace(id=1),
+        MediaPlan(kind=MediaKind.voice, download=True, transcribe=True),
+        ".ogg",
+    )
+    assert outcome.failed is True
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_a_long_flood_wait_is_raised_only_when_asked(monkeypatch, tmp_path):
+    from telethon.errors import FloodPremiumWaitError
+
+    from miya.services.media_policy import MediaPlan
+    from miya.userbot import main as ub
+
+    monkeypatch.setattr(ub, "userbot_media_dir", lambda: tmp_path)
+
+    class _Client:
+        async def download_media(self, message, file):
+            Path(file).write_bytes(b"first chunk")
+            raise FloodPremiumWaitError(request=None, capture=600)
+
+    plan = MediaPlan(kind=MediaKind.document, download=True)
+    outcome = await ub.fetch_media(_Client(), SimpleNamespace(id=1), plan, ".pdf")
+    assert outcome.failed is True
+    with pytest.raises(FloodPremiumWaitError):
+        await ub.fetch_media(
+            _Client(), SimpleNamespace(id=1), plan, ".pdf", pause_on_flood=True
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_a_declined_download_records_why(monkeypatch):
     from miya.services.media_policy import MediaPlan
     from miya.userbot import main as ub
@@ -682,6 +735,9 @@ def test_style_history_allowed_function_only():
             assert function in TOOL_HISTORY_ALLOWED_IN, function
     assert "iter_messages" in tool["fetch_style_history"]
     sweep = _calls_by_function(Path(userbot.__file__).read_text())
+    # The guards see the reads made through _reader_call's partial().
+    assert "get_messages" in sweep["fetch_approved"]
+    assert "download_media" in sweep["fetch_media"]
     assert "fetch_style_history" in sweep["fetch_style_imports"]
     assert not (sweep["fetch_style_imports"] & (HISTORY_CALLS | WRITE_CALLS))
 

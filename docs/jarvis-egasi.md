@@ -39,15 +39,44 @@ o'qimaydi.
 
 ## 1. Serverni yangilash
 
-```
-cd miya
-make update
-make doctor
-```
+Buyruqlarni **bittadan** yozing va har biridan keyin natijaga qarang. To'liq tartib:
+[jarvis-qollanma.md, 2-bo'lim](jarvis-qollanma.md).
 
-`make update` zaxira oladi, kodni tortadi va bazani o'zi yangilaydi (migratsiyalar). Hech
-qanday SQL yozish kerak emas. `make doctor` «.env faylida N ta yangi sozlama yo'q» deb bitta
-⚠️ qator chiqarsa — bu normal: ular standart qiymat bilan ishlaydi. Faqat ❌ qolmasin.
+1. Ulanish:
+
+   ```
+   cd miya
+   git fetch
+   ```
+
+   Xatosiz o'tsin. «Permission denied (publickey)» desa, bir marta
+   `git config core.sshCommand "ssh -i $HOME/.ssh/miya_deploy -o IdentitiesOnly=yes"`,
+   keyin yana `git fetch`.
+
+2. Zaxira:
+
+   ```
+   make backup
+   ```
+
+   Oxiri `error=None)` bilan tugasin. Boshqacha bo'lsa (masalan `error='no_recipient'`) —
+   **to'xtang**, `make update` ni yozmang, avval zaxirani tuzating (`BACKUP_AGE_RECIPIENT`).
+
+3. Yangilash:
+
+   ```
+   make update
+   make doctor
+   ```
+
+   - `make update` zaxira oladi, kodni tortadi va bazani o'zi yangilaydi (migratsiyalar). Hech
+     qanday SQL yozish kerak emas.
+   - «Stopped» qatorlaridan oldin to'xtasa (zaxira yoki `git pull` xatosi): tuzating va yana
+     `make update`. Keyin to'xtasa: tuzating, keyin `make up`.
+   - `make doctor` «.env faylida N ta yangi sozlama yo'q» deb bitta ⚠️ qator chiqarsa — bu
+     normal: ular standart qiymat bilan ishlaydi. Faqat ❌ qolmasin.
+   - `.env` da `REPORT_TIME=19:00` bo'lsa, `REPORT_TIME=20:00` qiling, keyin `make reload`.
+   - Botda `/holat` — hamma qator ✅.
 
 ## 2. Tayyorgarlik — Jarvis yoqilishidan oldin
 

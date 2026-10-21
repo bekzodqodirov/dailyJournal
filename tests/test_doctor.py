@@ -20,6 +20,9 @@ DISK = 60 * 1000**3
 PASSWORD = "p" * 48
 
 
+ALL_CLEAR = "✅ Hammasi joyida — endi: make up"
+
+
 def _env(**overrides: str) -> dict[str, str]:
     """A complete, correct .env: every expected key, every required value."""
     env = {key: "" for key in doctor.EXPECTED_ENV_KEYS}
@@ -59,7 +62,7 @@ def test_a_complete_env_on_a_good_server_is_clean():
     findings = _check()
     assert findings == []
     assert doctor.exit_code(findings) == 0
-    assert doctor.summary(findings) == "✅ Hammasi joyida — endi: make up"
+    assert doctor.summary(findings) == ALL_CLEAR
 
 
 def test_a_missing_key_is_a_warning_naming_it():
@@ -240,7 +243,7 @@ def test_the_sheets_key_is_read_and_its_address_printed():
         )
     ]
     assert doctor.exit_code(findings) == 0
-    assert doctor.summary(findings) == "✅ Hammasi joyida — endi: make up"
+    assert doctor.summary(findings) == ALL_CLEAR
     # The configured path is the one read.
     other = _sheets(
         {"/app/secrets/k.json": KEY_JSON},
@@ -305,10 +308,33 @@ def test_jarvis_without_the_reader_warns():
         "qil, keyin make reload."
     ]
     no_session = _texts(_check(_env(JARVIS_ENABLED="true", TELETHON_SESSION="")), "warn")
-    assert any(
-        "JARVIS_ENABLED=true, lekin TELETHON_SESSION bo'sh" in w for w in no_session
-    )
+    # One line with the whole fix, not the generic C10 one beside it.
+    assert len(no_session) == 1
+    assert "JARVIS_ENABLED=true, lekin TELETHON_SESSION bo'sh" in no_session[0]
+    assert _texts(_check(_env(TELETHON_SESSION="")), "warn") == [
+        "⚠️ TELETHON_SESSION bo'sh — make up'dan keyin make userbot-login qil."
+    ]
     assert _check(_env(JARVIS_ENABLED="true", JARVIS_MODE="draft")) == []
+
+
+def test_inside_make_update_the_all_clear_says_to_wait(monkeypatch, capsys):
+    assert doctor.summary([], in_update=True) == (
+        "✅ Hammasi joyida — make update davom etadi, hech narsa yozmang."
+    )
+    monkeypatch.setattr(doctor, "check", lambda *args, **kwargs: [])
+    monkeypatch.setenv("MIYA_IN_UPDATE", "1")
+    assert doctor.main() == 0
+    assert "make update davom etadi" in capsys.readouterr().out
+    monkeypatch.setenv("MIYA_IN_UPDATE", "")
+    doctor.main()
+    assert capsys.readouterr().out.strip() == ALL_CLEAR
+
+
+def test_an_old_report_time_gets_a_note_never_an_error():
+    [note] = _check(_env(REPORT_TIME="19:00"))
+    assert note.level == "info" and "REPORT_TIME=20:00" in note.text
+    assert doctor.exit_code([note]) == 0
+    assert _check(_env(REPORT_TIME="20:00")) == []
 
 
 def test_jarvis_mode_ceiling_notes():

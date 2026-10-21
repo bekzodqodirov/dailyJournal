@@ -90,18 +90,42 @@ tugmangiz yoki `.env` dagi o'zgarishingiz.
 
 ## 2. Serverni yangilash
 
-1. Serverga kiring va MIYA papkasiga o'ting. O'zgarish yo'qligini va `master` da
-   ekaningizni tekshiring:
+1. Serverga kiring va MIYA papkasiga o'ting. O'zgarish yo'qligini, `master` da
+   ekaningizni va GitHub'ga ulanish ishlashini tekshiring:
 
    ```
    cd miya
    git status
    git branch
+   git rev-parse --short HEAD
+   git fetch
    ```
 
    `git status` «nothing to commit» desin, `git branch` esa `* master` ni ko'rsatsin.
+   `git rev-parse --short HEAD` chiqargan qisqa kodni (masalan `8328214`) yozib qo'ying —
+   bu hozirgi versiya, kerak bo'lsa unga qaytasiz. `git fetch` xatosiz tugasin. `git fetch` «Permission denied (publickey)» desa, o'rnatishda
+   yaratilgan kalitni git'ga bir marta ko'rsating va qaytadan `git fetch`:
 
-2. Yangilang:
+   ```
+   git config core.sshCommand "ssh -i $HOME/.ssh/miya_deploy -o IdentitiesOnly=yes"
+   git fetch
+   ```
+
+2. Avval zaxirani alohida oling va natijasiga qarang:
+
+   ```
+   make backup
+   ```
+
+   Ekranda `BackupResult(path=PosixPath('/data/backups/miya-…'), …, error=None)` chiqsin.
+   Oxiri `error=None` emas bo'lsa, yangilashni boshlamang. `error='no_recipient'` bo'lsa —
+   [o'rnatishning 4-qadami](ornatish.md) («Zaxira kaliti»): `make backup-key`, chiqqan
+   `BACKUP_AGE_RECIPIENT=age1…` qatorini `.env` ga yozing, keyin yana `make backup`. Boshqa
+   xato bo'lsa, matnini dasturchiga yuboring. Bu zaxira
+   serverdagi `data/backups/` papkasiga yoziladi, Telegram'ga yuborilmaydi — Telegram'ga
+   zaxira fayli har kecha 03:30 dagi odatiy zaxiradan keyin keladi.
+
+3. Yangilang:
 
    ```
    make update
@@ -109,20 +133,26 @@ tugmangiz yoki `.env` dagi o'zgarishingiz.
 
    Bu buyruq o'zi: zaxira nusxa oladi → yangi kodni tortadi → bot, worker va userbot'ni
    to'xtatadi → `make doctor` ni o'tkazadi → bazani yangilaydi (migratsiyalar
-   0022 dan 0028 gacha, ketma-ket, avtomatik) → hammasini qayta yoqadi. **Hech qanday SQL
-   yozish kerak emas.**
+   0022 dan 0028 gacha, ketma-ket, avtomatik; bir necha soniya) → hammasini qayta yoqadi.
+   **Hech qanday SQL yozish kerak emas.**
 
-   - Zaxira serverdagi `data/backups/` papkasiga yoziladi; ekranda
-     `BackupResult(path=PosixPath('/data/backups/miya-…'), …, error=None)` qatori
-     chiqadi. Bu zaxira Telegram'ga yuborilmaydi — Telegram'ga zaxira fayli har kecha
-     03:30 dagi odatiy zaxiradan keyin keladi.
+   - O'rtada `make doctor` «✅ Hammasi joyida — endi: make up» (keyingi yangilashlarda
+     «✅ Hammasi joyida — make update davom etadi, hech narsa yozmang.») deydi. Hech narsa
+     yozmang — `make update` o'zi davom etadi.
    - Oxirida «Yangilandi. Botda /holat ni tekshir.» chiqishi kerak.
-   - Agar `make update` yarim yo'lda `make doctor` dagi ❌ bilan to'xtasa: bot, worker va
-     userbot **to'xtagan holda qoladi** va baza hali yangilanmagan. ❌ qatorini tuzating,
-     keyin `make up` ni yozing (u doctor'ni, migratsiyalarni va qayta yoqishni o'zi
-     bajaradi).
+   - `make update` «Stopped» qatorlaridan **oldin** to'xtasa (zaxira yoki `git pull`
+     xatosi): MIYA eski versiyada ishlab turibdi. Xatoni tuzating va yana `make update`
+     ni yozing (`make up` emas — u yangilamaydi).
+   - «Stopped» qatorlaridan **keyin** istalgan xato bilan to'xtasa (`make doctor` dagi ❌,
+     yig'ish xatosi yoki migratsiya xatosi): bot, worker va userbot **to'xtagan holda
+     qoladi**. Xatoni tuzating, keyin `make up` ni yozing (u doctor'ni, migratsiyalarni va
+     qayta yoqishni o'zi bajaradi).
+   - Migratsiya xatosi bo'lsa baza eski holatida qoladi (hech narsa yo'qolmaydi). Eski
+     versiyaga qaytish: `git checkout <1-qadamda yozib olgan kod>` va `make up`; xato
+     matnini dasturchiga yuboring. Tuzatilgandan keyin: `git checkout master` va
+     `make update`.
 
-3. Tekshiring:
+4. Tekshiring:
 
    ```
    make doctor
@@ -133,17 +163,18 @@ tugmangiz yoki `.env` dagi o'zgarishingiz.
      qator (yoki yetishmagani 3 tadan kam bo'lsa, har biri uchun «⚠️ … .env faylida yo'q»)
      — **normal**. Ular yangi sozlamalar, standart qiymat bilan ishlaydi. Kerak
      bo'lganini keyin `.env.example` dan ko'chirasiz.
+   - «ℹ️ REPORT_TIME=19:00 — yangi standart 20:00 …» — keyingi qadam.
 
-4. Kechki xulosa vaqti. `.env` da `REPORT_TIME=19:00` deb yozilgan bo'lsa, uni
+5. Kechki xulosa vaqti. `.env` da `REPORT_TIME=19:00` deb yozilgan bo'lsa, uni
    `REPORT_TIME=20:00` qiling (yoki qatorni o'chiring), keyin:
 
    ```
    make reload
    ```
 
-5. Botda `/holat` → hamma qator ✅ bo'lsin. `/ertalab` → ertalabki xulosa chiqsin.
+6. Botda `/holat` → hamma qator ✅ bo'lsin. `/ertalab` → ertalabki xulosa chiqsin.
 
-6. Ixtiyoriy `.env` qatorlari (keyin `make doctor` va `make reload`):
+7. Ixtiyoriy `.env` qatorlari (keyin `make doctor` va `make reload`):
 
    - `SAFETY_EXTRA_SAFE_DOMAINS=mycompany.uz` — o'zingiz tekshirgan saytlar (vergul bilan).
      Ularga havola hech qachon «soxta sayt» deb aytilmaydi. Lekin ular orqali kelgan dastur

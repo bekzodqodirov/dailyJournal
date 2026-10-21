@@ -947,7 +947,7 @@ Every key below goes to `miya/config.py` (with `Field` bounds or `Literal`), `.e
 | `JARVIS_SNOOZE_MAX` | `3` | JV-18 | Then the escalation goes to the brief |
 | `JARVIS_ESCALATION_DAILY_CAP` | `30` | JV-18 | Then alerts fold into one message |
 | `TELEGRAM_SEND_ENABLED` | `false` | JV-19 | Starts the sender task |
-| `USERBOT_FLOOD_SLEEP_SECONDS` | `5` | JV-19 | Client `flood_sleep_threshold` |
+| `USERBOT_FLOOD_SLEEP_SECONDS` | `5` | JV-19 | Client `flood_sleep_threshold` while the sender runs (60, Telethon's default, when it does not) |
 | `JARVIS_REPLY_DELAY_MIN_SECONDS` | `3` | JV-19 | Pre-send delay lower bound |
 | `JARVIS_REPLY_DELAY_MAX_SECONDS` | `7` | JV-19 | Upper bound; validator min ≤ max |
 | `JARVIS_TYPING_CHARS_PER_SECOND` | `6` | JV-19 | Typing time per character |

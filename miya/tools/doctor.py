@@ -522,7 +522,12 @@ def check(
                 "xabarlar senga qaratilgan deb tanilmaydi."
             )
         )
-    if _truthy(env.get("USERBOT_ENABLED", "true")) and not value("TELETHON_SESSION"):
+    # With Jarvis on, C15 says the same with the whole fix.
+    if (
+        _truthy(env.get("USERBOT_ENABLED", "true"))
+        and not value("TELETHON_SESSION")
+        and not _truthy(env.get("JARVIS_ENABLED", "false"))
+    ):
         found.append(
             _warn("⚠️ TELETHON_SESSION bo'sh — make up'dan keyin make userbot-login qil.")
         )
@@ -568,15 +573,29 @@ def check(
     # C15: the Jarvis switches.
     found.extend(_jarvis(env, value))
 
+    # C16: the evening recap moved to 20:00; an .env from before still says 19:00.
+    if value("REPORT_TIME") == "19:00":
+        found.append(
+            _info(
+                "ℹ️ REPORT_TIME=19:00 — yangi standart 20:00. Kechki xulosa 20:00 da "
+                "kelsin desang: .env da REPORT_TIME=20:00 qil (yoki qatorni o'chir), "
+                f"keyin {RELOAD}."
+            )
+        )
+
     rank = {"error": 0, "warn": 1, "info": 2}
     found.sort(key=lambda f: rank[f.level])
     return found
 
 
-def summary(findings: list[Finding]) -> str:
+def summary(findings: list[Finding], *, in_update: bool = False) -> str:
+    """``in_update``: run by ``make update`` (MIYA_IN_UPDATE=1), which goes on
+    by itself, so the all-clear does not tell the owner to type make up."""
     errors = sum(1 for f in findings if f.level == "error")
     if errors:
         return f"❌ {errors} ta muammo. Tuzatib, qaytadan: make doctor"
+    if in_update:
+        return "✅ Hammasi joyida — make update davom etadi, hech narsa yozmang."
     return "✅ Hammasi joyida — endi: make up"
 
 
@@ -626,7 +645,7 @@ def main() -> int:
     )
     for finding in findings:
         print(finding.text)
-    print(summary(findings))
+    print(summary(findings, in_update=os.environ.get("MIYA_IN_UPDATE") == "1"))
     return exit_code(findings)
 
 
