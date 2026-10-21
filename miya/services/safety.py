@@ -731,6 +731,11 @@ R_CARD_DATA_REQUEST = "card_data_request"
 R_TELEGRAM_SCAM = "telegram_scam_flag"
 R_TELEGRAM_FAKE = "telegram_fake_flag"
 R_PHOTO_LURE = "photo_lure"
+R_BRAND_PATH = "brand_path"
+R_LOGIN_PAGE = "login_page"
+R_HTML_FILE = "html_file"
+R_MONEY_PRETEXT = "money_pretext"
+R_QR_RECEIVE = "qr_receive"
 
 HARD_REASONS = frozenset(
     {
@@ -748,6 +753,11 @@ HARD_REASONS = frozenset(
         R_TELEGRAM_SCAM,
         R_TELEGRAM_FAKE,
         R_PHOTO_LURE,
+        R_BRAND_PATH,
+        R_LOGIN_PAGE,
+        R_HTML_FILE,
+        R_MONEY_PRETEXT,
+        R_QR_RECEIVE,
     }
 )
 
@@ -765,6 +775,9 @@ R_FORWARDED = "forwarded"
 R_VIA_BOT = "via_bot"
 R_FIRST_CONTACT = "first_contact"
 R_SCRIPT_SWITCH = "script_switch"
+R_PRETEXT = "pretext"
+R_MONEY_ASK = "money_ask"
+R_JOB_AD = "job_ad"
 
 SOFT_WEIGHTS: dict[str, int] = {
     R_SHORTENER: 25,
@@ -780,6 +793,9 @@ SOFT_WEIGHTS: dict[str, int] = {
     R_VIA_BOT: 20,
     R_FIRST_CONTACT: 15,
     R_SCRIPT_SWITCH: 15,
+    R_PRETEXT: 20,
+    R_MONEY_ASK: 20,
+    R_JOB_AD: 25,
 }
 
 # Possible hijack: a contact with history suddenly sends what they never did.
@@ -872,8 +888,10 @@ SENSITIVE_SAFE_DOMAINS = LOOKALIKE_TARGET_DOMAINS | frozenset(
     }
 )
 # Google's own share links: a goo.gl host, but they open only Google Maps or
-# Google Photos, so they hide no target and are no short link.
+# Google Photos, so they hide no target and are no short link. The older
+# «goo.gl/maps/…» links open only Google Maps too.
 GOOGLE_APP_LINKS = frozenset({"maps.app.goo.gl", "photos.app.goo.gl"})
+_GOOGLE_MAPS_PATH = re.compile(r"(?i)^/maps(?:/|$)")
 SAFE_DOMAINS = SENSITIVE_SAFE_DOMAINS | frozenset(
     {
         "youtube.com",
@@ -963,6 +981,13 @@ BRAND_TOKENS = frozenset(
         "soliq",
         "mygov",
         "gov",
+        # the post and the customs a cargo client hears from
+        "uzpost",
+        "customs",
+        "bojxona",
+        "tamozhnya",
+        "tamojnya",
+        "tamozhnia",
         "telegram",
         "whatsapp",
     }
@@ -987,12 +1012,77 @@ _BRAND_AFFIXES = frozenset(
         "free",
         "web",
         "auth",
+        # the lure in Uzbek and Russian: a refund, a cashback, a promotion
+        "qaytarish",
+        "qaytarildi",
+        "qaytim",
+        "vozvrat",
+        "refund",
+        "cashback",
+        "keshbek",
+        "kashback",
+        "aksiya",
+        "akciya",
+        "aktsiya",
+        "sovga",
+        "yutuq",
+        "prize",
+        "tolov",
+        "tulov",
+        "oplata",
+        "payment",
+        "kompensatsiya",
+        "kompensaciya",
+        "pul",
+        "karta",
+        "wallet",
+        "tasdiq",
+        "tiklash",
+        "restore",
+        "unblock",
     }
 )
 # Brands that are also everyday words and company names: «humo» is the
-# bird («Humo Express», «Humo Trans»), «uzum» the grape, «apelsin» the orange.
-# Read as the brand only alone in a label or beside a lure affix.
-_WORD_BRANDS = frozenset({"humo", "click", "uzum", "apelsin"})
+# bird («Humo Express», «Humo Trans»), «uzum» the grape, «apelsin» the orange;
+# «customs» and «bojxona» name every broker («customs-broker.uz»). Read as the
+# brand only alone in a label or beside a lure affix.
+_WORD_BRANDS = frozenset(
+    {
+        "humo",
+        "click",
+        "uzum",
+        "apelsin",
+        "customs",
+        "bojxona",
+        "tamozhnya",
+        "tamojnya",
+        "tamozhnia",
+    }
+)
+# A login or verify page: on a free host, a cheap TLD or a bare IP address it
+# is a credential phish («yiwu-sklad-login.web.app»). Read in the host's own
+# labels; «kirish» (an entrance, a door shop's word) is no such word.
+_CREDENTIAL_WORDS = frozenset(
+    {
+        "login",
+        "signin",
+        "logon",
+        "verify",
+        "verification",
+        "auth",
+        "secure",
+        "tasdiqlash",
+        "vhod",
+        "unlock",
+        "unblock",
+    }
+)
+# In the path of a free host or a bare address, a restore page too
+# («45.141.84.212/click/restore»); in a host name «restore» is a furniture
+# workshop's.
+_CREDENTIAL_PATH_WORDS = _CREDENTIAL_WORDS | frozenset(
+    {"restore", "recovery", "tiklash", "wallet", "kirish"}
+)
 _FUZZY_MIN_NAME = 5
 
 SHORTENER_DOMAINS = frozenset(
@@ -1276,7 +1366,30 @@ def _brand_hit(labels: list[str]) -> bool:
     country code is that country's own government registry («gov.kz»)."""
     last = len(labels) - 2
     names = [lb for i, lb in enumerate(labels[:-1]) if not (i == last and lb == "gov")]
-    return any(_brand_in_label(label) for label in names)
+    return any(_brand_in_label(label) or _confused_brand(label) for label in names)
+
+
+# Digits that pass for letters in a name («te1egram», «0ctobank»).
+_DIGIT_LOOKALIKES = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s"})
+
+
+def _skeleton(label: str) -> str:
+    """What a label reads as at a glance: «telegrarn» → «telegram»."""
+    return _unconfused(label.translate(_DIGIT_LOOKALIKES))
+
+
+def _confused_brand(label: str) -> bool:
+    """A brand spelled with letters that pass for its own: «telegrarn»,
+    «whatsaрp» aside (that is the mixed-script rule), «te1egram». Only the
+    names that are no everyday word, from five letters: «humo» and «click»
+    are words, and a short name is too easily another word."""
+    own = set(re.split(r"[-_]+", label))
+    for part in re.split(r"[-_]+", _skeleton(label)):
+        if part in own or len(part) < _FUZZY_MIN_NAME or part in _WORD_BRANDS:
+            continue
+        if part in BRAND_TOKENS:
+            return True
+    return False
 
 
 def _brand_in_label(label: str) -> bool:
@@ -1370,6 +1483,44 @@ def _bare_ip(host: str) -> bool:
     return True
 
 
+def _public_ip(host: str) -> bool:
+    """A bare address on the internet: a LAN camera or router («192.168.1.10»)
+    is no phishing page."""
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return address.is_global
+
+
+def _path_words(path: str) -> list[str]:
+    """The words of a link's path: «/click/restore-card» → click, restore, card."""
+    return [w for w in re.split(r"[^a-z]+", path.casefold()) if w]
+
+
+def _brand_path(path: str) -> bool:
+    """A payment, bank or government domain written into another site's path:
+    «secure-checkout.top/payme.uz/confirm» shows «payme.uz» to the eye."""
+    segments = [seg for seg in path.casefold().split("/") if "." in seg]
+    return any(_within(seg, LOOKALIKE_TARGET_DOMAINS) for seg in segments)
+
+
+def _credential_host(labels: list[str]) -> bool:
+    """A login or verify word in a host's own labels («yiwu-sklad-login»)."""
+    return any(
+        part in _CREDENTIAL_WORDS
+        for label in labels
+        for part in re.split(r"[-_0-9]+", label)
+    )
+
+
+def _google_app_link(found: FoundUrl) -> bool:
+    """A Google Maps or Photos share link, the new kind or the old goo.gl/maps."""
+    if _within(found.host, GOOGLE_APP_LINKS):
+        return True
+    return found.host == "goo.gl" and bool(_GOOGLE_MAPS_PATH.match(found.path))
+
+
 def _file_reason(path: str) -> str | None:
     """An installer or an archive at the end of a link's path."""
     name = path.rsplit("/", 1)[-1]
@@ -1409,11 +1560,19 @@ def link_verdict(found: FoundUrl, *, extra_safe: Iterable[str] = ()) -> LinkVerd
 
     if _bare_ip(host):
         soft.append(R_BARE_IP)
+        if _public_ip(host):
+            # «45.141.84.212/click/restore»: a brand or a login page behind a
+            # bare address is no one's real site.
+            words = _path_words(found.path)
+            if any(w in BRAND_TOKENS for w in words) or _brand_path(found.path):
+                hard.append(R_BRAND_PATH)
+            if any(w in _CREDENTIAL_PATH_WORDS for w in words):
+                hard.append(R_LOGIN_PAGE)
         return LinkVerdict(tuple(hard), tuple(soft))
     decoded = _idna_decoded(host)
     if decoded != host:
         soft.append(R_PUNYCODE)
-    if _within(host, safe) or _within(decoded, safe):
+    if _within(host, safe) or _within(decoded, safe) or _google_app_link(found):
         return LinkVerdict(tuple(hard), tuple(soft))
 
     labels = _labels(decoded)
@@ -1432,11 +1591,27 @@ def link_verdict(found: FoundUrl, *, extra_safe: Iterable[str] = ()) -> LinkVerd
     ):
         hard.append(R_LOOKALIKE_DOMAIN)
 
+    if _brand_path(found.path):
+        hard.append(R_BRAND_PATH)
+    free_host = _within(host, FREE_HOST_DOMAINS)
+    cheap = bool(labels) and labels[-1] in CHEAP_TLDS
+    if free_host or cheap:
+        # A free host's own labels are its service's name: only the part the
+        # sender chose counts («yiwu-sklad-login» of «….web.app»).
+        own = labels[:-1]
+        if free_host:
+            suffix = next(d for d in FREE_HOST_DOMAINS if _within(host, (d,)))
+            own = labels[: len(labels) - len(_labels(suffix))]
+        path_login = free_host and any(
+            w in _CREDENTIAL_PATH_WORDS for w in _path_words(found.path)
+        )
+        if _credential_host(own) or path_login:
+            hard.append(R_LOGIN_PAGE)
     if _within(host, SHORTENER_DOMAINS):
         soft.append(R_SHORTENER)
-    if _within(host, FREE_HOST_DOMAINS):
+    if free_host:
         soft.append(R_FREE_HOST)
-    if labels and labels[-1] in CHEAP_TLDS:
+    if cheap:
         soft.append(R_CHEAP_TLD)
     return LinkVerdict(tuple(dict.fromkeys(hard)), tuple(dict.fromkeys(soft)))
 
@@ -1444,8 +1619,7 @@ def link_verdict(found: FoundUrl, *, extra_safe: Iterable[str] = ()) -> LinkVerd
 def is_short_link(found: FoundUrl) -> bool:
     """A link whose real target is hidden: a shortener or a free host. A
     Google Maps or Photos share link opens only Google's own pages."""
-    host = found.host
-    return _within(host, _KNOWN_HOSTS) and not _within(host, GOOGLE_APP_LINKS)
+    return _within(found.host, _KNOWN_HOSTS) and not _google_app_link(found)
 
 
 # --- the message lexicons ---------------------------------------------------------
@@ -1505,6 +1679,14 @@ _SMS_CONTEXT = _markers(
         "на номер",
     )
 )
+# «Цифры из СМС», «SMS dagi raqamlar»: the one-time code by another name, and
+# an SMS context in itself.
+_SMS_DIGITS = re.compile(
+    r"(?<![\w'])(?:цифр\w* (?:из|в) (?:смс|sms|сообщени\w*)"
+    r"|(?:sms|смс) ?(?:dagi|даги|da kelgan|да келган|dan|дан)? "
+    r"(?:\d+ (?:xonali |хонали |ta |та )?)?"
+    r"(?:raqamlar\w*|raqamni|рақамлар\w*|рақамни|цифр\w*))"
+)
 # «SMS qilib yuboring» is «send it by SMS» (to a relative without Telegram),
 # not «tell me what an SMS said».
 _SMS_OUT = re.compile(r"(?<![\w'])(?:sms|смс) (?:qilib|қилиб|килиб)(?![\w'])")
@@ -1547,9 +1729,15 @@ _CODE_CONFIRMS = re.compile(
 )
 # The delivery code said to the warehouse keeper at pickup is the procedure,
 # not a fraud, unless it is to be written here.
+# So is the code a courier asks for once the cargo is in the reader's hands
+# («faqat yukni qo'lingizga olgandan keyin ayting»).
 _IN_PERSON = re.compile(
     r"(?<![\w'])(?:(?:кладовщ|kladovsh|omborchi|омборчи|skladchi|складчи)\w*"
-    r"|при (?:выдаче|получении)|(?:omborga|омборга) (?:kelganda|келганда))"
+    r"|при (?:выдаче|получении|вручении)|(?:omborga|омборга) (?:kelganda|келганда)"
+    r"|(?:qo'lingizga ol(?:gan|ganingiz)|қўлингизга ол(?:ган|ганингиз))\w*"
+    r"|(?:yuk|tovar|posilka)\w* ol(?:gan|ganingiz)dan (?:keyin|so'ng)"
+    r"|(?:юк|товар|посилка)\w* ол(?:ган|ганингиз)дан (?:кейин|сўнг)"
+    r"|после получения (?:груза|посылки|товара)|получив (?:груз|посылку|товар))"
 )
 _HERE = re.compile(
     r"(?<![\w'])(?:сюда|мне|в (?:этот |наш )?чат|menga|менга|shu yerga|bu yerga"
@@ -1630,14 +1818,16 @@ _CARD_BACK_DIGITS = re.compile(
 # on folded text, where «ё» is «е». The endings after a stem that ends in a
 # consonant: «ayt» → «ayting», «aytgin», «aytsangiz», «aytasizmi», «aytib
 # bering», «aytvoring».
-_LATIN_ASK = r"(?:ing|ingiz|gin|sangiz|asizmi|ib (?:bering|yuboring|jo'nating)|voring)"
-_CYRILLIC_ASK = r"(?:инг|ингиз|гин|сангиз|асизми|иб (?:беринг|юборинг)|воринг)"
+_LATIN_ASK = (
+    r"(?:ing|ingiz|gin|sangiz|asizmi|ib (?:bering|yuboring|jo'nating|qo'ying)|voring)"
+)
+_CYRILLIC_ASK = r"(?:инг|ингиз|гин|сангиз|асизми|иб (?:беринг|юборинг|қўйинг)|воринг)"
 _REQUEST_VERB = re.compile(
     r"(?<![\w'])(?:"
     # «yubor», «ayt» alone are imperatives too; a bare «yoz» is the summer.
     rf"(?:yubor|jo'nat|ayt|kirit){_LATIN_ASK}?"
     rf"|yoz{_LATIN_ASK}"
-    r"|tashla(?:ng|ngiz|gin|sangiz|ysizmi|b (?:bering|yuboring)|voring)?"
+    r"|tashla(?:ng|ngiz|gin|sangiz|ysizmi|b (?:bering|yuboring|qo'ying)|voring)?"
     rf"|(?:юбор|жўнат|айт|кирит){_CYRILLIC_ASK}?"
     rf"|ез{_CYRILLIC_ASK}"
     r"|ташла(?:нг|нгиз|гин|сангиз|йсизми|б (?:беринг|юборинг)|воринг)?"
@@ -1699,7 +1889,25 @@ _LURE = _markers(
         "vyigrali",
         "besplatn",
         "zarabot",
+        # trading signals and mass ad posting
+        "bitcoin",
+        "биткоин",
+        "forex",
+        "форекс",
+        "guruhlarga reklama",
+        "reklama tarqat",
+        "рассылка по группам",
     )
+)
+# Earnings promised by the day or the month, or as a percentage: «kunlik 40%
+# foyda», «kuniga 2-3 mln daromad», «kuniga 1 000 000 so'm ishlang».
+_EARNINGS = re.compile(
+    r"(?<![\w'])(?:kuniga|kunlik|oyiga|haftasiga|в день|в неделю|в месяц|ежедневно"
+    r"|per day|a day|per week)"
+    r"(?: \S+){0,4}? (?:daromad|foyda|ishlang|ishlab oling|заработ|доход|прибыл|earn)\w*"
+    r"|(?<![\w'])(?:daromad|заработ|доход|earning)\w* (?:от|dan|from)(?: \S+){1,3}? "
+    r"(?:kuniga|oyiga|haftasiga|в день|в неделю|в месяц|per day|a day|per week)"
+    r"|\d ?% (?:foyda|daromad|прибыл\w*|доход\w*|profit)"
 )
 # Trade words that hold an advert stem: «акциз» (excise) is no «акция», and
 # free storage days are a freight term. Removed before the lure is read.
@@ -1728,6 +1936,12 @@ _URGENCY = _markers(
         "заблокир",
         "srochno",
         "zablokir",
+        "faqat shu oy",
+        "фақат шу ой",
+        "только в этом месяце",
+        "joylar cheklangan",
+        "жойлар чекланган",
+        "места ограничены",
     )
 )
 _MASS_FORWARD = _markers(
@@ -1780,6 +1994,40 @@ _PROMO = _markers(
         "портфолио",
         "portfolio",
         "join our",
+        "kanalga qo'shiling",
+        "каналга қўшилинг",
+        "vip kanal",
+        "vip guruh",
+        "vip-kanal",
+        "tarqatamiz",
+        "тарқатамиз",
+        "разошлем",
+        "разместим рекламу",
+    )
+)
+# A job advert: earnings from home, no experience needed, money passed through
+# the reader's own card (a money mule). A client asking for work writes none of
+# these together, and one alone stays under the spam line.
+_JOB_AD = _markers(
+    (
+        "ish taklifi",
+        "иш таклифи",
+        "uydan turib ish",
+        "uydan turib pul",
+        "uydan turib daromad",
+        "уйдан туриб иш",
+        "уйдан туриб пул",
+        "tajriba shart emas",
+        "тажриба шарт эмас",
+        "tajriba talab qilinmaydi",
+        "har o'tkazmadan",
+        "kartangiz orqali pul",
+        "картангиз орқали пул",
+        "работа на дому",
+        "без опыта",
+        "подработк",
+        "через вашу карту",
+        "work from home",
     )
 )
 # «Is this you?» asked on its own: the phrase ends its clause, so «bu sizmi
@@ -1802,6 +2050,21 @@ _PHOTO_LURE: list[re.Pattern[str]] = [
             "videoda sizmi",
             "videodagi sizmi",
             "rasmda senmi",
+            "sizmi videoda",
+            "senmi videoda",
+            "senmi rasmda",
+            # «your photo is being spread»: the shame lure
+            "rasmingizni tarqat",
+            "rasmlaringizni tarqat",
+            "videongizni tarqat",
+            "расмингизни тарқат",
+            "расмларингизни тарқат",
+            "видеонгизни тарқат",
+            "ваше фото слили",
+            "ваши фото слили",
+            "ваше видео слили",
+            "твои фото слили",
+            "твое фото слили",
         )
     ),
     re.compile(
@@ -1896,6 +2159,118 @@ _LOAN_TRADE = _markers(
         "qarzim",
         "поддон",
     )
+)
+# Social engineering with no link (owner decision: hard only in a strong
+# combination). A pretext: a new number «it's me», an officer of the customs
+# or the police, or a payee whose bank account «changed».
+_NEW_NUMBER = re.compile(
+    r"(?<![\w'])(?:yangi (?:raqam|nomer)(?:im|imdan|imga)"
+    r"|янги (?:рақам|номер)(?:им|имдан|имга)|(?:raqamim|nomerim) o'zgardi"
+    r"|(?:мой|это мой|у меня) нов\w* номер|с нов\w* номера|(?:my|this is my) new number"
+    r"|it'?s me,? (?:\S+ )?new number)"
+)
+_AUTHORITY = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:bojxona|божхона|customs|таможн\w*|гтк) (?:inspektor|xodim|officer|инспектор"
+    r"|ходим|сотрудник|офицер)\w*"
+    r"|(?:инспектор|сотрудник) (?:таможни|гтк|полиции|мвд|банка|службы безопасности)"
+    r"|(?:militsiya|politsiya|prokuratura|ichki ishlar"
+    r"|милиция|полиция|прокуратура|ички ишлар)"
+    r"\w* (?:xodim|ходим|сотрудник|inspektor|инспектор)\w*"
+    r"|(?:bank|банк)\w* (?:xavfsizlik xizmati|хавфсизлик хизмати|служб\w* безопасности)"
+    r"|служба безопасности банка|security department"
+    r")"
+)
+_CHANGED_ACCOUNT = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:bank )?account (?:has )?changed|account details (?:have )?changed"
+    r"|new (?:bank )?account(?! manager| owner| holder| executive)"
+    # «новый счёт» alone is also a new invoice; the account is «расчётный».
+    r"|реквизит\w* (?:изменил|поменял|сменил)\w*|нов\w* реквизит\w*"
+    r"|нов\w* расч[её]тн\w*|на нов\w* (?:расч[её]тн\w* )?сч[её]т\w*"
+    r"|(?:hisob raqam|rekvizit|karta)\w* (?:o'zgardi|o'zgartirildi|almashdi)"
+    r"|(?:ҳисоб рақам|реквизит|карта)\w* (?:ўзгарди|алмашди)"
+    r"|yangi (?:hisob raqam|rekvizit|karta)\w*|янги (?:ҳисоб рақам|реквизит|карта)\w*"
+    r")"
+)
+# Money asked for, to a card or an account the sender names.
+_MONEY_SEND = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:tashla|o'tkaz|to'la|jo'nat)(?:ing|ingiz|ib yuboring|b yuboring|ib bering"
+    r"|b bering|ng|ngiz)"
+    r"|(?:ташла|ўтказ|тўла)(?:инг|иб юборинг|б юборинг|нг)"
+    r"|переведите|переведи|скиньте|скинь|перекиньте|оплатите|перечислите|внесите"
+    r"|pay|transfer|send (?:the )?(?:money|payment)"
+    r")(?![\w'])"
+)
+_MONEY_TARGET = re.compile(
+    r"(?<![\w'])(?:(?:shu|bu|quyidagi|mana shu) (?:karta|hisob)\w*|kartaga|kartamga"
+    r"|(?:шу|бу) (?:карта|ҳисоб)\w*|картага"
+    r"|на (?:эту |этот |мою |новую |новый )?(?:карт|сч[её]т)\w*"
+    r"|to (?:this|the new|our new|the following|my) (?:card|account)"
+    r")|\b\d{4} ?\d{4} ?\d{4} ?\d{4}\b"
+)
+# The pressure a fraudster adds: hurry, a threat, no time to talk.
+_THREAT = _markers(
+    (
+        "jinoiy ish",
+        "жиноий иш",
+        "aks holda",
+        "акс ҳолда",
+        "musodara",
+        "мусодара",
+        "уголовн",
+        "иначе",
+        "конфиск",
+        "арест",
+        "qamoq",
+        "criminal",
+        "otherwise",
+    )
+)
+_PRESSURE = _markers(
+    (
+        "tezda",
+        "тезда",
+        "tezroq",
+        "hozir gaplasha olmayman",
+        "гаплаша олмайман",
+        "majlisdaman",
+        "мажлисдаман",
+        "не могу говорить",
+        "на совещании",
+        "can't talk",
+        "urgent",
+        "asap",
+        "immediately",
+        r"today\b",
+    )
+)
+# «Pul o'tkazdim, qabul qilish uchun QR kodni skanerlang»: nobody scans a QR
+# code to receive money; the code is a payment request.
+_QR = re.compile(r"(?<![\w'])(?:qr|кьюар|кюар)(?![a-z])")
+_SCAN_ASK = re.compile(
+    r"(?<![\w'])(?:skanerlang|skaner qiling|скан(?:ерланг|ер қилинг)|сканируйте"
+    r"|отсканируйте|scan)(?![\w'])"
+)
+_RECEIVE_MONEY = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:pul\w*|to'lov\w*|o'tkazma\w*|пул\w*|тўлов\w*) (?:\S+ )?"
+    r"(?:(?:qabul qil|ol)(?:ish|ing|asiz|ib|ib oling)|(?:қабул қил|ол)(?:иш|инг|асиз|иб))"
+    r"(?![\w'])"
+    r"|(?:получить|получения|принять) (?:\S+ )?(?:деньг|перевод|оплат|средств|платеж)\w*"
+    r"|(?:receive|claim) (?:the |your )?(?:money|payment|funds|transfer)"
+    r")"
+)
+_SENT_MONEY = re.compile(
+    r"(?<![\w'])(?:pul (?:o'tkazdim|tashladim|yubordim)|пул (?:ўтказдим|ташладим)"
+    r"|(?:перевел|перевела|отправил|отправила|скинул|скинула)"
+    r" (?:вам |тебе )?(?:деньги|оплату)?"
+    r"|i (?:have )?sent (?:you )?(?:the )?money)"
+)
+_RECEIVE = re.compile(
+    r"(?<![\w'])(?:qabul qilish uchun|qabul qilib olish|olish uchun|қабул қилиш учун"
+    r"|олиш учун|чтобы получить|для получения|to receive)"
 )
 _MENTION_OR_TAG = re.compile(r"(?<![\w])[#@]\w+")
 _MASS_LINKS = 3
@@ -2022,9 +2397,10 @@ def _code_request(folded: str) -> bool:
     """A one-time code or a password asked for.
 
     A request verb and a secret (a password, «tasdiqlash kodi»), or a code
-    word in an SMS context. Codes with a name (a client's GS code, a tariff
-    code, a Wi-Fi password) are no secret. A code to be said to the warehouse
-    keeper at pickup is the procedure. The writer's own code, a code to be
+    word («the digits from the SMS» too) in an SMS context. Codes with a name
+    (a client's GS code, a tariff code, a Wi-Fi password) are no secret. A
+    code to be said to the warehouse keeper at pickup, or to the courier once
+    the cargo is in hand, is the procedure. The writer's own code, a code to be
     sent on by SMS, and a question about how codes arrive are a client's
     talk, unless the code came to the reader or by mistake.
     """
@@ -2035,8 +2411,10 @@ def _code_request(folded: str) -> bool:
     to_reader = bool(_CODE_TO_READER.search(text))
     arrived = bool(_ARRIVED_CODE.search(text))
     secret = _any(_SECRET, text)
-    sms = _any(_SMS_CONTEXT, _SMS_OUT.sub(" ", text))
-    if not secret and not (_any(_OTP, text) and (sms or arrived or to_reader)):
+    digits = bool(_SMS_DIGITS.search(text))
+    sms = digits or _any(_SMS_CONTEXT, _SMS_OUT.sub(" ", text))
+    otp = digits or _any(_OTP, text)
+    if not secret and not (otp and (sms or arrived or to_reader)):
         return False
     if _IN_PERSON.search(text) and not _HERE.search(text):
         return False
@@ -2089,6 +2467,38 @@ def _photo_lure(folded: str, features: MessageFeatures, risky_links: bool) -> bo
     return risky_file or not features.known
 
 
+def _money_pretext(folded: str, features: MessageFeatures) -> tuple[list[str], list[str]]:
+    """Money to a card under a pretext, with no link at all.
+
+    A pretext (a new number «it's me», a customs or police officer, a payee
+    whose bank account changed) and money asked for to a card or an account
+    are each a soft signal; together from a stranger they add up to spam.
+    With pressure on top (hurry, a threat, «I can't talk now») from someone
+    who is no contact, it is the fraud itself: a hard hit.
+    """
+    pretext = bool(
+        _NEW_NUMBER.search(folded)
+        or _AUTHORITY.search(folded)
+        or _CHANGED_ACCOUNT.search(folded)
+    )
+    money = bool(_MONEY_SEND.search(folded)) and bool(_MONEY_TARGET.search(folded))
+    soft = [r for r, hit in ((R_PRETEXT, pretext), (R_MONEY_ASK, money)) if hit]
+    pressure = _any(_URGENCY, folded) or _any(_THREAT, folded) or _any(_PRESSURE, folded)
+    if pretext and money and pressure and not features.contact:
+        return [R_MONEY_PRETEXT], soft
+    return [], soft
+
+
+def _qr_receive(folded: str) -> bool:
+    """«Scan this QR to receive the money»: a QR code to scan, and money said
+    to be received by it."""
+    if not (_QR.search(folded) and _SCAN_ASK.search(folded)):
+        return False
+    if _RECEIVE_MONEY.search(folded):
+        return True
+    return bool(_SENT_MONEY.search(folded) and _RECEIVE.search(folded))
+
+
 def _text_hits(
     text: str, features: MessageFeatures, safe: frozenset[str]
 ) -> tuple[list[str], list[str]]:
@@ -2103,10 +2513,17 @@ def _text_hits(
     risky_urls = [u for u in features.urls if not _within(u.host, safe)]
     if _photo_lure(folded, features, bool(risky_urls)):
         hard.append(R_PHOTO_LURE)
-    if _any(_LURE, _NOT_LURE.sub(" ", folded)):
+    if _qr_receive(folded):
+        hard.append(R_QR_RECEIVE)
+    pretext_hard, pretext_soft = _money_pretext(folded, features)
+    hard += pretext_hard
+    soft += pretext_soft
+    if _any(_LURE, _NOT_LURE.sub(" ", folded)) or _EARNINGS.search(folded):
         soft.append(R_LURE)
     if _any(_PROMO, folded):
         soft.append(R_PROMO)
+    if _any(_JOB_AD, folded):
+        soft.append(R_JOB_AD)
     if _any(_URGENCY, folded):
         soft.append(R_URGENCY)
     tags = len(_MENTION_OR_TAG.findall(folded))
@@ -2149,6 +2566,11 @@ def scam_verdict(
         hard.append(R_EXEC_FILE)
     if attachment is not None and attachment.kind == ARCHIVE:
         hard.append(R_ARCHIVE_FILE)
+    if attachment is not None and attachment.kind == HTML and not features.contact:
+        # A web page as a file, from someone the owner never dealt with: a
+        # login form that runs offline («Akt_sverki.html»). From a contact it
+        # is the hijack check's to judge.
+        hard.append(R_HTML_FILE)
     if features.sender_scam:
         hard.append(R_TELEGRAM_SCAM)
     if features.sender_fake:

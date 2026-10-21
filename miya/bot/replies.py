@@ -301,6 +301,13 @@ SCAM_REASON_LABELS: dict[str, str] = {
     safety.R_TELEGRAM_SCAM: "Telegram bu akkauntni firibgar deb belgilagan",
     safety.R_TELEGRAM_FAKE: "Telegram bu akkauntni soxta deb belgilagan",
     safety.R_PHOTO_LURE: "«rasmda sizmi?» degan aldov",
+    safety.R_BRAND_PATH: "bank yoki to'lov sayti nomi begona sayt ichiga yashirilgan",
+    safety.R_LOGIN_PAGE: "begona saytda soxta kirish yoki tasdiqlash sahifasi",
+    safety.R_HTML_FILE: "notanish odam HTML fayl yuborgan (soxta sahifa bo'lishi mumkin)",
+    safety.R_MONEY_PRETEXT: (
+        "o'zini tanish yoki xodim deb tanitib, shoshilinch pul so'ralyapti"
+    ),
+    safety.R_QR_RECEIVE: "«pulni olish uchun QR skanerlang» degan aldov",
 }
 SCAM_REASON_FALLBACK = "shubhali belgilar"
 SCAM_REASONS_SHOWN = 2

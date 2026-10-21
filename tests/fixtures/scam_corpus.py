@@ -121,6 +121,102 @@ SCAM: list[dict] = [
     # An everyday-word brand alone or beside a lure word is the brand.
     case("Kartangizga bonus: https://humo-bonus.uz/karta", "scam", "brand_domain"),
     case("Sovg'a sizni kutmoqda: https://humo.top/bonus", "scam", "brand_domain"),
+    # A brand glued to an Uzbek or Russian lure word (a refund, a cashback, a
+    # promotion), and the post and the customs by name.
+    case(
+        "Click: sizga 2 450 000 so'm qaytarildi. Kartangizni ulang "
+        "https://click-qaytarish-test.uz/pay",
+        "scam",
+        "brand_domain",
+    ),
+    case("Humo keshbek tushdi! https://humo-cashback-test.site", "scam", "brand_domain"),
+    case(
+        "Bojxona: boj to'lovi to'lanmagan, yuk musodara qilinadi! "
+        "https://customs-uz-test.online/boj",
+        "scam",
+        "brand_domain",
+    ),
+    case(
+        "Посылка задержана на таможне, оплатите пошлину: "
+        "https://uzpost-tamozhnya-test.site/pay",
+        "scam",
+        "brand_domain",
+    ),
+    case(
+        "O'zbekiston pochtasi: manzilni yangilang https://uzpost.uz-delivery-test.cfd/track",
+        "scam",
+        "brand_domain",
+    ),
+    # Letters that pass for the brand's own: «rn» for «m».
+    case(
+        "Bepul Telegram Premium: https://telegrarn-test.org/premium",
+        "scam",
+        "brand_domain",
+    ),
+    # A payment domain written into another site's path, and a brand behind a
+    # bare address.
+    case(
+        "Payme: to'lovingiz to'xtatildi https://secure-pay-test.top/payme.uz/confirm?id=1",
+        "scam",
+        "brand_path",
+    ),
+    case("Hisobingiz bloklandi: http://91.198.10.17/click/restore", "scam", "brand_path"),
+    # A login page on a free host, and a restore page behind a bare address.
+    case(
+        "Yiwu sklad: yukingizni ko'rish uchun kiring https://yiwu-sklad-login-test.web.app",
+        "scam",
+        "login_page",
+    ),
+    case("Tiklash: http://91.198.10.17/account/restore", "scam", "login_page"),
+    # A web page as a file from a stranger.
+    case(
+        "Akt sverka, ochib tekshiring", "scam", "html_file", attachment="Akt_sverki.html"
+    ),
+    # The one-time code as «digits from the SMS», and the vote scam's «a code
+    # will come, send it to me» from a (hijacked) known contact.
+    case(
+        "Назовите, пожалуйста, цифры из СМС для подтверждения получения груза",
+        "scam",
+        "code_request",
+    ),
+    case("SMS dagi raqamlarni yozib yuboring iltimos", "scam", "code_request"),
+    case(
+        "Jiyanim tanlovda, ovoz bering 🙏 Hozir raqamingizga kod keladi, shuni menga "
+        "yuborib qo'ying",
+        "scam",
+        "code_request",
+        **KNOWN,
+    ),
+    # Money to a card under a pretext, with pressure, from a stranger: a new
+    # number «it's me», a customs officer's threat, a payee's changed account.
+    case(
+        "Salom, bu men, yangi raqamim. Hozir gaplasha olmayman. Shu kartaga tezda "
+        "4 mln tashlab yuboring: 9860 0000 1111 2222",
+        "scam",
+        "money_pretext",
+    ),
+    case(
+        "Bojxona inspektoriman. Yukingizda taqiqlangan tovar chiqdi. 500$ shu kartaga "
+        "o'tkazing, aks holda jinoiy ish ochiladi",
+        "scam",
+        "money_pretext",
+    ),
+    case(
+        "Hello, this is supplier accounting. Our bank account changed, please pay the "
+        "invoice to the new account below today. Urgent.",
+        "scam",
+        "money_pretext",
+    ),
+    # «Scan this QR to receive the money».
+    case(
+        "Pul o'tkazdim, qabul qilish uchun shu QR kodni Payme ilovasida skanerlang",
+        "scam",
+        "qr_receive",
+        attachment="qr_test.png",
+    ),
+    # «Is this you in the video?», «your photo is being spread», with a link.
+    case("Bu sizmi videoda? 😱 https://telegra.ph/Video-test-1", "scam", "photo_lure"),
+    case("Расмингизни тарқатишибди, қаранг! https://bit.ly/test4", "scam", "photo_lure"),
 ]
 
 
@@ -170,6 +266,38 @@ SPAM: list[dict] = [
         "spam",
         forwarded=True,
     ),
+    # Trading signals, mass ad posting, a money mule, work from home, «only
+    # this month».
+    case(
+        "🚀 Bitcoin signal! Kunlik 40% foyda, VIP kanalga qo'shiling: "
+        "https://t.me/+TestSignal Joylar cheklangan!",
+        "spam",
+        forwarded=True,
+    ),
+    case(
+        "Telegram guruhlarga reklama: 5000+ guruhga tarqatamiz, narxi 50 000 so'm. "
+        "Batafsil @test_reklama_bot",
+        "spam",
+    ),
+    case(
+        "Ish taklifi: kartangiz orqali pul o'tkazib berasiz, har o'tkazmadan 10% "
+        "sizniki. Kuniga 2-3 mln daromad 💰",
+        "spam",
+    ),
+    case(
+        "Uydan turib kuniga 1 000 000 so'm ishlang! Tajriba shart emas: "
+        "https://ish-test.site123.me",
+        "spam",
+    ),
+    case(
+        "📢 Xitoydan yuk 2$/kg dan! Eng arzon narx faqat shu oy! Do'stlaringizga "
+        "ulashing https://t.me/test_kargo",
+        "spam",
+        forwarded=True,
+    ),
+    # A pretext and money to a card from a stranger, with no pressure: spam,
+    # not the hard rule.
+    case("Yangi raqamim, shu kartaga 500 ming tashlang 9860 0000 3333 4444", "spam"),
 ]
 
 
@@ -181,6 +309,8 @@ HIJACK: list[dict] = [
     case("", "hijack", attachment="hisob_faktura.html", **KNOWN),
     # Money to my card and a promise to repay, with no trade around it.
     case("Привет, можешь скинуть 2000 на карту? Завтра верну", "hijack", **KNOWN),
+    # A goo.gl link that is no Google Maps one is still a short link.
+    case("Mana ko'ring: https://goo.gl/TestAb12", "hijack", **KNOWN),
 ]
 
 
@@ -346,4 +476,69 @@ BENIGN: list[dict] = [
         "ok",
         forwarded=True,
     ),
+    # A company named with an everyday-word brand and no lure word, a customs
+    # broker's site, a shop's own Payme page, a price list on a free host, a
+    # LAN camera's login page.
+    case("Humo Delivery: yukingiz yo'lda https://humo-delivery-test.uz", "ok"),
+    case("Brokerimiz sayti: https://customs-broker-test.uz", "ok"),
+    case("Do'kon: https://mening-dokonim-test.shop/pay/payme", "ok"),
+    case("Yangi narxlar: https://telegra.ph/Yiwu-narxlar-test", "ok"),
+    case("Narxlar: https://narx-test.web.app", "ok"),
+    case("Kamera: http://192.168.1.20/login", "ok", **KNOWN),
+    # The old goo.gl/maps links open only Google Maps.
+    case(
+        "Yetkazib berish manzili o'sha eski: https://goo.gl/maps/TestAbc123",
+        "ok",
+        **KNOWN,
+    ),
+    # The courier's handover code, said once the cargo is in hand; the number
+    # in an SMS to call.
+    case(
+        "Kuryer yo'lda. Yetkazganda u sizdan SMS dagi 4 xonali kodni so'raydi — faqat "
+        "yukni qo'lingizga olgandan keyin ayting",
+        "ok",
+        **KNOWN,
+    ),
+    case(
+        "Iltimos, SMS dagi raqamga qo'ng'iroq qiling, omborchi javob beradi",
+        "ok",
+        **KNOWN,
+    ),
+    # A pretext alone, a known payee's changed account, an account manager,
+    # a new invoice: no fraud.
+    case("Assalomu alaykum, yangi raqamimdan yozyapman, Akmal GS367. Yuk keldimi?", "ok"),
+    case(
+        "Bizning hisob raqamimiz o'zgardi, yangi rekvizitlar ilova. Bugundan shu "
+        "hisobga to'lang",
+        "ok",
+        attachment="rekvizit.pdf",
+        **KNOWN,
+    ),
+    case(
+        "Hello, this is the new account manager from Yiwu XH. Please pay the deposit to "
+        "this account, urgent, production starts today",
+        "ok",
+    ),
+    case(
+        "Отправил новый счёт, оплатите, пожалуйста, на карту 8600 0000 5555 6666 сегодня",
+        "ok",
+    ),
+    case(
+        "Bojxona inspektori hujjatlarni so'rayapti, invoysni srochno tashlang",
+        "ok",
+        **KNOWN,
+    ),
+    # A QR code to pay with, or to collect the cargo with.
+    case("To'lov uchun QR kod tashlang, Click orqali skanerlayman", "ok", **KNOWN),
+    case(
+        "To'lovni oldindan qilish uchun QR kodni skanerlang",
+        "ok",
+        attachment="qr.png",
+        **KNOWN,
+    ),
+    case("Yukni olish uchun QR kodni omborda skanerlang", "ok", **KNOWN),
+    # A job seeker, ordering from home, «only this month» from a client.
+    case("Ish taklifi bormi? Haydovchiman, tajriba 10 yil", "ok"),
+    case("Uydan turib buyurtma bermoqchiman, srochno kerak", "ok"),
+    case("Faqat shu oy ichida to'lab qo'ysam bo'ladimi?", "ok", **KNOWN),
 ]
