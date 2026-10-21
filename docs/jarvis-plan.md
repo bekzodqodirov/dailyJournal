@@ -2193,6 +2193,35 @@ xarajat chegarasi tiklandi".
 
 **Acceptance.** Health suite green; an install without Jarvis shows no new lines.
 
+**As built.** `miya/jarvis/status.health_facts` (mypy strict) counts Jarvis's share in SQL and
+`health.gather` imports it only with JARVIS_ENABLED, in a savepoint: a failed read is the one line
+«⚠️ Jarvis — holatini o'qib bo'lmadi (make bot logini ko'ring)» (the bot gathers `/holat` and logs
+the failure), never a failed status, and while the read fails no Jarvis key is announced as
+recovered (`health.unjudged`). The values are plain (`health.JarvisHealth`, `health.ChannelSend`),
+so `problems()` and `replies.py` never import miya.jarvis. `outbox_stuck` counts approved rows due
+for 10 minutes (`STUCK_AFTER`; the due moment is the latest of the approval, `not_before` and the
+gate's `next_attempt_at`) on a channel whose switch is on with no pause or breaker in force, and the
+Telegram sender's own flood-wait pause (`sender_paused_until` on the userbot beat) counts as waiting
+until 10 minutes past its end; claimed rows whose lease ran out 10 minutes ago without a reconcile
+count too. The overdue rows of a channel not looked at (switched off, paused, limited, or the sender
+waiting out a flood wait) are counted as held (`backlog_held`): they are not a stuck queue, but
+while any are held `outbox_stuck` does not recover, so «✅ Xabar yuborish tiklandi» is said only once
+the rows left or were cancelled. The sweep tells `outbox_stuck` in quiet hours too, silently
+(`health.QUIET_SILENT`): the owner's approved sends go out at night, so a stuck queue is not held
+until morning; its recovery waits for morning like every other. The breaker trip is not sent by
+`jarvis_cards` but by `jarvis_send_notices` in the `jarvis_outbox` job, where JV-19 put it, and the
+JV-16 cost-stop notice by `jarvis_respond`: each records its delivery as the ledger's `alert:` row
+(`health.TOLD_FIRST_ELSEWHERE`), so the 5-minute sweep never says them first, repeats them word for
+word after ALERT_REPEAT_HOURS and says «tiklandi» once. A Jarvis key never recovers while its switch
+is off. The plan's «✅ Xabar yuborish tiklandi» is `outbox_stuck`'s recovery; `telegram_send_limited`
+says «✅ Telegram yuborish tiklandi». In «🤖 Jarvis: … bugun {y}/{cap} yuborildi» `{y}/{cap}` is the
+pair `/jarvis` shows as its limit: the mode's capped count today against its daily cap (auto sends
+against JARVIS_AUTO_DAILY_CAP in `auto`, draft cards against JARVIS_DRAFT_DAILY_CAP otherwise),
+`{q}` the approved rows waiting. Beyond the plan's lines `/holat` shows today's drafts, escalations
+and spend against the cap («🧾 Jarvis bugun: …»), the Telegram send line's other states (off, paused,
+waiting out a flood wait, the sender down), another channel's line only while its breaker is in
+force, rows stuck in a claim, sends in doubt of the last 24 hours and the responder job's last run.
+
 ---
 
 #### JV-22 — Jarvis sections in the 09:00 and 20:00 reports

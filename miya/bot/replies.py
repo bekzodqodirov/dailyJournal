@@ -2738,6 +2738,192 @@ def _phone_line(status: health.Status) -> str | None:
     return f"📱 Telefon — oxirgi aloqa: {contact} · oxirgi yangi voqea: {event}{tail}"
 
 
+# --- Jarvis in /holat (JV-21) ----------------------------------------------------
+# Only with JARVIS_ENABLED: off, /holat has none of these lines (rule 20). The
+# values come from health.JarvisHealth, plain, never from miya.jarvis.
+
+JARVIS_HEALTH_LINE = "🤖 Jarvis: {rejim} · bugun {y}/{cap} yuborildi · navbatda {q}"
+JARVIS_HEALTH_PAUSED = "{rejim}, to'xtatilgan"
+JARVIS_HEALTH_TODAY = (
+    "🧾 Jarvis bugun: {d} ta qoralama · {e} ta eskalatsiya · xarajat {x} / {cap}"
+)
+JARVIS_HEALTH_CAPPED = " — chegaraga yetdi"
+JARVIS_HEALTH_UNPRICED = " · narxi noma'lum: {n} ta chaqiruv"
+JARVIS_HEALTH_UNREADABLE = (
+    "⚠️ Jarvis — holatini o'qib bo'lmadi (<code>make bot</code> logini ko'ring)"
+)
+JARVIS_SEND_LINE = "📤 {kanal} yuborish: {holat}"
+JARVIS_SEND_WORKING = "✅ ishlayapti"
+JARVIS_SEND_LIMITED = "⛔ cheklangan ({gacha})"
+JARVIS_SEND_OFF = "⏸ o'chirilgan ({kalit}=false)"
+JARVIS_SEND_PAUSED = "⏸ to'xtatilgan (/jarvis yoq)"
+JARVIS_SEND_WAITING = "⏳ Telegram kutishni so'radi ({gacha})"
+JARVIS_SEND_DOWN = "⚠️ yuboruvchi ishlamayapti ({sabab})"
+JARVIS_SEND_LAST = " · oxirgi yuborish: {vaqt}"
+JARVIS_UNTIL = "{vaqt} gacha"
+JARVIS_UNTIL_LIFTED = "/jarvis yoq {kanal} bilan yoqilguncha"
+# A breaker this far ahead has no end Telegram named: it lasts until lifted.
+JARVIS_UNTIL_LIFTED_AFTER = timedelta(days=365)
+# The sender's own state on the userbot beat (JV-19) in the owner's words.
+JARVIS_SENDER_STATES = {
+    "restarting": "qayta ishga tushirilmoqda",
+    "stopped": "to'xtagan",
+    "not_started": "ishga tushmadi",
+}
+JARVIS_SENDER_NEVER = "hali ishga tushmagan"
+JARVIS_SENDER_USERBOT_DOWN = "Telegram o'quvchi jim"
+JARVIS_LEASES_STUCK = "⚠️ Jarvis: {n} ta xabar yuborilish holatida qotib qoldi"
+JARVIS_UNKNOWN_LINE = (
+    "❓ Jarvis: {n} ta xabar yuborilganmi — aniq emas (24 soat ichida). "
+    "Chatni tekshiring."
+)
+JARVIS_RESPONDER_OK = "✅ Javob beruvchi — oxirgi ishga tushish: {vaqt}"
+JARVIS_RESPONDER_NEVER = "⚠️ Javob beruvchi — hali ishga tushmagan"
+JARVIS_RESPONDER_SILENT = "❌ Javob beruvchi — {vaqt}dan beri ishlamagan"
+JARVIS_RESPONDER_FAILED = "❌ Javob beruvchi — xato: <code>{xato}</code>"
+# The channels' names in the send lines (JARVIS_CHANNEL_LABELS is defined with
+# the cards, further down; the send switch names the .env key to change).
+JARVIS_SEND_SWITCH_KEYS = {
+    "telegram": "TELEGRAM_SEND_ENABLED",
+    "whatsapp": "WHATSAPP_SEND_ENABLED",
+    "gmail": "GMAIL_SEND_ENABLED",
+}
+
+
+def _until_label(until: datetime, now: datetime, channel: str) -> str:
+    """'bugun 18:30 gacha' / 'ertaga 09:00 gacha' / '/jarvis yoq telegram
+    bilan yoqilguncha' for a breaker with no end Telegram named."""
+    if until - now > JARVIS_UNTIL_LIFTED_AFTER:
+        return JARVIS_UNTIL_LIFTED.format(kanal=channel)
+    local = until.astimezone(settings.tz)
+    days = (local.date() - now.astimezone(settings.tz).date()).days
+    if days == 0:
+        day = "bugun"
+    elif days == 1:
+        day = "ertaga"
+    else:
+        day = short_date(local.date())
+    return JARVIS_UNTIL.format(vaqt=f"{day} {clock(local)}")
+
+
+def _parsed_at(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=settings.tz)
+
+
+def _telegram_send_state(status: health.Status, channel: health.ChannelSend) -> str:
+    """The Telegram send line's state: the switch, the breaker, the owner's
+    pause, the sender's own wait and its loop, from the userbot beat."""
+    if not channel.send_enabled:
+        return JARVIS_SEND_OFF.format(kalit=JARVIS_SEND_SWITCH_KEYS["telegram"])
+    if channel.limited and channel.breaker_until is not None:
+        return JARVIS_SEND_LIMITED.format(
+            gacha=_until_label(channel.breaker_until, status.now, "telegram")
+        )
+    if channel.paused:
+        return JARVIS_SEND_PAUSED
+    userbot = status.components.get("userbot")
+    detail = (userbot.detail if userbot is not None else None) or {}
+    if userbot is None or userbot.stale or userbot.disabled:
+        return JARVIS_SEND_DOWN.format(sabab=JARVIS_SENDER_USERBOT_DOWN)
+    state = detail.get("sender")
+    if state != "running":
+        sabab = JARVIS_SENDER_STATES.get(str(state), JARVIS_SENDER_NEVER)
+        error = detail.get("sender_error")
+        if state in JARVIS_SENDER_STATES and error:
+            sabab += f": <code>{escape(str(error))}</code>"
+        return JARVIS_SEND_DOWN.format(sabab=sabab)
+    paused_until = _parsed_at(detail.get("sender_paused_until"))
+    if paused_until is not None and paused_until > status.now:
+        return JARVIS_SEND_WAITING.format(
+            gacha=_until_label(paused_until, status.now, "telegram")
+        )
+    line = JARVIS_SEND_WORKING
+    sent_at = _parsed_at(detail.get("sender_sent_at"))
+    if sent_at is not None:
+        line += JARVIS_SEND_LAST.format(vaqt=_since_when(sent_at, status.now))
+    return line
+
+
+def _jarvis_send_lines(status: health.Status, jarvis: health.JarvisHealth) -> list[str]:
+    """One line for Telegram, whose sender exists (JV-19); another channel
+    only while its breaker is in force (its adapter lands with JV-27/JV-30)."""
+    lines: list[str] = []
+    for channel in jarvis.channels:
+        name = JARVIS_CHANNEL_LABELS.get(channel.channel, channel.channel)
+        if channel.channel == "telegram":
+            holat = _telegram_send_state(status, channel)
+        elif channel.limited and channel.breaker_until is not None:
+            holat = JARVIS_SEND_LIMITED.format(
+                gacha=_until_label(channel.breaker_until, status.now, channel.channel)
+            )
+        else:
+            continue
+        lines.append(JARVIS_SEND_LINE.format(kanal=name, holat=holat))
+    return lines
+
+
+def _jarvis_responder_line(status: health.Status) -> str:
+    """The responder job's last run, from its ``job:`` heartbeat."""
+    job = status.jobs.get(health.JARVIS_RESPOND_JOB)
+    if job is None or job.age is None:
+        return JARVIS_RESPONDER_NEVER
+    if job.detail.get("ok") is False:
+        error = str(job.detail.get("error") or "?")[:120]
+        return JARVIS_RESPONDER_FAILED.format(xato=escape(error))
+    if job.stale:
+        return JARVIS_RESPONDER_SILENT.format(vaqt=age_label(job.age))
+    return JARVIS_RESPONDER_OK.format(vaqt=_ago(job.age))
+
+
+def jarvis_status_lines(status: health.Status) -> list[str] | None:
+    """Jarvis's lines in /holat (JV-21); None while JARVIS_ENABLED is off.
+
+    The mode with today's capped count against the mode's daily cap (auto
+    sends in auto mode, else draft cards, as /jarvis shows it) and the send
+    queue, today's drafts, escalations and spend against
+    JARVIS_DAILY_COST_CAP_USD, each channel's sending, sends stuck in a
+    claim, sends in doubt, and the responder's last run. A stuck queue, the
+    Telegram limit and the cost cap are also problems, listed at the end.
+    """
+    if not settings.jarvis_enabled:
+        return None
+    jarvis = status.jarvis
+    if jarvis is None:
+        return [JARVIS_HEALTH_UNREADABLE] if status.jarvis_unreadable else None
+    rejim = jarvis_mode_label(jarvis.mode).split(" (")[0]
+    if jarvis.paused:
+        rejim = JARVIS_HEALTH_PAUSED.format(rejim=rejim)
+    today = JARVIS_HEALTH_TODAY.format(
+        d=jarvis.drafts,
+        e=jarvis.escalations,
+        x=usd(jarvis.cost_usd),
+        cap=usd(jarvis.cost_cap_usd),
+    )
+    if jarvis.cost_unpriced:
+        today += JARVIS_HEALTH_UNPRICED.format(n=jarvis.cost_unpriced)
+    if jarvis.cost_capped:
+        today += JARVIS_HEALTH_CAPPED
+    lines = [
+        JARVIS_HEALTH_LINE.format(
+            rejim=rejim, y=jarvis.daily_used, cap=jarvis.daily_cap, q=jarvis.queued
+        ),
+        today,
+        *_jarvis_send_lines(status, jarvis),
+    ]
+    if jarvis.leases_stuck:
+        lines.append(JARVIS_LEASES_STUCK.format(n=jarvis.leases_stuck))
+    if jarvis.unknown:
+        lines.append(JARVIS_UNKNOWN_LINE.format(n=jarvis.unknown))
+    lines.append(_jarvis_responder_line(status))
+    return lines
+
+
 OWNER_ALIASES_BLANK = (
     "ℹ️ OWNER_ALIASES bo'sh — guruhlarda ismingizni yozib murojaat qilinganlar "
     "«sizga» deb belgilanmaydi (faqat @-eslatma va javoblar). .env ga qo'shing."
@@ -2767,6 +2953,7 @@ def status_report(
         *([line] if (line := _phone_line(status)) else []),
         *([line] if (line := _drill_line(status)) else []),
         *([line] if (line := _sheets_line(status)) else []),
+        *(jarvis_status_lines(status) or []),
         "<b>Navbatda</b>: "
         f"kutayotgan suhbatlar {status.windows_pending} · "
         f"batch'da {status.windows_submitted} · "
@@ -3433,11 +3620,9 @@ JARVIS_SEND_UNKNOWN = (
 # --- the Telegram sender (JV-19) -----------------------------------------------------
 # Told by the worker from what the sender recorded: the Telegram breaker, a
 # flood wait, and how each send the owner tapped ended.
-JARVIS_TELEGRAM_LIMITED = (
-    "⛔ Telegram yuborishni cheklab qo'ydi. MIYA Telegramdan yozishni to'xtatdi; "
-    "o'qish davom etadi. @SpamBot orqali holatni tekshiring. "
-    "Qayta yoqish: /jarvis yoq telegram"
-)
+# The trip notice is also the health sweep's repeat of it (JV-21), so its one
+# wording lives with the problem in services/health.py.
+JARVIS_TELEGRAM_LIMITED = health.TELEGRAM_SEND_LIMITED
 JARVIS_TELEGRAM_FLOOD = (
     "⏳ Telegram {daqiqa} daqiqa kutishni so'radi — xabarlar keyinroq yuboriladi."
 )
@@ -3916,9 +4101,8 @@ JARVIS_SHADOW_LINE = (
 )
 # Drafts per kind with a free-form statement: never sent on their own.
 JARVIS_SHADOW_STRAYED = "Erkin gapli qoralamalar (o'zi yuborilmasdi): {items}"
-JARVIS_COST_STOP = (
-    "💸 Jarvis bugungi xarajat chegarasiga yetdi — ertagacha faqat sizga yo'naltiradi."
-)
+# Also the health sweep's repeat of it (JV-21): one wording, in health.py.
+JARVIS_COST_STOP = health.JARVIS_COST_CAP
 SHADOW_DRAFTS_HEADER = "🧪 Kuzatuv qoralamalari:"
 SHADOW_DRAFT_LINE = "{i}. {ism}: «{mijoz}» → «{qoralama}» [{intent}]"
 SHADOW_DRAFTS_EMPTY = "🧪 Kuzatuv qoralamalari hali yo'q."

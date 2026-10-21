@@ -19,6 +19,12 @@ shared core of that:
   ledger, ``reminder_log``, so the bot's watchdog and the worker's health
   job share it: whichever of them is alive speaks, and neither repeats the
   other.
+* **Jarvis** (JV-21) — only with JARVIS_ENABLED, :func:`gather` adds
+  Jarvis's share (the mode, today's counts, the spend against its cap, each
+  channel's breaker, the send queue) from ``miya.jarvis.status``, imported
+  then and never at startup; with Jarvis off nothing new is read, judged or
+  alerted (rule 20). A Telegram breaker trip and the cost cap are first told
+  by their own jobs at once; the ledger repeats and recovers them.
 
 Nothing here sends anything. The worker and the bot decide *how* (quiet
 hours, plain-text fallback) and record only what was actually delivered.
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -83,6 +90,42 @@ PROBLEM_KEYS = (
     "phone_stream_off",
     "restore_drill_failed",
     "sheets_failing",
+    "outbox_stuck",
+    "telegram_send_limited",
+    "jarvis_cost_cap",
+)
+# JV-21: Jarvis's own problems. Each is judged only with JARVIS_ENABLED (and
+# the Telegram limit only with TELEGRAM_SEND_ENABLED), and neither alerted nor
+# recovered with its switch off (rule 20).
+JARVIS_PROBLEM_KEYS = ("outbox_stuck", "telegram_send_limited", "jarvis_cost_cap")
+OUTBOX_STUCK_KEY = "outbox_stuck"
+TELEGRAM_SEND_LIMITED_KEY = "telegram_send_limited"
+JARVIS_COST_CAP_KEY = "jarvis_cost_cap"
+# The problems whose first message another job sends the moment it happens:
+# the Telegram breaker trip (the worker's jarvis_send_notices, JV-19) and the
+# cost cap stopping the responder (jarvis_respond, JV-16). That job records
+# its delivery in this ledger, so the health sweep never says it first; it
+# only repeats it after ALERT_REPEAT_HOURS and says «tiklandi» once it clears.
+TOLD_FIRST_ELSEWHERE = frozenset({TELEGRAM_SEND_LIMITED_KEY, JARVIS_COST_CAP_KEY})
+# Warnings the worker's sweep still tells in quiet hours, silently: the owner's
+# approved sends go out at night too, so a queue that stopped moving is not
+# held until morning (JV-21). The Telegram trip is told at once by its job.
+QUIET_SILENT = frozenset({OUTBOX_STUCK_KEY})
+# The responder's scheduler job (its ``job:`` heartbeat), shown in /holat.
+JARVIS_RESPOND_JOB = "jarvis_respond"
+OUTBOX_STUCK = (
+    "📤 {n} ta xabar {daqiqa} daqiqadan beri yuborilmay turibdi. "
+    "Userbot ishlayotganini tekshiring."
+)
+# The JV-19 trip notice, which the health sweep repeats word for word.
+TELEGRAM_SEND_LIMITED = (
+    "⛔ Telegram yuborishni cheklab qo'ydi. MIYA Telegramdan yozishni to'xtatdi; "
+    "o'qish davom etadi. @SpamBot orqali holatni tekshiring. "
+    "Qayta yoqish: /jarvis yoq telegram"
+)
+# The JV-16 cost-stop notice, which the health sweep repeats word for word.
+JARVIS_COST_CAP = (
+    "💸 Jarvis bugungi xarajat chegarasiga yetdi — ertagacha faqat sizga yo'naltiradi."
 )
 # The phone app's streams (WP-66), as the heartbeat names them.
 KNOWN_STREAMS = ("call_log", "sms", "recordings", "notifications")
@@ -250,6 +293,69 @@ class BackupInfo:
     send_error: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelSend:
+    """One Jarvis channel's sending as the status sees it (JV-21)."""
+
+    channel: str
+    # Its <CHANNEL>_SEND_ENABLED switch.
+    send_enabled: bool
+    # A pause in force: the owner's /jarvis toxtat, global or this channel's.
+    paused: bool = False
+    # The breaker in force (a platform limit), with its end; None when not
+    # tripped.
+    breaker_until: datetime | None = None
+    breaker_reason: str | None = None
+
+    @property
+    def limited(self) -> bool:
+        return self.breaker_until is not None
+
+
+@dataclass(frozen=True, slots=True)
+class JarvisHealth:
+    """Jarvis's share of the status (JV-21), every number counted in SQL by
+    miya.jarvis.status.health_facts. Plain values: this module, the bot's
+    replies and the tests read them without importing miya.jarvis."""
+
+    # The global mode under the env ceiling.
+    mode: str
+    # The owner's global pause (/jarvis toxtat) is in force.
+    paused: bool
+    drafts: int
+    sent: int
+    escalations: int
+    # The mode's capped count today and its daily cap, the pair /jarvis shows:
+    # auto sends against JARVIS_AUTO_DAILY_CAP in auto mode, else draft cards
+    # against JARVIS_DRAFT_DAILY_CAP.
+    daily_used: int
+    daily_cap: int
+    # Approved rows waiting for an adapter.
+    queued: int
+    # Approved rows due this long ago on a channel that should be sending
+    # (miya.jarvis.status.STUCK_AFTER) and 'sending' rows whose lease ran out
+    # without a reconcile, with the oldest moment among them.
+    backlog_stuck: int
+    leases_stuck: int
+    stuck_since: datetime | None
+    # Sends in doubt (state 'unknown') of the last day.
+    unknown: int
+    cost_usd: Decimal
+    cost_cap_usd: Decimal
+    # Jarvis calls recorded without a price (the spend is then unknown).
+    cost_unpriced: int
+    cost_capped: bool
+    # Approved rows past STUCK_AFTER on a channel that is not expected to send
+    # now (switched off, paused, its breaker in force, or the Telegram
+    # sender waiting out a flood wait): held, so a stuck queue does not count
+    # as recovered while they wait.
+    backlog_held: int = 0
+    channels: tuple[ChannelSend, ...] = ()
+
+    def channel(self, name: str) -> ChannelSend | None:
+        return next((c for c in self.channels if c.channel == name), None)
+
+
 @dataclass(slots=True)
 class Status:
     now: datetime
@@ -292,6 +398,10 @@ class Status:
     api_starts_last_hour: int = 0
     embed_backlog: int = 0
     embed_oldest_at: datetime | None = None
+    # JV-21: only with JARVIS_ENABLED. ``jarvis_unreadable`` is a Jarvis read
+    # that failed: one line in /holat, never a failed status.
+    jarvis: JarvisHealth | None = None
+    jarvis_unreadable: bool = False
 
     @classmethod
     def unreachable(cls, now: datetime) -> Status:
@@ -407,6 +517,35 @@ async def _window_counts(session: AsyncSession, now: datetime) -> tuple[int, int
     )
 
 
+async def _jarvis_health(
+    session: AsyncSession, userbot: Heartbeat | None, now: datetime
+) -> tuple[JarvisHealth | None, bool]:
+    """Jarvis's share of the status (JV-21) and whether reading it failed.
+
+    Called only with JARVIS_ENABLED: miya.jarvis is imported here, never at
+    startup (rule 20). The read runs in a savepoint and is contained: a
+    failure is logged with its class and leaves the rest of the status whole.
+    The sender's own pause (a flood wait) rides the userbot beat (JV-19).
+    """
+    detail = dict((userbot.detail if userbot is not None else None) or {})
+    try:
+        from miya.jarvis import status as jarvis_status
+
+        async with session.begin_nested():
+            facts = await jarvis_status.health_facts(
+                session,
+                now,
+                sender_paused_until=_parse_iso(detail.get("sender_paused_until")),
+            )
+    except Exception as exc:
+        log.error(
+            "health: the jarvis status could not be read",
+            extra={"error": type(exc).__name__},
+        )
+        return None, True
+    return facts, False
+
+
 async def gather(session: AsyncSession, *, now: datetime | None = None) -> Status:
     """Everything ``/holat`` shows, in one pass of bounded queries.
 
@@ -433,6 +572,8 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
     needs_review = claims_pending = money_review = 0
     cost_today = cost_month = Decimal("0")
     anthropic_last_ok_at = None
+    jarvis: JarvisHealth | None = None
+    jarvis_unreadable = False
     if db_ok:
         rows = await beats(session)
         db_size = await session.scalar(
@@ -508,6 +649,10 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
                 UsageLog.provider == "anthropic"
             )
         )
+        if settings.jarvis_enabled:
+            jarvis, jarvis_unreadable = await _jarvis_health(
+                session, rows.get("userbot"), now
+            )
 
     anthropic_silent = (
         anthropic_last_ok_at is None or now - anthropic_last_ok_at > ANTHROPIC_SILENCE
@@ -565,6 +710,8 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Statu
         cost_month_usd=cost_month,
         anthropic_last_ok_at=anthropic_last_ok_at,
         anthropic_failing=failed > 0 or (pending > 0 and anthropic_silent),
+        jarvis=jarvis,
+        jarvis_unreadable=jarvis_unreadable,
     )
 
 
@@ -689,6 +836,64 @@ def sheets_failure(status: Status) -> str | None:
         return None
     code = str(detail.get("error") or "?")
     return SHEETS_REASONS.get(code, code)
+
+
+def jarvis_of(status: Status) -> JarvisHealth | None:
+    """Jarvis's share of the status, or None while JARVIS_ENABLED is off:
+    with Jarvis off nothing new is judged or shown (rule 20)."""
+    if not settings.jarvis_enabled:
+        return None
+    return status.jarvis
+
+
+def outbox_stuck(status: Status) -> tuple[int, int] | None:
+    """``(messages, minutes)`` waiting to leave past their time, or None."""
+    jarvis = jarvis_of(status)
+    if jarvis is None:
+        return None
+    count = jarvis.backlog_stuck + jarvis.leases_stuck
+    if count <= 0:
+        return None
+    since = jarvis.stuck_since or status.now
+    minutes = max(int((status.now - since).total_seconds() // 60), 1)
+    return count, minutes
+
+
+def telegram_limited(status: Status) -> ChannelSend | None:
+    """The Telegram channel while its breaker is in force (JV-19), only with
+    TELEGRAM_SEND_ENABLED."""
+    jarvis = jarvis_of(status)
+    if jarvis is None or not settings.telegram_send_enabled:
+        return None
+    telegram = jarvis.channel("telegram")
+    return telegram if telegram is not None and telegram.limited else None
+
+
+def jarvis_cost_capped(status: Status) -> bool:
+    jarvis = jarvis_of(status)
+    return jarvis is not None and jarvis.cost_capped
+
+
+def feature_on(key: str) -> bool:
+    """Whether a problem key's feature is switched on: a Jarvis key is
+    neither alerted nor recovered with its switch off (rule 20)."""
+    if key in JARVIS_PROBLEM_KEYS and not settings.jarvis_enabled:
+        return False
+    return not (key == TELEGRAM_SEND_LIMITED_KEY and not settings.telegram_send_enabled)
+
+
+def unjudged(status: Status) -> frozenset[str]:
+    """The Jarvis keys this status cannot clear: all of them when the Jarvis
+    read failed (nothing was seen, so nothing recovered), and ``outbox_stuck``
+    while approved rows are only held on a channel not sending now. They are
+    neither alerted nor announced as recovered until a status shows them."""
+    if not settings.jarvis_enabled:
+        return frozenset()
+    if status.jarvis is None:
+        return frozenset(JARVIS_PROBLEM_KEYS)
+    if status.jarvis.backlog_held > 0:
+        return frozenset({OUTBOX_STUCK_KEY})
+    return frozenset()
 
 
 def problems(status: Status) -> list[Problem]:
@@ -909,6 +1114,18 @@ def problems(status: Status) -> list[Problem]:
                 SHEETS_FAILING.format(sabab=escape(sheets_reason)),
             )
         )
+    if telegram_limited(status) is not None:
+        found.append(Problem(TELEGRAM_SEND_LIMITED_KEY, "warning", TELEGRAM_SEND_LIMITED))
+    stuck = outbox_stuck(status)
+    if stuck is not None:
+        count, minutes = stuck
+        found.append(
+            Problem(
+                OUTBOX_STUCK_KEY, "warning", OUTBOX_STUCK.format(n=count, daqiqa=minutes)
+            )
+        )
+    if jarvis_cost_capped(status):
+        found.append(Problem(JARVIS_COST_CAP_KEY, "warning", JARVIS_COST_CAP))
     revoked, _never = phone_streams(status)
     if revoked:
         names = ", ".join(STREAM_LABEL[key] for key in revoked)
@@ -948,13 +1165,24 @@ def problems(status: Status) -> list[Problem]:
 
 
 async def alerts_due(
-    session: AsyncSession, problems: list[Problem], *, now: datetime | None = None
+    session: AsyncSession,
+    problems: list[Problem],
+    *,
+    now: datetime | None = None,
+    unjudged: Collection[str] = (),
 ) -> tuple[list[Problem], list[str]]:
     """Which problems to say now, and which keys have recovered.
 
     A problem is due when no ``alert:<key>`` row is newer than
     ALERT_REPEAT_HOURS. A key has recovered when it is no longer a problem
     and its last ``alert:`` row is newer than its last ``recovered:`` row.
+
+    A key in TOLD_FIRST_ELSEWHERE is first said by its own job, at once
+    (JV-21): here it is due only once that job recorded the alert of this
+    episode (an ``alert:`` row newer than the last ``recovered:`` one), so
+    the sweep repeats it but never doubles it. A key whose feature is
+    switched off never recovers (rule 20), nor does a key in ``unjudged``
+    (see :func:`unjudged`): a state that was not read is not a recovery.
     """
     now = _now(now)
     kinds = [ALERT_KIND + key for key in PROBLEM_KEYS] + [
@@ -968,25 +1196,29 @@ async def alerts_due(
     last: dict[str, datetime] = dict(rows.all())
     repeat = timedelta(hours=settings.alert_repeat_hours)
 
+    def told(key: str) -> bool:
+        """This episode was announced: an alert newer than its recovery."""
+        alerted = last.get(ALERT_KIND + key)
+        if alerted is None:
+            return False
+        cleared = last.get(RECOVERED_KIND + key)
+        return cleared is None or cleared < alerted
+
     due = [
         problem
         for problem in problems
-        if (
+        if (problem.key not in TOLD_FIRST_ELSEWHERE or told(problem.key))
+        and (
             last.get(ALERT_KIND + problem.key) is None
             or now - last[ALERT_KIND + problem.key] > repeat
         )
     ]
     current = {problem.key for problem in problems}
-    recovered = []
-    for key in PROBLEM_KEYS:
-        if key in current:
-            continue
-        alerted = last.get(ALERT_KIND + key)
-        if alerted is None:
-            continue
-        cleared = last.get(RECOVERED_KIND + key)
-        if cleared is None or cleared < alerted:
-            recovered.append(key)
+    recovered = [
+        key
+        for key in PROBLEM_KEYS
+        if key not in current and key not in unjudged and feature_on(key) and told(key)
+    ]
     return due, recovered
 
 
@@ -1032,6 +1264,9 @@ _RECOVERY = {
     "backup_failed": "✅ Zaxira nusxa yana Telegramga yetib bordi — tiklandi",
     "anthropic_failing": "✅ Anthropic qayta ishlayapti — tiklandi",
     "review_backlog": "✅ Ishlanmagan xabarlar navbati bo'shadi — tiklandi",
+    "outbox_stuck": "✅ Xabar yuborish tiklandi",
+    "telegram_send_limited": "✅ Telegram yuborish tiklandi",
+    "jarvis_cost_cap": "✅ Jarvis xarajat chegarasi tiklandi",
 }
 
 
@@ -1044,26 +1279,44 @@ __all__ = [
     "ALERT_KIND",
     "BACKUP_COMPONENT",
     "COMPONENTS",
+    "JARVIS_COST_CAP",
+    "JARVIS_COST_CAP_KEY",
+    "JARVIS_PROBLEM_KEYS",
+    "JARVIS_RESPOND_JOB",
     "JOB_PREFIX",
+    "OUTBOX_STUCK",
+    "OUTBOX_STUCK_KEY",
     "PROBLEM_KEYS",
+    "QUIET_SILENT",
     "RECOVERED_KIND",
     "REVIEW_BACKLOG_THRESHOLD",
     "SHEETS_COMPONENT",
+    "TELEGRAM_SEND_LIMITED",
+    "TELEGRAM_SEND_LIMITED_KEY",
+    "TOLD_FIRST_ELSEWHERE",
     "BackupInfo",
+    "ChannelSend",
     "Component",
+    "JarvisHealth",
     "Problem",
     "Status",
     "alerts_due",
     "beat",
     "beats",
     "component_of",
+    "feature_on",
     "gather",
+    "jarvis_cost_capped",
+    "jarvis_of",
     "mark_alerted",
     "mark_recovered",
+    "outbox_stuck",
     "problems",
     "recovery_text",
     "sheets_failure",
     "sheets_last_ok_at",
     "size_label",
     "stale_after",
+    "telegram_limited",
+    "unjudged",
 ]

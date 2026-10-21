@@ -88,7 +88,11 @@ Jobs:
   * heartbeat    — every minute; the worker's own liveness row (build step 5)
   * health       — every 5 min; one status, the problems it shows, one alert
                    per problem per ALERT_REPEAT_HOURS and one recovery notice
-                   when it clears; critical ones ignore quiet hours
+                   when it clears; critical ones ignore quiet hours. With
+                   JARVIS_ENABLED it also judges Jarvis (JV-21): a send queue
+                   stuck past its time, the Telegram breaker and the cost cap
+                   (the last two first told at once by jarvis_outbox and
+                   jarvis_respond; the sweep only repeats and recovers them)
 
 Every job's outcome is also recorded as a ``job:<id>`` heartbeat by an
 APScheduler listener, so /holat can name the job that last failed.
@@ -101,6 +105,7 @@ import functools
 import logging
 import signal
 import sys
+from collections.abc import Collection
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -651,7 +656,11 @@ async def jarvis_send_notices(bot: Bot, *, now: datetime | None = None) -> int:
     minute or more («⏳»), a send that failed for good («✖️ … yuborib
     bo'lmadi») and a send the owner tapped that went out («✅ Yuborildi»,
     silently, as a reply to its card). Each step and each notice is
-    contained (rule 25); returns how many went out."""
+    contained (rule 25); returns how many went out.
+
+    The breaker trip is said here, at once, and recorded in the health
+    ledger as ``telegram_send_limited`` (JV-21): the 5-minute health sweep
+    never says it first, it only repeats it and announces the recovery."""
     from miya.jarvis import outbox, policy
 
     now = now or datetime.now(settings.tz)
@@ -667,6 +676,10 @@ async def jarvis_send_notices(bot: Bot, *, now: datetime | None = None) -> int:
                 if not await notify(bot, replies.JARVIS_TELEGRAM_LIMITED, silent=silent):
                     return told
                 await _note_told(JARVIS_BREAKER_KIND, [ref])
+                # The health ledger's alert of this episode (JV-21): the
+                # health sweep never says it first, only repeats it after
+                # ALERT_REPEAT_HOURS and says «tiklandi» once it clears.
+                await _mark_alert_delivered(health.TELEGRAM_SEND_LIMITED_KEY, now=now)
                 told += 1
     except Exception as exc:
         log.error("jarvis breaker notice failed", extra={"error": type(exc).__name__})
@@ -822,7 +835,9 @@ async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
     are over get a draft or an escalation, stored in the mode's state; each
     new escalation's alert and each new draft's card goes out in this same
     run (JV-18 1a). When the cost cap stopped a draft, the owner is told once
-    a day that Jarvis only forwards to them until tomorrow.
+    a day that Jarvis only forwards to them until tomorrow, recorded in the
+    health ledger as ``jarvis_cost_cap`` (JV-21: the health sweep repeats it
+    and announces the recovery, never says it first).
 
     Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
     startup (rule 20). The run contains each chat on its own (rule 25); a
@@ -860,6 +875,10 @@ async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
             session.add(ReminderLog(kind=JARVIS_COST_STOP_KIND, ref=day))
     except Exception as exc:
         log.error("jarvis cost-stop notice failed", extra={"error": type(exc).__name__})
+        return
+    # The health ledger's alert of this episode (JV-21): the sweep repeats it
+    # and says «tiklandi» when the next day's spend is under the cap.
+    await _mark_alert_delivered(health.JARVIS_COST_CAP_KEY, now=now)
 
 
 # The ReminderLog kind that records "the style profile of this import was
@@ -2032,7 +2051,12 @@ async def health_job(bot: Bot) -> None:
     ignore quiet hours; warnings and recoveries wait for morning — the ledger
     still shows them due then, nothing is lost. Only a delivered message is
     recorded, so an unreachable Telegram means the alert is simply tried
-    again next tick.
+    again next tick. A Telegram breaker trip and the Jarvis cost cap are
+    first told by their own jobs (JV-21, ``health.TOLD_FIRST_ELSEWHERE``):
+    this sweep only repeats them and announces their recovery; a Jarvis key
+    whose state this status could not read is never announced as recovered
+    (``health.unjudged``). A stuck send queue is told in quiet hours too,
+    silently: the owner's approved sends go out at night as well.
     """
     now = datetime.now(settings.tz)
     status: health.Status | None = None
@@ -2040,7 +2064,13 @@ async def health_job(bot: Bot) -> None:
         async with session_scope() as session:
             status = await health.gather(session, now=now)
             if status.db_ok:
-                await _alert_from_ledger(session, bot, health.problems(status), now=now)
+                await _alert_from_ledger(
+                    session,
+                    bot,
+                    health.problems(status),
+                    now=now,
+                    unjudged=health.unjudged(status),
+                )
                 return
     except Exception:
         # Leaving the scope commits; with the database gone that can fail
@@ -2052,10 +2082,15 @@ async def health_job(bot: Bot) -> None:
 
 
 async def _alert_from_ledger(
-    session, bot: Bot, found: list[health.Problem], *, now: datetime
+    session,
+    bot: Bot,
+    found: list[health.Problem],
+    *,
+    now: datetime,
+    unjudged: Collection[str] = (),
 ) -> None:
     quiet = reminders.in_quiet_hours(now)
-    due, recovered = await health.alerts_due(session, found, now=now)
+    due, recovered = await health.alerts_due(session, found, now=now, unjudged=unjudged)
     # Critical problems stand alone; everything else of one sweep is one
     # message (WP-80) — a bad night is one ping, not six.
     bundle = []
@@ -2064,6 +2099,11 @@ async def _alert_from_ledger(
             if await notify(bot, problem.text):
                 health.mark_alerted(session, [problem.key], now=now)
                 # Committed one by one: a crash mid-sweep repeats at most one.
+                await session.commit()
+        elif quiet and problem.key in health.QUIET_SILENT:
+            # Told at night too, without a sound (JV-21).
+            if await notify(bot, problem.text, silent=True):
+                health.mark_alerted(session, [problem.key], now=now)
                 await session.commit()
         elif not quiet:
             bundle.append(problem)

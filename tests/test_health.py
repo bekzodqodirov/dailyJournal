@@ -435,7 +435,55 @@ def _sheets(
     )
 
 
-def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
+def _jarvis(**overrides) -> health.JarvisHealth:
+    """Jarvis's share of a healthy status (JV-21): Telegram sending works."""
+    base = {
+        "mode": "draft",
+        "paused": False,
+        "drafts": 4,
+        "sent": 3,
+        "escalations": 1,
+        "daily_used": 2,
+        "daily_cap": 40,
+        "queued": 0,
+        "backlog_stuck": 0,
+        "leases_stuck": 0,
+        "stuck_since": None,
+        "unknown": 0,
+        "cost_usd": Decimal("0.42"),
+        "cost_cap_usd": Decimal("3.00"),
+        "cost_unpriced": 0,
+        "cost_capped": False,
+        "channels": (
+            health.ChannelSend("telegram", send_enabled=True),
+            health.ChannelSend("whatsapp", send_enabled=False),
+            health.ChannelSend("gmail", send_enabled=False),
+        ),
+    }
+    base.update(overrides)
+    return health.JarvisHealth(**base)
+
+
+def _limited(until: datetime = NOW + timedelta(hours=24)) -> tuple:
+    return (
+        health.ChannelSend(
+            "telegram",
+            send_enabled=True,
+            breaker_until=until,
+            breaker_reason="peer_flood",
+        ),
+        health.ChannelSend("whatsapp", send_enabled=False),
+        health.ChannelSend("gmail", send_enabled=False),
+    )
+
+
+@pytest.fixture
+def jarvis_on(monkeypatch):
+    monkeypatch.setattr(settings, "jarvis_enabled", True)
+    monkeypatch.setattr(settings, "telegram_send_enabled", True)
+
+
+def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch, jarvis_on):
     monkeypatch.setattr(settings, "heartbeat_stale_minutes", 10)
     monkeypatch.setattr(settings, "userbot_stale_minutes", 5)
     monkeypatch.setattr(settings, "sheets_enabled", True)
@@ -470,6 +518,16 @@ def test_every_problem_key_is_reachable_and_has_its_severity(monkeypatch):
                 granted={"sms": False},
                 ever_granted={"sms": True},
             )
+        ),
+        # JV-21: Jarvis's own, each only with its switch on.
+        "outbox_stuck": _status(
+            jarvis=_jarvis(
+                queued=2, backlog_stuck=2, stuck_since=NOW - timedelta(minutes=25)
+            )
+        ),
+        "telegram_send_limited": _status(jarvis=_jarvis(channels=_limited())),
+        "jarvis_cost_cap": _status(
+            jarvis=_jarvis(cost_usd=Decimal("3.10"), cost_capped=True)
         ),
     }
     assert set(cases) == set(health.PROBLEM_KEYS)
@@ -873,3 +931,734 @@ def test_the_holat_line_shows_silence(quiet):
         phone=_phone("phone", hours=6), phone_seen=_phone("phone_seen", hours=5)
     )
     assert replies._phone_line(status).startswith("⚠️ Telefon — 5 soatdan beri jim · ")
+
+
+# --- Jarvis (JV-21) ---------------------------------------------------------------
+
+
+def test_jarvis_problem_texts_and_their_recoveries(jarvis_on):
+    from miya.bot import replies
+
+    stuck = _status(
+        jarvis=_jarvis(
+            queued=2,
+            backlog_stuck=1,
+            leases_stuck=1,
+            stuck_since=NOW - timedelta(minutes=25),
+        )
+    )
+    [problem] = health.problems(stuck)
+    assert problem.text == (
+        "📤 2 ta xabar 25 daqiqadan beri yuborilmay turibdi. "
+        "Userbot ishlayotganini tekshiring."
+    )
+    # The repeats are the very notices their own jobs send first.
+    [limited] = health.problems(_status(jarvis=_jarvis(channels=_limited())))
+    assert limited.text == replies.JARVIS_TELEGRAM_LIMITED == health.TELEGRAM_SEND_LIMITED
+    [capped] = health.problems(_status(jarvis=_jarvis(cost_capped=True)))
+    assert capped.text == replies.JARVIS_COST_STOP == health.JARVIS_COST_CAP
+    assert health.recovery_text("outbox_stuck") == "✅ Xabar yuborish tiklandi"
+    assert (
+        health.recovery_text("telegram_send_limited") == "✅ Telegram yuborish tiklandi"
+    )
+    assert health.recovery_text("jarvis_cost_cap") == (
+        "✅ Jarvis xarajat chegarasi tiklandi"
+    )
+    assert set(health.JARVIS_PROBLEM_KEYS) <= set(health.PROBLEM_KEYS)
+    assert {"telegram_send_limited", "jarvis_cost_cap"} == health.TOLD_FIRST_ELSEWHERE
+
+
+def test_disabled_feature_no_problem(monkeypatch):
+    """Rule 20: with JARVIS_ENABLED off nothing Jarvis is judged or shown,
+    whatever the status carries; the Telegram limit also needs
+    TELEGRAM_SEND_ENABLED."""
+    from miya.bot import replies
+
+    broken = _status(
+        jarvis=_jarvis(
+            channels=_limited(),
+            backlog_stuck=3,
+            stuck_since=NOW - timedelta(hours=1),
+            cost_capped=True,
+        )
+    )
+    monkeypatch.setattr(settings, "jarvis_enabled", False)
+    monkeypatch.setattr(settings, "telegram_send_enabled", True)
+    assert _keys(broken) == []
+    assert replies.jarvis_status_lines(broken) is None
+    report = replies.status_report(broken, health.problems(broken))
+    assert (
+        "Jarvis" not in report and "📤" not in report and "Javob beruvchi" not in report
+    )
+    assert not any(health.feature_on(key) for key in health.JARVIS_PROBLEM_KEYS)
+
+    monkeypatch.setattr(settings, "jarvis_enabled", True)
+    monkeypatch.setattr(settings, "telegram_send_enabled", False)
+    assert _keys(broken) == ["outbox_stuck", "jarvis_cost_cap"]
+    assert not health.feature_on("telegram_send_limited")
+    assert health.feature_on("outbox_stuck")
+    # A status gathered with Jarvis off carries nothing Jarvis at all.
+    assert _keys(_status()) == []
+
+
+async def test_disabled_feature_never_reads_or_recovers(session, monkeypatch):
+    from miya.jarvis import status as jarvis_status
+
+    calls: list[datetime] = []
+
+    async def _facts(session, now, **kwargs):
+        calls.append(now)
+        raise AssertionError("Jarvis read with JARVIS_ENABLED off")
+
+    monkeypatch.setattr(jarvis_status, "health_facts", _facts)
+    monkeypatch.setattr(settings, "jarvis_enabled", False)
+    status = await health.gather(session, now=NOW)
+    assert calls == []
+    assert status.jarvis is None and status.jarvis_unreadable is False
+    # An episode alerted while Jarvis was on is not announced as recovered
+    # once the switch is off.
+    health.mark_alerted(session, ["telegram_send_limited"], now=NOW - timedelta(hours=1))
+    await session.flush()
+    _due, recovered = await health.alerts_due(session, [], now=NOW)
+    assert recovered == []
+
+
+async def test_a_failed_jarvis_read_is_one_line_not_a_failed_status(
+    session, monkeypatch, jarvis_on
+):
+    from miya.bot import replies
+    from miya.jarvis import status as jarvis_status
+
+    async def _broken(session, now, **kwargs):
+        await session.execute(sa.text("SELECT no_such_column FROM outbox_messages"))
+
+    monkeypatch.setattr(jarvis_status, "health_facts", _broken)
+    status = await health.gather(session, now=NOW)
+    assert status.db_ok is True
+    assert status.jarvis is None and status.jarvis_unreadable is True
+    assert replies.jarvis_status_lines(status) == [replies.JARVIS_HEALTH_UNREADABLE]
+    assert not set(_keys(status)) & set(health.JARVIS_PROBLEM_KEYS)
+    # The savepoint kept the session usable: the rest of the status is whole
+    # and the same session reads on.
+    assert status.db_size_bytes is not None
+    assert await session.scalar(sa.select(sa.func.count()).select_from(m.Heartbeat)) == 0
+
+
+async def test_a_failed_jarvis_read_never_announces_a_recovery(
+    session, monkeypatch, jarvis_on
+):
+    """A state that was not read is not a recovery: an open Telegram limit
+    stays open in the ledger, and is judged again once the read works."""
+    from miya.jarvis import status as jarvis_status
+
+    health.mark_alerted(
+        session,
+        ["telegram_send_limited", "outbox_stuck", "jarvis_cost_cap"],
+        now=NOW - timedelta(hours=1),
+    )
+    await session.flush()
+
+    async def _broken(session, now, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(jarvis_status, "health_facts", _broken)
+    status = await health.gather(session, now=NOW)
+    assert status.jarvis_unreadable is True
+    assert health.unjudged(status) == frozenset(health.JARVIS_PROBLEM_KEYS)
+    found = health.problems(status)
+    _due, recovered = await health.alerts_due(
+        session, found, now=NOW, unjudged=health.unjudged(status)
+    )
+    assert not set(recovered) & set(health.JARVIS_PROBLEM_KEYS)
+    # A status that read Jarvis judges it again.
+    healthy = _status(jarvis=_jarvis())
+    assert health.unjudged(healthy) == frozenset()
+    _due, recovered = await health.alerts_due(
+        session, [], now=NOW, unjudged=health.unjudged(healthy)
+    )
+    assert set(health.JARVIS_PROBLEM_KEYS) <= set(recovered)
+
+
+# The DB tests below run on the real clock: the outbox and the ledger stamp
+# their rows with the database's now().
+
+
+def _outbox(
+    *,
+    state: str,
+    key: str,
+    channel: str = "telegram",
+    **fields,
+) -> m.OutboxMessage:
+    return m.OutboxMessage(
+        channel=channel,
+        chat_key=f"tg:{abs(hash(key)) % 100000}",
+        origin="owner_command",
+        authored_by="owner",
+        body="Salom",
+        body_sha256="0" * 64,
+        state=state,
+        idempotency_key=key,
+        **fields,
+    )
+
+
+async def _trip(session, now: datetime, *, until: datetime) -> None:
+    from miya.jarvis import policy
+
+    await policy.trip_breaker(
+        session,
+        channel="telegram",
+        reason="peer_flood",
+        until=until,
+        by="adapter",
+        now=now,
+    )
+
+
+async def test_gather_reads_jarvis_facts(session, jarvis_on, monkeypatch):
+    from miya.services import reminders
+
+    monkeypatch.setattr(settings, "jarvis_daily_cost_cap_usd", Decimal("3.00"))
+    now = datetime.now(TZ)
+    session.add_all(
+        [
+            # Due 25 minutes ago and nobody claimed it: stuck.
+            _outbox(
+                state="approved",
+                key="stuck",
+                approved_by="button",
+                approved_at=now - timedelta(minutes=25),
+            ),
+            # Approved a minute ago: queued, not stuck.
+            _outbox(
+                state="approved",
+                key="fresh",
+                approved_by="button",
+                approved_at=now - timedelta(minutes=1),
+            ),
+            # Claimed 20 minutes ago, the lease long run out, never reconciled.
+            _outbox(
+                state="sending",
+                key="lease",
+                approved_by="button",
+                approved_at=now - timedelta(minutes=21),
+                lease_until=now - timedelta(minutes=15),
+            ),
+            _outbox(state="unknown", key="doubt", approved_by="button"),
+            _outbox(
+                state="sent",
+                key="sent",
+                approved_by="button",
+                sent_at=now - timedelta(minutes=3),
+            ),
+            m.UsageLog(
+                provider="anthropic", operation="jarvis_draft", cost_usd=Decimal("0.25")
+            ),
+            m.UsageLog(provider="anthropic", operation="extract", cost_usd=Decimal("9")),
+        ]
+    )
+    await session.flush()
+    status = await health.gather(session, now=now)
+    jarvis = status.jarvis
+    assert jarvis is not None and status.jarvis_unreadable is False
+    assert jarvis.mode == "shadow" and jarvis.paused is False
+    assert jarvis.queued == 2
+    assert jarvis.backlog_stuck == 1 and jarvis.leases_stuck == 1
+    assert jarvis.stuck_since is not None
+    assert abs(jarvis.stuck_since - (now - timedelta(minutes=25))) < timedelta(seconds=1)
+    assert jarvis.unknown == 1
+    # The sent row and the claimed one are on the wire (caps.day_counts),
+    # the claim counted from its moment, which may fall before midnight.
+    claimed_today = now - timedelta(minutes=20) >= reminders.day_start(now)
+    assert jarvis.sent == 1 + claimed_today
+    # The mode's capped count is the draft cards (none: the owner wrote these),
+    # not every send.
+    assert jarvis.daily_used == 0
+    assert jarvis.daily_cap == settings.jarvis_draft_daily_cap
+    assert jarvis.backlog_held == 0
+    # Only Jarvis operations count against its cap.
+    assert jarvis.cost_usd == Decimal("0.25") and jarvis.cost_capped is False
+    assert jarvis.cost_cap_usd == Decimal("3.00")
+    assert [c.channel for c in jarvis.channels] == ["telegram", "whatsapp", "gmail"]
+    telegram = jarvis.channel("telegram")
+    assert telegram is not None and telegram.send_enabled and not telegram.limited
+    assert _keys(status).count("outbox_stuck") == 1
+    [stuck] = [p for p in health.problems(status) if p.key == "outbox_stuck"]
+    assert stuck.text.startswith("📤 2 ta xabar 25 daqiqadan beri")
+
+
+async def test_a_stuck_queue_is_judged_only_where_sending_should_happen(
+    session, jarvis_on, monkeypatch
+):
+    from miya.jarvis import policy
+
+    now = datetime.now(TZ)
+    old = now - timedelta(minutes=30)
+    session.add_all(
+        [
+            _outbox(state="approved", key="a", approved_by="button", approved_at=old),
+            # The gate held it and looks again later: waiting, not stuck.
+            _outbox(
+                state="approved",
+                key="held",
+                approved_by="button",
+                approved_at=old,
+                next_attempt_at=now + timedelta(minutes=1),
+            ),
+            # Scheduled for this evening.
+            _outbox(
+                state="approved",
+                key="later",
+                approved_by="button",
+                approved_at=old,
+                not_before=now + timedelta(hours=3),
+            ),
+        ]
+    )
+    await session.flush()
+
+    held = 0
+
+    async def stuck(**beat) -> int:
+        nonlocal held
+        if beat:
+            await health.beat(session, "userbot", detail=beat, now=now)
+        status = await health.gather(session, now=now)
+        assert status.jarvis is not None
+        held = status.jarvis.backlog_held
+        return status.jarvis.backlog_stuck
+
+    assert await stuck() == 1 and held == 0
+    # The sender waits out a flood wait that ended five minutes ago: held.
+    recent = (now - timedelta(minutes=5)).isoformat()
+    assert await stuck(enabled=True, sender_paused_until=recent) == 0 and held == 1
+    long_ago = (now - timedelta(minutes=20)).isoformat()
+    assert await stuck(enabled=True, sender_paused_until=long_ago) == 1 and held == 0
+    # The owner's pause is their choice, not a fault: the row is held.
+    await policy.pause(session, by="command", now=now)
+    assert await stuck() == 0 and held == 1
+    await policy.resume(session, by="command", now=now)
+    assert await stuck() == 1 and held == 0
+    # The breaker is its own problem: never doubled as a stuck queue.
+    await _trip(session, now, until=now + timedelta(hours=24))
+    status = await health.gather(session, now=now)
+    assert "telegram_send_limited" in _keys(status)
+    assert "outbox_stuck" not in _keys(status)
+    assert status.jarvis is not None and status.jarvis.backlog_stuck == 0
+    assert status.jarvis.backlog_held == 1
+    assert health.unjudged(status) == frozenset({"outbox_stuck"})
+    await policy.resume(
+        session, scope=policy.channel_scope("telegram"), by="command", now=now
+    )
+    # With Telegram sending off no adapter is expected to take the row.
+    monkeypatch.setattr(settings, "telegram_send_enabled", False)
+    assert await stuck() == 0 and held == 1
+
+
+def _bot():
+    class _Bot:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send_message(self, chat_id, text, **kwargs) -> None:
+            self.sent.append(text)
+
+    return _Bot()
+
+
+async def _jarvis_sweep(bot, *, now: datetime) -> None:
+    """The health job's alert step over the Jarvis problems of a real status
+    (the rest of this database's problems are not under test)."""
+    from miya.db.session import session_scope
+    from miya.worker import main as worker
+
+    async with session_scope() as s:
+        status = await health.gather(s, now=now)
+        found = [
+            p for p in health.problems(status) if p.key in health.JARVIS_PROBLEM_KEYS
+        ]
+        await worker._alert_from_ledger(
+            s, bot, found, now=now, unjudged=health.unjudged(status)
+        )
+
+
+async def test_breaker_alert_immediate(session, jarvis_on, monkeypatch):
+    """The trip is told by jarvis_send_notices at once (JV-19), not by the
+    5-minute health sweep; the sweep records nothing new, repeats it after
+    ALERT_REPEAT_HOURS and says «tiklandi» once when it clears."""
+    from miya.bot import replies
+    from miya.db.session import SessionLocal
+    from miya.jarvis import policy
+    from miya.worker import main as worker
+
+    monkeypatch.setattr(settings, "alert_repeat_hours", 6)
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+    bot = _bot()
+    monkeypatch.setattr(worker, "notify", lambda b, text, **kw: _record(bot, text))
+    now = datetime.now(TZ)
+    async with SessionLocal() as s:
+        await _trip(s, now, until=now + timedelta(days=2))
+        await s.commit()
+
+    # A sweep that runs before the notice job says nothing: not its message.
+    await _jarvis_sweep(bot, now=now)
+    assert bot.sent == []
+    # The notice job tells it at once and records it in the health ledger.
+    assert await worker.jarvis_send_notices(None, now=now) == 1
+    assert bot.sent == [replies.JARVIS_TELEGRAM_LIMITED]
+    assert len(await _alert_rows(session, "telegram_send_limited")) == 1
+    # The next sweeps do not double it, nor does the notice job.
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=5))
+    await worker.jarvis_send_notices(None, now=now + timedelta(minutes=6))
+    assert bot.sent == [replies.JARVIS_TELEGRAM_LIMITED]
+    # Still limited after ALERT_REPEAT_HOURS: the ledger repeats it once.
+    later = now + timedelta(hours=6, minutes=5)
+    await _jarvis_sweep(bot, now=later)
+    await _jarvis_sweep(bot, now=later + timedelta(minutes=5))
+    assert bot.sent == [replies.JARVIS_TELEGRAM_LIMITED] * 2
+    # /jarvis yoq telegram lifts it: one «tiklandi», then silence.
+    async with SessionLocal() as s:
+        await policy.resume(
+            s, scope=policy.channel_scope("telegram"), by="command", now=later
+        )
+        await s.commit()
+    await _jarvis_sweep(bot, now=later + timedelta(minutes=10))
+    await _jarvis_sweep(bot, now=later + timedelta(minutes=15))
+    assert bot.sent[2:] == ["✅ Telegram yuborish tiklandi"]
+
+
+async def _record(bot, text: str) -> bool:
+    bot.sent.append(text)
+    return True
+
+
+async def _alert_rows(session, key: str) -> list:
+    return list(
+        await session.scalars(
+            sa.select(m.ReminderLog.sent_at).where(
+                m.ReminderLog.kind == health.ALERT_KIND + key
+            )
+        )
+    )
+
+
+async def test_cost_cap_told_by_the_responder_then_kept_by_the_ledger(
+    session, jarvis_on, monkeypatch
+):
+    from miya.bot import replies
+    from miya.jarvis import responder
+    from miya.worker import main as worker
+
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+    monkeypatch.setattr(settings, "jarvis_daily_cost_cap_usd", Decimal("0.10"))
+    bot = _bot()
+    monkeypatch.setattr(worker, "notify", lambda b, text, **kw: _record(bot, text))
+
+    async def _capped(*, now, alert=None):
+        return responder.RunResult(
+            claimed=1,
+            outcomes=(responder.Outcome("tg:1", responder.COST_CAP, cost_capped=True),),
+        )
+
+    monkeypatch.setattr(responder, "run", _capped)
+    session.add(
+        m.UsageLog(
+            provider="anthropic", operation="jarvis_draft", cost_usd=Decimal("0.20")
+        )
+    )
+    await session.commit()
+    now = datetime.now(TZ)
+    await _jarvis_sweep(bot, now=now)
+    assert bot.sent == []
+    await worker.jarvis_respond_job(None, now=now)
+    assert bot.sent == [replies.JARVIS_COST_STOP]
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=5))
+    assert bot.sent == [replies.JARVIS_COST_STOP]
+    # The cap is raised (or the next day comes): one «tiklandi».
+    monkeypatch.setattr(settings, "jarvis_daily_cost_cap_usd", Decimal("5"))
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=10))
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=15))
+    assert bot.sent[1:] == ["✅ Jarvis xarajat chegarasi tiklandi"]
+
+
+async def test_a_stuck_queue_is_alerted_by_the_sweep_and_recovers(
+    session, jarvis_on, monkeypatch
+):
+    from miya.worker import main as worker
+
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+    bot = _bot()
+    monkeypatch.setattr(worker, "notify", lambda b, text, **kw: _record(bot, text))
+    now = datetime.now(TZ)
+    row = _outbox(
+        state="approved",
+        key="stuck",
+        approved_by="button",
+        approved_at=now - timedelta(minutes=40),
+    )
+    session.add(row)
+    await session.commit()
+    await _jarvis_sweep(bot, now=now)
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=5))
+    assert bot.sent == [
+        "📤 1 ta xabar 40 daqiqadan beri yuborilmay turibdi. "
+        "Userbot ishlayotganini tekshiring."
+    ]
+    await session.execute(
+        sa.update(m.OutboxMessage)
+        .where(m.OutboxMessage.id == row.id)
+        .values(state="sent", sent_at=now)
+    )
+    await session.commit()
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=10))
+    assert bot.sent[1:] == ["✅ Xabar yuborish tiklandi"]
+
+
+async def test_a_paused_stuck_queue_is_not_announced_as_recovered(
+    session, jarvis_on, monkeypatch
+):
+    """Rows that only wait on a pause (or a breaker) did not leave: no
+    «tiklandi» until they do."""
+    from miya.db.session import SessionLocal
+    from miya.jarvis import policy
+    from miya.worker import main as worker
+
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: False)
+    bot = _bot()
+    monkeypatch.setattr(worker, "notify", lambda b, text, **kw: _record(bot, text))
+    now = datetime.now(TZ)
+    row = _outbox(
+        state="approved",
+        key="stuck",
+        approved_by="button",
+        approved_at=now - timedelta(minutes=40),
+    )
+    session.add(row)
+    await session.commit()
+    await _jarvis_sweep(bot, now=now)
+    assert len(bot.sent) == 1 and bot.sent[0].startswith("📤 1 ta xabar")
+    async with SessionLocal() as s:
+        await policy.pause(s, by="command", now=now)
+        await s.commit()
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=5))
+    assert len(bot.sent) == 1
+    async with SessionLocal() as s:
+        await policy.resume(s, by="command", now=now)
+        await s.commit()
+    await session.execute(
+        sa.update(m.OutboxMessage)
+        .where(m.OutboxMessage.id == row.id)
+        .values(state="sent", sent_at=now)
+    )
+    await session.commit()
+    await _jarvis_sweep(bot, now=now + timedelta(minutes=10))
+    assert bot.sent[1:] == ["✅ Xabar yuborish tiklandi"]
+
+
+async def test_a_stuck_queue_is_told_silently_in_quiet_hours(
+    session, jarvis_on, monkeypatch
+):
+    """Approved sends go out at night too: a queue stuck then is told at
+    once, without a sound; its recovery waits for morning."""
+    from miya.worker import main as worker
+
+    quiet = True
+    monkeypatch.setattr(worker.reminders, "in_quiet_hours", lambda now=None: quiet)
+    sent: list[tuple[str, bool]] = []
+
+    async def _notify(bot, text, *, silent=False, **kwargs) -> bool:
+        sent.append((text, silent))
+        return True
+
+    monkeypatch.setattr(worker, "notify", _notify)
+    now = datetime.now(TZ)
+    row = _outbox(
+        state="approved",
+        key="stuck",
+        approved_by="button",
+        approved_at=now - timedelta(minutes=40),
+    )
+    session.add(row)
+    await session.commit()
+    await _jarvis_sweep(None, now=now)
+    await _jarvis_sweep(None, now=now + timedelta(minutes=5))
+    assert len(sent) == 1
+    assert sent[0][0].startswith("📤 1 ta xabar") and sent[0][1] is True
+    await session.execute(
+        sa.update(m.OutboxMessage)
+        .where(m.OutboxMessage.id == row.id)
+        .values(state="sent", sent_at=now)
+    )
+    await session.commit()
+    await _jarvis_sweep(None, now=now + timedelta(minutes=10))
+    assert len(sent) == 1
+    quiet = False
+    await _jarvis_sweep(None, now=now + timedelta(minutes=15))
+    assert sent[1:] == [("✅ Xabar yuborish tiklandi", False)]
+
+
+# --- /holat (JV-21) ----------------------------------------------------------------
+
+
+def _userbot(**detail) -> dict[str, health.Component]:
+    return _with(
+        "userbot",
+        health.component_of(
+            "userbot",
+            _row("userbot", minutes=1, detail={"enabled": True, **detail}),
+            now=NOW,
+        ),
+    )
+
+
+def _job(minutes: float, **detail) -> dict[str, health.Component]:
+    return {
+        health.JARVIS_RESPOND_JOB: health.component_of(
+            health.JARVIS_RESPOND_JOB,
+            _row("job:jarvis_respond", minutes=minutes, detail={"ok": True, **detail}),
+            now=NOW,
+        )
+    }
+
+
+def test_holat_jarvis_lines(jarvis_on, monkeypatch):
+    from miya.bot import replies
+
+    monkeypatch.setattr(settings, "heartbeat_stale_minutes", 10)
+    sent_at = (NOW - timedelta(minutes=7)).isoformat()
+    status = _status(
+        jarvis=_jarvis(queued=1),
+        components=_userbot(sender="running", sender_sent_at=sent_at),
+        jobs=_job(0.2),
+    )
+    assert replies.jarvis_status_lines(status) == [
+        # The draft cards against their cap, as /jarvis shows it, not every
+        # send of the day (3).
+        "🤖 Jarvis: qoralama · bugun 2/40 yuborildi · navbatda 1",
+        "🧾 Jarvis bugun: 4 ta qoralama · 1 ta eskalatsiya · xarajat $0.42 / $3.00",
+        "📤 Telegram yuborish: ✅ ishlayapti · oxirgi yuborish: 7 daqiqa oldin",
+        "✅ Javob beruvchi — oxirgi ishga tushish: hozirgina",
+    ]
+    report = replies.status_report(status, health.problems(status))
+    assert "🤖 Jarvis: qoralama" in report
+    assert report.index("🤖 Jarvis") < report.index("<b>Navbatda</b>")
+
+
+def test_holat_jarvis_send_states(jarvis_on, monkeypatch):
+    from miya.bot import replies
+
+    monkeypatch.setattr(settings, "heartbeat_stale_minutes", 10)
+
+    def send_line(jarvis: health.JarvisHealth, **beat) -> str:
+        status = _status(jarvis=jarvis, components=_userbot(**beat), jobs=_job(1))
+        [line] = [
+            x for x in replies.jarvis_status_lines(status) if x.startswith("📤 Tel")
+        ]
+        return line
+
+    running = {"sender": "running"}
+    assert send_line(_jarvis(channels=_limited(NOW + timedelta(hours=2))), **running) == (
+        f"📤 Telegram yuborish: ⛔ cheklangan (bugun "
+        f"{(NOW + timedelta(hours=2)).strftime('%H:%M')} gacha)"
+    )
+    no_end = NOW + timedelta(days=3650)
+    assert send_line(_jarvis(channels=_limited(no_end)), **running) == (
+        "📤 Telegram yuborish: ⛔ cheklangan (/jarvis yoq telegram bilan yoqilguncha)"
+    )
+    off = (health.ChannelSend("telegram", send_enabled=False),)
+    assert send_line(_jarvis(channels=off), **running) == (
+        "📤 Telegram yuborish: ⏸ o'chirilgan (TELEGRAM_SEND_ENABLED=false)"
+    )
+    paused = (health.ChannelSend("telegram", send_enabled=True, paused=True),)
+    assert send_line(_jarvis(channels=paused), **running) == (
+        "📤 Telegram yuborish: ⏸ to'xtatilgan (/jarvis yoq)"
+    )
+    wait = (NOW + timedelta(minutes=30)).isoformat()
+    assert send_line(_jarvis(), sender="running", sender_paused_until=wait) == (
+        f"📤 Telegram yuborish: ⏳ Telegram kutishni so'radi (bugun "
+        f"{(NOW + timedelta(minutes=30)).strftime('%H:%M')} gacha)"
+    )
+    assert send_line(_jarvis(), sender="restarting", sender_error="<Boom>") == (
+        "📤 Telegram yuborish: ⚠️ yuboruvchi ishlamayapti "
+        "(qayta ishga tushirilmoqda: <code>&lt;Boom&gt;</code>)"
+    )
+    assert send_line(_jarvis()) == (
+        "📤 Telegram yuborish: ⚠️ yuboruvchi ishlamayapti (hali ishga tushmagan)"
+    )
+    silent = _status(
+        jarvis=_jarvis(), components=_with("userbot", _silent("userbot")), jobs=_job(1)
+    )
+    assert (
+        "📤 Telegram yuborish: ⚠️ yuboruvchi ishlamayapti (Telegram o'quvchi jim)"
+        in replies.jarvis_status_lines(silent)
+    )
+    # Another channel has a line only while its breaker is in force.
+    gmail = (
+        health.ChannelSend("telegram", send_enabled=True),
+        health.ChannelSend(
+            "gmail", send_enabled=False, breaker_until=NOW + timedelta(days=1)
+        ),
+    )
+    status = _status(jarvis=_jarvis(channels=gmail), components=_userbot(**running))
+    lines = replies.jarvis_status_lines(status)
+    assert any(x.startswith("📤 Gmail yuborish: ⛔ cheklangan (ertaga ") for x in lines)
+    assert not any(x.startswith("📤 WhatsApp") for x in lines)
+
+
+def test_holat_jarvis_queue_cost_and_responder_lines(jarvis_on, monkeypatch):
+    from miya.bot import replies
+
+    monkeypatch.setattr(settings, "heartbeat_stale_minutes", 10)
+    status = _status(
+        jarvis=_jarvis(
+            mode="auto",
+            paused=True,
+            # 25 sent today, 15 of them on their own: the cap counts those.
+            sent=25,
+            daily_used=15,
+            daily_cap=20,
+            leases_stuck=2,
+            unknown=1,
+            cost_usd=Decimal("3.20"),
+            cost_unpriced=1,
+            cost_capped=True,
+        ),
+        components=_userbot(sender="running"),
+        jobs=_job(30),
+    )
+    lines = replies.jarvis_status_lines(status)
+    assert (
+        lines[0]
+        == "🤖 Jarvis: avtomatik, to'xtatilgan · bugun 15/20 yuborildi · navbatda 0"
+    )
+    assert lines[1] == (
+        "🧾 Jarvis bugun: 4 ta qoralama · 1 ta eskalatsiya · xarajat $3.20 / $3.00"
+        " · narxi noma'lum: 1 ta chaqiruv — chegaraga yetdi"
+    )
+    assert "⚠️ Jarvis: 2 ta xabar yuborilish holatida qotib qoldi" in lines
+    assert (
+        "❓ Jarvis: 1 ta xabar yuborilganmi — aniq emas (24 soat ichida). "
+        "Chatni tekshiring."
+    ) in lines
+    assert lines[-1] == "❌ Javob beruvchi — 30 daqiqadan beri ishlamagan"
+    never = _status(jarvis=_jarvis(), components=_userbot(sender="running"))
+    assert replies.jarvis_status_lines(never)[-1] == (
+        "⚠️ Javob beruvchi — hali ishga tushmagan"
+    )
+    failed = _status(
+        jarvis=_jarvis(),
+        components=_userbot(sender="running"),
+        jobs={
+            health.JARVIS_RESPOND_JOB: health.component_of(
+                health.JARVIS_RESPOND_JOB,
+                _row(
+                    "job:jarvis_respond", minutes=1, detail={"ok": False, "error": "<x>"}
+                ),
+                now=NOW,
+            )
+        },
+    )
+    assert replies.jarvis_status_lines(failed)[-1] == (
+        "❌ Javob beruvchi — xato: <code>&lt;x&gt;</code>"
+    )
