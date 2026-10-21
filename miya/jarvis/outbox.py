@@ -50,7 +50,7 @@ from miya.db.models import (
     Person,
 )
 from miya.jarvis import caps, chatkey, costs, gate, policy
-from miya.services import authorship, codes, reminders, safety
+from miya.services import authorship, codes, people, reminders, safety
 
 log = logging.getLogger(__name__)
 
@@ -279,7 +279,11 @@ async def chat_facts(
         person = await session.get(Person, person_id)
         if person is not None:
             is_bot = policy.looks_like_bot(person.telegram_username)
-            is_owner = owner_id is not None and person.telegram_id == owner_id
+            # The owner under one of their own names (§5.4), by account or
+            # by an alias the owner set (OWNER_ALIASES).
+            is_owner = (
+                owner_id is not None and person.telegram_id == owner_id
+            ) or people.is_owner_alias(person.display_name)
     return policy.ChatFacts(
         chat_key=chat_key,
         channel=channel,
@@ -613,12 +617,9 @@ async def _initial_state(
     )
     if mode == "off":
         raise JarvisDisabled("mode_off")
-    if policy.never_rule(rules) is not None:
-        return BLOCKED, "personal_chat"
-    if excluded:
-        return BLOCKED, excluded
-    if facts.chat_type == "group" and not policy.group_enabled(rules):
-        return BLOCKED, "group_off"
+    refused = policy.ai_refusal(facts, rules, addressed=None)
+    if refused is not None:
+        return BLOCKED, refused
     if mode == "shadow":
         return SHADOW, None
     if not guard.passed:
@@ -675,11 +676,7 @@ async def approve(
             tg_chat_id=row.tg_chat_id,
             person_id=row.person_id,
         )
-        refused = (
-            "personal_chat"
-            if policy.never_rule(rules) is not None
-            else policy.hard_exclusion(facts)
-        )
+        refused = policy.ai_refusal(facts, rules, addressed=None)
         if refused:
             _transition(row, BLOCKED, by=by, now=now, code=refused)
             await session.flush()

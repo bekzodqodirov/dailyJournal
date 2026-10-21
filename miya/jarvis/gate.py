@@ -326,21 +326,26 @@ def _mode(row: Row, ctx: Context) -> Decision | None:
 
 
 def _rules(row: Row, ctx: Context) -> Decision | None:
-    if policy.never_rule(ctx.rules) is not None:
-        if row.ai:
-            return Decision("block", "rules", "personal_chat")
-        if warned(row.history, WARNED_PERSONAL) is None:
-            return Decision("redraft", "rules", "personal_warning")
-    excluded = policy.hard_exclusion(ctx.chat)
-    if excluded is not None:
-        return Decision("block", "rules", excluded)
     if not row.ai:
-        return None
-    if ctx.chat.chat_type == "group":
-        if not policy.group_enabled(ctx.rules):
-            return Decision("block", "rules", "group_off")
-        if ctx.trigger is None or not ctx.trigger.to_me:
-            return Decision("block", "rules", "group_not_addressed")
+        # The owner's own words may go to a personal chat, but only after
+        # their card showed the warning; never to a hard exclusion.
+        if (
+            policy.never_rule(ctx.rules) is not None
+            and warned(row.history, WARNED_PERSONAL) is None
+        ):
+            return Decision("redraft", "rules", "personal_warning")
+        excluded = policy.hard_exclusion(ctx.chat)
+        return Decision("block", "rules", excluded) if excluded is not None else None
+    # One precedence for every AI row (policy.ai_refusal, §5.4): a personal
+    # rule, the hard exclusions, groups off unless enabled and then only for
+    # messages addressed to the owner.
+    refused = policy.ai_refusal(
+        ctx.chat,
+        ctx.rules,
+        addressed=ctx.trigger is not None and ctx.trigger.to_me,
+    )
+    if refused is not None:
+        return Decision("block", "rules", refused)
     if row.auto and policy.rule_mode(ctx.rules) == policy.RULE_DRAFT:
         return Decision("redraft", "rules", "rule_draft")
     return None

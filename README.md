@@ -250,6 +250,9 @@ ledger only ever has the bank's own record and your own words.
 | `/savollar` | Every question waiting for the owner's tap (claims, money texts, missed calls, groups, files), ranked money first and paged; answering here spends none of the day's 5–10 asked questions |
 | `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong |
 | `/jarvis [toxtat\|yoq [kanal]\|tarix]` | Jarvis (off until `JARVIS_ENABLED`): the mode, today's drafts, sends and escalations, the daily limit and each channel; `toxtat` stops every send at once (checked whenever a message is about to leave), `yoq` or `yoq telegram` resumes everything or one channel, `tarix` lists the last 20 actions |
+| `/shaxsiy <ism yoki GS kod>` | Mark a person (by name or client code) or a chat (a family group by its title) personal: MIYA never writes there on its own, reading goes on. Every address the person is known at is kept (their Telegram chat, a WhatsApp number written with its country code), so `/unut` or `/birlashtir` never reopens it. On a chat already personal it asks before unmarking (✅ Ha, chiqar / ✖️ Yo'q) |
+| `/shaxsiylar` | The personal chats, each with 🔓 (unmark, asks first), and likely family and friends found in the database (kinship in the contact name or the relationship you set, your informal «sen» towards them, no work talk, no client code), each with 🔒 to mark in one tap; nothing is marked without you |
+| `/guruhai <guruh>` | AI replies in one group: on after a confirm tap, and then only as drafts for your tap and only to messages addressed to you; off at once. Groups get no AI reply until switched on; `/guruhai` alone lists the groups that are on |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like

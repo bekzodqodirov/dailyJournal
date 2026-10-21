@@ -97,6 +97,14 @@ owner's words may not be contradicted.
   kill switches, `/jarvis toxtat`, the personal-chat rules, the spam and file shield, the
   red-line guard, the caps and the cost cap). The rest of MIYA never loads Jarvis and works the
   same with it off.
+- Implemented in JV-12: `/shaxsiy Ism` (or a GS code, or a family group's title) marks a chat
+  personal at once and keeps every address the person is known at, so forgetting or merging the
+  person never reopens it; `/shaxsiylar` lists the personal chats and suggests likely family and
+  friends from the database, one tap each, and nothing is marked without the owner. Unmarking
+  asks first. Groups get no AI reply until `/guruhai` switches one on with a confirm tap, and
+  then only drafts for the owner's tap, only for messages addressed to the owner. A personal
+  rule outranks every other rule, mode and setting; Saved Messages, Telegram's service chat,
+  bots, channels, the owner's own names and WhatsApp broadcasts are never written to at all.
 
 ## Dangerous files (owner rule 4, docs/jarvis-plan.md decision 4)
 - The owner's decision of 2026-10-20 (docs/jarvis-plan.md §8.1): MIYA never downloads,

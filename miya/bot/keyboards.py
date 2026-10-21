@@ -12,6 +12,11 @@ bytes, and a chat list page carries one payload per button.
     ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
     cl:y|n|e:<claim_id>         a counterparty's claim: write it / drop it / correct it
     rcp:ok|f:<receipt_id>       a receipt card: the money came / the receipt is fake
+    jr:p:<person_id>            mark a suggested person personal (one tap, restricting)
+    jr:u:<rule_id>              ask to unmark a personal chat
+    jr:y:<rule_id>              unmark it (the confirm, JV-12)
+    jr:n:<rule_id|monitor_id>   keep it / do not switch on (the id is not read)
+    jr:g:<monitor_id>           switch AI replies on in a group (the confirm)
 """
 
 from __future__ import annotations
@@ -21,9 +26,11 @@ from datetime import timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from miya.bot import replies
 from miya.bot.formatting import claim_ref, ref
 from miya.db.enums import ChatType
 from miya.db.models import ChatMonitor
+from miya.services import safety
 
 PAGE_SIZE = 8
 TITLE_WIDTH = 22
@@ -971,6 +978,88 @@ def merge_confirm(source_id: int, target_id: int) -> InlineKeyboardMarkup:
                     callback_data=f"birl:{source_id}:{target_id}",
                 ),
                 InlineKeyboardButton(text="Bekor", callback_data="birl:no"),
+            ]
+        ]
+    )
+
+
+# --- personal chats and group replies (JV-12) ----------------------------------------
+#
+# Not in handlers._button_handlers: a typed batch answer can never change a
+# reply rule, only the owner's tap on these buttons.
+
+RULE_PREFIX = "jr"
+RULE_MARK = "p"
+RULE_ASK = "u"
+RULE_YES = "y"
+RULE_NO = "n"
+RULE_GROUP_YES = "g"
+RULE_BUTTON_WIDTH = 28
+
+
+def _rule_label(name: str | None) -> str:
+    """A button shows plain text: no HTML escaping, but no bidi or
+    zero-width characters either (the name is the counterparty's)."""
+    text = safety.display_name(name or "").strip() or replies.PERSONAL_UNKNOWN_CHAT
+    return text if len(text) <= RULE_BUTTON_WIDTH else text[: RULE_BUTTON_WIDTH - 1] + "…"
+
+
+def personal_list(
+    marked: list[tuple[int, str | None]], suggested: list[tuple[int, str]]
+) -> InlineKeyboardMarkup | None:
+    """`/shaxsiylar`: 🔓 per personal chat (asks first), 🔒 per suggestion."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🔓 {_rule_label(name)}",
+                callback_data=f"{RULE_PREFIX}:{RULE_ASK}:{rule_id}",
+            )
+        ]
+        for rule_id, name in marked[: replies.PERSONAL_LIST_MAX]
+    ]
+    rows += [
+        [
+            InlineKeyboardButton(
+                text=f"🔒 {_rule_label(name)}",
+                callback_data=f"{RULE_PREFIX}:{RULE_MARK}:{person_id}",
+            )
+        ]
+        for person_id, name in suggested
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def personal_unmark_confirm(rule_id: int) -> InlineKeyboardMarkup:
+    """Loosening needs a tap (§5.4): ✅ Ha, chiqar / ✖️ Yo'q."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.PERSONAL_UNMARK_YES,
+                    callback_data=f"{RULE_PREFIX}:{RULE_YES}:{rule_id}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.PERSONAL_UNMARK_NO,
+                    callback_data=f"{RULE_PREFIX}:{RULE_NO}:{rule_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def group_reply_confirm(monitor_id: int) -> InlineKeyboardMarkup:
+    """Switching AI replies on in a group is a loosening: ✅ Ha, yoq / ✖️ Yo'q."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.GROUP_REPLY_YES,
+                    callback_data=f"{RULE_PREFIX}:{RULE_GROUP_YES}:{monitor_id}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.GROUP_REPLY_NO,
+                    callback_data=f"{RULE_PREFIX}:{RULE_NO}:{monitor_id}",
+                ),
             ]
         ]
     )

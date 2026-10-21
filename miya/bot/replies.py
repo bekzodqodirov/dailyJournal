@@ -118,6 +118,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /xarajat — MIYA'ning API xarajati
 /holat — MIYA'ning ahvoli
 /jarvis — Jarvis holati (toxtat — to'xtatish, yoq [kanal] — yoqish, tarix)
+/shaxsiy &lt;ism yoki GS kod&gt; — shaxsiy chat: MIYA u yerga hech qachon o'zi yozmaydi
+/shaxsiylar — shaxsiy chatlar va oila/do'st takliflari
+/guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -159,6 +162,9 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("xarajat", "MIYA'ning API xarajati"),
     ("holat", "MIYA'ning ahvoli"),
     ("jarvis", "Jarvis holati, to'xtatish va yoqish"),
+    ("shaxsiy", "Chatni shaxsiy deb belgilash"),
+    ("shaxsiylar", "Shaxsiy chatlar va takliflar"),
+    ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -713,6 +719,7 @@ _AMBIGUOUS_HINT = {
     "eslab": "/eslab {name}: …",
     "unut": "/unut {name}",
     "kod": "/kod {name} …",
+    "shaxsiy": "/shaxsiy {name}",
 }
 
 
@@ -3349,6 +3356,8 @@ JARVIS_FIELD_LABELS = {
     "person_id": "shaxs",
     "warned_personal": "shaxsiy chat ogohlantirishi",
     "warned_safety": "xavf ogohlantirishi",
+    "reason": "sabab",
+    "linked": "bog'langan belgi",
 }
 JARVIS_STATE_LABELS = {
     "shadow": "kuzatuv",
@@ -3383,6 +3392,15 @@ JARVIS_BY_LABELS = {
     "reconcile": "qayta tekshiruv",
 }
 JARVIS_PAUSE_REASON_LABELS = {"owner": "siz"}
+# A reply rule's mode and reason (JV-12) in `/jarvis tarix`.
+JARVIS_RULE_MODE_LABELS = {"never": "hech qachon"}
+JARVIS_RULE_REASON_LABELS = {
+    "personal": "shaxsiy",
+    "group": "guruh",
+    "spam": "spam",
+    "bot": "bot",
+    "owner": "siz",
+}
 JARVIS_SCOPE_LABELS = {
     "global": "Jarvis",
     "channel:telegram": "Telegram",
@@ -3442,6 +3460,12 @@ def _jarvis_value(field: str, value: str | None) -> str:
         return JARVIS_STATE_LABELS.get(value, value)
     if field == "mode" and value in JARVIS_MODE_LABELS:
         return jarvis_mode_label(value).split(" (")[0]
+    if field == "mode" and value in JARVIS_RULE_MODE_LABELS:
+        return JARVIS_RULE_MODE_LABELS[value]
+    if field == "reason":
+        return JARVIS_RULE_REASON_LABELS.get(value, value)
+    if field == "linked":
+        return _jarvis_ref("rule", value)
     if field == "pause":
         return JARVIS_PAUSE_REASON_LABELS.get(value, value)
     return value
@@ -3470,3 +3494,134 @@ def jarvis_history(actions) -> str:
             f"{escape(field)}: {change}{code}{by}"
         )
     return clip("\n".join(lines))
+
+
+# --- /shaxsiy, /shaxsiylar, /guruhai (JV-12) -------------------------------------------
+#
+# Names and titles here are a counterparty's choosing: shown through _shown.
+
+PERSONAL_USAGE = (
+    "Kimni shaxsiy deb belgilay? <code>/shaxsiy Ism</code> yoki "
+    "<code>/shaxsiy GS367</code> (oilaviy guruh nomi ham bo'ladi).\n"
+    "MIYA belgilangan chatga hech qachon o'zi yozmaydi. Ro'yxat: /shaxsiylar"
+)
+PERSONAL_MARKED = (
+    "🔒 {ism} shaxsiy deb belgilandi. MIYA bu chatga hech qachon o'zi yozmaydi "
+    "(o'qish davom etadi)."
+)
+PERSONAL_UNMARK_QUESTION = (
+    "🔓 {ism}ni shaxsiydan chiqaraymi? Shunda MIYA unga qoralama tayyorlay oladi."
+)
+PERSONAL_UNMARK_YES = "✅ Ha, chiqar"
+PERSONAL_UNMARK_NO = "✖️ Yo'q"
+PERSONAL_UNMARKED = "🔓 {ism} shaxsiydan chiqarildi."
+PERSONAL_LIST_HEADER = "🔒 Shaxsiy chatlar ({n}):"
+PERSONAL_LIST_EMPTY = "Hali hech kim belgilanmagan. Belgilash: <code>/shaxsiy Ism</code>"
+PERSONAL_SUGGESTIONS_HEADER = "💡 Oila yoki do'st bo'lishi mumkin:"
+PERSONAL_LIST_HINT = (
+    "<i>🔒 tugmasi — bir bosishda shaxsiy deb belgilash; 🔓 — shaxsiydan chiqarish "
+    "(tasdiq so'raladi).</i>"
+)
+PERSONAL_UNKNOWN_CHAT = "Nomaʼlum chat"
+# The most markings listed by name in one message (the buttons follow it).
+PERSONAL_LIST_MAX = 30
+RULE_KEPT = "✖️ Hech narsa o'zgarmadi."
+RULE_STALE = "Bu savol eskirgan — ro'yxat: /shaxsiylar"
+
+GROUP_REPLY_USAGE = (
+    "Qaysi guruh? <code>/guruhai Guruh nomi</code> — shu guruhda MIYA javob "
+    "yozishini yoqish yoki o'chirish (faqat sizga murojaat qilinganda)."
+)
+GROUP_REPLY_ENABLED = "👥 Javob yoqilgan guruhlar: {list}"
+GROUP_REPLY_QUESTION = (
+    "👥 «{guruh}» guruhida MIYA javob yozsinmi? Faqat sizga murojaat qilingan "
+    "xabarlarga, har biri sizning tasdig'ingiz bilan."
+)
+GROUP_REPLY_YES = "✅ Ha, yoq"
+GROUP_REPLY_NO = "✖️ Yo'q"
+GROUP_REPLY_ON = (
+    "👥 «{guruh}» guruhida MIYA javob yozishi yoqildi (faqat sizga murojaat "
+    "qilinganda)."
+)
+GROUP_REPLY_OFF = "👥 «{guruh}» guruhida MIYA javob yozishi o'chirildi."
+GROUP_REPLY_PERSONAL = (
+    "🔒 «{guruh}» shaxsiy deb belgilangan — MIYA u yerda javob yozmaydi."
+)
+GROUP_NOT_FOUND = "❓ «{guruh}» nomli guruh topilmadi."
+GROUP_AMBIGUOUS = (
+    "Qaysi {kind}? {list} — nomini to'liqroq yozing yoki raqamini: "
+    "<code>/{command} {example}</code>"
+)
+
+
+def _rule_name(name: str | None) -> str:
+    return _shown(name) if name else PERSONAL_UNKNOWN_CHAT
+
+
+def personal_marked(name: str | None) -> str:
+    return PERSONAL_MARKED.format(ism=_rule_name(name))
+
+
+def personal_unmark_question(name: str | None) -> str:
+    return PERSONAL_UNMARK_QUESTION.format(ism=_rule_name(name))
+
+
+def personal_unmarked(name: str | None) -> str:
+    return PERSONAL_UNMARKED.format(ism=_rule_name(name))
+
+
+def personal_list(marked, suggestions) -> str:
+    """`/shaxsiylar`: the personal chats by name, then MIYA's suggestions of
+    likely family and friends (each one a 🔒 button below)."""
+    lines = [PERSONAL_LIST_HEADER.format(n=len(marked))]
+    if not marked:
+        lines.append(PERSONAL_LIST_EMPTY)
+    lines += [f"• {_rule_name(item.name)}" for item in marked[:PERSONAL_LIST_MAX]]
+    if len(marked) > PERSONAL_LIST_MAX:
+        lines.append(f"… va yana {len(marked) - PERSONAL_LIST_MAX} ta")
+    if suggestions:
+        lines += ["", PERSONAL_SUGGESTIONS_HEADER]
+        lines += [f"• {_rule_name(item.name)}" for item in suggestions]
+    if marked or suggestions:
+        lines += ["", PERSONAL_LIST_HINT]
+    return clip("\n".join(lines))
+
+
+def group_reply_question(title: str | None) -> str:
+    return GROUP_REPLY_QUESTION.format(guruh=_rule_name(title))
+
+
+def group_reply_on(title: str | None) -> str:
+    return GROUP_REPLY_ON.format(guruh=_rule_name(title))
+
+
+def group_reply_off(title: str | None) -> str:
+    return GROUP_REPLY_OFF.format(guruh=_rule_name(title))
+
+
+def group_reply_personal(title: str | None) -> str:
+    return GROUP_REPLY_PERSONAL.format(guruh=_rule_name(title))
+
+
+def group_not_found(title: str) -> str:
+    return GROUP_NOT_FOUND.format(guruh=_shown(title))
+
+
+def group_ambiguous(chats, *, command: str) -> str:
+    """Several chats match: each with its Telegram id, which picks one
+    (``/guruhai -100123``), since two chats can share a title."""
+    shown = ", ".join(f"«{_rule_name(title)}» ({int(tg_id)})" for title, tg_id in chats)
+    return GROUP_AMBIGUOUS.format(
+        kind="guruh" if command == "guruhai" else "chat",
+        list=shown,
+        command=command,
+        example=int(chats[0][1]),
+    )
+
+
+def group_reply_usage(enabled_titles) -> str:
+    """`/guruhai` alone: how to use it, and which groups are switched on."""
+    if not enabled_titles:
+        return GROUP_REPLY_USAGE
+    shown = ", ".join(f"«{_rule_name(t)}»" for t in enabled_titles)
+    return f"{GROUP_REPLY_USAGE}\n{GROUP_REPLY_ENABLED.format(list=shown)}"

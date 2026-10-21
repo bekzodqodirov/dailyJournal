@@ -1019,6 +1019,346 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
     await _safe_answer(message, body)
 
 
+# --- personal chats and group replies (JV-12) ---------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# Restricting is immediate (/shaxsiy, a 🔒 tap, switching a group off);
+# loosening is a confirmed tap (unmarking, switching a group on). The jr:
+# buttons are not in _button_handlers, so a typed batch answer never changes
+# a rule.
+
+
+# The most chats named in one «which one?» answer.
+CHATS_TITLED_MAX = 6
+
+
+async def _chats_titled(
+    session, title: str, *, kinds: tuple[ChatType, ...], exact_only: bool = False
+) -> list[ChatMonitor]:
+    """Chats of ``kinds`` titled exactly ``title``, else those whose title
+    contains it, newest first; a bare chat id finds that chat. Titles are
+    compared folded like a person's name (case, apostrophes, Cyrillic), so
+    «Do‘stlar» and «Оила» are found as typed «Do'stlar» and «Oila»."""
+    wanted = title.strip()
+    if not wanted:
+        return []
+    base = sa.select(ChatMonitor).where(ChatMonitor.chat_type.in_(kinds))
+    if wanted.lstrip("-").isdigit():
+        found = await session.scalar(base.where(ChatMonitor.tg_chat_id == int(wanted)))
+        if found is not None:
+            return [found]
+    folded = normalise_for_search(wanted)
+    if not folded:
+        return []
+    # The monitors table is small: one row per chat the account is in.
+    titled = [
+        (normalise_for_search(monitor.title), monitor)
+        for monitor in await session.scalars(
+            base.where(ChatMonitor.title.isnot(None)).order_by(ChatMonitor.id)
+        )
+    ]
+    exact = [monitor for name, monitor in titled if name == folded]
+    if exact or exact_only:
+        return exact
+    contains = [monitor for name, monitor in titled if folded in name]
+    contains.sort(
+        key=lambda monitor: (
+            monitor.last_seen_at is None,
+            -(monitor.last_seen_at.timestamp() if monitor.last_seen_at else 0.0),
+            monitor.id,
+        )
+    )
+    return contains[:CHATS_TITLED_MAX]
+
+
+async def _personal_command(session, name: str, *, now: datetime):
+    """`/shaxsiy` on one name: mark at once, or ask before unmarking."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    # A family group named exactly so is the chat; otherwise a person by
+    # name or code (_lookup), then any chat whose title holds the words.
+    groups = await _chats_titled(session, name, kinds=(ChatType.group,), exact_only=True)
+    monitor = groups[0] if len(groups) == 1 else None
+    person = None
+    if monitor is None:
+        person, body = await _lookup(session, name, command="shaxsiy")
+        if person is None:
+            if body != replies.person_not_found(name):
+                return body, None
+            found = await _chats_titled(
+                session, name, kinds=(ChatType.private, ChatType.group)
+            )
+            if not found:
+                return body, None
+            if len(found) > 1:
+                return (
+                    replies.group_ambiguous(
+                        [(c.title, c.tg_chat_id) for c in found], command="shaxsiy"
+                    ),
+                    None,
+                )
+            monitor = found[0]
+    if person is not None:
+        addresses = await people.known_addresses(session, person)
+        rule = await jarvis_policy.personal_rule(
+            session,
+            person_id=person.id,
+            chat_keys=[a for a in addresses if a.startswith("tg:")],
+        )
+        if rule is not None:
+            return (
+                replies.personal_unmark_question(person.display_name),
+                keyboards.personal_unmark_confirm(rule.id),
+            )
+        await jarvis_policy.mark_person(session, person, by=records.BY_COMMAND, now=now)
+        return replies.personal_marked(person.display_name), None
+    key = jarvis_chatkey.telegram(monitor.tg_chat_id)
+    rule = await jarvis_policy.personal_rule(session, chat_keys=[key])
+    if rule is not None:
+        return (
+            replies.personal_unmark_question(monitor.title),
+            keyboards.personal_unmark_confirm(rule.id),
+        )
+    await jarvis_policy.mark_chat(session, monitor, by=records.BY_COMMAND, now=now)
+    return replies.personal_marked(monitor.title), None
+
+
+@router.message(Command("shaxsiy"))
+async def cmd_personal(message: Message, command: CommandObject) -> None:
+    """`/shaxsiy <ism|kod>` — MIYA never writes into this person's or chat's
+    conversation on its own (JV-12). Marked at once, with every address the
+    person is known at; on a chat already personal it asks before unmarking."""
+    name = (command.args or "").strip()
+    if not name:
+        await _safe_answer(message, replies.PERSONAL_USAGE)
+        return
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            body, keyboard = await _personal_command(
+                session, name, now=datetime.now(settings.tz)
+            )
+    except Exception as exc:
+        log.error(
+            "/shaxsiy failed",
+            extra={"command": "shaxsiy", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _personal_page():
+    """The `/shaxsiylar` text and its buttons. The suggestions run in a
+    savepoint: when they fail, the list still comes out without them."""
+    from miya.jarvis import policy as jarvis_policy
+
+    now = datetime.now(settings.tz)
+    async with session_scope() as session:
+        marked = await jarvis_policy.personal_chats(session)
+        try:
+            async with session.begin_nested():
+                suggestions = await jarvis_policy.suggest_personal(session, now=now)
+        except Exception as exc:
+            log.error(
+                "personal suggestions failed",
+                extra={"marked": len(marked), "error": type(exc).__name__},
+            )
+            suggestions = []
+    body = replies.personal_list(marked, suggestions)
+    keyboard = keyboards.personal_list(
+        [(item.rule_id, item.name) for item in marked],
+        [(item.person_id, item.name) for item in suggestions],
+    )
+    return body, keyboard
+
+
+@router.message(Command("shaxsiylar"))
+async def cmd_personal_list(message: Message) -> None:
+    """`/shaxsiylar` — the personal chats, and likely family and friends MIYA
+    found from the database, each one tap to mark (nothing is marked
+    without the owner)."""
+    try:
+        body, keyboard = await _personal_page()
+    except Exception as exc:
+        log.error(
+            "/shaxsiylar failed",
+            extra={"command": "shaxsiylar", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.message(Command("guruhai"))
+async def cmd_group_reply(message: Message, command: CommandObject) -> None:
+    """`/guruhai <guruh>` — AI replies in one group: off at once, on after a
+    confirm tap, and then only to messages addressed to the owner (JV-12)."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    title = (command.args or "").strip()
+    keyboard = None
+    monitor_id = None
+    try:
+        async with session_scope() as session:
+            if not title:
+                body = replies.group_reply_usage(
+                    await jarvis_policy.enabled_group_titles(session)
+                )
+            else:
+                found = await _chats_titled(session, title, kinds=(ChatType.group,))
+                if not found:
+                    body = replies.group_not_found(title)
+                elif len(found) > 1:
+                    body = replies.group_ambiguous(
+                        [(c.title, c.tg_chat_id) for c in found], command="guruhai"
+                    )
+                else:
+                    monitor = found[0]
+                    monitor_id = monitor.id
+                    key = jarvis_chatkey.telegram(monitor.tg_chat_id)
+                    state = await jarvis_policy.group_reply_state(session, key)
+                    if state == "personal":
+                        body = replies.group_reply_personal(monitor.title)
+                    elif state == "on":
+                        await jarvis_policy.set_group_reply(
+                            session,
+                            chat_key=key,
+                            enabled=False,
+                            by=records.BY_COMMAND,
+                            now=datetime.now(settings.tz),
+                        )
+                        body = replies.group_reply_off(monitor.title)
+                    else:
+                        body = replies.group_reply_question(monitor.title)
+                        keyboard = keyboards.group_reply_confirm(monitor.id)
+    except Exception as exc:
+        log.error(
+            "/guruhai failed",
+            extra={
+                "command": "guruhai",
+                "monitor_id": monitor_id,
+                "error": type(exc).__name__,
+            },
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _rule_tap(action: str, ident: int, *, now: datetime):
+    """One jr: tap: (text, keyboard, edit the tapped message in place)."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    async with session_scope() as session:
+        if action == keyboards.RULE_MARK:
+            person = await session.get(Person, ident)
+            if person is None:
+                return replies.RULE_STALE, None, False
+            await jarvis_policy.mark_person(
+                session, person, by=records.BY_BUTTON, now=now
+            )
+            return replies.personal_marked(person.display_name), None, False
+        if action == keyboards.RULE_ASK:
+            rule = await jarvis_policy.personal_rule_by_id(session, ident)
+            if rule is None:
+                return replies.RULE_STALE, None, False
+            [listed] = await jarvis_policy.describe(session, [rule])
+            return (
+                replies.personal_unmark_question(listed.name),
+                keyboards.personal_unmark_confirm(rule.id),
+                False,
+            )
+        if action == keyboards.RULE_YES:
+            rule = await jarvis_policy.unmark_personal(
+                session, ident, by=records.BY_BUTTON, now=now
+            )
+            if rule is None:
+                return replies.RULE_STALE, None, True
+            [listed] = await jarvis_policy.describe(session, [rule])
+            return replies.personal_unmarked(listed.name), None, True
+        # keyboards.RULE_GROUP_YES
+        monitor = await session.get(ChatMonitor, ident)
+        if monitor is None or monitor.chat_type != ChatType.group:
+            return replies.RULE_STALE, None, True
+        state = await jarvis_policy.set_group_reply(
+            session,
+            chat_key=jarvis_chatkey.telegram(monitor.tg_chat_id),
+            enabled=True,
+            by=records.BY_BUTTON,
+            now=now,
+        )
+        if state == "personal":
+            return replies.group_reply_personal(monitor.title), None, True
+        return replies.group_reply_on(monitor.title), None, True
+
+
+_RULE_ACTIONS = {
+    keyboards.RULE_MARK,
+    keyboards.RULE_ASK,
+    keyboards.RULE_YES,
+    keyboards.RULE_NO,
+    keyboards.RULE_GROUP_YES,
+}
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.RULE_PREFIX}:"))
+async def on_rule_button(callback: CallbackQuery) -> None:
+    """🔒 / 🔓 under `/shaxsiylar`, and the confirms of unmarking and of
+    switching a group on (JV-12). Every change runs under a row lock and is
+    re-checked; a second tap changes nothing. Not in ``_button_handlers``.
+    """
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    ident = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if action not in _RULE_ACTIONS or ident is None:
+        await _ack(callback)
+        return
+    if action == keyboards.RULE_NO:
+        await _edit_callback(callback, replies.RULE_KEPT)
+        return
+    try:
+        body, keyboard, in_place = await _rule_tap(
+            action, ident, now=datetime.now(settings.tz)
+        )
+    except Exception as exc:
+        log.error(
+            "reply rule tap failed",
+            extra={"rule_action": action, "ref_id": ident, "error": type(exc).__name__},
+        )
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if in_place:
+        await _edit_callback(callback, body)
+        return
+    if callback.message is not None:
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+        if action == keyboards.RULE_MARK and body != replies.RULE_STALE:
+            await _refresh_personal_page(callback)
+    await _ack(callback)
+
+
+async def _refresh_personal_page(callback: CallbackQuery) -> None:
+    """The tapped list shows the person among the personal chats now."""
+    try:
+        body, keyboard = await _personal_page()
+        await callback.message.edit_text(body, reply_markup=keyboard)
+    except Exception as exc:
+        # Cosmetic: the mark is committed; the next /shaxsiylar shows it.
+        log.info(
+            "could not refresh the personal list", extra={"error": type(exc).__name__}
+        )
+
+
+async def _ack(callback: CallbackQuery) -> None:
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
 @router.message(Command("unut"))
 async def cmd_purge(message: Message, command: CommandObject) -> None:
     """`/unut` — destructive, so it only ever shows a plan and asks first."""

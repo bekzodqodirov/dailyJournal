@@ -19,6 +19,7 @@ from rapidfuzz import fuzz
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
+from miya.db.enums import Direction
 from miya.db.models import Person
 from miya.services import codes
 from miya.services.text import fold_apostrophes, to_latin
@@ -637,6 +638,54 @@ async def find_by_phone(session: AsyncSession, phone: str) -> Person | None:
         )
         .limit(1)
     )
+
+
+# --- the addresses a person is reached at (JV-12) ----------------------------------
+
+# A WhatsApp user's jid is their international number at this domain.
+WHATSAPP_USER_DOMAIN = "@s.whatsapp.net"
+# A private Telegram chat the person wrote in, looked up only for a person with
+# no telegram_id (an imported history): enough for every real case.
+PRIVATE_CHATS_MAX = 5
+
+
+def whatsapp_jid(phone: str | None) -> str | None:
+    """The jid of a number written with its country code (11-15 digits).
+
+    A shorter number has no country code, and a country is never guessed.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    return f"{digits}{WHATSAPP_USER_DOMAIN}" if 11 <= len(digits) <= 15 else None
+
+
+async def known_addresses(session: AsyncSession, person: Person) -> list[str]:
+    """Every channel-qualified address this person is known at, for a
+    reply rule's snapshot (docs/jarvis-plan.md §4.2): ``tg:<user id>`` (a
+    Telegram private chat has the user's id), ``wa:<jid>`` from a phone with
+    its country code. Forgetting or merging the person later keeps them.
+    """
+    from miya.db import models as m
+
+    found: list[str] = []
+    if person.telegram_id is not None:
+        found.append(f"tg:{int(person.telegram_id)}")
+    else:
+        chats = await session.scalars(
+            sa.select(m.Interaction.tg_chat_id)
+            .where(
+                m.Interaction.person_id == person.id,
+                m.Interaction.tg_chat_id > 0,
+                m.Interaction.direction == Direction.in_,
+            )
+            .group_by(m.Interaction.tg_chat_id)
+            .order_by(sa.func.max(m.Interaction.occurred_at).desc())
+            .limit(PRIVATE_CHATS_MAX)
+        )
+        found += [f"tg:{int(chat_id)}" for chat_id in chats if chat_id is not None]
+    jid = whatsapp_jid(person.phone)
+    if jid is not None:
+        found.append(f"wa:{jid}")
+    return list(dict.fromkeys(found))
 
 
 # --- merging two people (WP-77) ----------------------------------------------------
