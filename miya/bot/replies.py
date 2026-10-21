@@ -122,6 +122,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /shaxsiylar — shaxsiy chatlar va oila/do'st takliflari
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
 /uslub [yukla] — yozish uslubingiz (yukla — eski yozishmalardan o'rganish)
+/bilim [qo'sh|tuzat|o'chir|taklif] — bilimlar bazasi: mijozlarga umumiy javoblar
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -167,6 +168,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("shaxsiylar", "Shaxsiy chatlar va takliflar"),
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
     ("uslub", "Yozish uslubingiz"),
+    ("bilim", "Bilimlar bazasi: umumiy javoblar"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -1991,6 +1993,7 @@ _COUNT_LABEL = {
     "outbox": "Jarvis xabari (qoralama yoki yuborilgan)",
     "escalations": "Jarvis eskalatsiyasi",
     "style_examples": "uslub misoli",
+    "knowledge_entries": "bilimlar bazasi yozuvi",
 }
 PURGE_REPORTS_NOTE = (
     "<i>O'sha kunlarning saqlangan kunlik xulosalari butunlay o'chadi (boshqa "
@@ -3723,3 +3726,127 @@ def style_too_few(n: int, minimum: int) -> str:
 
 def style_activated(version: int) -> str:
     return STYLE_ACTIVATED.format(v=version)
+
+
+# --- /bilim (JV-15) -----------------------------------------------------------------
+#
+# The entries come from miya.jarvis.kb as plain values (kb.EntryView): this
+# module never imports miya.jarvis (rule 20). A suggestion is written from
+# clients' messages, so every entry's text is shown through _shown.
+
+KB_HEADER = "📚 Bilimlar bazasi ({n} ta faol):"
+KB_LINE_FAQ = "<code>{ref}</code> {savol} — {javob}"
+KB_LINE_FACT = "<code>{ref}</code> {javob}"
+KB_MORE = "… yana {n} ta"
+KB_EMPTY = "📚 Bilimlar bazasi bo'sh. Qo'shish: <code>/bilim qo'sh Savol | Javob</code>"
+KB_ADDED = "✅ Qo'shildi: b{id} — {savol}"
+KB_EDITED = "✏️ b{id} yangilandi: {savol}"
+KB_REFUSED = (
+    "⛔ Qo'shilmadi: javobda {belgilar} bor. Bunday savollarga MIYA doim sizga "
+    "yo'naltiradi."
+)
+# A client's personal data is never stored (no phone, card, e-mail, handle,
+# client code or a person's name).
+KB_REFUSED_PRIVATE = (
+    "⛔ Qo'shilmadi: matnda {belgilar} bor. Mijozlarning shaxsiy ma'lumotlari "
+    "bilimlar bazasiga yozilmaydi."
+)
+KB_TOO_LONG = "⛔ Qo'shilmadi: matn juda uzun (ko'pi bilan {n} belgi)."
+KB_SUGGESTED = "💡 Javoblaringizdan {n} ta bilim taklif qilindi: /bilim taklif"
+KB_SUGGESTION_CARD = "💡 Taklif {ref}:\n{savol}\n— {javob}"
+KB_NO_SUGGESTIONS = "💡 Hozircha bilim takliflari yo'q."
+KB_ADD = "✅ Qo'shish"
+KB_DISMISS = "✖️ Kerak emas"
+KB_RETIRED = "🗑 b{id} o'chirildi."
+KB_DISMISSED = "✖️ b{id} taklifi olib tashlandi."
+KB_STALE = "Bu taklif allaqachon ko'rib chiqilgan: /bilim taklif"
+KB_NOT_FOUND = "b{id} topilmadi yoki allaqachon o'chirilgan: /bilim"
+KB_USAGE = (
+    "<code>/bilim</code> — bilimlar bazasi\n"
+    "<code>/bilim qo'sh Savol | Javob</code> — qo'shish (savolsiz bo'lsa — fakt)\n"
+    "<code>/bilim tuzat b12 Savol | Javob</code> — tuzatish\n"
+    "<code>/bilim o'chir b12</code> — o'chirish\n"
+    "<code>/bilim taklif</code> — javoblaringizdan MIYA takliflari"
+)
+# How much of a long question or answer a list line or a confirmation shows.
+KB_SHOWN_CHARS = 120
+
+
+def _kb_text(text: str | None) -> str:
+    value = (text or "").strip()
+    if len(value) > KB_SHOWN_CHARS:
+        value = value[: KB_SHOWN_CHARS - 1].rstrip() + "…"
+    return _shown(value)
+
+
+def _kb_title(entry) -> str:
+    """What names an entry in a confirmation: its question, else its answer."""
+    return _kb_text(entry.question or entry.answer)
+
+
+def kb_list(entries, active: int) -> str:
+    """`/bilim`: the active entries, oldest first."""
+    if not active:
+        return KB_EMPTY
+    lines = [KB_HEADER.format(n=active)]
+    for entry in entries:
+        if entry.question:
+            lines.append(
+                KB_LINE_FAQ.format(
+                    ref=entry.ref,
+                    savol=_kb_text(entry.question),
+                    javob=_kb_text(entry.answer),
+                )
+            )
+        else:
+            lines.append(KB_LINE_FACT.format(ref=entry.ref, javob=_kb_text(entry.answer)))
+    if active > len(entries):
+        lines.append(KB_MORE.format(n=active - len(entries)))
+    return clip("\n".join(lines))
+
+
+def kb_added(entry) -> str:
+    return KB_ADDED.format(id=entry.id, savol=_kb_title(entry))
+
+
+def kb_edited(entry) -> str:
+    return KB_EDITED.format(id=entry.id, savol=_kb_title(entry))
+
+
+def kb_refused(reason: str, labels, limit: int = 0) -> str:
+    """Why an entry was not stored (kb.Refusal)."""
+    if reason == "too_long":
+        return KB_TOO_LONG.format(n=limit)
+    if reason == "empty":
+        return KB_USAGE
+    shown = ", ".join(_shown(label) for label in labels)
+    if reason == "private":
+        return KB_REFUSED_PRIVATE.format(belgilar=shown)
+    return KB_REFUSED.format(belgilar=shown)
+
+
+def kb_suggested(n: int) -> str:
+    return KB_SUGGESTED.format(n=n)
+
+
+def kb_suggestion(entry) -> str:
+    """One suggestion card, above ✅ Qo'shish / ✖️ Kerak emas."""
+    return clip(
+        KB_SUGGESTION_CARD.format(
+            ref=entry.ref,
+            savol=_shown(entry.question or ""),
+            javob=_shown(entry.answer),
+        )
+    )
+
+
+def kb_retired(entry_id: int) -> str:
+    return KB_RETIRED.format(id=entry_id)
+
+
+def kb_dismissed(entry_id: int) -> str:
+    return KB_DISMISSED.format(id=entry_id)
+
+
+def kb_not_found(entry_id: int) -> str:
+    return KB_NOT_FOUND.format(id=entry_id)

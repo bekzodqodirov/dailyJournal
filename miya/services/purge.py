@@ -35,6 +35,7 @@ from miya.db.models import (
     Event,
     Interaction,
     JarvisChatState,
+    KnowledgeEntry,
     Memory,
     OutboxMessage,
     OwnerStyleExample,
@@ -182,6 +183,11 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
         )
         if ids
         else 0,
+        # A knowledge-base entry mined from the owner's answer (JV-15) goes
+        # with that answer, suggested or approved.
+        "knowledge_entries": await _count(
+            session, KnowledgeEntry, KnowledgeEntry.source_interaction_id, ids
+        ),
     }
 
     if ids:
@@ -771,6 +777,30 @@ def _redact(pattern, text: str | None) -> str | None:
     return pattern.sub(REDACTED, text)
 
 
+async def _forget_in_knowledge_base(session: AsyncSession, pattern, person_id) -> None:
+    """Strike a forgotten person's names from the knowledge base (JV-15).
+    miya.jarvis is loaded only when the base holds an entry (rule 20);
+    retired entries are struck too. A failure there is logged and never
+    stops the purge (rule 25)."""
+    try:
+        async with session.begin_nested():
+            held = await session.scalar(
+                sa.select(sa.func.count()).select_from(KnowledgeEntry)
+            )
+            if not held:
+                return
+            from miya.jarvis import kb
+
+            await kb.forget_names(
+                session, pattern, now=datetime.now(settings.tz), mark=REDACTED
+            )
+    except Exception as exc:
+        log.error(
+            "knowledge entries not scrubbed after a purge",
+            extra={"person_id": person_id, "error": type(exc).__name__},
+        )
+
+
 async def _forget_person(session: AsyncSession, plan: PurgePlan) -> None:
     """The person-only steps, after their rows are gone."""
     await session.flush()
@@ -817,6 +847,11 @@ async def _forget_person(session: AsyncSession, plan: PurgePlan) -> None:
             if len(kept) != len(rows):
                 traits["phrases"] = kept
                 profile.traits = traits
+    # A knowledge-base entry (JV-15) never names a client: one that names the
+    # forgotten person anyway (written before they were known) has the name
+    # struck and is retired, so it is never quoted again.
+    if pattern is not None:
+        await _forget_in_knowledge_base(session, pattern, plan.person_id)
     # Deleting the person cascades to their debts and promises, including
     # ones that came from a call the owner is otherwise keeping.
     await session.execute(sa.delete(Person).where(Person.id == plan.person_id))

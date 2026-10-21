@@ -91,6 +91,9 @@ async def _truncate(session) -> None:
         m.OwnerStyleExample,
         m.OwnerStyleProfile,
         m.OwnerStylePerson,
+        # Knowledge-base entries reference the interaction they were mined
+        # from (JV-15).
+        m.KnowledgeEntry,
         m.JarvisChatState,
         m.ReplyRule,
         m.JarvisPolicy,

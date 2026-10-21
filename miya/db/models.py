@@ -990,6 +990,7 @@ __all__ = [
     "Interaction",
     "JarvisChatState",
     "JarvisPolicy",
+    "KnowledgeEntry",
     "Memory",
     "OutboxMessage",
     "OwnerStyleExample",
@@ -1930,5 +1931,98 @@ class OwnerStylePerson(Base):
         sa.CheckConstraint(
             f"lang IN ({_sql_list(STYLE_PERSON_LANGS)})",
             name="ck_owner_style_people_lang",
+        ),
+    )
+
+
+# The values the knowledge-base CHECKs allow (JV-15, 0027). The migration keeps
+# its own frozen copy; tests/test_kb.py holds the two equal.
+KB_KINDS = ("fact", "faq")
+KB_STATES = ("suggested", "active", "retired")
+KB_SOURCES = ("owner", "suggested", "import")
+
+
+class KnowledgeEntry(Base):
+    """One fact or question-and-answer the owner approved (JV-15, 0027).
+
+    A ``fact`` is an answer alone; a ``faq`` has the client's question too.
+    ``active`` entries are the owner's: typed in with ``/bilim qo'sh`` or a
+    suggestion they approved with one tap; a ``suggested`` row is MIYA's
+    proposal from the owner's own past answers and is never read as an
+    answer; a ``retired`` one is never read again. ``guard`` is the red-line
+    verdict in the ``kb`` role at write time; every reader checks the text
+    again. Never a client's personal data: no phone, card, e-mail, handle,
+    client code or person's name. The search columns are those of
+    ``memories``.
+    """
+
+    __tablename__ = "knowledge_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    title: Mapped[str | None] = mapped_column(sa.Text)
+    question: Mapped[str | None] = mapped_column(sa.Text)
+    answer: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    lang: Mapped[str | None] = mapped_column(sa.String(4))
+    tags: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    source: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    # The owner's answer a suggestion was mined from: purging it takes the entry.
+    source_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    guard: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
+    search_norm: Mapped[str | None] = mapped_column(sa.Text)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        sa.Computed(
+            "to_tsvector('simple'::regconfig, coalesce(search_norm, ''))", persisted=True
+        ),
+    )
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"kind IN ({_sql_list(KB_KINDS)})", name="ck_knowledge_entries_kind"
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(KB_STATES)})", name="ck_knowledge_entries_state"
+        ),
+        sa.CheckConstraint(
+            f"source IN ({_sql_list(KB_SOURCES)})", name="ck_knowledge_entries_source"
+        ),
+        sa.CheckConstraint("btrim(answer) <> ''", name="ck_knowledge_entries_answer"),
+        sa.CheckConstraint(
+            "kind <> 'faq' OR question IS NOT NULL",
+            name="ck_knowledge_entries_faq_question",
+        ),
+        # Foreign keys that cascade are indexed (WP-23, 0016).
+        sa.Index("ix_knowledge_entries_source_interaction", "source_interaction_id"),
+        sa.Index("ix_knowledge_entries_tags", "tags", postgresql_using="gin"),
+        sa.Index("ix_knowledge_entries_tsv", "search_tsv", postgresql_using="gin"),
+        sa.Index(
+            "ix_knowledge_entries_trgm",
+            "search_norm",
+            postgresql_using="gin",
+            postgresql_ops={"search_norm": "gin_trgm_ops"},
+        ),
+        sa.Index(
+            "ix_knowledge_entries_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        sa.Index(
+            "ix_knowledge_entries_unembedded",
+            "id",
+            postgresql_where=sa.text("embedding IS NULL"),
         ),
     )

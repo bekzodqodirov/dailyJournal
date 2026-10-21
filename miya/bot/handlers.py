@@ -1471,6 +1471,175 @@ async def on_style_button(callback: CallbackQuery) -> None:
     await _ack(callback)
 
 
+# --- the knowledge base (JV-15) -------------------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# The kb: buttons are not in _button_handlers, so a typed batch answer never
+# adds a text the AI may send on its own.
+
+KB_ADD_WORDS = {"qosh", "qoshish", "qoshing", "add"}
+KB_EDIT_WORDS = {"tuzat", "tuzatish", "edit"}
+KB_RETIRE_WORDS = {"ochir", "ochirish", "uchir", "delete"}
+KB_SUGGEST_WORDS = {"taklif", "takliflar"}
+# The most entries `/bilim` lists, and suggestion cards sent at once.
+KB_LIST_MAX = 50
+KB_SUGGESTIONS_SHOWN = 5
+
+
+def _kb_word(word: str) -> str:
+    return fold_apostrophes(word).casefold().replace("'", "")
+
+
+def _first_word(text: str) -> tuple[str, str]:
+    """(the first word, the rest), split on any whitespace: the owner may
+    put the rest on the next line."""
+    parts = text.split(maxsplit=1)
+    return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
+
+
+def _kb_outcome(result) -> str:
+    """The text for a kb.WriteResult: added, or why not."""
+    if result.refusal is not None:
+        refusal = result.refusal
+        return replies.kb_refused(refusal.reason, refusal.labels, refusal.limit)
+    return replies.kb_added(result.entry)
+
+
+async def _kb_command(session, sub: str, rest: str, *, now: datetime):
+    """One `/bilim` subcommand: [(text, keyboard)], one message each."""
+    from miya.jarvis import kb
+
+    if not sub:
+        active = await kb.count(session, kb.ACTIVE)
+        entries = await kb.listing(session, kb.ACTIVE, limit=KB_LIST_MAX)
+        return [(replies.kb_list(entries, active), None)]
+    if sub in KB_ADD_WORDS:
+        question, answer = kb.split_entry(rest)
+        if not answer:
+            return [(replies.KB_USAGE, None)]
+        result = await kb.add(
+            session, question=question, answer=answer, by=records.BY_COMMAND, now=now
+        )
+        return [(_kb_outcome(result), None)]
+    if sub in KB_EDIT_WORDS:
+        handle, body = _first_word(rest)
+        entry_id = kb.parse_ref(handle)
+        question, answer = kb.split_entry(body)
+        if entry_id is None or not answer:
+            return [(replies.KB_USAGE, None)]
+        edited = await kb.edit(
+            session,
+            entry_id,
+            question=question,
+            answer=answer,
+            by=records.BY_COMMAND,
+            now=now,
+        )
+        if edited is None:
+            return [(replies.kb_not_found(entry_id), None)]
+        if edited.refusal is not None:
+            return [(_kb_outcome(edited), None)]
+        return [(replies.kb_edited(kb.view(edited.entry)), None)]
+    if sub in KB_RETIRE_WORDS:
+        entry_id = kb.parse_ref(rest)
+        if entry_id is None:
+            return [(replies.KB_USAGE, None)]
+        retired = await kb.retire(session, entry_id, by=records.BY_COMMAND, now=now)
+        if retired is None:
+            return [(replies.kb_not_found(entry_id), None)]
+        return [(replies.kb_retired(entry_id), None)]
+    if sub in KB_SUGGEST_WORDS:
+        waiting = await kb.listing(session, kb.SUGGESTED, limit=KB_SUGGESTIONS_SHOWN)
+        if not waiting:
+            return [(replies.KB_NO_SUGGESTIONS, None)]
+        cards = [
+            (replies.kb_suggestion(entry), keyboards.kb_suggestion(entry.id))
+            for entry in waiting
+        ]
+        more = await kb.count(session, kb.SUGGESTED) - len(waiting)
+        if more > 0:
+            cards.append((replies.KB_MORE.format(n=more), None))
+        return cards
+    return [(replies.KB_USAGE, None)]
+
+
+@router.message(Command("bilim"))
+async def cmd_knowledge(message: Message, command: CommandObject) -> None:
+    """`/bilim` — the business knowledge base: the facts and answers the
+    owner approved, the only statements Jarvis may make on its own.
+    `/bilim qo'sh Savol | Javob` adds one (a price, discount, payment term,
+    deadline, promise or a client's personal data is refused), `/bilim tuzat
+    b12 Savol | Javob` corrects one, `/bilim o'chir b12` retires one, and
+    `/bilim taklif` shows what MIYA suggests from the owner's own answers."""
+    first, rest = _first_word(command.args or "")
+    sub = _kb_word(first) if first else ""
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            outgoing = await _kb_command(session, sub, rest.strip(), now=now)
+    except Exception as exc:
+        log.error(
+            "/bilim failed",
+            extra={"command": sub or "list", "error": type(exc).__name__},
+        )
+        outgoing = [(replies.JARVIS_FAILED, None)]
+    for body, keyboard in outgoing:
+        await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _kb_tap(action: str, entry_id: int, *, now: datetime) -> str:
+    """One kb: tap: the card's new text."""
+    from miya.jarvis import kb
+
+    async with session_scope() as session:
+        if action == keyboards.KB_ADD:
+            result = await kb.approve_suggestion(
+                session, entry_id, by=records.BY_BUTTON, now=now
+            )
+            if result is None:
+                return replies.KB_STALE
+            return _kb_outcome(result)
+        dismissed = await kb.dismiss_suggestion(
+            session, entry_id, by=records.BY_BUTTON, now=now
+        )
+        if dismissed is None:
+            return replies.KB_STALE
+        return replies.kb_dismissed(entry_id)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.KB_PREFIX}:"))
+async def on_knowledge_button(callback: CallbackQuery) -> None:
+    """✅ Qo'shish / ✖️ Kerak emas under a knowledge-base suggestion
+    (JV-15): the owner's one tap is the only way a mined entry becomes
+    active. Under a row lock and re-checked; a second tap changes nothing.
+    Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    entry_id = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if action not in (keyboards.KB_ADD, keyboards.KB_DISMISS) or entry_id is None:
+        await _ack(callback)
+        return
+    try:
+        body = await _kb_tap(action, entry_id, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "knowledge tap failed",
+            extra={
+                "kb_action": action,
+                "kb_entry_id": entry_id,
+                "error": type(exc).__name__,
+            },
+        )
+        await _ack(callback)
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        return
+    if callback.message is not None:
+        await _edit_callback(callback, body)
+    else:
+        await _ack(callback)
+
+
 @router.message(Command("unut"))
 async def cmd_purge(message: Message, command: CommandObject) -> None:
     """`/unut` — destructive, so it only ever shows a plan and asks first."""

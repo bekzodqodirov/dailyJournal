@@ -33,4 +33,12 @@ The owner's style (JV-14):
   the profile versions and the owner's stall overrides.
 * ``style_prompt`` — the prose prompt and its checks, the deterministic
   fallback prose and the style block a reply drafter reads (pure).
+
+The knowledge base (JV-15):
+
+* ``kb`` — the owner-approved facts and answers: the writer that refuses
+  red lines and a client's personal data, hybrid retrieval, the active
+  answers the outbox reads for the statement allowlist, and the weekly
+  suggestions mined from the owner's own answers (never used before the
+  owner's tap).
 """

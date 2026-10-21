@@ -1698,6 +1698,33 @@ emas" · "🗑 b{id} o'chirildi."
 
 **Acceptance.** Green. Owner check: adding an office-hours fact works.
 
+**As built.** `miya/jarvis/kb.py` (mypy strict). The writer checks a client's personal data
+first (a phone or card number, an e-mail, a handle, a client code or waybill, a known person's
+name other than the owner's), then the answer in the `kb` role; the question is checked for
+personal data only, since it is never sent. Besides the plan's strings the owner sees «⛔
+Qo'shilmadi: matnda {belgilar} bor. Mijozlarning shaxsiy ma'lumotlari bilimlar bazasiga
+yozilmaydi.», a length refusal, `/bilim tuzat b12 Savol | Javob` (edit; the state stays) with
+«✏️ b{id} yangilandi: {savol}», and «✖️ b{id} taklifi olib tashlandi.» for «Kerak emas»
+(`kb:y:<id>` / `kb:n:<id>`, not in `_button_handlers`). A dismissed suggestion is retired and
+never mined again. Retrieval: an entry matches when the cosine similarity of the embeddings or
+the share of the question's words found (by prefix, through `search_tsv`) in the entry's
+question reaches `KB_MATCH_THRESHOLD`; every read checks the entry again. `outbox.create` takes
+`kb_entry_ids` (ints only, `bad_kb_entry_ids` otherwise), loads the answers of those still
+active itself and keeps the ids in the guard JSON (`kb_entry_ids`, carried over on a re-guard);
+caller texts stay refused. `outbox._context` passes the answers of every active entry, read once
+per claim (`owner_kb_texts`, contained). `kb_mining` runs hourly with `JARVIS_ENABLED`: it embeds
+new entries, and once a week (`reminder_log` kind `kb_mining`) clusters the owner's genuine
+answers to questions asked in at least two chats (no question with a red-line or identity
+signal, no private data on either side) and lets EXTRACT_MODEL write at most five digit-free
+suggestions (`jarvis_kb` usage, skipped over the cost cap). Purging the owner's answer takes a
+mined entry with it (`/unut` counts it); forgetting a person strikes their name from every entry
+that names them, retired ones included, and retires it. The writer reads the answer in the `kb`
+role, the outbox in the `reply` role, so an entry with a digit or a verb the reply role reads as
+a promise (office hours «soat 9 dan 18 gacha», «Biz Xitoydan yuk olib kelamiz») is stored, but a
+body quoting it is `blocked` by `create`, never sent or drafted; an entry never loosens a red
+line. Mining groups clients' questions at its own `MINING_CLUSTER_THRESHOLD` (0.75), not at
+`KB_MATCH_THRESHOLD`.
+
 ---
 
 #### JV-16 — Responder pipeline in shadow mode

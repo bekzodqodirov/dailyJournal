@@ -252,6 +252,11 @@ class Settings(BaseSettings):
     style_sample_size: int = Field(default=300, ge=10, le=5000)
     style_min_samples: int = Field(default=50, ge=1, le=5000)
 
+    # --- Knowledge base (JV-15) -------------------------------------------
+    # How close a client's question must be to an owner-approved entry for the
+    # entry to be retrieved: meaning similarity or word overlap, 0 to 1.
+    kb_match_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

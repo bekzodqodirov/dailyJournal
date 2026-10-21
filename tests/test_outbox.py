@@ -2115,8 +2115,9 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
     off = await jobs(False)
     assert off and not [job for job in off if job.startswith("jarvis")]
     on = await jobs(True)
-    # The owner-style refresh (JV-14) imports miya.jarvis: Jarvis-only too.
-    assert set(on) - set(off) == {"jarvis_outbox", "style_refresh"}
+    # The owner-style refresh (JV-14) and the knowledge-base job (JV-15) import
+    # miya.jarvis: Jarvis-only too.
+    assert set(on) - set(off) == {"jarvis_outbox", "style_refresh", "kb_mining"}
     # The userbot has no Telegram write path yet, and never imports miya.jarvis.
     tree = ast.parse(Path(userbot.__file__).read_text(encoding="utf-8"))
     imports = [

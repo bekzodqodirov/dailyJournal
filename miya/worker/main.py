@@ -23,6 +23,10 @@ Jobs:
                    import is read and tells the owner it is ready, and
                    rebuilds it weekly when the owner's messages changed (a
                    new version waits as a draft for the owner's tap)
+  * kb_mining    — hourly, only with JARVIS_ENABLED; embeds new knowledge-base
+                   entries, and once a week suggests entries from the
+                   owner's own answers to questions several clients asked
+                   (JV-15); a suggestion is never used before the owner's tap
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -592,6 +596,49 @@ async def style_refresh_job(bot: Bot, *, now: datetime | None = None) -> None:
         log.error(
             "style ready notice failed",
             extra={"version": version, "error": type(exc).__name__},
+        )
+
+
+async def kb_mining_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The knowledge base (JV-15). Every run embeds the entries still
+    without a vector; once a week (``kb.mining_due``) MIYA suggests entries
+    from the owner's own past answers and tells the owner how many wait for
+    their tap. A run stopped by the cost cap is not counted: the next hourly
+    run checks the cap first (reading and embedding nothing while it holds)
+    and mines once it lifts, the next day.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step is contained: a failure is logged with
+    its class and the job ends until its next run (rule 25); inside the
+    mining, one cluster that fails never stops the others.
+    """
+    from miya.jarvis import kb
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            await kb.embed_pending(session)
+    except Exception as exc:
+        log.error("knowledge entries not embedded", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            if not await kb.mining_due(session, now=now):
+                return
+            result = await kb.mine(session, now=now)
+            if result.stopped is None:
+                kb.mark_mined(session, now=now)
+    except Exception as exc:
+        log.error("knowledge mining failed", extra={"error": type(exc).__name__})
+        return
+    if result.suggested <= 0:
+        return
+    try:
+        text = replies.kb_suggested(result.suggested)
+        await notify(bot, text, silent=reminders.in_quiet_hours(now))
+    except Exception as exc:
+        log.error(
+            "knowledge suggestion notice failed",
+            extra={"suggested": result.suggested, "error": type(exc).__name__},
         )
 
 
@@ -1975,6 +2022,14 @@ async def run() -> None:
             IntervalTrigger(minutes=10),
             args=[bot],
             id="style_refresh",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            kb_mining_job,
+            IntervalTrigger(hours=1),
+            args=[bot],
+            id="kb_mining",
             max_instances=1,
             coalesce=True,
         )

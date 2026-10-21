@@ -22,9 +22,10 @@ The lifecycle::
 An AI row is approved on its own (``auto:policy``) only when its intent
 graduated and its bound verdict carries ``shapes_ok`` (the statement
 allowlist, rule 13a): every sentence a courtesy, a question, a stall or an
-approved KB text. A text with a free-form statement becomes a draft card
-(``unapproved_statement``) instead; ``gate.evaluate`` holds the same line at
-the claim.
+approved KB text (the answer of an active owner-approved knowledge-base
+entry, JV-15, which the outbox loads itself). A text with a free-form
+statement becomes a draft card (``unapproved_statement``) instead;
+``gate.evaluate`` holds the same line at the claim.
 
 Every transition appends ``{at, field, old, new, by}`` to ``history``.
 Functions take the caller's session and flush; the caller commits. Logs
@@ -56,7 +57,7 @@ from miya.db.models import (
     OutboxMessage,
     Person,
 )
-from miya.jarvis import caps, chatkey, costs, gate, policy, redlines, style
+from miya.jarvis import caps, chatkey, costs, gate, kb, policy, redlines, style
 from miya.services import authorship, codes, people, reminders, safety
 
 log = logging.getLogger(__name__)
@@ -107,6 +108,11 @@ BY_COMMAND: Final = "command"
 AUTO_APPROVER: Final = gate.AUTO_APPROVER
 # create() takes no approved statements from its caller (rule 13a): see there.
 APPROVED_TEXTS_REFUSED: Final = "approved_texts_unverified"
+# create() takes KB entries by id only: a list of ints (JV-15).
+BAD_KB_IDS: Final = "bad_kb_entry_ids"
+# Where the bound verdict keeps the ids of the KB entries a draft was written
+# from; a re-guard carries them over.
+KB_IDS_KEY: Final = "kb_entry_ids"
 # approve() is the owner's tap: the autonomous approver is create()'s alone.
 BAD_APPROVER: Final = "bad_approver"
 ORIGINS: Final = ("auto_reply", "stall", "owner_command", "escalation")
@@ -243,10 +249,30 @@ def _transition(
     _note(row, "state", None if old == "new" else old, new, by=by, now=now, code=code)
 
 
-def _bind(row: OutboxMessage, result: gate.GuardResult) -> None:
+def _kb_ids(guard: Mapping[str, Any] | None) -> list[int]:
+    """The KB entry ids a bound verdict names (JV-15)."""
+    ids = (guard or {}).get(KB_IDS_KEY)
+    if not isinstance(ids, list):
+        return []
+    return [i for i in ids if isinstance(i, int) and not isinstance(i, bool)]
+
+
+def _bound_guard(
+    result: gate.GuardResult, sha: str, *, kb_ids: Sequence[int] = ()
+) -> dict[str, object]:
+    guard = result.bound_to(sha)
+    if kb_ids:
+        guard[KB_IDS_KEY] = sorted(set(kb_ids))
+    return guard
+
+
+def _bind(
+    row: OutboxMessage, result: gate.GuardResult, *, kb_ids: Sequence[int] | None = None
+) -> None:
     sha = gate.body_hash(row.body)
     row.body_sha256 = sha
-    row.guard = result.bound_to(sha)
+    kept = _kb_ids(row.guard) if kb_ids is None else kb_ids
+    row.guard = _bound_guard(result, sha, kb_ids=kept)
 
 
 def _log_guard_error(row: OutboxMessage, result: gate.GuardResult) -> None:
@@ -526,6 +552,28 @@ async def owner_stall_texts(session: AsyncSession) -> tuple[str, ...]:
         return ()
 
 
+async def owner_kb_texts(
+    session: AsyncSession, ids: Sequence[int] | None = None
+) -> dict[int, str]:
+    """The answers of the active, owner-approved knowledge-base entries that
+    pass their checks now (JV-15), by id: the ``kb`` approved texts of the
+    statement allowlist. ``ids`` narrows them to the entries a draft was
+    written from. Read from the owner's own records here, never taken from a
+    caller; a suggested or retired entry approves nothing. A failure to read
+    them is logged and counts as none (an auto row that leaned on one goes
+    back to the card); it never raises into a create, an approval or a
+    claim."""
+    try:
+        async with session.begin_nested():
+            return await kb.active_texts(session, ids)
+    except Exception as exc:
+        log.error(
+            "knowledge entries unreadable",
+            extra={"kb_entry_ids": list(ids or ())[:20], "error": type(exc).__name__},
+        )
+        return {}
+
+
 async def _chat_state(session: AsyncSession, chat_key: str) -> gate.ChatState | None:
     state = await session.get(JarvisChatState, chat_key)
     if state is None:
@@ -594,25 +642,31 @@ async def create(
     by: str | None = None,
     approved_kb: Sequence[str] = (),
     stall_texts: Sequence[str] = (),
+    kb_entry_ids: Sequence[int] = (),
 ) -> OutboxMessage:
     """Store a proposal: shadow, draft, approved (a graduated auto intent
     whose text passed the statement allowlist only) or blocked. The same
     proposal twice is the same row.
 
-    ``approved_kb`` are the active owner-approved KB texts the draft was
-    written from (JV-15) and ``stall_texts`` the owner's stall overrides
-    (JV-14): verbatim, they are approved statements; they never loosen a
-    red line. Texts a caller hands in are never trusted as approved: the
-    outbox loads the owner's stall overrides itself from the active
-    ``owner_style_profiles`` row (``owner_stall_texts``), and until JV-15
-    loads the KB entries by id, any caller text is refused, and so is a
-    bare string (it would be read one character a text)."""
+    ``kb_entry_ids`` are the ids of the knowledge-base entries the draft
+    was written from (JV-15, the responder's retrieval). The outbox loads
+    their answers itself, only those still active and owner-approved
+    (``owner_kb_texts``), and keeps the ids in the bound verdict; with the
+    owner's stall overrides (JV-14, ``owner_stall_texts``) they are the
+    approved statements a verbatim text may be made of. They never loosen a
+    red line. Texts a caller hands in (``approved_kb``, ``stall_texts``) are
+    never trusted as approved and are refused, and so is a bare string (it
+    would be read one character a text) or an id that is not an int."""
     if isinstance(approved_kb, str) or isinstance(stall_texts, str):
         raise OutboxError(APPROVED_TEXTS_REFUSED)
     if approved_kb or stall_texts:
         # The outbox resolves the approved texts from the owner's own
         # records, and the claim rechecks them still in force.
         raise OutboxError(APPROVED_TEXTS_REFUSED)
+    if isinstance(kb_entry_ids, str | bytes) or any(
+        not isinstance(i, int) or isinstance(i, bool) for i in kb_entry_ids
+    ):
+        raise OutboxError(BAD_KB_IDS)
     if not settings.jarvis_enabled:
         raise JarvisDisabled("jarvis_disabled")
     if policy.ceiling() == "off":
@@ -681,14 +735,17 @@ async def create(
         created_at=now,
     )
     rules = await _rules(session, row)
+    kb_texts = (
+        await owner_kb_texts(session, list(kb_entry_ids)) if ai and kb_entry_ids else {}
+    )
     result = _run_guard(
         row,
         await allowed_tokens(session, row),
         await guard_names(session, row),
-        approved_kb=approved_kb,
+        approved_kb=tuple(kb_texts.values()),
         stall_texts=await owner_stall_texts(session) if ai else (),
     )
-    _bind(row, result)
+    _bind(row, result, kb_ids=sorted(kb_texts))
     state, code = await _initial_state(
         session, row=row, facts=facts, rules=rules, guard=result, now=now
     )
@@ -825,10 +882,13 @@ async def approve(
         if mode in ("off", "shadow"):
             return Approval(row, False, f"mode_{mode}")
         if not (_bound(row) and (row.guard or {}).get("verdict") == gate.GUARD_PASS):
+            kb_ids = _kb_ids(row.guard)
+            kb_texts = await owner_kb_texts(session, kb_ids) if kb_ids else {}
             result = _run_guard(
                 row,
                 await allowed_tokens(session, row),
                 await guard_names(session, row),
+                approved_kb=tuple(kb_texts.values()),
                 stall_texts=await owner_stall_texts(session),
             )
             _bind(row, result)
@@ -995,6 +1055,7 @@ async def _context(
     policies: policy.Policies,
     counters: _Counters,
     stall_texts: tuple[str, ...] = (),
+    kb_texts: tuple[str, ...] = (),
 ) -> gate.Context:
     trigger = await _trigger(session, row)
     names = await guard_names(session, row)
@@ -1037,11 +1098,11 @@ async def _context(
         allowed_names=names.allowed,
         other_names=names.others,
         client_script=names.client_script,
-        # The approved texts of the statement allowlist: the owner's stall
-        # overrides in force now (JV-14), read once per claim; JV-15 passes
-        # the active KB entries. Until then a body re-guarded here matches no
-        # KB text, and an auto row that leaned on one goes back to the card.
-        approved_kb=(),
+        # The approved texts of the statement allowlist, read once per claim:
+        # the answers of the KB entries active now (JV-15) and the owner's
+        # stall overrides in force now (JV-14). An auto row that leaned on an
+        # entry retired since matches nothing and goes back to the card.
+        approved_kb=kb_texts,
         stall_texts=stall_texts,
         quiet_until=quiet_until(now),
         auto_in_quiet_hours=bool(getattr(settings, AUTO_IN_QUIET_HOURS, False)),
@@ -1053,8 +1114,10 @@ def _apply(
 ) -> bool:
     """Write one gate decision; True when the row was claimed."""
     if decision.guard is not None:
-        row.guard = decision.guard.bound_to(
-            decision.body_sha256 or gate.body_hash(row.body)
+        row.guard = _bound_guard(
+            decision.guard,
+            decision.body_sha256 or gate.body_hash(row.body),
+            kb_ids=_kb_ids(row.guard),
         )
         row.body_sha256 = decision.body_sha256 or gate.body_hash(row.body)
         _log_guard_error(row, decision.guard)
@@ -1150,6 +1213,7 @@ async def claim_ready(
     )
     policies = await policy.load(session)
     owner_stalls = await owner_stall_texts(session)
+    active_kb = tuple((await owner_kb_texts(session)).values())
     claimed_by = account or channel
     rng = rng or random.Random()
     claimed: list[ClaimedSend] = []
@@ -1164,6 +1228,7 @@ async def claim_ready(
                     policies=policies,
                     counters=counters,
                     stall_texts=owner_stalls,
+                    kb_texts=active_kb,
                 )
                 decision = gate.evaluate(snapshot(row), ctx)
                 taken = _apply(row, decision, now=now, claimed_by=claimed_by)

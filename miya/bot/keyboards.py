@@ -1093,3 +1093,32 @@ def style_card(version: int, *, active: bool) -> InlineKeyboardMarkup:
         )
     )
     return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+# --- /bilim (JV-15) -----------------------------------------------------------------
+#
+# kb:y:<id> adds a suggested knowledge entry, kb:n:<id> drops it. Not in
+# handlers._button_handlers: a typed batch answer never puts words in the
+# AI's mouth.
+
+KB_PREFIX = "kb"
+KB_ADD = "y"
+KB_DISMISS = "n"
+
+
+def kb_suggestion(entry_id: int) -> InlineKeyboardMarkup:
+    """✅ Qo'shish / ✖️ Kerak emas under one suggestion."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.KB_ADD,
+                    callback_data=f"{KB_PREFIX}:{KB_ADD}:{int(entry_id)}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.KB_DISMISS,
+                    callback_data=f"{KB_PREFIX}:{KB_DISMISS}:{int(entry_id)}",
+                ),
+            ]
+        ]
+    )
