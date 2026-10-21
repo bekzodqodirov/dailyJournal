@@ -2,9 +2,10 @@
 
 «Ertaga 14:00 gacha», «kechki 6 da», «soat 3 da», «завтра в 10»: the day and
 the clock time the owner's words name, with no model involved. The records
-parser (`/tuzat p12 ertaga 14:00`) reads time this way, and the command mode's
-cross-check of a scheduled send (JV-20) will too, so one phrase means one
-moment everywhere.
+parser (`/tuzat p12 ertaga 14:00`) reads time this way, and so does the command
+mode's cross-check of a scheduled send (JV-20, `miya.jarvis.commands`): a time
+the model proposes goes out only when the owner's own words name it here, so
+one phrase means one moment everywhere.
 
 The rule is that nothing is guessed. A phrase whose reading depends on
 something the text does not say — two different days, two different times,

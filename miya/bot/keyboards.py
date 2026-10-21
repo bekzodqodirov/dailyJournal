@@ -1153,6 +1153,8 @@ def _jarvis_button(
 def jarvis_card(card) -> InlineKeyboardMarkup | None:
     """The buttons of a cards.Card. The send button only when the channel's
     sender is ready and a text waits (copy mode has none)."""
+    if card.kind == "command":
+        return _command_card(card)
     if card.kind == "draft":
         prefix = JARVIS_DRAFT_PREFIX
         first = [_jarvis_button(replies.JARVIS_BUTTON_EDIT, prefix, JARVIS_EDIT, card.id)]
@@ -1179,3 +1181,80 @@ def jarvis_card(card) -> InlineKeyboardMarkup | None:
         )
     rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- the owner's commands (JV-20) -----------------------------------------------------
+#
+# ja:y|e|n:<outbox id> under a send the owner commanded (send, edit, cancel);
+# ja:c:<command message id>:<n>:<person id> picks one person under «Qaysi …?»;
+# ja:s|x:<command message id>:<n> applies or drops the n-th setting that
+# command proposed. Id-only payloads; what a tap applies is read back from
+# the stored proposal, never from the payload. Not in
+# handlers._button_handlers: a typed batch answer never sends or changes a
+# setting. The action letters are miya.jarvis.cards's and commands's (a test
+# holds them together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_COMMAND_PREFIX = "ja"
+JARVIS_COMMAND_PICK = "c"
+JARVIS_SETTING_APPLY = "s"
+JARVIS_SETTING_DROP = "x"
+# The two loosenings whose confirm card is JV-12's own.
+JV12_SETTINGS = ("personal_off", "group_reply_on")
+
+
+def _command_card(card) -> InlineKeyboardMarkup:
+    prefix = JARVIS_COMMAND_PREFIX
+    first = [_jarvis_button(replies.JARVIS_BUTTON_EDIT, prefix, JARVIS_EDIT, card.id)]
+    if card.can_send:
+        first.insert(
+            0, _jarvis_button(replies.JARVIS_BUTTON_SEND, prefix, JARVIS_SEND, card.id)
+        )
+    second = [
+        _jarvis_button(replies.JARVIS_BUTTON_CANCEL, prefix, JARVIS_CANCEL, card.id)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[first, second])
+
+
+def _candidate_label(name: str, code: str | None) -> str:
+    return _rule_label(f"{name} · {code}" if code else name)
+
+
+def command_candidates(action) -> InlineKeyboardMarkup | None:
+    """One button per person under «Qaysi Sardor?» (a commands.Action)."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_candidate_label(c.name, c.code),
+                callback_data=(
+                    f"{JARVIS_COMMAND_PREFIX}:{JARVIS_COMMAND_PICK}:"
+                    f"{int(action.interaction_id)}:{int(action.index)}:{int(c.person_id)}"
+                ),
+            )
+        ]
+        for c in action.candidates
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def command_setting(action) -> InlineKeyboardMarkup:
+    """The buttons of a setting card (a commands.Action): the JV-12 confirm
+    card for the loosenings it covers, else ✅ / ✖️ Yo'q."""
+    if action.setting == "personal_off":
+        return personal_unmark_confirm(int(action.target_id))
+    if action.setting == "group_reply_on":
+        return group_reply_confirm(int(action.target_id))
+    ref = f"{int(action.interaction_id)}:{int(action.index)}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_SETTING_YES[action.setting],
+                    callback_data=f"{JARVIS_COMMAND_PREFIX}:{JARVIS_SETTING_APPLY}:{ref}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_SETTING_NO,
+                    callback_data=f"{JARVIS_COMMAND_PREFIX}:{JARVIS_SETTING_DROP}:{ref}",
+                ),
+            ]
+        ]
+    )

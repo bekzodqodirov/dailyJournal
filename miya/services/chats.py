@@ -212,6 +212,80 @@ async def toggle(
     return monitor
 
 
+async def set_monitor(
+    session: AsyncSession,
+    monitor_id: int,
+    enabled: bool,
+    *,
+    now: datetime | None = None,
+) -> ChatMonitor | None:
+    """Reading one chat switched on or off on purpose, as the owner's command
+    asked (JV-20 ``set_group_monitor``): the same change as the ``/chats``
+    toggle (``toggle``), made only when the chat is not already so, under the
+    row's lock, so a tap that comes twice never flips it back. None when the
+    row is gone."""
+    locked = await session.scalar(
+        sa.select(ChatMonitor)
+        .where(ChatMonitor.id == monitor_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        return None
+    if bool(locked.monitor_enabled) == enabled:
+        return locked
+    return await toggle(session, monitor_id, "monitor_enabled", now=now)
+
+
+# The most chats named in one «which one?» answer.
+TITLED_MAX = 6
+
+
+async def find_titled(
+    session: AsyncSession,
+    title: str,
+    *,
+    kinds: tuple[ChatType, ...],
+    exact_only: bool = False,
+) -> list[ChatMonitor]:
+    """Chats of ``kinds`` titled exactly ``title``, else those whose title
+    contains it, newest first; a bare chat id finds that chat. Titles are
+    compared folded like a person's name (case, apostrophes, Cyrillic), so
+    «Do‘stlar» and «Оила» are found as typed «Do'stlar» and «Oila»."""
+    from miya.services.text import normalise_for_search
+
+    wanted = title.strip()
+    if not wanted:
+        return []
+    base = sa.select(ChatMonitor).where(ChatMonitor.chat_type.in_(kinds))
+    if wanted.lstrip("-").isdigit():
+        found = await session.scalar(base.where(ChatMonitor.tg_chat_id == int(wanted)))
+        if found is not None:
+            return [found]
+    folded = normalise_for_search(wanted)
+    if not folded:
+        return []
+    # The monitors table is small: one row per chat the account is in.
+    titled = [
+        (normalise_for_search(monitor.title or ""), monitor)
+        for monitor in await session.scalars(
+            base.where(ChatMonitor.title.isnot(None)).order_by(ChatMonitor.id)
+        )
+    ]
+    exact = [monitor for name, monitor in titled if name == folded]
+    if exact or exact_only:
+        return exact
+    contains = [monitor for name, monitor in titled if folded in name]
+    contains.sort(
+        key=lambda monitor: (
+            monitor.last_seen_at is None,
+            -(monitor.last_seen_at.timestamp() if monitor.last_seen_at else 0.0),
+            monitor.id,
+        )
+    )
+    return contains[:TITLED_MAX]
+
+
 # --- new groups, one tap -----------------------------------------------------
 #
 # Three processes, none of which can call the others, share this: the userbot

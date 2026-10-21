@@ -89,9 +89,12 @@ from miya.services.brief import BRIEF_KIND
 
 log = logging.getLogger(__name__)
 
-CardKind = Literal["draft", "escalation"]
+CardKind = Literal["draft", "escalation", "command"]
 DRAFT_CARD: Final[CardKind] = "draft"
 ESCALATION_CARD: Final[CardKind] = "escalation"
+# The confirmation card of a send the owner commanded in the bot (JV-20):
+# ``ja:y|e|n:<id>``.
+COMMAND_CARD: Final[CardKind] = "command"
 
 # The draft buttons (``jv:<action>:<id>``) and the escalation buttons
 # (``je:<action>:<id>``); keyboards.py builds the payloads from these.
@@ -102,6 +105,7 @@ CANCEL: Final = "n"
 SNOOZE: Final = "s"
 DRAFT_ACTIONS: Final = (SEND, EDIT, OWN, CANCEL)
 ESCALATION_ACTIONS: Final = (SEND, OWN, SNOOZE)
+COMMAND_ACTIONS: Final = (SEND, EDIT, CANCEL)
 
 # What a tap or a reply came to (the bot says it in Uzbek).
 TapCode = Literal[
@@ -154,6 +158,7 @@ SHOWN_MODES: Final = ("draft", "auto")
 STALL_ORIGIN: Final = "stall"
 REPLY_ORIGIN: Final = outbox.ESCALATION_ORIGIN
 DRAFT_ORIGIN: Final = "auto_reply"
+COMMAND_ORIGIN: Final = outbox.OWNER_COMMAND_ORIGIN
 # A draft or stall that has gone out (or is going) reads «Mijozga yuborildi».
 GONE_OUT: Final = (outbox.SENDING, outbox.SENT)
 SHOWN_BODY_STATES: Final = (outbox.DRAFT, outbox.APPROVED, *GONE_OUT)
@@ -262,6 +267,10 @@ class Card:
     copy_mode: bool = True
     # 0 for the first alert, n for the n-th reminder after a snooze.
     reminder: int = 0
+    # A command card (JV-20): the chat's own title, and when the send goes
+    # (None: right after the tap).
+    chat: str | None = None
+    not_before: datetime | None = None
 
 
 class Presenter(Protocol):
@@ -565,6 +574,36 @@ async def draft_card(session: AsyncSession, row_id: int) -> Card | None:
         redline_warning=redline,
         personal_warning=personal,
         safety=shield,
+        can_send=row.state == outbox.DRAFT and outbox.channel_send_enabled(row.channel),
+        copy_mode=not outbox.channel_send_enabled(row.channel),
+    )
+
+
+async def command_card(session: AsyncSession, row_id: int) -> Card | None:
+    """The confirmation card of one owner-commanded send (JV-20): the exact
+    text, who it goes to (name, code, the chat's own title), the channel and
+    when, with the warnings the gate wants on record (red-line words, a
+    personal chat, a message the shield flagged). None when the row is gone
+    or is not a command."""
+    row = await session.get(OutboxMessage, row_id, populate_existing=True)
+    if row is None or row.origin != COMMAND_ORIGIN:
+        return None
+    name, code = await _who(session, row.person_id, row.tg_chat_id)
+    redline, personal, shield = await _owner_bits(session, row)
+    return Card(
+        kind=COMMAND_CARD,
+        id=row.id,
+        channel=row.channel,
+        name=name,
+        code=code,
+        chat=await _chat_title(session, row.tg_chat_id),
+        body=row.body,
+        outbox_id=row.id,
+        owner_text=row.authored_by == gate.OWNER,
+        redline_warning=redline,
+        personal_warning=personal,
+        safety=shield,
+        not_before=row.not_before,
         can_send=row.state == outbox.DRAFT and outbox.channel_send_enabled(row.channel),
         copy_mode=not outbox.channel_send_enabled(row.channel),
     )
@@ -1299,6 +1338,53 @@ async def tap_draft(
     return TapResult("own", channel=row.channel, name=name, until=until)
 
 
+async def tap_command(
+    session: AsyncSession,
+    row_id: int,
+    action: str,
+    *,
+    message_id: int | None,
+    now: datetime,
+) -> TapResult:
+    """One button of a command card (JV-20) under the row's lock: ✅ approves
+    the owner's own words exactly as the card shows them (the gate still runs
+    at the claim, and a scheduled row waits for ``not_before``), ✏️ asks for
+    new words by reply, ✖️ cancels. Honoured only from the card the row was
+    last shown on; a second tap is answered."""
+    row = await _locked_row(session, row_id)
+    if row is None or row.origin != COMMAND_ORIGIN or action not in COMMAND_ACTIONS:
+        return TapResult("answered")
+    if (
+        row.state == outbox.EXPIRED
+        or message_id is None
+        or message_id != row.card_tg_message_id
+    ):
+        return TapResult("stale")
+    if row.state != outbox.DRAFT:
+        return TapResult("answered")
+    name = await _name(session, row.person_id, row.tg_chat_id)
+    if action == EDIT:
+        return TapResult("edit", channel=row.channel, name=name)
+    if action == SEND:
+        if not outbox.channel_send_enabled(row.channel):
+            return TapResult("copy", channel=row.channel)
+        try:
+            approval = await outbox.approve(session, row_id, by=BY_BUTTON, now=now)
+        except outbox.AlreadyAnswered:
+            return TapResult("answered")
+        if approval.approved:
+            later = row.not_before if row.not_before and row.not_before > now else None
+            return TapResult("queued", channel=row.channel, name=name, until=later)
+        if approval.code == "expired":
+            return TapResult("stale")
+        return TapResult("failed", detail=approval.code)
+    try:
+        await outbox.cancel(session, row_id, by=BY_BUTTON, now=now, code=CANCELLED_CODE)
+    except outbox.AlreadyAnswered:
+        return TapResult("answered")
+    return TapResult("cancelled", channel=row.channel, name=name)
+
+
 async def _locked_escalation(
     session: AsyncSession, escalation_id: int
 ) -> Escalation | None:
@@ -1507,8 +1593,8 @@ def _shown_on(
 async def find_card(session: AsyncSession, message_id: int) -> CardRef | None:
     """The draft or escalation a bot message showed (the current card or an
     earlier one of the same row; never the folded message, which shows many)."""
-    row_id = await session.scalar(
-        sa.select(OutboxMessage.id)
+    found_row = await session.execute(
+        sa.select(OutboxMessage.id, OutboxMessage.origin)
         .where(
             sa.or_(
                 OutboxMessage.card_tg_message_id == message_id,
@@ -1521,8 +1607,10 @@ async def find_card(session: AsyncSession, message_id: int) -> CardRef | None:
         .order_by(OutboxMessage.id.desc())
         .limit(1)
     )
-    if row_id is not None:
-        return CardRef(DRAFT_CARD, int(row_id))
+    shown = found_row.first()
+    if shown is not None:
+        kind = COMMAND_CARD if shown.origin == COMMAND_ORIGIN else DRAFT_CARD
+        return CardRef(kind, int(shown.id))
     found = list(
         await session.scalars(
             sa.select(Escalation.id).where(
@@ -1563,6 +1651,23 @@ async def owner_reply(
         return TapResult("failed")
     if len(body) > OWNER_TEXT_MAX:
         return TapResult("too_long")
+    if ref.kind == COMMAND_CARD:
+        # New words for a commanded send (JV-20): still the owner's, and the
+        # card shows them again before any tap.
+        row = await session.get(OutboxMessage, ref.id, populate_existing=True)
+        if row is None or row.state != outbox.DRAFT or row.origin != COMMAND_ORIGIN:
+            return TapResult(
+                "stale" if row is not None and row.state == outbox.EXPIRED else "answered"
+            )
+        try:
+            await outbox.owner_text(session, ref.id, body=body, by=BY_REPLY, now=now)
+        except outbox.AlreadyAnswered:
+            return TapResult("answered")
+        except outbox.NotPlainText:
+            return TapResult("failed")
+        return TapResult(
+            "edited", card=await command_card(session, ref.id), channel=row.channel
+        )
     if ref.kind == DRAFT_CARD:
         row = await session.get(OutboxMessage, ref.id, populate_existing=True)
         if row is None or row.state != outbox.DRAFT or row.origin != DRAFT_ORIGIN:
@@ -1639,12 +1744,23 @@ async def owner_reply(
     )
 
 
+async def command_shown(
+    session: AsyncSession, card: Card, *, message_id: int, now: datetime
+) -> None:
+    """A command card reached the owner (JV-20): its taps and replies are
+    honoured from that message, and its warnings are on record for the gate."""
+    await outbox.mark_carded(
+        session, card.id, message_id=message_id, now=now, by=outbox.BY_COMMAND
+    )
+    await record_shown(session, card, now=now)
+
+
 async def recarded(
     session: AsyncSession, card: Card, *, message_id: int, now: datetime
 ) -> None:
     """The card was shown again as a new bot message (after the owner's
     reply): taps and replies follow it there, and its warnings are on record."""
-    if card.kind == DRAFT_CARD:
+    if card.kind in (DRAFT_CARD, COMMAND_CARD):
         await outbox.mark_carded(
             session, card.id, message_id=message_id, now=now, by=BY_REPLY
         )
@@ -1750,6 +1866,8 @@ async def brief_items(session: AsyncSession, *, now: datetime) -> BriefItems:
 
 __all__ = [
     "CANCEL",
+    "COMMAND_ACTIONS",
+    "COMMAND_CARD",
     "DRAFT_ACTIONS",
     "DRAFT_CARD",
     "EDIT",
@@ -1773,6 +1891,8 @@ __all__ = [
     "alerts_today",
     "brief_items",
     "card_now",
+    "command_card",
+    "command_shown",
     "created_mode",
     "draft_card",
     "escalation_card",
@@ -1784,6 +1904,7 @@ __all__ = [
     "record_shown",
     "silent_at",
     "sweep",
+    "tap_command",
     "tap_draft",
     "tap_escalation",
 ]

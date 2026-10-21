@@ -2129,6 +2129,43 @@ urinib ko'ring."
 **Acceptance.** Green. Owner check: a voice command produces a correct card and the message
 arrives at 18:00.
 
+**As built.** `miya/jarvis/commands.py` (mypy strict) holds `ACT_TOOLS`, which `rag.answer_full`
+imports only in command mode (`rag.ACT_TOOL_NAMES` mirrors the names, so a model naming one
+outside command mode is told `unknown tool`); command mode is read before the question check
+(«Sardorga yozib yubor: ertaga kelasanmi?» is the owner's words to send), only with
+JARVIS_ENABLED (otherwise the words are read as before), never for a forwarded message (a
+client's words), and skips the evidence prefetch. The cues cover the settings tools too
+(«shaxsiydan chiqar», «guruhini o'qi/o'qima», «guruhida javob yoz/yozma», «jadvalni
+yangila», «kutayotgan xabarlarni ko'rsat»). Its model calls are recorded as `jarvis_command`;
+over JARVIS_DAILY_COST_CAP_USD (or with the spend unreadable) a command is answered read-only
+as a question (`rag`, no act tools) with «💸 Jarvis bugungi xarajat chegarasiga yetdi — hech
+narsa navbatga qo'yilmadi, ertaga qayta urinib ko'ring.». A command that proposed nothing (a
+`list_pending` read alone aside) is the owner's note after all («Ertaga konteynerni
+jo'nat»): its row loses `kind: question` and is extracted, and the receipt follows the
+«Hech narsa navbatga qo'yilmadi» answer. The `person` a tool names must be words of the
+owner's command text (case endings aside) before `find_person` runs, and one person is
+accepted only when the reading as written and the one without a case ending agree («Malika»
+next to «Malik» is asked back); «Qaysi {ism}?» shows the name without its ending. The time is
+read from the owner's words without the recipient's name («Jumaga» is not Friday). Every money
+figure in the text must be one the owner said (`figure_not_in_owner_words`). The channel is
+the one the owner's words name, else Telegram («pochta» and «mail» alone name none); with two
+named, the model picks one of them. The same send or «which one?» twice in a turn is the first
+answer, before the three-proposal limit; the same text at another time is refused as
+`already_proposed` with the row's own time. `outbox.create` refuses an `owner_command` row without
+`command_interaction_id` or not authored by the owner. A card that does not reach the owner
+cancels its row. Besides `ja:y|e|n:<outbox id>`, a «Qaysi …?» button is
+`ja:c:<command message id>:<n>:<person id>` and a setting card's buttons are
+`ja:s|x:<command message id>:<n>`; the proposal they act on is stored on the command message
+(`meta.jarvis_proposals`), never read from the payload. Unmarking personal and switching group
+replies on show the JV-12 cards themselves (`jr:y`, `jr:g`); the other settings (mark
+personal, group replies off, reading a group on or off, `sheets_resync`) have cards whose
+wording the plan did not give («🔒 {ism}ni shaxsiy deb belgilaymi? …», «👁 «{guruh}»
+guruhini o'qishni boshlaymi? …», «🙈 … to'xtataymi?», «👥 … o'chiraymi?», «📊 Google Sheets
+jadvalini bazadan qaytadan to'liq yozaymi?»). `chats.set_monitor` sets the `/chats` toggle to a
+value under a row lock, `chats.find_titled` is the chat-title lookup `/shaxsiy` and `/guruhai`
+used, and `sheets_sync.request_resync` puts every written row back to pending. The command
+card names the chat by its own title too when it differs from the person's name.
+
 ---
 
 #### JV-21 — Jarvis health, /holat lines and breaker alerts

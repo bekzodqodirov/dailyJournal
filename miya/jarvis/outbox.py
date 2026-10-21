@@ -128,6 +128,10 @@ MODEL_PASS: Final = "pass"
 ORIGINS: Final = ("auto_reply", "stall", "owner_command", "escalation")
 # The owner's own reply to an escalation card (JV-18).
 ESCALATION_ORIGIN: Final = "escalation"
+# A send the owner commanded in the bot (JV-20): their words, from the
+# command message (``command_interaction_id``), which create() requires.
+OWNER_COMMAND_ORIGIN: Final = "owner_command"
+NO_COMMAND: Final = "no_command_interaction"
 # history ``field`` of a card shown to the owner (JV-18): its message id.
 CARD_FIELD: Final = "card"
 # history ``field`` of the owner's own words replacing a draft's text.
@@ -820,6 +824,12 @@ async def create(
         # The idempotency key needs the message the row comes from; without
         # one, the same short text a day later would be taken for this row.
         raise OutboxError("no_source_interaction")
+    if origin == OWNER_COMMAND_ORIGIN and (
+        command_interaction_id is None or authored_by != gate.OWNER
+    ):
+        # An owner command (JV-20) is the owner's words, from the message
+        # they gave the command in: never a row without one.
+        raise OutboxError(NO_COMMAND)
     if chatkey.channel_of(chat_key) != channel:
         raise OutboxError("chat_key_channel")
     if not gate.plain_text(body):
@@ -2138,6 +2148,8 @@ __all__ = [
     "FAILED",
     "FLOOD_NOTICE_SECONDS",
     "FLOOD_WAIT_CODE",
+    "NO_COMMAND",
+    "OWNER_COMMAND_ORIGIN",
     "PENDING",
     "REDRAFT_CODES",
     "SENDING",

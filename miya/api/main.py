@@ -465,7 +465,11 @@ class AskRequest(BaseModel):
 
 @api.post("/ask", tags=["intelligence"])
 async def ask(body: AskRequest, session: SessionDep) -> dict[str, str]:
-    """Same RAG path as the bot: figures come from SQL tools, never invented."""
+    """Same RAG path as the bot: figures come from SQL tools, never invented.
+
+    Read-only, always: ``rag.answer`` never offers the act tools of the bot's
+    command mode (JV-20, rule 16), so «… yozib yubor» here is answered as a
+    question and nothing is proposed, stored or sent."""
     answer = await rag.answer(session, body.question)
     await session.commit()  # usage_log rows from the tool loop
     return {"answer": answer}

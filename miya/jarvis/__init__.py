@@ -75,4 +75,14 @@ The cards (JV-18):
   daily alert fold and the copy mode until a channel can send. The worker's
   ``jarvis_cards`` job and the bot's ``jv:``/``je:`` handlers import it when
   they run.
+
+The owner's commands (JV-20):
+
+* ``commands`` — the act tools of the bot's command mode
+  (``rag.answer_full(allow_actions=True)``): each only proposes, a send as an
+  ``owner_command`` outbox draft with its confirmation card (``ja:``), a
+  setting as a card to tap. The recipient comes only from the owner's words
+  (``people.find_person``, asked back when two people match), the chat must
+  already exist, and a scheduled time must agree with ``when.parse`` of the
+  owner's words. ``POST /v1/ask`` never gets these tools.
 """

@@ -1201,6 +1201,26 @@ async def tombstone_missing(session: AsyncSession) -> int:
     return marked
 
 
+async def request_resync(session: AsyncSession) -> int:
+    """Every row the mirror wrote, or failed to write, goes pending again, so
+    the next ``sheets_sync`` run rewrites the whole sheet from SQL (the
+    owner's «jadvalni yangila», JV-20 ``sheets_resync``). Row numbers stay,
+    so nothing moves on the sheet. In the caller's transaction, in a
+    savepoint; never raises. Returns the count, -1 when it failed."""
+    try:
+        async with session.begin_nested():
+            ids = await session.scalars(
+                sa.update(SheetRow)
+                .where(SheetRow.state.in_((SYNCED, FAILED)))
+                .values(state=PENDING, attempts=0, next_attempt_at=None)
+                .returning(SheetRow.id)
+            )
+            return len(ids.all())
+    except Exception as exc:
+        log.error("sheet rows not queued for a resync: %s", type(exc).__name__)
+        return -1
+
+
 __all__ = [
     "HEADERS",
     "TAB_FOLLOWUPS",
@@ -1212,6 +1232,7 @@ __all__ = [
     "content_hash",
     "layout_requests",
     "plan",
+    "request_resync",
     "run",
     "sync",
     "tombstone_missing",

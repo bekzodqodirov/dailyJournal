@@ -3668,6 +3668,8 @@ def jarvis_card_fits(card) -> bool:
 
 
 def _jarvis_card_text(card, messages) -> str:
+    if card.kind == "command":
+        return _command_card_text(card)
     lines: list[str] = []
     if card.reminder:
         lines += [
@@ -3773,6 +3775,139 @@ def jarvis_brief_lines(items) -> list[str]:
             JARVIS_BRIEF_UNANSWERED.format(n=len(items.unanswered), ismlar=names)
         )
     return lines
+
+
+# --- the owner's commands (JV-20) ---------------------------------------------------
+#
+# «Sardorga Telegramdan yozib yubor …»: every proposal is a card the owner
+# taps; the recipient's name, code and the chat's title are theirs to choose,
+# shown through _shown. The text is the owner's, shown exactly.
+
+JARVIS_COMMAND_HEADER = "📤 Yuborishni tasdiqlang j{id}"
+JARVIS_COMMAND_WHO = "👤 Kimga: {ism}{kod} · {kanal}"
+# The chat's own title, when it is not just the person's name again.
+JARVIS_COMMAND_CHAT = " («{chat}» chati)"
+JARVIS_COMMAND_WHEN = "🕕 Qachon: {qachon}"
+JARVIS_COMMAND_BODY = "💬 Matn: «{matn}»"
+JARVIS_COMMAND_NOW = "hozir"
+JARVIS_COMMAND_TODAY = "bugun"
+JARVIS_COMMAND_TOMORROW = "ertaga"
+JARVIS_COMMAND_WHICH = "Qaysi {ism}?"
+JARVIS_COMMAND_NO_CHAT = "{ism} uchun {kanal} chati topilmadi."
+JARVIS_COMMAND_SCHEDULED = "🕕 {vaqt} da yuboriladi."
+JARVIS_COMMAND_NOTHING = "Hech narsa navbatga qo'yilmadi — qayta urinib ko'ring."
+# A command over JARVIS_DAILY_COST_CAP_USD (§7: no Jarvis model call); the
+# plan gives no wording for it.
+JARVIS_COMMAND_COST_CAP = (
+    "💸 Jarvis bugungi xarajat chegarasiga yetdi — hech narsa navbatga "
+    "qo'yilmadi, ertaga qayta urinib ko'ring."
+)
+# A setting the owner commanded (the plan gives no wording for these cards;
+# the JV-12 cards are reused for the two loosenings they cover).
+JARVIS_SETTING_QUESTIONS = {
+    "personal_on": (
+        "🔒 {ism}ni shaxsiy deb belgilaymi? MIYA bu chatga hech qachon o'zi "
+        "yozmaydi (o'qish davom etadi)."
+    ),
+    "group_reply_off": "👥 «{ism}» guruhida MIYA javob yozishini o'chiraymi?",
+    "monitor_on": (
+        "👁 «{ism}» guruhini o'qishni boshlaymi? MIYA undagi xabarlarni o'qib, "
+        "yozib boradi."
+    ),
+    "monitor_off": "🙈 «{ism}» guruhini o'qishni to'xtataymi?",
+    "sheets_resync": "📊 Google Sheets jadvalini bazadan qaytadan to'liq yozaymi?",
+}
+JARVIS_SETTING_YES = {
+    "personal_on": "✅ Ha, belgila",
+    "group_reply_off": "✅ Ha, o'chir",
+    "monitor_on": "✅ Ha, o'qi",
+    "monitor_off": "✅ Ha, to'xtat",
+    "sheets_resync": "✅ Ha, yangila",
+}
+JARVIS_SETTING_NO = "✖️ Yo'q"
+JARVIS_MONITOR_ON = "👁 «{ism}» guruhi endi o'qiladi."
+JARVIS_MONITOR_OFF = "🙈 «{ism}» guruhi endi o'qilmaydi."
+JARVIS_SHEETS_QUEUED = "📊 Jadval keyingi sinxronlashda bazadan to'liq qayta yoziladi."
+JARVIS_SETTING_STALE = "Bu taklif eskirdi — buyruqni qayta yozing."
+
+
+def jarvis_command_when(moment: datetime | None, *, now: datetime | None = None) -> str:
+    """«hozir», «bugun 18:00», «ertaga 09:00», «24-okt 18:00»."""
+    if moment is None:
+        return JARVIS_COMMAND_NOW
+    local = moment.astimezone(settings.tz)
+    today = (now or datetime.now(settings.tz)).astimezone(settings.tz).date()
+    if local.date() == today:
+        return f"{JARVIS_COMMAND_TODAY} {clock(local)}"
+    if local.date() == today + timedelta(days=1):
+        return f"{JARVIS_COMMAND_TOMORROW} {clock(local)}"
+    return f"{short_date(local.date())} {clock(local)}"
+
+
+def _same_name(a: str | None, b: str | None) -> bool:
+    return " ".join((a or "").casefold().split()) == " ".join(
+        (b or "").casefold().split()
+    )
+
+
+def _command_card_text(card) -> str:
+    kod = f" · {_shown(card.code)}" if card.code else ""
+    who = JARVIS_COMMAND_WHO.format(
+        ism=_jarvis_name(card.name), kod=kod, kanal=jarvis_channel_label(card.channel)
+    )
+    if card.chat and not _same_name(card.chat, card.name):
+        who += JARVIS_COMMAND_CHAT.format(chat=_shown(card.chat))
+    lines = [
+        JARVIS_COMMAND_HEADER.format(id=card.id),
+        who,
+        JARVIS_COMMAND_WHEN.format(qachon=jarvis_command_when(card.not_before)),
+        JARVIS_COMMAND_BODY.format(matn=_card_body(card)),
+    ]
+    lines += _owner_warnings(card)
+    if card.copy_mode:
+        lines.append(JARVIS_COPY_FOOTER)
+    return "\n".join(lines)
+
+
+def jarvis_command_scheduled(moment: datetime) -> str:
+    return JARVIS_COMMAND_SCHEDULED.format(vaqt=jarvis_command_when(moment))
+
+
+def jarvis_command_which(name: str | None) -> str:
+    return JARVIS_COMMAND_WHICH.format(ism=_jarvis_name(name))
+
+
+def jarvis_command_no_chat(name: str | None, channel: str | None) -> str:
+    return JARVIS_COMMAND_NO_CHAT.format(
+        ism=_jarvis_name(name), kanal=jarvis_channel_label(channel)
+    )
+
+
+def jarvis_setting_question(setting: str, name: str | None) -> str:
+    """The card of a setting the owner commanded (the loosenings JV-12 has a
+    card for use that card: ``personal_unmark_question``,
+    ``group_reply_question``)."""
+    if setting == "personal_off":
+        return personal_unmark_question(name)
+    if setting == "group_reply_on":
+        return group_reply_question(name)
+    return JARVIS_SETTING_QUESTIONS[setting].format(ism=_rule_name(name))
+
+
+def jarvis_setting_done(setting: str | None, name: str | None, state: str | None) -> str:
+    """What a ✅ on a setting card came to."""
+    if setting == "personal_on":
+        return personal_marked(name)
+    if setting == "group_reply_off":
+        if state == "personal":
+            return group_reply_personal(name)
+        return group_reply_off(name)
+    if setting in ("monitor_on", "monitor_off"):
+        line = JARVIS_MONITOR_ON if state == "on" else JARVIS_MONITOR_OFF
+        return line.format(ism=_rule_name(name))
+    if setting == "sheets_resync":
+        return JARVIS_SHEETS_QUEUED
+    return JARVIS_SETTING_STALE
 
 
 # --- the responder in observation mode (JV-16) -------------------------------------
