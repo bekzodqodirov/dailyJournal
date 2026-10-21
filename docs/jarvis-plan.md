@@ -53,6 +53,11 @@ This plan continues `docs/handoff-plan.md` (WP-01…85). Its work packages are n
    - **APK, .exe, arxiv va boshqa o'rnatiladigan fayllarni hech qachon yuklab olmaydi va ochmaydi**,
      sizni ogohlantiradi. Spam va firibgarlik xabarlariga javob bermaydi. Tanish odamdan kelgan
      bo'lsa ham — chunki bunday fayllar ko'pincha buzilgan akkauntlardan keladi.
+   - **O'zi (tugmasiz) yuborganda faqat ruxsat etilgan gaplarni yozadi:** salom-alik, bayram
+     tabrigi, rahmat, «kuttirganim uchun uzr», «qanday yordam bera olaman?», mijozga savol, tayyor
+     «kutib turing» shablonlari va siz tasdiqlagan bilimlar bazasidagi matn — so'zma-so'z. Boshqa
+     har qanday erkin gap («mol bizda, aka», «hammasi joyida», «как штык») hech qachon o'zi
+     ketmaydi: u qoralama bo'lib sizga keladi va siz o'qib tasdiqlamaguningizcha yuborilmaydi.
    - Hech kimga birinchi bo'lib yozmaydi (faqat sizga yozganlarga javob beradi). «Botmisiz?» deb
      so'rashsa, yolg'on gapirmaydi — sizga yo'naltiradi.
 
@@ -201,6 +206,14 @@ state is account-takeover-grade. A restore therefore needs a re-pair; the guide 
     price, discount, payment term, money figure or payment confirmation) are enforced by pure
     Python in `miya/jarvis/redlines.py`, before and independent of any model. The guard fails
     closed into a fixed stall template plus an escalation.
+13a. **AI text goes out on its own only in approved shapes.** The lexicons cannot list every
+    way to say a promise, so an autonomous send (`auto:policy`, no owner tap) needs the statement
+    allowlist as well as the red lines: every sentence is a courtesy from a closed set, a question,
+    a fixed stall template (or the owner's override that passed the stall role), or the verbatim
+    text of an active owner-approved KB entry (`redlines.check_shapes`, `shapes_ok` in the bound
+    verdict). Any other sentence is an `unapproved_statement`: it never blocks a draft card, but
+    such a row is never approved for auto send, and the gate sends an auto row without a passing
+    shape check back to the owner's card at the claim.
 14. **AI-authored text contains no digits** except a GS code or waybill that appears verbatim in
     the same chat's inbound messages.
 15. **The client responder has no tools and no private data.** Its inputs are this thread, the
@@ -282,7 +295,7 @@ No new Python process. One new optional Node process.
                  |
                  v
      outbox.create(...)  -- runs policy + caps + guard, binds guard to body_sha256,
-                 |          state shadow | draft | approved (auto intents only)
+                 |          state shadow | draft | approved (auto intents, shapes_ok only)
                  v
      owner card (jv:/je:/ja:)  -- bot: approve() under row lock, re-validate, state=approved
                  |
@@ -304,7 +317,9 @@ No new Python process. One new optional Node process.
           caps (daily drafts/auto, per chat, min gap per account, channel daily send cap
             GMAIL_/WHATSAPP_DAILY_SEND_CAP), cost cap; owner-authored rows count towards
             the per-account gap and channel caps (anti-ban), not the AI caps
-          guard binding: body_sha256 unchanged, else re-guard (red lines, for every row)
+          guard binding: body_sha256 unchanged, else re-guard (red lines, for every row);
+            an auto row also needs shapes_ok (statement allowlist), else back to draft
+            (unapproved_statement), never sent
           payload shape: text body only (rule 27)
           quiet hours for AI auto rows
         -> state=sending, lease_until, claimed_by; COMMIT
@@ -594,6 +609,10 @@ AI-authored text (`authored_by='ai'`) must not contain:
 Text the owner authored (`owner_command`, or an edit by reply to a card) is their own words. The
 guard flags it on the card; it does not block it. Confirmation is still required.
 
+What AI text may say *without* the owner's tap is narrower still: only approved shapes (§5.2
+step 3). A sentence that is neither a red line nor an approved shape is a draft for the owner,
+never an autonomous send.
+
 ### 5.2 Enforcement, layered and fail-closed
 
 1. **Deterministic inbound signals** (`redlines.classify_inbound`). A hit opens an escalation and
@@ -610,7 +629,54 @@ guard flags it on the card; it does not block it. Confirmation is still required
    - No URLs, emails, @handles or phone shapes; no person name other than the counterparty's
      display name and the owner's aliases; no AI self-disclosure or prompt leakage; the script
      matches the client's; at most 400 characters; no HTML or Markdown.
-3. **Model check** (EXTRACT_MODEL, JSON). It can block or escalate; it can never approve or
+3. **Statement allowlist (auto only)** (`redlines.check_shapes`, run inside `check_outbound` for
+   the `reply` and `stall` roles). Three red-team rounds showed the blocklist alone cannot be
+   complete (slang and implication: «mol bizda aka», «С вас ничего», «Как штык»). An AI text is
+   split into sentences (a «.», «!», «?», «…» or line break always ends one, so a «?» ends its
+   own sentence) and every sentence must have one approved shape:
+   - **courtesy**: only phrases from a closed, normalised set (greetings including holiday
+     greetings such as «hayit ayyomi muborak», «navro'z bayrami bilan», «С Днём независимости!»;
+     thanks; an apology for the wait with no time in it; «qanday yordam bera olaman»; farewells),
+     in Uzbek Latin, Uzbek Cyrillic and Russian, plus words of address and, once, the first word
+     of the counterparty's name (never a name word that says something: the client sets the
+     display name, «Всё Отлично» or «Mol Bor»); or only the emoji 🙂 🙏 👋 (never 👍 ✅ 🤝, never
+     punctuation alone). Phrases that agree («рады помочь», «xizmatingizdamiz», «eshitaman»)
+     are not in the set;
+   - **question**: a closed grammar, not the blocklist read once more. Every segment (split at
+     commas, semicolons, colons and dashes) asks or is a courtesy, so a statement glued to a
+     question («Yuk omborda, yana savol bormi?») is still a statement. A segment asks only with
+     an explicit interrogative: a question word (Russian «что»/«как» only as the segment's first
+     word, «как» only before «вас/вам/с/называется/зовут…»), a Russian «ли» after the first word,
+     or an Uzbek «-mi» predicate as the last word (not a noun such as «qismi»). A «?» alone asks
+     nothing («Мы квиты?», «С вас ничего?», «Yuk Xitoydan?» are statements). Nothing in the
+     question may: name a time or «now» («Hozir bo'ladimi?», «Bayram arafasida kelsa
+     qulaymi?»); argue or vouch («Nega …», «Разве …», «Kim sizni aldaydi?», «Yuk qayerga ham
+     ketardi?», «Nima bo'lsa ham …»); tag an assertion on («shundaymi», «to'g'rimi», «xo'pmi»,
+     «emasmi», «-ku», «axir», «ведь», «же», «не так ли»); carry a clause in a verbal noun or
+     participle («Yuk kelganini bildingizmi?», «Куда везти прибывший груз?»); report with a
+     verb of knowing («bilasizmi», «Знаете, что …»); say what happened or what someone else
+     does («… груз пришёл», «… доедет»); offer («… kelsa qulaymi?», «Yuborsakmi?»); or state
+     the cargo's status or place. The words before and after the question word must pass the
+     red lines read as a statement (their verb forms are read by the grammar). A refused
+     question is a statement: a draft card, never a block;
+   - **stall**: a fixed template of §5.3 or a sentence of one, or the owner's override that
+     passed the `stall` role;
+   - **kb**: the verbatim text (after normalisation) of an active owner-approved KB entry, a
+     whole entry or a whole sentence of one (JV-15). The outbox resolves the entries itself; it
+     takes no approved texts from its caller (`outbox.create` refuses them until JV-15 and
+     JV-14 load the KB entries and the stall overrides from the owner's records), and the claim
+     guards a `kb` row again with the entries active then, so a retired entry approves nothing.
+
+   Any other sentence makes the text `unapproved_statement` (a flag that never blocks; its
+   escalation reason is `other`, so no migration). The verdict carries `shapes_ok` (true only when
+   the red lines passed and every sentence has a shape) and the shapes, bound to `body_sha256` like
+   the rest. In draft mode the flag changes nothing: the owner reads every text. `outbox.create`
+   approves an auto-intent row on its own only with `shapes_ok`, else it becomes a draft card
+   (`last_error=unapproved_statement`); `outbox.approve` is the owner's tap only and refuses
+   `by=auto:policy`; `gate.evaluate` redrafts an auto row whose bound verdict lacks a passing
+   shape check, and one whose re-guarded body fails it. The deterministic
+   blocklist stays binding for every row.
+4. **Model check** (EXTRACT_MODEL, JSON). It can block or escalate; it can never approve or
    override a deterministic block. An error, refusal or parse failure counts as a block.
 
 The verdict is stored in `outbox_messages.guard` and bound to `body_sha256`; `claim_ready`
@@ -623,7 +689,9 @@ block; the owner's stall must pass.
 Stalls are fixed templates keyed by reason × script (Latin, Cyrillic, Russian) × honorific, never
 generated. The owner may override a template; the override passes the guard in the `stall` role.
 At most one stall per open escalation; a second push from the client gets silence and a higher
-escalation priority. No stall invents a fact ("I'm in a meeting").
+escalation priority. No stall invents a fact ("I'm in a meeting"). Every template, and an override
+that passed the `stall` role, is an approved shape for the statement allowlist (§5.2 step 3), so a
+stall can go out on its own once the `stall` intent graduates.
 
 ### 5.4 Who the AI may write to
 
@@ -730,7 +798,11 @@ intent to `auto` needs the owner to raise the ceiling in `.env` as well as tap �
 All must hold: at least `JARVIS_GRADUATION_MIN_DAYS` (7) days in `draft`; at least
 `JARVIS_GRADUATION_MIN_DRAFTS` (30) drafts; at least `JARVIS_GRADUATION_MIN_APPROVAL_PCT` (90) %
 approved without an edit; zero «Bu xato edi» flags; no channel breaker trip in the last 7 days.
-Then the bot offers promotion with a button. Nothing promotes silently.
+Then the bot offers promotion with a button. Nothing promotes silently. Graduation only lets an
+intent go out on its own; each row of it still needs, at creation and at the claim, the
+deterministic blocklist, the model guard (JV-16, block-only) **and** `shapes_ok` from the statement
+allowlist (§5.2 step 3). A graduated intent's text with a free-form statement is a draft card.
+The approval-rate metric counts those drafts like any other.
 
 **Demotion (automatic, back to draft):** a «Bu xato edi» tap, a guard incident found after a send,
 a breaker trip, or the cost cap hit twice in a week.
@@ -1492,6 +1564,13 @@ templates in the owner's register.
    word views, and the stall-verb allowlist.
 4. Stall templates by reason × script × honorific; each passes `check_outbound` in the `stall`
    role.
+5. `check_shapes(text, *, approved_kb=(), stall_texts=None) -> ShapeVerdict`: the statement
+   allowlist of §5.2 step 3 (courtesy set, questions, stalls, KB texts; glued statements, emoji
+   and rhetorical questions handled as described there). `check_outbound` runs it for the `reply`
+   and `stall` roles and exposes `shapes` and `shapes_ok` on the `Verdict`, and `shapes_ok`,
+   `shapes` and the non-blocking flag `unapproved_statement` on the `GuardResult` the gate stores.
+   Every stall template passes it. `outbox.create` never auto-approves without `shapes_ok`, and
+   `gate.evaluate` redrafts an auto row without it (rule 13a).
 
 **Owner strings.** Stalls (Latin):
 - price: "Aka, narx bo'yicha hozir aniqlashtirib, o'zim sizga yozaman."
@@ -1511,7 +1590,13 @@ beraman», «100% hal qilamiz», «Ertaga 14:00 gacha hisoblab beraman», «Dush
 «Обещаю, завтра отправлю», «Цена со скидкой, предоплата 50%»), `test_owner_stall_passes`,
 `test_info_questions_pass` («Yuk qayerdan qayerga, necha kilo?»), `test_cyrillic_and_russian`,
 `test_surface_view_catches_symbols`, `test_allowed_code_tokens_only`,
-`test_unified_currency_table`.
+`test_unified_currency_table`, `test_shape_courtesy_is_a_closed_set`, `test_shape_questions`,
+`test_shape_glued_statements_are_statements`, `test_shape_emoji`, `test_shape_stalls_and_kb`,
+`test_every_stall_template_passes_the_shape_check`, `test_corpus_auto_and_never_auto` (every
+bypass of the third verifier is blocked or never auto), and in `tests/test_outbox.py`
+`test_an_unapproved_statement_is_a_draft_never_auto`,
+`test_an_auto_row_without_shapes_ok_is_never_sent`,
+`test_gate_refuses_auto_without_a_passing_shape_check`.
 
 **Acceptance.** Every corpus line has its expected verdict; no network.
 
@@ -1577,13 +1662,27 @@ b12` retires; `/bilim taklif` lists suggestions. Retrieval is hybrid (vector + t
 `KB_MATCH_THRESHOLD`, at most 3 entries. Weekly `kb_mining` clusters past client questions with
 the owner's genuine answers; EXTRACT_MODEL writes a neutral digit-free Q/A stored as `suggested`.
 
+The active entries also feed the statement allowlist (§5.2 step 3): the responder passes the
+ids of the entries it retrieved to `outbox.create(..., kb_entry_ids=...)` (never the texts:
+`create` loads the active entries itself and stores their ids in the guard JSON; it refuses
+caller-supplied `approved_kb` texts until then), and an answer that
+repeats an entry verbatim (the whole entry, or whole sentences of it) is an approved `kb` shape,
+so a `general_question` may go out on its own once graduated. A paraphrase of an entry is a
+free-form statement and stays a draft. JV-15 also fills `gate.Context.approved_kb` in
+`outbox._context` with the active entries, so a body re-guarded at the claim is matched against
+the same texts (until then it is matched against none and an auto row goes back to the card). A
+retired entry is no longer passed, and the claim guards every auto row with a `kb` shape again,
+so a row approved before the entry's retirement goes back to the card. An entry never loosens a red line: `check_outbound` still
+reads it like any text.
+
 **Owner strings.** "📚 Bilimlar bazasi ({n} ta faol):" · "✅ Qo'shildi: b{id} — {savol}" · "⛔
 Qo'shilmadi: javobda {belgilar} bor. Bunday savollarga MIYA doim sizga yo'naltiradi." · "💡
 Javoblaringizdan {n} ta bilim taklif qilindi: /bilim taklif" · buttons "✅ Qo'shish" / "✖️ Kerak
 emas" · "🗑 b{id} o'chirildi."
 
 **Tests.** `test_writer_refuses_red_lines`, `test_retrieval_threshold`,
-`test_suggestion_needs_approval`, `test_retired_not_retrieved`.
+`test_suggestion_needs_approval`, `test_retired_not_retrieved`, `test_kb_text_is_an_approved_shape`
+(verbatim auto, paraphrase draft), `test_retired_entry_no_longer_approves`.
 
 **Acceptance.** Green. Owner check: adding an office-hours fact works.
 
@@ -1610,6 +1709,13 @@ for calibration.
 3. Deterministic signals first; a red-line hit opens an escalation and queues a stall row.
    Otherwise intent model, KB retrieval, a draft with `tools=[]` and strict JSON, then the guards
    (§5.2; the model guard can block, never approve). Rows are stored as `shadow`.
+   The responder prompt says: in an auto-eligible intent (`greeting`, `info_gathering`,
+   `general_question`) answer **only** with questions, courtesy from the closed set and the
+   retrieved KB text verbatim; no other statement of any kind. The statement allowlist (§5.2
+   step 3) enforces it in code: the ids of the KB entries retrieved for the draft are passed to
+   `outbox.create`, which loads their texts and the owner's stall overrides itself, and a draft
+   that strays is a draft card, never an autonomous send. The shadow metrics count
+   `unapproved_statement` drafts per intent, so the owner sees how often the model strays.
 4. Model failures → `needs_review`; nothing is sent. Usage operations `jarvis_intent`,
    `jarvis_draft`, `jarvis_guard`. Over the cost cap: escalate-only with templates, no model calls.
 5. `/qoralamalar` lists shadow drafts.
@@ -1623,6 +1729,7 @@ stop: "💸 Jarvis bugungi xarajat chegarasiga yetdi — ertagacha faqat sizga y
 `test_guard_failure_becomes_stall`, `test_model_guard_cannot_override_det_block`,
 `test_model_error_needs_review`, `test_cost_cap_stops_drafting`,
 `test_responder_has_no_tools_and_no_private_data` (assert the exact prompt inputs),
+`test_prompt_limits_auto_intents_to_approved_shapes`, `test_kb_texts_reach_the_allowlist`,
 `test_injection_in_thread_never_sends`.
 
 **Acceptance.** With fake model payloads, shadow rows and escalations are correct. Owner check:
@@ -1917,7 +2024,10 @@ always with the owner's yes.
 `miya/tools/doctor.py`, `tests/test_rollout.py`.
 
 **Behaviour.** `jarvis_rollout` (daily) computes channel × intent metrics from outbox history and
-offers promotion (§6.4) with `jg:y` / `jg:n`. In auto mode rows are approved with `auto:policy`;
+offers promotion (§6.4) with `jg:y` / `jg:n`. In auto mode rows are approved with `auto:policy`
+only when their bound verdict carries `shapes_ok` (rule 13a); a graduated intent's text with a
+free-form statement is a draft card (`unapproved_statement`), and the claim redrafts an auto row
+without a passing shape check. Those drafts count in the intent's metrics like any other;
 each send produces a silent notice with `jv:x:<id>` «↩️ Bu xato edi», which demotes that intent.
 Breakers and incidents demote automatically. Never-auto intents are rejected. `/jarvis rejim`
 shows the mode of each intent. Auto rows are held in quiet hours unless
@@ -1932,7 +2042,8 @@ rejimiga qaytdi: {sabab}." · intent labels "salomlashish", "ma'lumot so'rash", 
 qilish kerak."
 
 **Tests.** `test_criteria_math`, `test_no_silent_promotion`, `test_never_auto_intents_rejected`,
-`test_xato_demotes`, `test_env_ceiling_respected`, `test_auto_held_in_quiet_hours`.
+`test_xato_demotes`, `test_env_ceiling_respected`, `test_auto_held_in_quiet_hours`,
+`test_auto_needs_shapes_ok`.
 
 **Acceptance.** Green; graduation happens only on the owner's tap.
 

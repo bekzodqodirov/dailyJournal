@@ -36,6 +36,7 @@ ALL_BLOCK = [
     *corpus.HOLDOUT_BLOCK,
     *corpus.REDTEAM3_BLOCK,
     *corpus.REDTEAM4_BLOCK,
+    *corpus.REDTEAM5_BLOCK,
 ]
 ALL_PASS = [
     *corpus.OUTBOUND_PASS,
@@ -43,6 +44,7 @@ ALL_PASS = [
     *corpus.HOLDOUT_PASS,
     *corpus.REDTEAM3_PASS,
     *corpus.REDTEAM4_PASS,
+    *corpus.REDTEAM5_PASS,
 ]
 
 
@@ -70,7 +72,7 @@ def _expect(case: corpus.Outbound, text: str) -> None:
 
 
 def test_corpus_is_substantial_and_versioned():
-    assert corpus.CORPUS_VERSION >= 2
+    assert corpus.CORPUS_VERSION >= 6
     assert len(ALL_BLOCK) >= 700
     assert len(ALL_PASS) >= 250
     assert len(corpus.INBOUND) >= 200
@@ -687,6 +689,381 @@ def test_owner_override_used_only_when_it_passes():
         assert chosen.text == stalls.template("price", "latin", "aka")
 
 
+# --- the statement allowlist (§5.2 step 3) ---------------------------------------------
+
+
+def _shapes(text: str, **kw) -> tuple[str, ...]:
+    return redlines.check_shapes(text, allowed_tokens=TOKENS, **kw).shapes
+
+
+def test_shape_courtesy_is_a_closed_set():
+    """Greetings, holiday greetings, thanks, an apology for the wait, the
+    offer of help and farewells, in Uzbek Latin, Cyrillic and Russian, with
+    words of address and the counterparty's name: a courtesy."""
+    for text in (
+        "Assalomu alaykum, aka!",
+        "Salom!",
+        "Va alaykum assalom, opa.",
+        "Xayrli kun!",
+        "Rahmat, aka!",
+        "Katta rahmat!",
+        "Kutganingiz uchun rahmat.",
+        "Kuttirganim uchun uzr, aka.",
+        "Qanday yordam bera olaman?",
+        "Sizga qanday yordam bera olaman",
+        "Xayr, salomat bo'ling!",
+        "Hayit ayyomi muborak, aka!",
+        "Xalqaro xotin-qizlar kuni bilan, opa!",
+        "Navro'z bayrami bilan, aka!",
+        "Ramazon hayiti bilan tabriklayman!",
+        "Yangi yil arafasida tabriklayman, aka!",
+        "Tug'ilgan kuningiz muborak bo'lsin!",
+        "Здравствуйте!",
+        "Добрый день!",
+        "Спасибо за ожидание.",
+        "Извините за ожидание.",
+        "Чем могу помочь?",
+        "Всего доброго!",
+        "С Днём независимости!",
+        "С днем независимости!",
+        "Поздравляю с Наврузом!",
+        "С Международным женским днём!",
+        "Рамазан мубарак!",
+    ):
+        assert _shapes(text) == ("courtesy",), text
+        cyrillic = _cyrillic(text)
+        if cyrillic is not None:
+            assert _shapes(cyrillic) == ("courtesy",), cyrillic
+    # The counterparty's name is an address; another word is not a courtesy.
+    assert _shapes("Rahmat, Akmal aka!", allowed_names=("Akmal",)) == ("courtesy",)
+    assert _shapes("Rahmat, Akmal aka!") == ("statement",)
+    # Nothing outside the set is one: agreement, slang, a time.
+    for text in (
+        "Tabriklayman, aka!",
+        "Поздравляю!",
+        "Muborak bo'lsin!",
+        "Xo'p, aka.",
+        "Mayli.",
+        "Ok, aka.",
+        "Хорошо, спасибо.",
+        "Как штык.",
+        "Bosh ustiga, aka.",
+        "Bayram arafasida.",
+        "Rahmat, yuk omborda.",
+        "Salom, yuk tayyor.",
+    ):
+        assert _shapes(text) == ("statement",), text
+    assert all(isinstance(p, tuple) and p for p in redlines.COURTESY)
+
+
+def test_shape_questions():
+    """A question asks in every segment, states nothing before it asks,
+    names no time and is not rhetorical."""
+    for text in (
+        "Yuk qayerdan qayerga, necha kilo?",
+        "Yukning rasmi bormi?",
+        "Sizga avia qulaymi?",
+        "Yuk Xitoydanmi?",
+        "Yana savollaringiz bormi",
+        "Qaysi shahardan, qaysi shaharga?",
+        "Yuk qayerda, aka?",
+        "Откуда и куда нужно доставить груз?",
+        "Есть ли документы?",
+        "Сколько весит груз?",
+        "Как вас зовут?",
+        "Как с вами связаться?",
+        "Yukni kim qabul qiladi?",
+        "Rasmini yuborishingiz mumkinmi?",
+    ):
+        assert _shapes(text) == ("question",), text
+    # A rising voice alone asks nothing; a lexicon word after the question
+    # word is still read («chiqadi»); «qaysi omborda» presumes the place.
+    for text, why in (
+        ("Yuk Xitoydan?", "intonation"),
+        ("Мы квиты?", "intonation"),
+        ("Как штык?", "intonation"),
+        ("GS367 bo'yicha yukingiz qayerdan chiqadi?", "asserted"),
+        ("Yuk qaysi omborda?", "asserted"),
+    ):
+        verdict = redlines.check_shapes(text, allowed_tokens=TOKENS)
+        assert verdict.sentences[0].why == why, (text, verdict)
+    for text in (
+        "Kim ertaga yukni qabul qiladi?",
+        "Как насчёт субботы?",
+        "Вам когда удобнее утром или вечером?",
+        "Qachon tez orada kerak?",
+    ):
+        verdict = redlines.check_shapes(text)
+        assert verdict.sentences[0].why == "timed", text
+    for text in (
+        "Nega bo'lmasin?",
+        "Nega yetib bormasin?",
+        "Разве это проблема?",
+        "Bu ham muammomi?",
+        "Shu ham gapmi, aka?",
+        "Gap bo'lishi mumkinmi, aka?",
+        "Qayerda bundan yaxshisini topasiz?",
+    ):
+        verdict = redlines.check_shapes(text)
+        assert verdict.sentences[0].why == "rhetorical", text
+    # Russian words that end like a «-mi» question are not one, nor Uzbek
+    # nouns in «-m» with the possessive («qismi», «ismi»).
+    assert _shapes("Днями, ака.") == ("statement",)
+    assert _shapes("Bosh ustiga bu ishimiz qismi") == ("statement",)
+    assert _shapes("Yukning nomi") == ("statement",)
+
+
+def test_shape_questions_are_a_closed_grammar():
+    """Round 4: a question asks with a question word, «ли» or a «-mi»
+    predicate, and nothing else in it says, argues, reports, offers or
+    tells a time. Each family of the verifier's bypasses, with its reason."""
+    for text, why in (
+        # A clause in a verbal noun or a participle, a verb of knowing.
+        ("Yuk kelganini bildingizmi?", "reported"),
+        ("Yuk kelganidan xabaringiz bormi?", "clause"),
+        ("Yuk yo'qolmasligini bilasizmi?", "reported"),
+        ("Yetkazib berishimizni bilasizmi?", "reported"),
+        ("Yetib kelganlarni kim oladi?", "clause"),
+        ("Yukni olganingizda berasizmi?", "clause"),
+        ("Куда везти прибывший груз?", "clause"),
+        ("Bilasizmi yuk kelganini?", "intonation"),
+        # Russian «что»/«как» joining a clause or comparing.
+        ("Знаете что груз пришёл?", "intonation"),
+        ("Вы в курсе что груз доехал?", "intonation"),
+        ("Как по маслу доедет?", "intonation"),
+        ("Как вам новость груз приехал?", "asserted"),
+        ("Что с грузом может случиться?", "rhetorical"),
+        # Tags and particles.
+        ("Mol bor shundaymi?", "asserted"),
+        ("Mol bor emasmi", "asserted"),
+        ("Mol bor-ku?", "asserted"),
+        ("Мы ведь квиты?", "asserted"),
+        ("Мы квиты не так ли?", "rhetorical"),
+        ("Hozir xo'pmi?", "timed"),
+        ("Bosh ustiga xo'pmi?", "asserted"),
+        ("Мы квиты ли?", "intonation"),
+        # Rhetorical guarantees.
+        ("Kim sizni aldaydi?", "rhetorical"),
+        ("Yuk qayerga ham ketardi?", "rhetorical"),
+        ("Nima bo'lsa ham yetib boradi?", "rhetorical"),
+        ("Kim bizdan yaxshiroq?", "rhetorical"),
+        ("Nega qo'rqasiz?", "rhetorical"),
+        ("Hech yuk yo'qotganmizmi?", "rhetorical"),
+        # A time or an offer.
+        ("Bayram arafasida kelsa qulaymi?", "timed"),
+        ("Как рассветёт приедет?", "timed"),
+        ("Yuborsakmi?", "offer"),
+        ("Olib boraversakmi?", "offer"),
+    ):
+        verdict = redlines.check_shapes(text, allowed_tokens=TOKENS)
+        assert verdict.sentences[0].shape == "statement", (text, verdict)
+        assert verdict.sentences[0].why == why, (text, verdict)
+    # Every question mark NFKC folds to «?» asks no more than «?» does.
+    for mark in ("?", "？", "؟", "﹖", "︖", "⁇", "⁉", "⁈", "…?", "?!", "?.."):
+        assert not redlines.check_shapes(f"Мы квиты{mark}").ok, mark
+    # Every statement of the allowlist's corpus with a «?» or a tag added
+    # is still one.
+    for text in corpus.SHAPE_STATEMENTS:
+        base = text.rstrip(".!?… ")
+        if not base.strip(". "):
+            continue
+        for variant in (
+            f"{base}?",
+            f"{base} shundaymi?",
+            f"{base}, to'g'rimi?",
+            f"{base} xo'pmi?",
+            f"{base}-ku?",
+            f"{base} axir?",
+            f"{base} emasmi",
+            f"{base} не так ли?",
+            f"{base} ведь?",
+            f"Знаете что {base.lower()}?",
+        ):
+            assert not _verdict(variant).shapes_ok, variant
+
+
+def test_shape_names_say_nothing():
+    """The courtesy shape takes the counterparty's name once, by its first
+    word, and never a name made of words that say something: the client
+    sets their display name."""
+    assert _shapes("Rahmat, Akmal aka!", allowed_names=("Akmal Karimov",)) == (
+        "courtesy",
+    )
+    assert _shapes("Здравствуйте, Javlon!", allowed_names=("Javlon",)) == ("courtesy",)
+    for text, name in corpus.NAMED_STATEMENTS:
+        verdict = redlines.check_outbound(
+            text, "reply", TOKENS, allowed_names=(name,), client_script=None
+        )
+        assert not verdict.shapes_ok, (text, name, verdict)
+
+
+def test_shape_glued_statements_are_statements():
+    """A statement glued to a question with a comma, a dash or nothing at
+    all is still a statement, and a «?» ends its own sentence."""
+    for text in (
+        "Yuk omborda, yana savol bormi?",
+        "Yuk omborda — yana savol bormi?",
+        "Yuk omborda - yana savol bormi?",
+        "Yuk omborda; yana savol bormi?",
+        "Yuk omborda yana savol bormi?",
+        "Rasmi bor yuk omborda bormi?",
+        "Qayerdan, yuk omborda?",
+        "Yuk Xitoydan, qayerga?",
+        "Груз готов?",
+        "Груз в Ташкенте, что ещё?",
+        "Как штык, что ещё?",
+        "Что ещё, груз у нас?",
+        "Qayerga, yuk allaqachon yo'lda?",
+    ):
+        assert not redlines.check_shapes(text).ok, text
+        assert "statement" in _shapes(text), text
+    # The red lines read words after a question word as asked; the allowlist
+    # does not let a question assert the cargo's status there.
+    asserted = redlines.check_shapes("Qayerdan bilasiz yuk tayyor ekanini?")
+    assert asserted.sentences[0].why == "reported"
+    assert redlines.check_shapes("Kimga beraylik, yuk bizda?").sentences[0].shape == (
+        "statement"
+    )
+    assert _shapes("Yukingiz tayyormi?") == ("question",)
+    assert _shapes("Yuk qayerdan?Toshkentda.") == ("question", "statement")
+    assert _shapes("Rahmat, aka. Yuk qayerdan?") == ("courtesy", "question")
+    assert _shapes("Rahmat!Mol bizda.") == ("courtesy", "statement")
+    assert _shapes("Salom\nMol bizda") == ("courtesy", "statement")
+
+
+def test_shape_emoji():
+    """Emoji alone are a courtesy only as 🙂 🙏 👋; punctuation alone is no
+    shape; any other symbol makes its sentence a statement."""
+    for text in ("🙂", "🙏", "👋", "🙂🙂", "🙏🏻", "Rahmat 🙏", "👋 Salom!", "Salom! 🙂"):
+        assert redlines.check_shapes(text).ok, text
+    for text in (
+        "👍",
+        "✅",
+        "🤝",
+        "👌",
+        "+",
+        "Rahmat 👍",
+        "Salom ✅",
+        "Salom 🤝",
+        "🙂👍",
+    ):
+        assert not redlines.check_shapes(text).ok, text
+    for text in ("...", "!", "?", "-", "", "   "):
+        assert not redlines.check_shapes(text).ok, repr(text)
+    assert not redlines.check_shapes("Rahmat (aka)").ok
+    assert not redlines.check_shapes("Salom 🙂\u200d🔥").ok
+
+
+def test_shape_stalls_and_kb():
+    """A stall template, a sentence of one, an override that passed the
+    stall role, and an approved KB text verbatim: approved statements."""
+    for _reason, script, _form, text in stalls.all_templates():
+        verdict = redlines.check_outbound(text, "stall", client_script=script)
+        assert verdict.passed and verdict.shapes_ok, (text, verdict)
+        assert set(verdict.shapes.shapes) == {"stall"}, text
+    assert _shapes("Assalomu alaykum! Aka, aniq bilib, keyin o'zim aytaman.") == (
+        "courtesy",
+        "stall",
+    )
+    # An override is a stall only once it passed the stall role.
+    mine = "Aka, narxini bilib, o'zim aytaman."
+    assert _shapes(mine) == ("statement",)
+    assert redlines.check_outbound(mine, "stall", stall_texts=(mine,)).shapes_ok
+    bad = "Aka, mol bizda."
+    refused = redlines.check_outbound(bad, "stall", stall_texts=(bad,))
+    assert not refused.passed and not refused.shapes_ok
+    chosen = stalls.choose(
+        ["price"],
+        script="latin",
+        honorific="aka",
+        overrides={stalls.override_key("price", "latin", "aka"): mine},
+    )
+    assert chosen.source == "owner" and chosen.verdict.shapes_ok
+    # KB: the whole entry, or a whole sentence of one, after normalising.
+    kb = ("Ofisimiz Toshkentda joylashgan. Biz Xitoydan yuk olib kelamiz.",)
+    assert _shapes("Ofisimiz Toshkentda joylashgan.", approved_kb=kb) == ("kb",)
+    assert _shapes("ofisimiz toshkentda joylashgan", approved_kb=kb) == ("kb",)
+    assert set(_shapes(kb[0], approved_kb=kb)) == {"kb"}
+    assert _shapes("Ofisimiz Toshkentda.", approved_kb=kb) == ("statement",)
+    assert _shapes("Ofisimiz Toshkentda joylashgan.") == ("statement",)
+    # The KB never loosens a red line: a refused text stays refused.
+    priced = ("Narxi 100 dollar.",)
+    verdict = redlines.check_outbound(priced[0], approved_kb=priced)
+    assert not verdict.passed and not verdict.shapes_ok
+
+
+def test_every_stall_template_passes_the_shape_check():
+    for _reason, script, _form, text in stalls.all_templates():
+        assert redlines.check_shapes(text).ok, text
+        assert redlines.check_outbound(text, "stall", client_script=script).shapes_ok
+        picked = stalls.choose([_reason], script=script, honorific=_form)
+        assert picked.verdict.shapes_ok, picked
+
+
+def test_corpus_auto_and_never_auto():
+    """The allowlist's corpus: what may go out alone, and what never may
+    (the third verifier's every bypass, blocked or a statement)."""
+    for text in corpus.AUTO_OK:
+        verdict = _verdict(text)
+        assert verdict.passed and verdict.shapes_ok, (text, verdict)
+        cyrillic = _cyrillic(text)
+        if cyrillic is not None:
+            assert _verdict(cyrillic).shapes_ok, cyrillic
+    for text in corpus.SHAPE_STATEMENTS:
+        verdict = _verdict(text)
+        assert not verdict.shapes_ok, (text, verdict)
+        assert redlines.SHAPE_FLAG in verdict.notes, text
+        if verdict.passed:
+            # Never a block: the owner may still send it from a card.
+            assert verdict.result().passed and not verdict.result().shapes_ok
+    assert len(corpus.NEVER_AUTO) >= 500
+    for text, role in corpus.NEVER_AUTO:
+        verdict = _verdict(text, role)  # type: ignore[arg-type]
+        assert not verdict.shapes_ok, (text, role, verdict)
+    assert len(corpus.REDTEAM6_NEVER_AUTO) >= 128
+    for text in corpus.REDTEAM6_NEVER_AUTO:
+        # As the verifier ran it: the client's script, the counterparty's
+        # name and two other people.
+        verdict = redlines.check_outbound(
+            text,
+            "reply",
+            TOKENS,
+            allowed_names=("Javlon",),
+            other_names=("Akmal", "Dilshod"),
+            client_script=redlines.script_of(text),
+        )
+        assert not verdict.shapes_ok, (text, verdict)
+
+
+def test_shapes_in_the_guard_result():
+    """The verdict the gate stores carries the allowlist: ``shapes_ok``, the
+    shapes, and the non-blocking ``unapproved_statement`` flag."""
+    ok = redlines.GUARD.check(
+        "Assalomu alaykum, aka! Yuk qayerdan?", role="reply", allowed_tokens=frozenset()
+    )
+    assert ok.passed and ok.shapes_ok and ok.shapes == ("courtesy", "question")
+    assert redlines.SHAPE_FLAG not in ok.flags
+    bound = ok.bound_to("ab" * 32)
+    assert bound["shapes_ok"] is True and bound["shapes"] == ["courtesy", "question"]
+    assert gate.shapes_passed(bound)
+    free = redlines.GUARD.check("Как штык.", role="reply", allowed_tokens=frozenset())
+    assert free.passed and not free.shapes_ok
+    assert free.flags == (redlines.SHAPE_FLAG,)
+    assert not gate.shapes_passed(free.bound_to("ab" * 32))
+    blocked = redlines.GUARD.check("Mol bizda.", role="reply", allowed_tokens=frozenset())
+    assert not blocked.passed and not blocked.shapes_ok
+    # The owner's and the KB writer's words are not shape-checked.
+    for role in ("owner", "kb"):
+        verdict = redlines.check_outbound("Как штык.", role)  # type: ignore[arg-type]
+        assert verdict.shapes is None and not verdict.shapes_ok and not verdict.notes
+    # A guard result that does not say is no pass: fail closed.
+    assert not gate.GuardResult(verdict="pass").shapes_ok
+    assert not gate.shapes_passed({"verdict": "pass"})
+    assert not gate.shapes_passed({"verdict": "block", "shapes_ok": True})
+    assert redlines.SHAPE_REASON in m.ESCALATION_REASONS
+    assert redlines.SHAPE_LABEL == "erkin gap"
+
+
 # --- the currency table -----------------------------------------------------------------
 
 
@@ -919,6 +1296,54 @@ async def test_red_line_guard_gates_ai_drafts(session, real_guard):
     assert kept.state == "draft" and "price" in kept.guard["flags"]
     rows = await session.scalar(sa.select(sa.func.count()).select_from(m.OutboxMessage))
     assert rows == 5
+
+
+async def test_the_allowlist_decides_auto_with_the_real_guard(session, real_guard):
+    """With the real guard: a greeting and a question in an auto-eligible
+    intent keep ``shapes_ok`` and go out on their own; a free-form statement
+    the red lines let through is a draft card; a KB text the caller hands
+    in is refused."""
+    from tests.test_outbox import NOW, _ai_row, _inbound, _setup
+
+    person, trigger = await _setup(session, mode="auto")
+    asked = await _ai_row(
+        session,
+        person,
+        trigger,
+        body="Assalomu alaykum, aka! Yuk qayerdan qayerga, necha kilo?",
+        intent="info_gathering",
+    )
+    assert asked.state == "approved" and asked.approved_by == "auto:policy"
+    assert asked.guard["shapes_ok"] is True
+    assert asked.guard["shapes"] == ["courtesy", "question"]
+    free = await _ai_row(session, person, trigger, body="Bosh ustiga, aka.")
+    assert free.state == "draft" and free.last_error == "unapproved_statement"
+    assert free.guard["verdict"] == "pass" and free.guard["shapes_ok"] is False
+    assert "unapproved_statement" in free.guard["flags"]
+    fact = "Ofisimiz Toshkentda joylashgan."
+    unknown = await _ai_row(
+        session, person, trigger, body=fact, intent="general_question"
+    )
+    assert unknown.state == "draft"
+    assert unknown.guard["shapes"] == ["statement"]
+    # A KB text approves only through the outbox's own records (JV-15): one
+    # a caller hands in is refused.
+    again = await _inbound(session, person, text="Ofisingiz qayerda?")
+    with pytest.raises(outbox.OutboxError):
+        await _ai_row(
+            session,
+            person,
+            again,
+            body=fact,
+            intent="general_question",
+            approved_kb=(fact,),
+        )
+    # The question grammar decides auto too: a statement with a «?» is a card.
+    tagged = await _ai_row(session, person, again, body="Mol bor, shundaymi?")
+    assert tagged.state in ("draft", "blocked") and tagged.state != "approved"
+    # The claim sends only the shaped rows.
+    claimed = await outbox.claim_ready(session, "telegram", now=NOW, limit=10)
+    assert {c.id for c in claimed} == {asked.id}
 
 
 async def test_outbox_guard_checks_names_and_script(session, real_guard):

@@ -6,7 +6,10 @@ owner's own register; the owner may override one (``owner_style_profiles.
 stalls``, JV-14), and an override is used only while it passes the red-line
 guard in the ``stall`` role. Every template passes that guard too (a test
 pins it): a stall promises nothing, names no price, no time and no figure,
-and invents no fact («I'm in a meeting»). At most one stall goes out per
+and invents no fact («I'm in a meeting»). A template, and an override that
+passed the stall role, is also an approved shape for the statement allowlist
+(``redlines.check_shapes``), so a stall may go out on its own once the
+``stall`` intent graduates. At most one stall goes out per
 open escalation; the responder (JV-16) holds that line.
 
 Pure: no I/O.
@@ -195,8 +198,13 @@ def choose(
     form = honorific_of(honorific)
     override = (overrides or {}).get(override_key(reason, written, form))
     if isinstance(override, str) and override.strip():
+        # An override that passes the stall role is a stall for the
+        # statement allowlist too (§5.2 step 3).
         verdict = redlines.check_outbound(
-            override.strip(), "stall", client_script=written
+            override.strip(),
+            "stall",
+            client_script=written,
+            stall_texts=(override.strip(),),
         )
         if verdict.passed:
             return Stall(override.strip(), reason, written, form, "owner", verdict)

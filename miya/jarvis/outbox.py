@@ -13,11 +13,18 @@ report goes to ``reconcile``: an echo found means sent, none means
 
 The lifecycle::
 
-    create ─▶ shadow | draft | approved (auto intents only) | blocked
+    create ─▶ shadow | draft | approved (auto intents with shapes_ok only) | blocked
     draft ──approve──▶ approved ──claim_ready──▶ sending ──complete──▶ sent
                           │  ▲                     │   └──fail──▶ failed | approved
                           │  └──── hold ───────────┘   └──reconcile──▶ sent | unknown
                           └─▶ draft (redraft) · blocked · expired · cancelled
+
+An AI row is approved on its own (``auto:policy``) only when its intent
+graduated and its bound verdict carries ``shapes_ok`` (the statement
+allowlist, rule 13a): every sentence a courtesy, a question, a stall or an
+approved KB text. A text with a free-form statement becomes a draft card
+(``unapproved_statement``) instead; ``gate.evaluate`` holds the same line at
+the claim.
 
 Every transition appends ``{at, field, old, new, by}`` to ``history``.
 Functions take the caller's session and flush; the caller commits. Logs
@@ -98,6 +105,10 @@ BY_OWN: Final = "auto:own"
 BY_COMMAND: Final = "command"
 
 AUTO_APPROVER: Final = gate.AUTO_APPROVER
+# create() takes no approved statements from its caller (rule 13a): see there.
+APPROVED_TEXTS_REFUSED: Final = "approved_texts_unverified"
+# approve() is the owner's tap: the autonomous approver is create()'s alone.
+BAD_APPROVER: Final = "bad_approver"
 ORIGINS: Final = ("auto_reply", "stall", "owner_command", "escalation")
 AUTHORS: Final = (gate.AI, gate.OWNER)
 
@@ -481,7 +492,12 @@ async def guard_names(session: AsyncSession, row: OutboxMessage) -> GuardNames:
 
 
 def _run_guard(
-    row: OutboxMessage, tokens: frozenset[str], names: GuardNames
+    row: OutboxMessage,
+    tokens: frozenset[str],
+    names: GuardNames,
+    *,
+    approved_kb: Sequence[str] = (),
+    stall_texts: Sequence[str] = (),
 ) -> gate.GuardResult:
     return gate.run_guard(
         gate.registered_guard(),
@@ -491,6 +507,8 @@ def _run_guard(
         allowed_names=names.allowed,
         other_names=names.others,
         client_script=names.client_script,
+        approved_kb=tuple(t for t in approved_kb if isinstance(t, str)),
+        stall_texts=tuple(t for t in stall_texts if isinstance(t, str)),
     )
 
 
@@ -560,9 +578,26 @@ async def create(
     reply_to_external_id: str | None = None,
     not_before: datetime | None = None,
     by: str | None = None,
+    approved_kb: Sequence[str] = (),
+    stall_texts: Sequence[str] = (),
 ) -> OutboxMessage:
     """Store a proposal: shadow, draft, approved (a graduated auto intent
-    only) or blocked. The same proposal twice is the same row."""
+    whose text passed the statement allowlist only) or blocked. The same
+    proposal twice is the same row.
+
+    ``approved_kb`` are the active owner-approved KB texts the draft was
+    written from (JV-15) and ``stall_texts`` the owner's stall overrides
+    (JV-14): verbatim, they are approved statements; they never loosen a
+    red line. Texts a caller hands in are not trusted as approved: until
+    the outbox loads them itself (the active KB entries by id, the
+    overrides from ``owner_style_profiles``), any is refused, and so is a
+    bare string (it would be read one character a text)."""
+    if isinstance(approved_kb, str) or isinstance(stall_texts, str):
+        raise OutboxError(APPROVED_TEXTS_REFUSED)
+    if approved_kb or stall_texts:
+        # JV-15 / JV-14: the outbox resolves the approved texts from the
+        # owner's own records, and the claim rechecks them still active.
+        raise OutboxError(APPROVED_TEXTS_REFUSED)
     if not settings.jarvis_enabled:
         raise JarvisDisabled("jarvis_disabled")
     if policy.ceiling() == "off":
@@ -632,7 +667,11 @@ async def create(
     )
     rules = await _rules(session, row)
     result = _run_guard(
-        row, await allowed_tokens(session, row), await guard_names(session, row)
+        row,
+        await allowed_tokens(session, row),
+        await guard_names(session, row),
+        approved_kb=approved_kb,
+        stall_texts=stall_texts,
     )
     _bind(row, result)
     state, code = await _initial_state(
@@ -696,15 +735,20 @@ async def _initial_state(
         return SHADOW, None
     if not guard.passed:
         return BLOCKED, guard.verdict[:64]
-    if (
+    auto = (
         mode == "auto"
         and row.intent in gate.AUTO_INTENTS
         and policy.rule_mode(rules) != policy.RULE_DRAFT
         and not await costs.over_cap(session, now)
-    ):
+    )
+    if auto and guard.shapes_ok:
         return APPROVED, None
     if await caps.draft_cap_reached(session, now):
         return DRAFT, caps.DRAFT_CAP_CODE
+    if auto:
+        # Rule 13a: a free-form statement is never sent on its own; the
+        # owner reads it on a card first.
+        return DRAFT, gate.UNAPPROVED_STATEMENT
     return DRAFT, None
 
 
@@ -730,6 +774,10 @@ async def approve(
     that became personal blocks the AI row. The CHECK
     ``ck_outbox_messages_guarded`` holds the same line in the database.
     """
+    if by == AUTO_APPROVER:
+        # Only create() approves on its own, and only a row with shapes_ok:
+        # a draft card is a free-form statement waiting for the owner.
+        raise OutboxError(BAD_APPROVER)
     row = await _locked(session, row_id)
     if row is None or row.state != DRAFT:
         raise AlreadyAnswered(str(row_id))
@@ -972,6 +1020,12 @@ async def _context(
         allowed_names=names.allowed,
         other_names=names.others,
         client_script=names.client_script,
+        # The approved texts of the statement allowlist: JV-15 passes the
+        # active KB entries, JV-14 the owner's stall overrides. Until then a
+        # body re-guarded here matches none, and an auto row that leaned on
+        # one goes back to the card (never out).
+        approved_kb=(),
+        stall_texts=(),
         quiet_until=quiet_until(now),
         auto_in_quiet_hours=bool(getattr(settings, AUTO_IN_QUIET_HOURS, False)),
     )

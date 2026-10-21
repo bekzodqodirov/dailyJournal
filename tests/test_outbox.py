@@ -48,15 +48,19 @@ OWNER_ID = 990001
 
 
 class PassGuard:
-    """Stands in for the JV-13 red-line guard."""
+    """Stands in for the JV-13 red-line guard. A passing verdict also passes
+    the statement allowlist unless ``shapes_ok`` says otherwise."""
 
-    def __init__(self, verdict: str = "pass") -> None:
+    def __init__(self, verdict: str = "pass", *, shapes_ok: bool | None = None) -> None:
         self.verdict = verdict
+        self.shapes_ok = verdict == "pass" if shapes_ok is None else shapes_ok
         self.calls: list[tuple[str, str]] = []
 
     def check(self, body, *, role, allowed_tokens, **names):
         self.calls.append((body, role))
-        return gate.GuardResult(verdict=self.verdict, checker_version="test")
+        return gate.GuardResult(
+            verdict=self.verdict, checker_version="test", shapes_ok=self.shapes_ok
+        )
 
 
 @pytest.fixture
@@ -542,6 +546,153 @@ async def test_guard_hash_mismatch_reguards(session, jarvis):
     assert await outbox.claim_ready(session, "telegram", now=NOW, limit=1) == []
     third = await _reload(session, tapped[2].id)
     assert third.state == "blocked" and third.last_error == "guard_unavailable"
+
+
+async def test_an_unapproved_statement_is_a_draft_never_auto(session, jarvis):
+    """Rule 13a: an AI text with a free-form statement in an auto intent is
+    a draft card, never approved on its own; the owner's tap still sends it."""
+    person, trigger = await _setup(session, mode="auto")
+    gate.register_guard(PassGuard(shapes_ok=False))
+    row = await _ai_row(session, person, trigger, body="Bosh ustiga, aka.")
+    assert row.state == "draft" and row.approved_by is None
+    assert row.last_error == gate.UNAPPROVED_STATEMENT
+    assert row.guard["verdict"] == "pass" and row.guard["shapes_ok"] is False
+    assert row.history[0]["code"] == gate.UNAPPROVED_STATEMENT
+    assert await outbox.claim_ready(session, "telegram", now=NOW) == []
+    # A draft is never blocked by the allowlist: the owner reads and taps.
+    tapped = await _approved(session, row)
+    assert tapped.approved_by == "button"
+    [claimed] = await outbox.claim_ready(session, "telegram", now=NOW)
+    assert claimed.id == row.id
+    # A shaped text in the same intent is approved on its own.
+    gate.register_guard(PassGuard())
+    auto = await _ai_row(session, person, trigger, body="Salom, aka!")
+    assert auto.state == "approved" and auto.approved_by == "auto:policy"
+    assert auto.guard["shapes_ok"] is True and auto.last_error is None
+
+
+async def test_an_auto_row_without_shapes_ok_is_never_sent(session, jarvis):
+    """At the claim an autonomous row whose verdict lacks a passing shape
+    check (it says no, or it was stored before the check) goes back to the
+    owner's card; so does a re-guarded body that fails it."""
+    person, trigger = await _setup(session, mode="auto")
+    said_no = await _ai_row(session, person, trigger, body="Salom!")
+    legacy = await _ai_row(session, person, trigger, body="Assalomu alaykum!")
+    changed = await _ai_row(session, person, trigger, body="Rahmat!")
+    for row in (said_no, legacy, changed):
+        assert row.approved_by == "auto:policy"
+    await session.execute(
+        sa.text(
+            "UPDATE outbox_messages SET guard = jsonb_set(guard, '{shapes_ok}', "
+            "'false') WHERE id = :i"
+        ),
+        {"i": said_no.id},
+    )
+    await session.execute(
+        sa.text("UPDATE outbox_messages SET guard = guard - 'shapes_ok' WHERE id = :i"),
+        {"i": legacy.id},
+    )
+    await session.execute(
+        sa.text("UPDATE outbox_messages SET body = :b WHERE id = :i"),
+        {"b": "Bosh ustiga, aka.", "i": changed.id},
+    )
+    gate.register_guard(PassGuard(shapes_ok=False))
+    assert await outbox.claim_ready(session, "telegram", now=NOW) == []
+    for row in (said_no, legacy, changed):
+        back = await _reload(session, row.id)
+        assert back.state == "draft", back.id
+        assert back.last_error == gate.UNAPPROVED_STATEMENT
+        assert back.approved_by is None and back.approved_at is None
+        assert back.history[-1]["by"] == "gate"
+    fresh = await _reload(session, changed.id)
+    assert fresh.guard["body_sha256"] == gate.body_hash("Bosh ustiga, aka.")
+    assert fresh.guard["shapes_ok"] is False and fresh.guard["verdict"] == "pass"
+    # Nothing of them reached an adapter.
+    assert (await caps.day_counts(session, NOW)).auto_sent == 0
+
+
+def test_gate_refuses_auto_without_a_passing_shape_check():
+    """gate.evaluate: an autonomous row needs ``shapes_ok`` in its bound
+    verdict; an owner-tapped AI row does not; a re-guard binds the fresh one."""
+    sha = gate.body_hash("Assalomu alaykum!")
+    for guard in (
+        {"verdict": "pass", "body_sha256": sha},
+        {"verdict": "pass", "body_sha256": sha, "shapes_ok": False},
+        {"verdict": "pass", "body_sha256": sha, "shapes_ok": "true"},
+    ):
+        decision = gate.evaluate(_gate_row(guard=guard), _gate_ctx())
+        assert (decision.action, decision.line, decision.code) == (
+            "redraft",
+            "guard",
+            gate.UNAPPROVED_STATEMENT,
+        ), guard
+        assert not decision.sends
+        tapped = _gate_row(guard=guard, approved_by="button")
+        assert gate.evaluate(tapped, _gate_ctx()).sends
+    assert gate.evaluate(_gate_row(), _gate_ctx()).sends
+    # The body moved: re-guarded, a failing shape check is a redraft with the
+    # fresh verdict bound, a passing one a send.
+    moved = _gate_row(guard={"verdict": "pass", "body_sha256": "0" * 64})
+    back = gate.evaluate(moved, _gate_ctx(guard=PassGuard(shapes_ok=False)))
+    assert (back.action, back.code) == ("redraft", gate.UNAPPROVED_STATEMENT)
+    assert back.guard is not None and not back.guard.shapes_ok
+    assert back.body_sha256 == sha
+    assert gate.evaluate(moved, _gate_ctx(guard=PassGuard())).sends
+
+
+def test_gate_rechecks_a_kb_row_at_the_claim():
+    """An autonomous row approved for a KB text is guarded again at the
+    claim with the entries active now: a retired entry approves nothing."""
+    body = "Ofisimiz Toshkentda joylashgan."
+    sha = gate.body_hash(body)
+    bound = {"verdict": "pass", "body_sha256": sha, "shapes_ok": True, "shapes": ["kb"]}
+
+    class KbGuard:
+        def check(self, text, *, role, allowed_tokens, approved_kb=(), **names):
+            return gate.GuardResult(
+                verdict="pass", shapes_ok=text in approved_kb, shapes=("kb",)
+            )
+
+    row = _gate_row(body=body, guard=bound, intent="general_question")
+    retired = gate.evaluate(row, _gate_ctx(guard=KbGuard()))
+    assert (retired.action, retired.code) == ("redraft", gate.UNAPPROVED_STATEMENT)
+    assert not retired.sends
+    active = gate.evaluate(row, _gate_ctx(guard=KbGuard(), approved_kb=(body,)))
+    assert active.sends and active.code == "reguarded"
+    # The owner's tap needs no KB: the bound verdict stands.
+    tapped = _gate_row(body=body, guard=bound, approved_by="button")
+    assert gate.evaluate(tapped, _gate_ctx(guard=KbGuard())).sends
+
+
+async def test_create_takes_no_approved_texts_from_its_caller(session, jarvis):
+    """Rule 13a: a caller cannot hand create() the texts that make a body an
+    approved statement (JV-15/JV-14 load them from the owner's records), nor
+    a bare string read one character a text."""
+    person, trigger = await _setup(session, mode="auto")
+    fact = "Ofisimiz Toshkentda joylashgan."
+    for kw in (
+        {"approved_kb": (fact,)},
+        {"approved_kb": fact},
+        {"stall_texts": (fact,)},
+        {"stall_texts": "x"},
+    ):
+        with pytest.raises(outbox.OutboxError, match=outbox.APPROVED_TEXTS_REFUSED):
+            await _ai_row(session, person, trigger, body=fact, **kw)
+    rows = await session.scalar(sa.select(sa.func.count()).select_from(m.OutboxMessage))
+    assert rows == 0
+
+
+async def test_approve_refuses_the_auto_approver(session, jarvis):
+    """Only create() approves on its own: a tap ``by`` the policy approver
+    is refused and the draft stays a draft."""
+    gate.register_guard(PassGuard(shapes_ok=False))
+    person, trigger = await _setup(session, mode="auto")
+    draft = await _ai_row(session, person, trigger, intent="info_gathering")
+    assert draft.state == "draft" and draft.last_error == gate.UNAPPROVED_STATEMENT
+    with pytest.raises(outbox.OutboxError, match=outbox.BAD_APPROVER):
+        await outbox.approve(session, draft.id, by=outbox.AUTO_APPROVER, now=NOW)
+    assert (await _reload(session, draft.id)).state == "draft"
+    assert (await _approved(session, draft)).approved_by == "button"
 
 
 async def test_no_guard_fails_closed(session, jarvis, no_guard):
@@ -1383,7 +1534,7 @@ def _gate_row(**kw) -> gate.Row:
         "authored_by": "ai",
         "body": body,
         "body_sha256": sha,
-        "guard": {"verdict": "pass", "body_sha256": sha},
+        "guard": {"verdict": "pass", "body_sha256": sha, "shapes_ok": True},
         "created_at": NOW - timedelta(minutes=1),
         "intent": "greeting",
         "approved_by": "auto:policy",

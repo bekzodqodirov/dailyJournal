@@ -15,6 +15,12 @@ skip a line. The first line that objects decides:
 * ``block`` / ``expire`` / ``cancel`` — the row is never sent.
 * ``send`` — every line passed; the row may be claimed.
 
+An autonomous row (``auto:policy``, no owner tap) also needs the statement
+allowlist (§5.2 step 3, rule 13a): its bound verdict must say ``shapes_ok``,
+every sentence a courtesy, a question, a stall or an approved KB text. One
+without it never goes out on its own: it goes back to the owner's card
+(``unapproved_statement``).
+
 The red-line guard is reached through the small ``Guard`` interface.
 ``outbox`` registers the real one (``redlines.GUARD``, JV-13) when it is
 imported; with no guard registered the binding check fails closed: AI-authored
@@ -64,6 +70,10 @@ GUARD_ERROR: Final = "guard_error"
 PAYLOAD_NOT_TEXT: Final = "payload_not_text"
 NO_TRIGGER: Final = "no_trigger"
 SAFETY_UNREADABLE: Final = "safety_unreadable"
+# The statement allowlist (§5.2 step 3): an AI text with a sentence that is
+# not a courtesy, a question, a stall or an approved KB text. Its flag on the
+# verdict, and the code of an autonomous row sent back to the card for it.
+UNAPPROVED_STATEMENT: Final = "unapproved_statement"
 
 # The longest body any channel takes in one message (Telegram's limit).
 MAX_BODY_CHARS: Final = 4096
@@ -91,13 +101,20 @@ def body_hash(body: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class GuardResult:
-    """A red-line verdict: ``pass`` or anything else (a block or escalation)."""
+    """A red-line verdict: ``pass`` or anything else (a block or escalation).
+
+    ``shapes_ok`` is the statement allowlist (§5.2 step 3): True only when the
+    red lines passed and every sentence has an approved shape (``shapes``,
+    one name per sentence). It never blocks a draft; an autonomous row needs
+    it. A guard that does not say is False: fail closed."""
 
     verdict: str
     flags: tuple[str, ...] = ()
     det_hits: tuple[str, ...] = ()
     model_verdict: str | None = None
     checker_version: str = ""
+    shapes_ok: bool = False
+    shapes: tuple[str, ...] = ()
 
     @property
     def passed(self) -> bool:
@@ -112,7 +129,16 @@ class GuardResult:
             "model_verdict": self.model_verdict,
             "body_sha256": sha256,
             "checker_version": self.checker_version,
+            "shapes_ok": self.shapes_ok,
+            "shapes": list(self.shapes),
         }
+
+
+def shapes_passed(guard: Mapping[str, object]) -> bool:
+    """Does a stored verdict (``outbox_messages.guard``) carry a passing
+    statement-allowlist check? A verdict stored before the check existed, or
+    by a guard that does not make it, does not."""
+    return guard.get("verdict") == GUARD_PASS and guard.get("shapes_ok") is True
 
 
 class Guard(Protocol):
@@ -123,6 +149,9 @@ class Guard(Protocol):
     may carry. ``other_names`` are people the text must not name unless they
     are in ``allowed_names`` (the counterparty, the owner's aliases), and
     ``client_script`` is the script the client wrote in (§5.2 step 2).
+    ``approved_kb`` are the active owner-approved knowledge-base texts and
+    ``stall_texts`` the owner's stall overrides: verbatim, they are approved
+    statements for the allowlist (§5.2 step 3).
     """
 
     def check(
@@ -134,6 +163,8 @@ class Guard(Protocol):
         allowed_names: tuple[str, ...] = (),
         other_names: tuple[str, ...] = (),
         client_script: str | None = None,
+        approved_kb: tuple[str, ...] = (),
+        stall_texts: tuple[str, ...] = (),
     ) -> GuardResult: ...
 
 
@@ -165,6 +196,8 @@ def run_guard(
     allowed_names: tuple[str, ...] = (),
     other_names: tuple[str, ...] = (),
     client_script: str | None = None,
+    approved_kb: tuple[str, ...] = (),
+    stall_texts: tuple[str, ...] = (),
 ) -> GuardResult:
     """Run the guard; no guard, or one that raises, is a failed check. The
     error's class is kept in ``det_hits`` (``error:<class>``) for the log
@@ -179,6 +212,8 @@ def run_guard(
             allowed_names=allowed_names,
             other_names=other_names,
             client_script=client_script,
+            approved_kb=approved_kb,
+            stall_texts=stall_texts,
         )
     except Exception as exc:
         return GuardResult(
@@ -292,6 +327,10 @@ class Context:
     allowed_names: tuple[str, ...] = ()
     other_names: tuple[str, ...] = ()
     client_script: str | None = None
+    # Approved texts for the statement allowlist: the active KB entries and
+    # the owner's stall overrides (JV-15, JV-14).
+    approved_kb: tuple[str, ...] = ()
+    stall_texts: tuple[str, ...] = ()
     # The end of the quiet hours when ``now`` is inside them, else None.
     quiet_until: datetime | None = None
     auto_in_quiet_hours: bool = False
@@ -471,8 +510,14 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         return None  # the payload line refuses it
     sha = body_hash(row.body)
     bound = row.body_sha256 == sha and row.guard.get("body_sha256") == sha
-    if row.ai and bound and row.guard.get("verdict") == GUARD_PASS:
+    leaned_on_kb = row.auto and "kb" in _shape_names(row.guard)
+    if row.ai and bound and row.guard.get("verdict") == GUARD_PASS and not leaned_on_kb:
+        if row.auto and not shapes_passed(row.guard):
+            # Rule 13a: free-form statements go out only after an owner tap.
+            return Decision("redraft", "guard", UNAPPROVED_STATEMENT)
         return None
+    # An autonomous row approved for a KB text is guarded again with the KB
+    # entries active now: a retired entry approves nothing (JV-15).
     if not row.ai and bound:
         return None
     result = run_guard(
@@ -483,6 +528,8 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         allowed_names=ctx.allowed_names,
         other_names=ctx.other_names,
         client_script=ctx.client_script,
+        approved_kb=ctx.approved_kb,
+        stall_texts=ctx.stall_texts,
     )
     if not row.ai:
         # The owner's words are flagged, never blocked; but a body that
@@ -499,9 +546,22 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         # The owner tapped send on another text: the new one goes back to
         # the card, with the fresh verdict bound to it (rule 16).
         return Decision("redraft", "guard", "body_changed", guard=result, body_sha256=sha)
+    if not result.shapes_ok:
+        # Re-guarded, the red lines pass but a sentence is a free-form
+        # statement: back to the owner's card with the fresh verdict bound.
+        return Decision(
+            "redraft", "guard", UNAPPROVED_STATEMENT, guard=result, body_sha256=sha
+        )
     # An autonomous row re-guarded and passed: the claim binds the fresh
     # verdict to this body.
     return Decision("send", "guard", "reguarded", guard=result, body_sha256=sha)
+
+
+def _shape_names(guard: Mapping[str, object]) -> tuple[str, ...]:
+    shapes = guard.get("shapes")
+    if not isinstance(shapes, list | tuple):
+        return ()
+    return tuple(s for s in shapes if isinstance(s, str))
 
 
 def plain_text(body: object) -> bool:
@@ -565,6 +625,7 @@ __all__ = [
     "NO_TRIGGER",
     "PAYLOAD_NOT_TEXT",
     "SAFETY_UNREADABLE",
+    "UNAPPROVED_STATEMENT",
     "WARNED_PERSONAL",
     "WARNED_SAFETY",
     "Action",
@@ -584,6 +645,7 @@ __all__ = [
     "register_guard",
     "registered_guard",
     "run_guard",
+    "shapes_passed",
     "unavailable",
     "warned",
 ]

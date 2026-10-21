@@ -36,7 +36,7 @@ JID = "998901234567@s.whatsapp.net"
 
 class PassGuard:
     def check(self, body, *, role, allowed_tokens, **names):
-        return gate.GuardResult(verdict="pass", checker_version="test")
+        return gate.GuardResult(verdict="pass", checker_version="test", shapes_ok=True)
 
 
 @pytest.fixture
@@ -191,7 +191,7 @@ def _gate_row(**kw) -> gate.Row:
         "authored_by": "ai",
         "body": body,
         "body_sha256": sha,
-        "guard": {"verdict": "pass", "body_sha256": sha},
+        "guard": {"verdict": "pass", "body_sha256": sha, "shapes_ok": True},
         "created_at": NOW - timedelta(minutes=1),
         "intent": "greeting",
         "approved_by": "auto:policy",

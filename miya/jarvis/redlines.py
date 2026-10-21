@@ -78,7 +78,7 @@ from miya.services.text import (
 
 # Bumped whenever a lexicon or a rule changes, so a stored verdict says which
 # checker made it (outbox_messages.guard.checker_version).
-CHECKER_VERSION: Final = "redlines-4"
+CHECKER_VERSION: Final = "redlines-6"
 
 # The longest AI reply (§5.2).
 MAX_CHARS: Final = 400
@@ -349,7 +349,8 @@ TIME = Lexicon.of(
     ertanga*, ertagi kun, ertagi*, bugin*, irtaga*, sigodnya*, tez*, eng tez*,
     полчас*, часок, часочек, часочк*, минутк*, минуточк*, секундочк*, секундк*,
     недельк*, денёчек, денечек, chasik*, chasok*, chasochk*, polchas*, minutk*,
-    minutochk*, sekundochk*, nedelk*, denyok, denek
+    minutochk*, sekundochk*, nedelk*, denyok, denek, днями, dnyami, нынче, ninche,
+    спозаранку, spozaranku, до темноты
     """,
     english="""
     today, tomorrow, tonight, yesterday, morning, evening, noon, week*, month*, hour*,
@@ -760,7 +761,22 @@ GREETINGS = Lexicon.of(
     tug'ilgan kuningiz bilan, с днём рождения, с днем рождения, с наврузом,
     с праздником навруз, с курбан хайитом, с рамазан хайитом, с курбан байрамом,
     с рамадан байрамом, рамадан мубарак, рамазан мубарак, хайит мубарак,
-    с праздником курбан, с наступающим новым годом, хорошего утра, доброго утра
+    с праздником курбан, с наступающим новым годом, хорошего утра, доброго утра,
+    hayit ayyomi muborak, hayit ayyomingiz muborak, hayit bayrami bilan,
+    hayitingiz bilan, ramazon hayiti bilan, ramazon hayitingiz bilan,
+    qurbon hayiti bilan, qurbon hayitingiz bilan, ro'za hayiti bilan,
+    navro'z ayyomi muborak, navro'z ayyomingiz muborak, navro'z bayrami bilan,
+    navro'z bilan, navro'zingiz bilan, navro'zingiz muborak bo'lsin,
+    xalqaro xotin-qizlar kuni bilan, xotin-qizlar kuni bilan,
+    xotin-qizlar bayrami bilan, o'qituvchilar kuni bilan,
+    o'qituvchi va murabbiylar kuni bilan, ustozlar kuni bilan, mustaqillik kuni bilan,
+    mustaqillik bayrami bilan, mustaqillik bayramingiz bilan, konstitutsiya kuni bilan,
+    vatan himoyachilari kuni bilan, xotira va qadrlash kuni bilan,
+    yangi yil arafasida tabrik*, bayram arafasida tabrik*, с днём независимости,
+    с днем независимости, с международным женским днём, с международным женским днем,
+    с женским днём, с женским днем, с днём учителя, с днем учителя, с днём конституции,
+    с днем конституции, с днём защитника отечества, с днем защитника отечества,
+    с ураза байрамом, с праздником навруз байрам, навруз мубарак, ид мубарак
     """,
 )
 
@@ -906,7 +922,8 @@ NEUTRAL_VERBS = _forms(
     совсем, всем, затем, зачем, причем, причём, xursandman, xursandmiz, mamnunman,
     mamnunmiz, minnatdorman, minnatdormiz, shodman, dushman, karman, roman, obman,
     tushundim, tushundik, думаем, желаем, желаю, qalaysiz, xizmatingizdamiz,
-    tushunmadim, tushunmadik, слушаю, слушаем, работаем, занимаемся, rahmat
+    tushunmadim, tushunmadik, слушаю, слушаем, работаем, занимаемся, rahmat,
+    поздравляю, поздравляем
     """
 )
 # Words that make a clause a real question («qayerdan», «qaysi», «какой»).
@@ -1030,10 +1047,14 @@ _NOT_AFTER = _words(
 _UNTIL = re.compile(r"(?:gacha|[gk]u(?:n|nim|nimiz|ningiz|ni|nlari)cha)$")
 # The cargo, the truck or the papers as the subject of a place («yuk
 # Toshkentda», «yukingiz bizda»): a status claim.
+# Colloquial nouns too («mol», «quti», «kargo», «jo'natma», «gruz»), and the
+# colloquial second person «-iz» («yukiz», «zakaziz», «mashinez»).
 _CARGO = re.compile(
-    r"^(?:yuk|mashina|fura|tovar|konteyner|kontayner|haydovchi|posilka|buyurtma"
-    r"|mahsulot|hujjat|deklaratsiya|partiya|zakaz)(?:lar)?"
-    r"(?:i|im|imiz|ingiz|ngiz|miz|si|ri|lari|laringiz)?$"
+    r"^(?:yuk|mashina|mashin|moshina|moshin|fura|tovar|konteyner|kontayner|haydovchi"
+    r"|shopir|shofyor|shafyor|posilka|buyurtma|mahsulot|hujjat|deklaratsiya|partiya"
+    r"|zakaz|mol|kuti|korobka|karobka|kargo|jonatma|junatma|gruz|sizniki|bizniki)"
+    r"(?:lar)?"
+    r"(?:i|im|imiz|ingiz|ngiz|miz|si|ri|lari|laringiz|iz|ez|z)?$"
 )
 _NOT_LOCATIVE = _words(
     """
@@ -1043,10 +1064,32 @@ _NOT_LOCATIVE = _words(
 )
 _RU_CARGO = _words(
     """
-    груз, грузы, машина, машины, фура, фуры, товар, посылка, контейнер, документы,
-    документ
+    груз, грузы, машина, машины, фура, фуры, товар, товары, посылка, посылки,
+    контейнер, документы, документ, коробка, коробки, заказ, заказы, мешки, груз
     """
 )
+# A hub, a border, customs or a warehouse in the locative («Xorgosda»,
+# «skladida», «tamojnyada», «postda»): said as the predicate («hozir
+# xorgosda, aka», «aytishicha xorgosda»), it is where the cargo is.
+_HUB = re.compile(
+    r"^(?=[a-z-]{5,}$)(?:xorgos|horgos|khorgos|korgos|urumchi|urumki|urumci|kashkar"
+    r"|kashgar|almat|sklad|tamojn|tamojk|tamozhn|tamozn|post|chegara|ombor|bojxona"
+    r"|terminal|trassa|granits)[a-z-]*(?:da|ta|de)$"
+)
+# «hozir» (now) with a place as the predicate: «hozir postda», «ҳозир
+# навбатда», «hozir yuklanishda».
+_NOW_WORDS = _words(
+    """
+    hozir, hozirda, hozircha, xozir, hozirgi, ҳозир, allaqachon, allakachon
+    """
+)
+# The negative perfect «tushgani yo'q» (it has not arrived), and «hali yo'q»
+# (not yet): a status.
+_NEG_PERFECT = re.compile(r"^(?=[a-z]{5,}$).*[gk]ani$")
+_NONE_WORDS = frozenset({"yok", "yuk"})
+# «chiqishi kerak», «yetishi kerak»: it should, a prediction.
+_SHOULD = re.compile(r"^(?=[a-z]{5,}$).*shi$")
+_NOT_SHOULD = frozenset({"yaxshi", "yahshi", "kishi", "boshi", "tashi", "kushi"})
 _RU_PLACE = _words(
     """
     в, во, на, у
@@ -1136,6 +1179,8 @@ _LONE_ENDING = re.compile(
 # --- the surface view -------------------------------------------------------------------
 
 _PERCENT = re.compile(r"[%‰‱]")
+# «+», «++» (yes, agreed); not the «+» of a phone number.
+_PLUS = re.compile(r"\+(?!\s*\d)")
 _HUNDRED_PERCENT = re.compile(r"(?<!\d)100\s?%")
 _CLOCK = re.compile(r"(?<!\d)\d{1,2}\s?[:.]\s?\d{2}(?!\d)")
 _DATE = re.compile(r"(?<!\d)\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?(?!\d)")
@@ -1259,6 +1304,13 @@ _EMOJI: Final[Mapping[str, tuple[Flag, str]]] = {
     "🚛": ("promise", "promise:emoji"),
     "✈": ("promise", "promise:emoji"),
     "📦": ("promise", "promise:emoji"),
+    "🔜": ("deadline", "time:emoji"),
+    "💪": ("promise", "promise:emoji"),
+    "🫡": ("promise", "promise:emoji"),
+    "🛬": ("promise", "promise:emoji"),
+    "➕": ("promise", "promise:emoji"),
+    "🎁": ("discount", "discount:emoji"),
+    "📥": ("payment_claim", "payment_claim:emoji"),
 }
 
 
@@ -1407,6 +1459,8 @@ def _surface_hits(
     for ch in dict.fromkeys(raw):
         if ch in _EMOJI:
             hits.add(*_EMOJI[ch])
+    if _PLUS.search(masked):
+        hits.add("promise", "promise:plus")
     if (
         safety.extract_urls(clean)
         or _URL_HINT.search(masked)
@@ -1771,19 +1825,61 @@ def _stalling(tokens: list[str], i: int, *, primed: bool = False) -> bool:
     return _token_in(token, AUXILIARIES) and _led(tokens, i, primed=primed)
 
 
-def _located(tokens: list[str], i: int, *, script: Script | None) -> bool:
+def _cargo_in(tokens: Sequence[str]) -> bool:
+    return any(_CARGO.match(t) or t in _RU_CARGO for t in tokens)
+
+
+def _located(
+    tokens: list[str], i: int, *, script: Script | None, cargo_before: bool = False
+) -> bool:
     """The cargo, the truck or the papers somewhere: «yuk Toshkentda»,
-    «yukingiz bizda», «груз уже в Ташкенте». A status the AI cannot know."""
+    «yukingiz bizda», «груз уже в Ташкенте», «yuk, Xorgosda» (the cargo in an
+    earlier segment of the sentence: ``cargo_before``). A status the AI
+    cannot know."""
     token = tokens[i]
     earlier = tokens[:i]
     if script == "russian":
-        return token in _RU_PLACE and any(t in _RU_CARGO for t in earlier)
+        return token in _RU_PLACE and (
+            cargo_before or any(t in _RU_CARGO for t in earlier)
+        )
     return (
         len(token) >= 4
         and token.endswith("da")
         and token not in _NOT_LOCATIVE
-        and any(_CARGO.match(t) for t in earlier)
+        and (cargo_before or any(_CARGO.match(t) for t in earlier))
     )
+
+
+def _predicate_at(tokens: Sequence[str], i: int) -> bool:
+    """Is token ``i`` the segment's last word, words of address aside?"""
+    return all(t in _ADDRESS for t in tokens[i + 1 :])
+
+
+def _placed(tokens: list[str], i: int, *, russian: bool = False) -> bool:
+    """A place as the predicate with no subject: «hozir xorgosda, aka»,
+    «aytishicha xorgosda», «hozir postda», «ҳозир навбатда». In text read as
+    Russian only a hub in the Uzbek locative counts («мошинез постда»)."""
+    token = tokens[i]
+    if not _predicate_at(tokens, i) or token in _NOT_LOCATIVE:
+        return False
+    if _HUB.match(token):
+        return True
+    return (
+        not russian
+        and len(token) >= 5
+        and token.endswith(("da", "ta"))
+        and any(t in _NOW_WORDS for t in tokens[:i])
+    )
+
+
+def _not_yet(tokens: list[str], i: int) -> bool:
+    """«hali tushgani yo'q», «ҳали келгани йўқ», «yuk hali yo'q»: «yo'q» as
+    the predicate. «yuq» reads as «yuk» (the cargo), so «Hali yuk haqida
+    aniqlab, …» is not one."""
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    if after not in _NONE_WORDS or not _predicate_at(tokens, i + 1):
+        return False
+    return tokens[i] == "hali" or _NEG_PERFECT.match(tokens[i]) is not None
 
 
 # Said, not asked, «можно» (one may) and «есть» (there is) agree to
@@ -1977,9 +2073,11 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
     if not kb:
         _sentence_hits(clean_masked, hits)
     primed = False
+    cargo_before = False
     for clause in _clauses(clean_masked):
         words = _polite(clause.words)
         primed = primed and not clause.first
+        cargo_before = cargo_before and not clause.first
         if not kb and clause.hedged:
             hits.add("promise", "promise:status:hedged")
         if role == "stall" and OWNER_SOON.hit(words):
@@ -2052,8 +2150,22 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
                 hits.add("price", "price:like")
             if not kb and not clause.question and _PER_UNIT.match(token):
                 hits.add("price", "price:per_unit")
-            if not (kb or clause.question) and _located(tokens, i, script=script):
+            if not (kb or clause.question) and _located(
+                tokens, i, script=script, cargo_before=cargo_before
+            ):
                 hits.add("promise", "promise:located")
+            if not (kb or clause.question) and _placed(tokens, i, russian=russian):
+                hits.add("promise", "promise:placed")
+            if not (kb or clause.question) and _not_yet(tokens, i):
+                hits.add("promise", "promise:status:not_yet")
+            if (
+                not (kb or clause.question or russian)
+                and _SHOULD.match(token)
+                and token not in _NOT_SHOULD
+                and i + 1 < len(tokens)
+                and tokens[i + 1] == "kerak"
+            ):
+                hits.add("promise", "promise:prediction:should")
             bare = _bare(tokens, i)
             if bare == "guarantee":
                 hits.add("guarantee", "guarantee:aniq")
@@ -2072,6 +2184,7 @@ def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
                     time_hit = True
             if _paying_via(tokens, i):
                 hits.add("payment_terms", "payment_terms:via")
+            cargo_before = cargo_before or _cargo_in(tokens[i : i + 1])
             for flag, lexicon in TOPICS:
                 # «Sug'urta kerakmi?», «Kontraktingiz bormi?»: a detail asked.
                 if (lexicon is INSURANCE or flag == "promise") and clause.question:
@@ -2290,21 +2403,826 @@ def _language_hits(clean: str, hits: _Hits) -> None:
         hits.add("language", "language:english")
 
 
+# --- the statement allowlist ------------------------------------------------------------
+#
+# The lexicons cannot list every way to say a promise («mol bizda, aka», «Как
+# штык», «С вас ничего»): three red teams kept finding new ones. So an AI
+# text goes out on its own (auto mode, no owner tap) only when every sentence
+# has one of four approved shapes (§5.2 step 3, rule 13a):
+#
+# * ``courtesy``: made only of phrases from the closed set below (greetings,
+#   holiday greetings, thanks, an apology for the wait with no time in it,
+#   the offer of help, farewells), words of address and the counterparty's
+#   name; or only the emoji 🙂 🙏 👋.
+# * ``question``: it ends in «?» or is a «-mi» question, every segment of it
+#   (split at commas and dashes) asks or is a courtesy, nothing before the
+#   question word states anything the red lines refuse, and it names no time
+#   and asks nothing rhetorical («Nega bo'lmasin?», «Разве это проблема?»).
+#   The red lines still read it as they read everything.
+# * ``stall``: a fixed stall template, a sentence of one, or the owner's
+#   override that passed the stall role.
+# * ``kb``: the verbatim text of an active owner-approved knowledge-base
+#   entry, a whole entry or a whole sentence of one.
+#
+# Any other sentence is a ``statement``: the text is flagged
+# ``unapproved_statement``. That never blocks a draft card (the owner reads
+# every draft), but an AI row with it is never sent without an owner tap.
+
+Shape = Literal["courtesy", "question", "stall", "kb", "statement"]
+SHAPES: Final[tuple[Shape, ...]] = ("courtesy", "question", "stall", "kb", "statement")
+SHAPE_FLAG: Final = gate.UNAPPROVED_STATEMENT
+# What the owner's card says about it (JV-18) and the escalation reason it
+# maps to (escalations.reasons has no «unapproved_statement»: no migration).
+SHAPE_LABEL: Final = "erkin gap"
+SHAPE_REASON: Final = "other"
+
+
+def _ckey_tokens(text: str) -> list[str]:
+    """The tokens a courtesy phrase, a stall or a KB text is matched by: the
+    word view, with «h» and «x» one letter."""
+    return normalise_for_search(_clean(text)).replace("h", "x").split()
+
+
+def _ckey(text: str) -> str:
+    return " ".join(_ckey_tokens(text))
+
+
+_COURTESY_RAW: Final = """
+    salom, salomlar, assalomu alaykum, assalom alaykum, assalomu aleykum,
+    assalamu alaykum, assalamu aleykum, assalom aleykum, salom alaykum,
+    assalomu alaykum va rohmatulloh, vaalaykum assalom, va alaykum assalom,
+    wa alaykum assalom, vaaleykum assalom, alaykum assalom, va aleykum assalom,
+    xush kelibsiz, yaxshimisiz, yaxshimisiz aka, qalaysiz, ishlaringiz yaxshimi,
+    ahvollaringiz yaxshimi, ahvolingiz yaxshimi, yaxshi yuribsizmi, charchamayapsizmi,
+    xayrli tong, xayrli kun, xayrli kech, xayrli oqshom, xayrli tun,
+    kuningiz xayrli o'tsin, kuningiz xayrli bo'lsin, ishlaringizga omad, omad,
+    omad yor bo'lsin, xayr, salomat bo'ling, sog' bo'ling, ko'rishguncha,
+    yaxshi dam oling, yaxshi qoling,
+    rahmat, katta rahmat, ko'p rahmat, rahmat sizga, sizga rahmat, sizga katta rahmat,
+    oldindan rahmat, murojaatingiz uchun rahmat, murojaat uchun rahmat,
+    yozganingiz uchun rahmat, xabaringiz uchun rahmat, kutganingiz uchun rahmat,
+    sabringiz uchun rahmat, sabr qilganingiz uchun rahmat, tushunganingiz uchun rahmat,
+    minnatdorman, minnatdormiz, uzr, uzr so'rayman, uzr so'raymiz, kechirasiz,
+    kuttirganim uchun uzr, kuttirganimiz uchun uzr, kuttirib qo'yganim uchun uzr,
+    kuttirib qo'yganimiz uchun uzr, kuttirganim uchun kechirasiz,
+    kuttirganimiz uchun kechirasiz, bezovta qilganim uchun uzr,
+    qanday yordam bera olaman, qanday yordam bera olamiz,
+    sizga qanday yordam bera olaman, sizga qanday yordam bera olamiz,
+    nima yordam bera olaman, nimada yordam bera olaman, nimada yordam bera olamiz,
+    qanday yordam kerak, sizga qanday yordam kerak,
+    здравствуйте, здравствуй, привет, приветствую, добрый день, доброе утро,
+    добрый вечер, доброго утра, доброго дня, доброго вечера, доброй ночи,
+    спокойной ночи, салам, салам алейкум, ассаламу алейкум, ва алейкум ассалам,
+    добро пожаловать, как дела, как ваши дела, как вы, спасибо, большое спасибо,
+    спасибо большое, спасибо вам, спасибо вам большое, благодарю, благодарим,
+    благодарю вас, спасибо за обращение, спасибо за сообщение, спасибо за ожидание,
+    спасибо за терпение, спасибо за понимание, заранее спасибо, извините, простите,
+    извините за ожидание, простите за ожидание, извините что заставил ждать,
+    извините что заставили ждать, приносим извинения за ожидание, чем могу помочь,
+    чем можем помочь, чем могу быть полезен, чем могу быть полезна,
+    до свидания, всего доброго, всего хорошего, хорошего дня, хорошего вечера,
+    хорошего вам дня, удачного дня, хороших выходных, приятных выходных, удачи
+"""
+# Not in the set: «рады помочь», «будем рады помочь», «xizmatingizdamiz»,
+# «eshitaman», «слушаю вас». After «Скидку сделаете?» or «Ertaga olib
+# kelasizmi?» they read as a yes, like «Bosh ustiga» and «Jonim bilan».
+# Holiday greetings: a holiday name with «muborak», «muborak bo'lsin»,
+# «bilan» or «arafasida tabriklayman» (never «arafasida» alone: «Bayram
+# arafasida» names a time); Russian «с …» and «… мубарак». «Tabriklayman»
+# and «поздравляю» count only with a holiday: alone, after «did it
+# arrive?», a congratulation says yes.
+_HOLIDAYS_UZ: Final = """
+    hayit, hayitingiz, hayit bayrami, hayit bayramingiz, hayit ayyomi,
+    hayit ayyomingiz, ramazon hayiti, ramazon hayitingiz, ro'za hayiti,
+    ro'za hayitingiz, qurbon hayiti, qurbon hayitingiz, navro'z, navro'zingiz,
+    navro'z bayrami, navro'z bayramingiz, navro'z ayyomi, navro'z ayyomingiz,
+    navruz, navruz bayrami, navruz bayramingiz,
+    yangi yil, yangi yilingiz, bayram, bayramingiz, bayram ayyomi, bayram ayyomingiz,
+    juma, juma ayyomi, juma ayyomingiz, juma kuningiz, ramazon, ramazon oyi,
+    ramazon oyingiz, mustaqillik kuni, mustaqillik bayrami, mustaqillik bayramingiz,
+    xalqaro xotin-qizlar kuni, xotin-qizlar kuni, xotin-qizlar bayrami,
+    o'qituvchilar kuni, o'qituvchi va murabbiylar kuni, ustozlar kuni,
+    konstitutsiya kuni, vatan himoyachilari kuni, xotira va qadrlash kuni,
+    tug'ilgan kuningiz, tug'ilgan kun
+"""
+_HOLIDAY_ENDINGS_UZ: Final = (
+    "muborak",
+    "muborak bo'lsin",
+    "bilan",
+    "bilan tabriklayman",
+    "bilan tabriklaymiz",
+    "bilan sizni tabriklayman",
+    "bilan sizni tabriklaymiz",
+    "bilan chin dildan tabriklayman",
+    "arafasida tabriklayman",
+    "arafasida tabriklaymiz",
+)
+_HOLIDAY_OPENINGS_RU: Final = (
+    "",
+    "поздравляю ",
+    "поздравляем ",
+    "поздравляю вас ",
+    "поздравляем вас ",
+    "от всей души поздравляю ",
+    "от всей души поздравляем ",
+)
+_HOLIDAYS_RU: Final = """
+    праздником, наступающим, наступающим праздником, новым годом,
+    наступающим новым годом, наврузом, праздником навруз, праздником навруз байрам,
+    днём рождения, днём независимости, международным женским днём, женским днём,
+    восьмым марта, днём учителя, днём конституции, днём защитника отечества,
+    курбан хайитом, рамазан хайитом, курбан байрамом, ураза байрамом,
+    рамадан байрамом, рамаданом, рамазаном, священным месяцем рамадан, юбилеем
+"""
+_MUBARAK_RU: Final = """
+    рамадан, рамазан, хайит, навруз, ид, джума
+"""
+
+
+def _courtesy_phrases() -> frozenset[tuple[str, ...]]:
+    phrases = [*_entries(_COURTESY_RAW)]
+    for name in _entries(_HOLIDAYS_UZ):
+        phrases.extend(f"{name} {ending}" for ending in _HOLIDAY_ENDINGS_UZ)
+        phrases.append(f"muborak {name}")
+        phrases.append(f"sizni {name} bilan tabriklayman")
+        phrases.append(f"sizni {name} bilan tabriklaymiz")
+    phrases.extend(
+        f"{opening}с {name}"
+        for name in _entries(_HOLIDAYS_RU)
+        for opening in _HOLIDAY_OPENINGS_RU
+    )
+    phrases.extend(f"{name} мубарак" for name in _entries(_MUBARAK_RU))
+    # «днём» is also written «днем».
+    phrases.extend([p.replace("ё", "е") for p in phrases if "ё" in p])
+    return frozenset(t for t in (tuple(_ckey_tokens(p)) for p in phrases) if t)
+
+
+COURTESY: Final = _courtesy_phrases()
+_COURTESY_LONGEST: Final = max(len(p) for p in COURTESY)
+# Words of address a courtesy or a question may carry.
+_SHAPE_ADDRESS: Final = frozenset(
+    _ckey(word)
+    for word in _entries(
+        """
+        aka, opa, uka, akajon, opajon, ukajon, brat, bratan, do'stim, xonim, janob,
+        aka-uka, hurmatli, aziz, azizim, singlim, ака, опа, ука, брат, уважаемый,
+        уважаемая, дорогой, дорогая, друг
+        """
+    )
+)
+# The only emoji a courtesy may be: never 👍 ✅ 🤝 (agreement) or anything
+# else. Skin tones and the presentation selector go with them.
+_SHAPE_EMOJI: Final = frozenset("🙂🙏👋")
+_EMOJI_MODIFIERS: Final = frozenset({"️", *(chr(c) for c in range(0x1F3FB, 0x1F400))})
+# The punctuation a sentence of an approved shape may carry.
+_SHAPE_PUNCT: Final = frozenset(".,!?…;:-–—'\"«»“”„’‘ʼʻ`؟")
+# A sentence ends at «.», «!», «?», «…» or a line end, always: «Yuk
+# omborda?Savol bormi» is two sentences, and the «?» ends its own.
+_SENTENCE_END: Final = re.compile(r"[.!?…\n؟]+")
+# A segment of a sentence ends at a comma, a semicolon, a colon or a dash.
+_SHAPE_SEGMENT: Final = re.compile(r"[,;:—–]|\s-+|-+\s|^-+|-+$")
+_TOKEN: Final = re.compile(r"[^\W_]+(?:['’‘ʼʻ`-][^\W_]+)*")
+# A «-mi» question («bormi», «qulaymi», «yaxshimisiz»), and Russian «ли».
+_MI: Final = re.compile(r"^.{2,}(?:mi|mikan|mikin|misiz|misan)$")
+# Nouns that end like one: the possessive of a stem in «-m» («qismi»,
+# «ismi», «hajmi»): «Bu ishimiz qismi» says, it does not ask.
+_MI_NOUNS: Final = _words(
+    """
+    qismi, ismi, nomi, hajmi, rasmi, jismi, taomi, ilmi, hukmi, mavsumi, kilogrammi,
+    grammi, razmi, tizimi, tuzumi, xodimi, muallimi, qadami, olami, bayrami, xizmatimi,
+    sistemi, programmi, rejimi, formi, termi
+    """
+)
+_LI: Final = frozenset({"li"})
+# «как» asks only before one of these («Как вас зовут?», «Как с вами
+# связаться?», «Как вам удобнее?»); before anything else it compares or
+# tells a time («Как штык?», «Как по маслу доедет?», «Как рассветёт»).
+_HOW_ASKS: Final = _words(
+    """
+    вас, вам, вы, ваш, ваша, ваше, ваши, вашего, вашей, с, со, к, можно, называется,
+    называются, зовут, удобнее, удобно
+    """
+)
+# Russian question words that start a clause only: in the middle of one
+# «что» and «как» are a conjunction («Знаете, что груз пришёл?»).
+_CLAUSE_STARTERS: Final = frozenset({"chto", "kak", "kakk", "chyo", "chego"})
+# Rhetorical questions vouch instead of asking: «Разве это проблема?», «Nega
+# bo'lmasin?», «Bu ham muammomi?», «Qayerda bundan yaxshisini topasiz?»,
+# «Что может пойти не так?», «Kim sizni aldaydi?», «Kim bizdan yaxshiroq?».
+_RHETORICAL: Final = _forms(
+    """
+    разве, неужели, nahotki, nahot, muammo*, problem*, проблем*, gapmi, ташвиш*,
+    bundan yaxshi*, лучше, выгодн*, xavotir*, gap bo'lishi*, gap bo'larmidi*,
+    не так, пойти не, может случиться, обман*, ald*, bizdan, yaxshiroq*, zo'rroq*,
+    arzonroq*, qo'rq*, xafa*, bo'lsa ham, bo'lmasin, bo'lmasa ham, qilib bo'lsa*,
+    hech qachon, hech yuk, hech narsa, hech nima, hech kim, ничего не, никогда не,
+    случится, случиться, пропад*, потеря*
+    """
+)
+# Tags and particles that assert what they seem to ask («Mol bor,
+# shundaymi?», «Мы ведь квиты?», «Bosh ustiga, xo'pmi?», «Mol bor-ku?»).
+_ASSERTING: Final = _forms(
+    """
+    shundaymi, shundaymasmi, shunaqami, shundaymidi, to'g'rimi, tug'rimi, to'g'ri,
+    rostmi, rost, xo'pmi, xupmi, maylimi, emasmi, emasmidi, emasmikan, axir, ahir,
+    axiyri, ведь, же, правда, верно, так ли, deb, degan*, деб
+    """
+)
+# The Uzbek verbal nouns and participles a question carries a clause in:
+# «Yuk kelganini bildingizmi?», «Yuk kelganidan xabaringiz bormi?»,
+# «Yuk yo'qolmasligini bilasizmi?», «Yetkazib berishimizni bilasizmi?»,
+# «Yetib kelganlarni kim oladi?», «Yukni olganingizda berasizmi?».
+_NOMINAL: Final = re.compile(
+    r"^(?=[a-z]{5,}$).*(?:"
+    r"[gkq]an(?:lar)?(?:im|imiz|ing|ingiz|i|lari|laringiz)?(?:ni|dan|ga|da|i|day)"
+    r"|[gkq]anlar|[gkq]anim(?:iz)?|[gkq]aning(?:iz)?"
+    r"|slig[a-z]*|lig(?:i|im|imiz|ingiz)(?:ni|ga|dan|da)?"
+    r"|ish(?:i|im|imiz)(?:ni|ga|dan|da)?"
+    r")$"
+)
+_NOT_NOMINAL: Final = _words(
+    """
+    kishi, kishini, kishiga, ishi, ishini, qishi, tishi, qanday, yaqinda, yangi,
+    organi, qanchadan, qancha, yaxshi, ko'p, javobgarligi
+    """
+)
+# Russian active participles («прибывший груз», «пришедший», «приехавший»):
+# a clause about the cargo inside a question.
+_RU_ACTIVE: Final = re.compile(
+    r"^(?=[a-z]{7,}$).*(?:vsh|dsh|tsh|shch|sch)"
+    r"(?:iy|iye|aya|ee|ie|ego|emu|im|ix|ikh|uyu|ey|ego)$"
+)
+# Verbs of knowing, seeing, hearing and being glad: «… bildingizmi?»,
+# «… ko'rdingizmi?», «Знаете, что …?», «Вы в курсе …?», «Рады, что …?».
+# Asked about a clause they report it.
+_REPORTING: Final = re.compile(
+    r"^(?:bil(?:asiz|asan|dingiz|ding|armi|maysiz|madingiz|ganmi|ishingiz|ib)"
+    r"|kor(?:dingiz|ding|ganmi|asiz|dim|dik)|eshit|xabar(?:ingiz|dor|i)|habar"
+    r"|xursand|xursan|mamnun|shod"
+    r"|zna(?:ete|esh|li|la|l|yu|em)|kurse|pomni|pomnish|vidi(?:te|sh)|vidish"
+    r"|slisha|slishal|uvere|rad|radi|rada|novost|zdorovo|soobsh)"
+)
+# The first person asked about itself, or offering: «Hech yuk
+# yo'qotganmizmi?», «Yuborsakmi?», «Olib boraymi?», «Kelaylikmi?».
+_FIRST_PERSON_ASKED: Final = re.compile(
+    r"(?:miz|man|dik|dim|sak|sam|ylik|aylik|ayin)(?:mi|chi|mikan)$"
+)
+# The third person's «if» in a question: an offer of a when or a how
+# («Bayram arafasida kelsa qulaymi?»).
+_IF_THIRD: Final = re.compile(r"^(?=[a-z]{4,}$).*[^n]sa$")
+_NOT_IF: Final = _words(
+    """
+    esa, kassa, pressa, hissa, nusxa, masala, xossa, qissa, kasa, trassa, adresa,
+    agarda, bo'lsa
+    """
+)
+# What a question asked by intonation alone may be: nothing. «Мы квиты?»,
+# «С вас ничего?», «Дело в шляпе?» state with a rising voice.
+# Verbs a question may still ask about in Russian (the third person and the
+# reflexive otherwise state what someone else does or did).
+_ASKABLE: Final = _words(
+    """
+    весит, весят, называется, называются, зовут, требуется, требуются, нужен, нужна,
+    нужно, нужны, находится, находятся, подходит, хотите, можете, будете, сможете
+    """
+)
+_NOW_ASKED: Final = _words(
+    """
+    hozir, hozirda, hozircha, xozir, hoziroq, darhol, darrov, сейчас, щас, сразу,
+    немедленно, сегодня, бугун, bugun
+    """
+)
+# Clauses of time an offer names: «Bayram arafasida», «Ro'za tugashi bilan»,
+# «Как рассветёт», «Как только».
+_TIME_ASKED: Final = _forms(
+    """
+    arafa*, рассвет*, рассвёт*, стемне*, как только, tugashi bilan, chiqishi bilan,
+    kelishi bilan, bo'lishi bilan, keyin*, so'ng*, oldin*, avval*
+    """
+)
+_WITH_SOON: Final = re.compile(r"^(?=[a-z]{5,}$).*shi$")
+# «Why» asks the client to justify a doubt («Nega qo'rqasiz?», «Nega
+# bo'lmasin?», «Почему нет?»): never an approved question.
+_WHY: Final = _forms(
+    """
+    nega, nimaga, nimaga endi, почему, зачем, отчего, с чего
+    """
+)
+# What a question may not assert anywhere in it («Qayerdan bilasiz, yuk
+# tayyor ekanini?», «Kimga beraylik, yuk bizda?»): the cargo ready, on its
+# way, somewhere, or the matter settled. The red lines shield words after a
+# question word; the allowlist does not.
+STATUS_IN_QUESTION: Final = Lexicon.of(
+    "status",
+    """
+    tayyor, tayyormas, готов, готова, готовы, уже, allaqachon, allakachon, yo'lda,
+    yo'lga chiqdi, в пути, в дороге, omborda, omborimizda, bojxonada, chegarada,
+    на складе, на таможне, на границе, на месте, bizda, у нас, hal bo'ldi, решено,
+    решён, hal qilingan, joyida, в порядке, hal, квиты, в шляпе, цел, целый, целая,
+    тут, здесь, sog'-salomat, sog' salomat, butun, по-старому, по старому, отлично,
+    ничего, бесплатно, tekin, bepul
+    """,
+)
+_NEGATIVE_WORDS: Final = frozenset({"yok", "emas", "ne", "net", "nikak"})
+
+
+@dataclass(frozen=True, slots=True)
+class SentenceShape:
+    """The shape of one sentence; for a statement, what made it one."""
+
+    shape: Shape
+    why: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ShapeVerdict:
+    """The statement allowlist's reading of one text, one shape a sentence."""
+
+    sentences: tuple[SentenceShape, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Every sentence has an approved shape (and there is one)."""
+        return bool(self.sentences) and all(
+            s.shape != "statement" for s in self.sentences
+        )
+
+    @property
+    def shapes(self) -> tuple[Shape, ...]:
+        return tuple(s.shape for s in self.sentences)
+
+    @property
+    def flags(self) -> tuple[str, ...]:
+        return () if self.ok else (SHAPE_FLAG,)
+
+
+def _sentences(clean: str) -> list[tuple[str, bool]]:
+    """(sentence, ends in «?») for every sentence with anything in it."""
+    out: list[tuple[str, bool]] = []
+    last = 0
+    for match in _SENTENCE_END.finditer(clean):
+        piece = clean[last : match.start()]
+        if piece.strip():
+            mark = match.group(0)
+            out.append((piece, "?" in mark or "؟" in mark))
+        last = match.end()
+    if clean[last:].strip():
+        out.append((clean[last:], False))
+    return out
+
+
+def _odd_symbol(sentence: str) -> bool:
+    """A character no approved shape carries: 👍, ✅, «+», «/», «(», a ZWJ…"""
+    for ch in sentence:
+        if ch.isalnum() or ch.isspace() or ch in _SHAPE_PUNCT:
+            continue
+        if ch in _SHAPE_EMOJI or ch in _EMOJI_MODIFIERS:
+            continue
+        return True
+    return False
+
+
+def _covered(tokens: Sequence[str], names: frozenset[str]) -> bool:
+    """Is every token part of a courtesy phrase, a word of address or the
+    counterparty's name (once at most)? At least one courtesy phrase must
+    be there."""
+    n = len(tokens)
+    # reach[i]: the (courtesy seen, name used) states tokens[:i] can end in.
+    reach: list[set[tuple[bool, bool]]] = [set() for _ in range(n + 1)]
+    reach[0].add((False, False))
+    for i in range(n):
+        for polite, named in reach[i]:
+            if tokens[i] in _SHAPE_ADDRESS:
+                reach[i + 1].add((polite, named))
+            elif tokens[i] in names and not named:
+                reach[i + 1].add((polite, True))
+            for size in range(1, min(_COURTESY_LONGEST, n - i) + 1):
+                if tuple(tokens[i : i + size]) in COURTESY:
+                    reach[i + size].add((True, named))
+    return any(polite for polite, _named in reach[n])
+
+
+_COURTESY_WORDS: Final = frozenset(t for phrase in COURTESY for t in phrase)
+# Words a display name may be made of that would say something in a
+# courtesy («Здравствуйте, Всё Отлично!», «Salom, Mol Bor aka»): a name
+# that starts with one is no name to the allowlist.
+_NOT_NAMES: Final = frozenset(
+    _ckey(word)
+    for word in _entries(
+        """
+        bor, yo'q, yoq, yuq, ha, xa, xo'p, xop, mayli, ok, okey, tayyor, hal, bosh,
+        ustiga, jonim, bilan, mol, yuk, hammasi, joyida, bizda, aniq, albatta, zo'r,
+        super, norm, normal, tamom, bo'ldi, keldi, yetdi, rost, to'g'ri, kafolat, tekin,
+        bepul, ertaga, bugun, hozir, всё, все, отлично, хорошо, готов, готово, да, нет,
+        ладно, точно, конечно, норм, супер, пришёл, пришел, доехал, едет, ок, окей,
+        бесплатно, гарантия, завтра, сегодня, сейчас, квиты, шляпе, штык, мы, вас,
+        ничего, plus, done, yes
+        """
+    )
+)
+
+
+def _shape_names(
+    allowed_names: Iterable[str], allowed_tokens: frozenset[str]
+) -> frozenset[str]:
+    """The counterparty's names as a courtesy may carry one: the first word
+    of each display name or alias, never a word of address, of a courtesy,
+    of a question or of the cargo, nor one that says something on its own.
+    The client sets the display name; a name made of statements stays one."""
+    out: set[str] = set()
+    for name in allowed_names:
+        if not isinstance(name, str) or not name.strip():
+            continue
+        keys = _ckey_tokens(name)
+        if not keys:
+            continue
+        first = keys[0]
+        word = normalise_for_search(name).split()[0] if name.split() else ""
+        if (
+            len(first) < 3
+            or first in _NOT_NAMES
+            or first in _SHAPE_ADDRESS
+            or first in _COURTESY_WORDS
+            or _CARGO.match(word) is not None
+            or word in _RU_CARGO
+            or _token_in(word, QUESTION_WORDS)
+            or _MI.match(word) is not None
+            or _fragment_refused(name.split()[0], allowed_tokens)
+        ):
+            continue
+        out.add(first)
+    return frozenset(out)
+
+
+def _words_with_offsets(segment: str) -> list[tuple[str, int]]:
+    """The segment's word-view tokens, each with where its word starts."""
+    out: list[tuple[str, int]] = []
+    for match in _TOKEN.finditer(segment):
+        for token in normalise_for_search(match.group(0)).split():
+            out.append((token, match.start()))
+    return out
+
+
+def _asks_at(tokens: Sequence[str], *, mi: bool = True) -> int | None:
+    """Where a segment asks, or None: it does not (rule 13a: a rising voice
+    alone is no question). An Uzbek question word anywhere («Yuk
+    qayerdan?»); Russian «что» and «как» only as the segment's first word,
+    and «как» only before a word of ``_HOW_ASKS`` (elsewhere they join a
+    clause or compare: «Знаете, что груз пришёл?», «Как штык?»); the verb a
+    Russian «ли» follows as the second word («Есть ли документы?», not «Мы
+    квиты ли?»); or the last word when it is a «-mi» question (``mi``: not
+    in Russian, where «днями», «вами» end the same way), not a noun that
+    ends like one («qismi»)."""
+    words = [i for i, t in enumerate(tokens) if t not in _SHAPE_ADDRESS]
+    if not words:
+        return None
+    for i, token in enumerate(tokens):
+        if token in _CLAUSE_STARTERS:
+            after = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if i != words[0] or (token.startswith("kak") and after not in _HOW_ASKS):
+                continue
+            return i
+        if token in _LI:
+            if len(words) > 1 and i == words[1]:
+                return words[0]
+            continue
+        if _token_in(token, QUESTION_WORDS):
+            return i
+    last = tokens[words[-1]]
+    if mi and _MI.match(last) and last not in _MI_NOUNS:
+        return words[-1]
+    return None
+
+
+def _timed(words: str, tokens: Sequence[str]) -> bool:
+    """A time anywhere in a question, asked or not («Kim ertaga yukni qabul
+    qiladi?», «Как насчёт субботы?», «Hozir bo'ladimi?», «Bayram arafasida
+    kelsa qulaymi?», «Yuk kelganda berasizmi?»): no approved question."""
+    if TIME.hit(words) or DEADLINE.hit(words) or OWNER_SOON.hit(words):
+        return True
+    pairs = [" ".join(tokens[i : i + 2]) for i in range(len(tokens))]
+    if any(_token_in(t, _TIME_ASKED) for t in (*tokens, *pairs)):
+        return True
+    return any(
+        _near_day(t) is not None
+        or (t in _WEEKDAY_ABBR and i and tokens[i - 1] in _WEEKDAY_PREP)
+        or t in _NOW_ASKED
+        or _until(t)
+        or _time_clause(list(tokens), i)
+        or (
+            _WITH_SOON.match(t) is not None
+            and i + 1 < len(tokens)
+            and tokens[i + 1] == "bilan"
+        )
+        for i, t in enumerate(tokens)
+    )
+
+
+def _rhetorical(tokens: Sequence[str]) -> bool:
+    """A question that vouches or argues instead of asking: «Разве …»,
+    «Nega …», «Kim sizni aldaydi?», «Yuk qayerga ham ketardi?», «Nima
+    bo'lsa ham yetib boradi?», «Qanday bo'lmasin …»."""
+    pairs = [" ".join(tokens[i : i + 2]) for i in range(len(tokens))]
+    if any(_token_in(t, _RHETORICAL) or _token_in(t, _WHY) for t in (*tokens, *pairs)):
+        return True
+    for i, token in enumerate(tokens):
+        # «qayerga ham», «nima ham»: a question word with «ham» argues.
+        if token == "ham" and i and _token_in(tokens[i - 1], QUESTION_WORDS):
+            return True
+        # The conditional past «ketardi», «bo'lardi», «bo'larmidi»: «where
+        # would it go?»; the jussive negative «bo'lmasin»: «whatever happens».
+        if len(token) >= 6 and _WOULD.search(token):
+            return True
+    return False
+
+
+_WOULD: Final = re.compile(r"(?:[aeiou]r|ar|ur|ir)(?:di|dik|midi|midik)$|masin(?:lar)?$")
+# A particle glued to a word: «bor-ku», «bilan-ku», «hal-da», «borku».
+_PARTICLE: Final = re.compile(r"-(?:ku|da|a|ya|yu|e|ey|chi)$|^[a-z]{3,}ku$")
+
+
+def _asserting(tokens: Sequence[str]) -> bool:
+    """A tag or a particle that asserts what the question seems to ask
+    («…, shundaymi?», «Мы ведь квиты?», «Mol bor-ku?», «… не так ли?»)."""
+    pairs = [" ".join(tokens[i : i + 2]) for i in range(len(tokens))]
+    if any(_token_in(t, _ASSERTING) for t in (*tokens, *pairs)):
+        return True
+    return any(_PARTICLE.search(t) for t in tokens)
+
+
+def _claims(
+    tokens: Sequence[str], at: int, *, script: Script | None, infinitives: frozenset[str]
+) -> str:
+    """What a question segment says rather than asks, or "": a clause in a
+    verbal noun or participle («Yuk kelganini bildingizmi?», «Куда везти
+    прибывший груз?»), a verb of knowing that reports one («Знаете, …»), a
+    verb that says what happened or someone else does («… груз пришёл»,
+    «… доедет»), an offer («… kelsa qulaymi?», «Yuborsakmi?»), or the
+    cargo's status or place anywhere but straight after the question word
+    («Yuk qaysi omborda?» asks; «Yuk omborda, qaysi?» does not)."""
+    russian = script == "russian"
+    words = list(tokens)
+    asking = words[at]
+    if _REPORTING.match(asking):
+        return "reported"
+    if len(asking) > 5 and (
+        _FIRST_PERSON_ASKED.search(asking) or _committing(words, at, script=script)
+    ):
+        return "offer"
+    for i, token in enumerate(words):
+        after_question = i > 0 and _token_in(words[i - 1], QUESTION_WORDS)
+        if i == at or token in _ASKABLE or token in infinitives:
+            continue
+        if (_NOMINAL.match(token) and token not in _NOT_NOMINAL) or _RU_ACTIVE.match(
+            token
+        ):
+            return "clause"
+        if _REPORTING.match(token):
+            return "reported"
+        if not russian and (_IF_THIRD.match(token) is not None and token not in _NOT_IF):
+            return "offer"
+        if _committing(words, i, script=script):
+            return "offer"
+        future = not russian and _UZ_THIRD.search(token) is not None
+        if not future and _status(words, i, script=script) is not None:
+            return "asserted"
+        if not after_question and (
+            _located(words, i, script=script)
+            or _placed(words, i, russian=russian)
+            or _not_yet(words, i)
+        ):
+            return "asserted"
+    text = " ".join(words)
+    for _entry, (start, _end) in STATUS_IN_QUESTION.hits(text):
+        j = _token_at(text, start)
+        if not (j > 0 and _token_in(words[j - 1], QUESTION_WORDS)):
+            return "asserted"
+    return ""
+
+
+def _asking_shape(
+    sentence: str,
+    asked: bool,
+    *,
+    tokens_allowed: frozenset[str],
+    names: frozenset[str],
+) -> SentenceShape:
+    """A question sentence, or the statement it hides (see above). A closed
+    grammar, not the red lines read once more: every segment asks with a
+    question word, «ли» or a «-mi» predicate, or is a courtesy; nothing in
+    it names a time, argues, tags an assertion on, carries a clause, says
+    what happened or offers; and the words before and after the question
+    word pass the red lines read as a statement."""
+    del asked  # a «?» alone asks nothing
+    words = _polite(normalise_for_search(sentence))
+    all_tokens = words.split()
+    plain = normalise_for_search(sentence).split()
+    if _timed(words, all_tokens) or _timed(" ".join(plain), plain):
+        return SentenceShape("statement", "timed")
+    if _rhetorical(plain):
+        return SentenceShape("statement", "rhetorical")
+    if _asserting(plain):
+        return SentenceShape("statement", "asserted")
+    segments = [seg for seg in _SHAPE_SEGMENT.split(sentence) if seg and seg.strip()]
+    parts = [(seg, _words_with_offsets(seg)) for seg in segments]
+    parts = [(seg, toks) for seg, toks in parts if toks]
+    key_parts = [_ckey_tokens(seg) for seg, _toks in parts]
+    asking = [
+        k
+        for k, keys in enumerate(key_parts)
+        if not all(t in _SHAPE_ADDRESS or t in names for t in keys)
+    ]
+    if not asking:
+        return SentenceShape("statement", "empty")
+    final = asking[-1]
+    script = script_of(sentence)
+    infinitives = _infinitives(sentence)
+    for k in asking:
+        segment, toks = parts[k]
+        if _covered(key_parts[k], names):
+            continue
+        tokens = [t for t, _o in toks]
+        at = _asks_at(tokens, mi=script != "russian")
+        if at is None:
+            # «Yuk omborda, yana savol bormi?»: a statement glued on; «Мы
+            # квиты?»: a statement with a rising voice.
+            return SentenceShape("statement", "glued" if k != final else "intonation")
+        why = _claims(tokens, at, script=script, infinitives=infinitives)
+        if why:
+            return SentenceShape("statement", why)
+        prefix = segment[: toks[at][1]]
+        if prefix.strip() and _fragment_refused(prefix, tokens_allowed):
+            return SentenceShape("statement", "glued")
+        rest = segment[toks[at + 1][1] :] if at + 1 < len(toks) else ""
+        if rest.strip() and _fragment_refused(rest, tokens_allowed, asked=True):
+            return SentenceShape("statement", "asserted")
+    return SentenceShape("question")
+
+
+def _fragment_refused(
+    fragment: str, allowed_tokens: frozenset[str], *, asked: bool = False
+) -> bool:
+    """Do the red lines refuse ``fragment`` read as a statement? The language,
+    names and script lines are the whole text's, not a fragment's. For the
+    words a question asks (``asked``), the verb forms are read by
+    ``_claims`` instead («Сколько весит груз?», «Yukni kim qabul qiladi?»
+    ask about a weight and a person); every lexicon hit still refuses."""
+    found = _red_line_hits(fragment, "reply", allowed_tokens, language=False)
+    if asked:
+        found = [
+            (flag, code)
+            for flag, code in found
+            if not code.startswith(("promise:status:", "promise:prediction"))
+        ]
+    return bool(found)
+
+
+_TEMPLATE_KEYS: list[tuple[frozenset[str], frozenset[str]]] = []
+
+
+def _template_keys() -> tuple[frozenset[str], frozenset[str]]:
+    """The stall templates' keys: (whole texts, single sentences), read once."""
+    if not _TEMPLATE_KEYS:
+        from miya.jarvis import stalls  # stalls imports this module
+
+        texts = [text for _r, _s, _h, text in stalls.all_templates()]
+        _TEMPLATE_KEYS.append(_text_keys(texts))
+    return _TEMPLATE_KEYS[0]
+
+
+def _text_keys(texts: Iterable[str]) -> tuple[frozenset[str], frozenset[str]]:
+    whole: set[str] = set()
+    sentences: set[str] = set()
+    for text in texts:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        whole.add(_ckey(text))
+        sentences.update(_ckey(s) for s, _q in _sentences(_clean(text)))
+    return frozenset(whole - {""}), frozenset(sentences - {""})
+
+
+def check_shapes(
+    text: str,
+    *,
+    approved_kb: Iterable[str] = (),
+    stall_texts: Iterable[str] | None = None,
+    extra_stalls: Iterable[str] = (),
+    allowed_tokens: frozenset[str] = frozenset(),
+    allowed_names: Iterable[str] = (),
+) -> ShapeVerdict:
+    """The statement allowlist (§5.2 step 3): the shape of every sentence.
+
+    ``approved_kb`` are the active owner-approved KB texts (JV-15);
+    ``stall_texts`` the stall texts that count as stalls (None: the fixed
+    templates of ``stalls``), and ``extra_stalls`` more of them (the owner's
+    overrides that passed the stall role). ``allowed_tokens`` are the chat's codes (a
+    question may carry one), ``allowed_names`` the counterparty's names (a
+    courtesy may carry one). Pure; the red lines are not read here except
+    on the part of a question before it asks."""
+    clean = _clean(text or "")
+    if not clean.strip():
+        return ShapeVerdict()
+    if stall_texts is None:
+        stall_whole, stall_sentences = _template_keys()
+    else:
+        stall_whole, stall_sentences = _text_keys(stall_texts)
+    if extra_stalls:
+        more_whole, more_sentences = _text_keys(extra_stalls)
+        stall_whole, stall_sentences = (
+            stall_whole | more_whole,
+            stall_sentences | more_sentences,
+        )
+    kb_whole, kb_sentences = _text_keys(approved_kb)
+    names = _shape_names(allowed_names, allowed_tokens)
+    sentences = _sentences(clean)
+    whole = _ckey(clean)
+    whole_shapes: tuple[tuple[frozenset[str], Shape], ...] = (
+        (stall_whole, "stall"),
+        (kb_whole, "kb"),
+    )
+    for keys, shape in whole_shapes:
+        if whole and whole in keys and not any(_odd_symbol(s) for s, _q in sentences):
+            return ShapeVerdict(tuple(SentenceShape(shape) for _s in sentences))
+    out: list[SentenceShape] = []
+    for sentence, asked in sentences:
+        out.append(
+            _sentence_shape(
+                sentence,
+                asked,
+                stalls=stall_sentences,
+                kb=kb_sentences,
+                tokens_allowed=allowed_tokens,
+                names=names,
+            )
+        )
+    return ShapeVerdict(tuple(out))
+
+
+def _sentence_shape(
+    sentence: str,
+    asked: bool,
+    *,
+    stalls: frozenset[str],
+    kb: frozenset[str],
+    tokens_allowed: frozenset[str],
+    names: frozenset[str],
+) -> SentenceShape:
+    if _odd_symbol(sentence):
+        return SentenceShape("statement", "symbol")
+    tokens = _ckey_tokens(sentence)
+    if not tokens:
+        # Emoji or punctuation alone: a courtesy only as 🙂 🙏 👋.
+        if any(ch in _SHAPE_EMOJI for ch in sentence):
+            return SentenceShape("courtesy")
+        return SentenceShape("statement", "symbol")
+    if _covered(tokens, names):
+        return SentenceShape("courtesy")
+    key = " ".join(tokens)
+    if key in stalls:
+        return SentenceShape("stall")
+    if key in kb:
+        return SentenceShape("kb")
+    plain = [t for t in normalise_for_search(sentence).split() if t not in _ADDRESS]
+    # Without a «?», only an Uzbek «-mi» question is one («Savolingiz bormi»).
+    if asked or (
+        plain
+        and script_of(sentence) != "russian"
+        and _MI.match(plain[-1]) is not None
+        and plain[-1] not in _MI_NOUNS
+    ):
+        return _asking_shape(sentence, asked, tokens_allowed=tokens_allowed, names=names)
+    return SentenceShape("statement", "statement")
+
+
 # --- the verdict ------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class Verdict:
-    """The deterministic verdict on one outbound text."""
+    """The deterministic verdict on one outbound text: the red lines
+    (``verdict``, ``flags``, ``hits``) and, for AI text (roles ``reply`` and
+    ``stall``), the statement allowlist (``shapes``)."""
 
     verdict: Outcome
     flags: tuple[Flag, ...] = ()
     hits: tuple[str, ...] = ()
     role: GuardRole = "reply"
+    shapes: ShapeVerdict | None = None
 
     @property
     def passed(self) -> bool:
         return self.verdict == PASS
+
+    @property
+    def shapes_ok(self) -> bool:
+        """The red lines passed and every sentence has an approved shape:
+        the only verdict an autonomous send may carry (rule 13a)."""
+        return self.passed and self.shapes is not None and self.shapes.ok
+
+    @property
+    def notes(self) -> tuple[str, ...]:
+        """Flags that never block: ``unapproved_statement``."""
+        return self.shapes.flags if self.shapes is not None else ()
 
     @property
     def labels(self) -> tuple[str, ...]:
@@ -2320,10 +3238,12 @@ class Verdict:
         """The verdict as ``gate`` stores it (outbox_messages.guard)."""
         return GuardResult(
             verdict=self.verdict,
-            flags=self.flags,
+            flags=(*self.flags, *self.notes),
             det_hits=self.hits,
             model_verdict=None,
             checker_version=CHECKER_VERSION,
+            shapes_ok=self.shapes_ok,
+            shapes=self.shapes.shapes if self.shapes is not None else (),
         )
 
 
@@ -2335,8 +3255,11 @@ def check_outbound(
     allowed_names: Iterable[str] = (),
     other_names: Iterable[str] = (),
     client_script: Script | None = None,
+    approved_kb: Iterable[str] = (),
+    stall_texts: Iterable[str] = (),
 ) -> Verdict:
-    """The binding red-line check on one outbound text (§5.2 step 2).
+    """The binding red-line check on one outbound text (§5.2 step 2), with
+    the statement allowlist (§5.2 step 3) for AI text.
 
     ``role``: ``reply`` (an AI reply) and ``stall`` (a stall template or the
     owner's override of one) are blocked on any hit; ``owner`` (the owner's
@@ -2347,7 +3270,58 @@ def check_outbound(
     inbound messages. ``other_names`` are people the text must not name
     unless they are in ``allowed_names`` (the counterparty, the owner's
     aliases); ``client_script`` is the script the client wrote in.
+    ``approved_kb`` (active owner-approved KB texts) and ``stall_texts`` (the
+    owner's stall overrides; one counts only if it passes the stall role)
+    are approved statements for the allowlist; they never loosen a red line.
     """
+    names = tuple(allowed_names)
+    found = _red_line_hits(
+        text,
+        role,
+        allowed_tokens,
+        allowed_names=names,
+        other_names=other_names,
+        client_script=client_script,
+    )
+    shapes = None
+    if role in ("reply", "stall"):
+        overrides = tuple(
+            t
+            for t in stall_texts
+            if isinstance(t, str)
+            and t.strip()
+            and not _red_line_hits(
+                t, "stall", allowed_tokens, client_script=client_script
+            )
+        )
+        shapes = check_shapes(
+            text,
+            approved_kb=approved_kb,
+            extra_stalls=overrides,
+            allowed_tokens=allowed_tokens,
+            allowed_names=names,
+        )
+    flags = tuple(f for f in FLAGS if any(flag == f for flag, _ in found))
+    codes_found = tuple(dict.fromkeys(code for _, code in found))
+    if not codes_found:
+        return Verdict(PASS, role=role, shapes=shapes)
+    outcome: Outcome = FLAG if role == "owner" else BLOCK
+    return Verdict(outcome, flags, codes_found, role, shapes)
+
+
+def _red_line_hits(
+    text: str,
+    role: GuardRole,
+    allowed_tokens: frozenset[str],
+    *,
+    allowed_names: Iterable[str] = (),
+    other_names: Iterable[str] = (),
+    client_script: Script | None = None,
+    language: bool = True,
+) -> list[tuple[Flag | None, str]]:
+    """What the red lines find in ``text`` in ``role``: (flag, hit code)
+    pairs, empty when it passes. ``language`` False leaves out the language
+    allowlist (a fragment of a text, not a text)."""
     hits = _Hits([])
     raw = text or ""
     clean = _clean(raw)
@@ -2362,7 +3336,7 @@ def check_outbound(
         hits.add("digits", "digits:unknown_code")
     _surface_hits(raw, clean, masked, hits, role=role)
     _word_hits(masked, hits, role=role)
-    if role in ("reply", "kb"):
+    if language and role in ("reply", "kb"):
         # AI-authored text: Uzbek or Russian only.
         _language_hits(masked, hits)
     if role != "owner":
@@ -2383,12 +3357,7 @@ def check_outbound(
             and not code.startswith(("time:", "self_disclosure:"))
             and code not in ("markup", "script", "name", "too_long")
         ]
-    flags = tuple(f for f in FLAGS if any(flag == f for flag, _ in found))
-    codes_found = tuple(dict.fromkeys(code for _, code in found))
-    if not codes_found:
-        return Verdict(PASS, role=role)
-    outcome: Outcome = FLAG if role == "owner" else BLOCK
-    return Verdict(outcome, flags, codes_found, role)
+    return found
 
 
 # --- inbound signals --------------------------------------------------------------------
@@ -2745,9 +3714,10 @@ _SCRIPTS: Final[Mapping[str, Script]] = {
 
 
 class RedLineGuard:
-    """``gate.Guard``: the deterministic check, nothing else, with the names
-    and the client's script the outbox passes. The model check (JV-16) runs
-    before a row is created and can only add a block."""
+    """``gate.Guard``: the deterministic check and the statement allowlist,
+    nothing else, with the names, the client's script and the approved texts
+    the outbox passes. The model check (JV-16) runs before a row is created
+    and can only add a block."""
 
     def check(
         self,
@@ -2758,6 +3728,8 @@ class RedLineGuard:
         allowed_names: tuple[str, ...] = (),
         other_names: tuple[str, ...] = (),
         client_script: str | None = None,
+        approved_kb: tuple[str, ...] = (),
+        stall_texts: tuple[str, ...] = (),
     ) -> GuardResult:
         return check_outbound(
             body,
@@ -2766,6 +3738,8 @@ class RedLineGuard:
             allowed_names=allowed_names,
             other_names=other_names,
             client_script=_SCRIPTS.get(client_script or ""),
+            approved_kb=approved_kb,
+            stall_texts=stall_texts,
         ).result()
 
 
@@ -2780,6 +3754,7 @@ def install() -> None:
 __all__ = [
     "BLOCK",
     "CHECKER_VERSION",
+    "COURTESY",
     "ESCALATING",
     "FLAG",
     "FLAGS",
@@ -2787,13 +3762,21 @@ __all__ = [
     "GUARD",
     "MAX_CHARS",
     "PASS",
+    "SHAPES",
+    "SHAPE_FLAG",
+    "SHAPE_LABEL",
+    "SHAPE_REASON",
     "Flag",
     "Lexicon",
     "RedLineGuard",
     "Script",
+    "SentenceShape",
+    "Shape",
+    "ShapeVerdict",
     "Signal",
     "Verdict",
     "check_outbound",
+    "check_shapes",
     "classify_inbound",
     "escalation_reasons",
     "install",
