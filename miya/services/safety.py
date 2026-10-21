@@ -2219,9 +2219,10 @@ _LOAN_NEED = _markers(
 )
 _LOAN_SEND: list[re.Pattern[str]] = [
     *_markers(("kartamga", "картамга", "в долг", "qarzga", "v dolg")),
-    # Imperatives only: «скинул на карту» (sent) is a repayment, not an ask.
+    # An ask (imperative or «можешь скинуть»), never «скинул на карту»: sent
+    # money is a repayment.
     re.compile(
-        r"(?<![\w'])(?:скинь|скиньте|переведи|переведите|перекинь|перекиньте)"
+        r"(?<![\w'])(?:скин(?:ь|ьте|уть)|перевед(?:и|ите)|перевести|перекин(?:ь|ьте|уть))"
         r"(?: \S+){0,3}? на (?:мою )?карт"
     ),
 ]
