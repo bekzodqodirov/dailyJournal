@@ -48,8 +48,8 @@ from miya.db.models import (
     Task,
     Transaction,
 )
+from miya.services import amounts, people, when
 from miya.services import codes as client_codes
-from miya.services import people, when
 from miya.services.people import resolve_person
 
 Record = Debt | Promise | Task | Transaction
@@ -916,31 +916,27 @@ def pending_person(record: Record, index: int) -> str | None:
 
 # --- parsing `/tuzat` arguments ----------------------------------------------
 
-_CURRENCY_WORDS = {
-    Currency.UZS: ("so'm", "so’m", "som", "sum", "uzs", "сум", "сўм"),
-    Currency.USD: ("$", "usd", "dollar", "dollor", "доллар", "долл"),
-    Currency.CNY: ("¥", "cny", "yuan", "юань"),
-    Currency.KRW: ("₩", "krw", "won", "von", "вон"),
-    Currency.RUB: ("₽", "rub", "rubl", "руб", "рубль", "ruble"),
-}
+# The words and symbols of each currency, and the scale words, come from the
+# one table every money reader shares (amounts.py, JV-13). Only currencies a
+# row can store are kept: «100 евро» is not an amount `/tuzat` can write.
+_STORABLE = {currency.value: currency for currency in Currency}
 _CURRENCY_OF = {
-    word: currency for currency, words in _CURRENCY_WORDS.items() for word in words
+    word: _STORABLE[code]
+    for word, code in amounts.CURRENCY_WORDS.items()
+    if code in _STORABLE
 }
 
-_SCALE = {
-    "mln": 1_000_000,
-    "million": 1_000_000,
-    "млн": 1_000_000,
-    "ming": 1_000,
-    "k": 1_000,
-    "тыс": 1_000,
-}
+_SCALE = amounts.SCALE_WORDS
+_LEADS = "".join(
+    re.escape(word) for word in _CURRENCY_OF if word in amounts.CURRENCY_SYMBOLS
+)
+_SCALES = "|".join(sorted(map(re.escape, _SCALE), key=len, reverse=True))
 
 # The scale token must end the string or be followed by whitespace: "300k" is
 # 300 000, but "300 krw" is 300 won, not scale "k" plus a tail "rw".
 _AMOUNT = re.compile(
-    r"^(?P<lead>[$¥₩₽])?\s*(?P<number>\d+(?:[.,]\d+)?)\s*"
-    r"(?:(?P<scale>mln|million|млн|ming|k|тыс)(?=\s|$))?\s*(?P<tail>[^\d\s]+)?$",
+    rf"^(?P<lead>[{_LEADS}])?\s*(?P<number>\d+(?:[.,]\d+)?)\s*"
+    rf"(?:(?P<scale>{_SCALES})(?=\s|$))?\s*(?P<tail>[^\d\s]+)?$",
     re.IGNORECASE,
 )
 
@@ -1111,7 +1107,8 @@ def parse_amount(text: str) -> tuple[Decimal, Currency | None] | None:
             return None
         currency = found
     try:
-        amount = Decimal(number.replace(",", ".")) * _SCALE.get((scale or "").lower(), 1)
+        scaled = _SCALE.get((scale or "").lower(), Decimal(1))
+        amount = Decimal(number.replace(",", ".")) * scaled
     except InvalidOperation:
         return None
     amount = amount.quantize(Decimal("0.01"))

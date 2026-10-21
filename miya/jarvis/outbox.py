@@ -49,10 +49,15 @@ from miya.db.models import (
     OutboxMessage,
     Person,
 )
-from miya.jarvis import caps, chatkey, costs, gate, policy
+from miya.jarvis import caps, chatkey, costs, gate, policy, redlines
 from miya.services import authorship, codes, people, reminders, safety
 
 log = logging.getLogger(__name__)
+
+# The red-line guard (JV-13): every row this module creates, approves or
+# lets an adapter claim is checked by it. Registered here, where the rows
+# are, so no path to a send exists without it.
+redlines.install()
 
 SHADOW: Final = "shadow"
 DRAFT: Final = "draft"
@@ -233,6 +238,19 @@ def _bind(row: OutboxMessage, result: gate.GuardResult) -> None:
     row.guard = result.bound_to(sha)
 
 
+def _log_guard_error(row: OutboxMessage, result: gate.GuardResult) -> None:
+    """A guard that raised is a block (gate.run_guard); say so, with ids only."""
+    if gate.GUARD_ERROR in result.flags:
+        log.warning(
+            "red-line guard raised",
+            extra={
+                "outbox_id": row.id,
+                "chat_key": row.chat_key,
+                "error": ",".join(result.det_hits),
+            },
+        )
+
+
 def _bound(row: OutboxMessage) -> bool:
     sha = gate.body_hash(row.body)
     return row.body_sha256 == sha and (row.guard or {}).get("body_sha256") == sha
@@ -394,8 +412,10 @@ async def unsafe_inbound(
 
 
 async def allowed_tokens(session: AsyncSession, row: OutboxMessage) -> frozenset[str]:
-    """The GS codes and waybills written in this chat's inbound messages: the
-    only digits AI text may carry (rule 14)."""
+    """The GS codes and waybills written in this chat's inbound messages, as
+    the client wrote them: the only digits AI text may carry (rule 14). The
+    guard compares their digits verbatim, so no canonical form (leading
+    zeros stripped) is added here."""
     if row.tg_chat_id is None:
         return frozenset()
     texts = await session.execute(
@@ -415,9 +435,63 @@ async def allowed_tokens(session: AsyncSession, row: OutboxMessage) -> frozenset
                 continue
             for pattern in (codes.client_code_re(), codes.waybill_re()):
                 tokens.update(match.group(0).strip() for match in pattern.finditer(text))
-            tokens.update(codes.find_client_codes(text))
-            tokens.update(codes.find_waybills(text))
     return frozenset(t for t in tokens if t)
+
+
+@dataclass(frozen=True, slots=True)
+class GuardNames:
+    """What §5.2 step 2 checks besides the red lines: the names an AI text
+    may carry (the counterparty's, the owner's aliases), the names it may not
+    (every other person MIYA knows), and the script the client wrote in."""
+
+    allowed: tuple[str, ...] = ()
+    others: tuple[str, ...] = ()
+    client_script: str | None = None
+
+
+async def guard_names(session: AsyncSession, row: OutboxMessage) -> GuardNames:
+    """The names and the script the red-line guard checks ``row`` against.
+
+    The owner's own words carry what they like (role ``owner`` checks
+    neither). A stall is a fixed template or the owner's override of one,
+    never a name the model chose, so only an AI reply is checked for other
+    people's names; every AI row is checked for the client's script."""
+    if row.authored_by != gate.AI:
+        return GuardNames()
+    allowed = list(settings.owner_aliases_parsed)
+    if row.person_id is not None:
+        person = await session.get(Person, row.person_id)
+        if person is not None:
+            allowed.extend([person.display_name, *(person.aliases or [])])
+    others: list[str] = []
+    if gate.guard_role(row.origin, row.authored_by) == "reply":
+        query = sa.select(Person.display_name, Person.aliases)
+        if row.person_id is not None:
+            query = query.where(Person.id != row.person_id)
+        for display_name, aliases in await session.execute(query):
+            others.extend(n for n in (display_name, *(aliases or [])) if n)
+    script = None
+    if row.trigger_interaction_id is not None:
+        trigger = await session.get(Interaction, row.trigger_interaction_id)
+        if trigger is not None:
+            script = redlines.script_of(trigger.raw_text or trigger.transcript or "")
+    return GuardNames(
+        tuple(n for n in allowed if n), tuple(dict.fromkeys(others)), script
+    )
+
+
+def _run_guard(
+    row: OutboxMessage, tokens: frozenset[str], names: GuardNames
+) -> gate.GuardResult:
+    return gate.run_guard(
+        gate.registered_guard(),
+        row.body,
+        role=gate.guard_role(row.origin, row.authored_by),
+        allowed_tokens=tokens,
+        allowed_names=names.allowed,
+        other_names=names.others,
+        client_script=names.client_script,
+    )
 
 
 async def _chat_state(session: AsyncSession, chat_key: str) -> gate.ChatState | None:
@@ -557,12 +631,8 @@ async def create(
         created_at=now,
     )
     rules = await _rules(session, row)
-    tokens = await allowed_tokens(session, row)
-    result = gate.run_guard(
-        gate.registered_guard(),
-        body,
-        role=gate.guard_role(origin, authored_by),
-        allowed_tokens=tokens,
+    result = _run_guard(
+        row, await allowed_tokens(session, row), await guard_names(session, row)
     )
     _bind(row, result)
     state, code = await _initial_state(
@@ -588,6 +658,8 @@ async def create(
         "outbox row created",
         extra={"outbox_id": row.id, "state": row.state, "code": code, "origin": origin},
     )
+    # Logged once the row has its id (rule 25), and only for a row stored.
+    _log_guard_error(row, result)
     return row
 
 
@@ -690,13 +762,13 @@ async def approve(
         if mode in ("off", "shadow"):
             return Approval(row, False, f"mode_{mode}")
         if not (_bound(row) and (row.guard or {}).get("verdict") == gate.GUARD_PASS):
-            result = gate.run_guard(
-                gate.registered_guard(),
-                row.body,
-                role=gate.guard_role(row.origin, row.authored_by),
-                allowed_tokens=await allowed_tokens(session, row),
+            result = _run_guard(
+                row,
+                await allowed_tokens(session, row),
+                await guard_names(session, row),
             )
             _bind(row, result)
+            _log_guard_error(row, result)
             if not result.passed:
                 code = result.verdict[:64]
                 row.last_error = code
@@ -709,15 +781,14 @@ async def approve(
                 return Approval(row, False, code)
     elif not _bound(row):
         # The owner's own words: flagged, never blocked; bound to this body.
-        _bind(
-            row,
-            gate.run_guard(
-                gate.registered_guard(),
-                row.body,
-                role="owner",
-                allowed_tokens=await allowed_tokens(session, row),
-            ),
+        owned = gate.run_guard(
+            gate.registered_guard(),
+            row.body,
+            role="owner",
+            allowed_tokens=await allowed_tokens(session, row),
         )
+        _bind(row, owned)
+        _log_guard_error(row, owned)
     _transition(row, APPROVED, by=by, now=now)
     row.approved_by = by
     row.approved_at = now
@@ -861,6 +932,7 @@ async def _context(
     counters: _Counters,
 ) -> gate.Context:
     trigger = await _trigger(session, row)
+    names = await guard_names(session, row)
     if row.chat_key not in counters.chat_ai_sent:
         counters.chat_ai_sent[row.chat_key] = await caps.chat_ai_sent_today(
             session, row.chat_key, now
@@ -897,6 +969,9 @@ async def _context(
         ),
         guard=gate.registered_guard(),
         allowed_tokens=await allowed_tokens(session, row),
+        allowed_names=names.allowed,
+        other_names=names.others,
+        client_script=names.client_script,
         quiet_until=quiet_until(now),
         auto_in_quiet_hours=bool(getattr(settings, AUTO_IN_QUIET_HOURS, False)),
     )
@@ -911,6 +986,7 @@ def _apply(
             decision.body_sha256 or gate.body_hash(row.body)
         )
         row.body_sha256 = decision.body_sha256 or gate.body_hash(row.body)
+        _log_guard_error(row, decision.guard)
     if decision.action == "send":
         _transition(row, SENDING, by=BY_GATE, now=now)
         row.lease_until = now + caps.SEND_LEASE

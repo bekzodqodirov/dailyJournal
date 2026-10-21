@@ -54,7 +54,7 @@ class PassGuard:
         self.verdict = verdict
         self.calls: list[tuple[str, str]] = []
 
-    def check(self, body, *, role, allowed_tokens):
+    def check(self, body, *, role, allowed_tokens, **names):
         self.calls.append((body, role))
         return gate.GuardResult(verdict=self.verdict, checker_version="test")
 
@@ -67,10 +67,12 @@ def jarvis(monkeypatch):
     monkeypatch.setattr(settings, "owner_telegram_id", OWNER_ID)
     monkeypatch.setattr(settings, "jarvis_send_min_gap_seconds", 0)
     monkeypatch.setattr(outbox, "channel_send_enabled", lambda channel: True)
+    previous = gate.registered_guard()
     guard = PassGuard()
     gate.register_guard(guard)
     yield guard
-    gate.register_guard(None)
+    # Back to the guard outbox registered (the JV-13 red-line guard).
+    gate.register_guard(previous)
 
 
 @pytest.fixture

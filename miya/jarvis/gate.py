@@ -15,10 +15,11 @@ skip a line. The first line that objects decides:
 * ``block`` / ``expire`` / ``cancel`` — the row is never sent.
 * ``send`` — every line passed; the row may be claimed.
 
-The red-line guard is reached through the small ``Guard`` interface. JV-13
-registers the real one; until a guard is registered the binding check fails
-closed: AI-authored text whose verdict is not bound to its exact body is
-never claimed (``guard_unavailable``).
+The red-line guard is reached through the small ``Guard`` interface.
+``outbox`` registers the real one (``redlines.GUARD``, JV-13) when it is
+imported; with no guard registered the binding check fails closed: AI-authored
+text whose verdict is not bound to its exact body is never claimed
+(``guard_unavailable``).
 """
 
 from __future__ import annotations
@@ -58,6 +59,8 @@ AUTO_APPROVER: Final = "auto:policy"
 GUARD_PASS: Final = "pass"
 GUARD_UNAVAILABLE: Final = "guard_unavailable"
 GUARD_FAILED: Final = "guard_failed"
+# The flag of a guard that raised instead of answering.
+GUARD_ERROR: Final = "guard_error"
 PAYLOAD_NOT_TEXT: Final = "payload_not_text"
 NO_TRIGGER: Final = "no_trigger"
 SAFETY_UNREADABLE: Final = "safety_unreadable"
@@ -117,11 +120,20 @@ class Guard(Protocol):
 
     Pure: no I/O, no model. ``allowed_tokens`` are the GS codes and waybills
     seen verbatim in this chat's inbound messages, the only digits AI text
-    may carry.
+    may carry. ``other_names`` are people the text must not name unless they
+    are in ``allowed_names`` (the counterparty, the owner's aliases), and
+    ``client_script`` is the script the client wrote in (§5.2 step 2).
     """
 
     def check(
-        self, body: str, *, role: GuardRole, allowed_tokens: frozenset[str]
+        self,
+        body: str,
+        *,
+        role: GuardRole,
+        allowed_tokens: frozenset[str],
+        allowed_names: tuple[str, ...] = (),
+        other_names: tuple[str, ...] = (),
+        client_script: str | None = None,
     ) -> GuardResult: ...
 
 
@@ -145,15 +157,35 @@ def unavailable() -> GuardResult:
 
 
 def run_guard(
-    guard: Guard | None, body: str, *, role: GuardRole, allowed_tokens: frozenset[str]
+    guard: Guard | None,
+    body: str,
+    *,
+    role: GuardRole,
+    allowed_tokens: frozenset[str],
+    allowed_names: tuple[str, ...] = (),
+    other_names: tuple[str, ...] = (),
+    client_script: str | None = None,
 ) -> GuardResult:
-    """Run the guard; no guard, or one that raises, is a failed check."""
+    """Run the guard; no guard, or one that raises, is a failed check. The
+    error's class is kept in ``det_hits`` (``error:<class>``) for the log
+    line the caller writes with the row's ids (rule 25)."""
     if guard is None:
         return unavailable()
     try:
-        return guard.check(body, role=role, allowed_tokens=allowed_tokens)
-    except Exception:
-        return GuardResult(verdict=GUARD_FAILED, flags=("guard_error",))
+        return guard.check(
+            body,
+            role=role,
+            allowed_tokens=allowed_tokens,
+            allowed_names=allowed_names,
+            other_names=other_names,
+            client_script=client_script,
+        )
+    except Exception as exc:
+        return GuardResult(
+            verdict=GUARD_FAILED,
+            flags=(GUARD_ERROR,),
+            det_hits=(f"error:{type(exc).__name__}",),
+        )
 
 
 def guard_role(origin: str, authored_by: str) -> GuardRole:
@@ -256,6 +288,10 @@ class Context:
     caps: Caps = field(default_factory=Caps)
     guard: Guard | None = None
     allowed_tokens: frozenset[str] = frozenset()
+    # The names the text may and may not carry, and the client's script.
+    allowed_names: tuple[str, ...] = ()
+    other_names: tuple[str, ...] = ()
+    client_script: str | None = None
     # The end of the quiet hours when ``now`` is inside them, else None.
     quiet_until: datetime | None = None
     auto_in_quiet_hours: bool = False
@@ -444,6 +480,9 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         row.body,
         role=guard_role(row.origin, row.authored_by),
         allowed_tokens=ctx.allowed_tokens,
+        allowed_names=ctx.allowed_names,
+        other_names=ctx.other_names,
+        client_script=ctx.client_script,
     )
     if not row.ai:
         # The owner's words are flagged, never blocked; but a body that
@@ -517,6 +556,7 @@ def evaluate(row: Row, ctx: Context) -> Decision:
 
 __all__ = [
     "AUTO_INTENTS",
+    "GUARD_ERROR",
     "GUARD_FAILED",
     "GUARD_PASS",
     "GUARD_UNAVAILABLE",

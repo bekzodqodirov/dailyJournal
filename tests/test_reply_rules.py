@@ -35,7 +35,7 @@ JID = "998901234567@s.whatsapp.net"
 
 
 class PassGuard:
-    def check(self, body, *, role, allowed_tokens):
+    def check(self, body, *, role, allowed_tokens, **names):
         return gate.GuardResult(verdict="pass", checker_version="test")
 
 
@@ -47,9 +47,10 @@ def jarvis(monkeypatch):
     monkeypatch.setattr(settings, "owner_telegram_id", OWNER_ID)
     monkeypatch.setattr(settings, "jarvis_send_min_gap_seconds", 0)
     monkeypatch.setattr(outbox, "channel_send_enabled", lambda channel: True)
+    previous = gate.registered_guard()
     gate.register_guard(PassGuard())
     yield
-    gate.register_guard(None)
+    gate.register_guard(previous)
 
 
 @pytest.fixture

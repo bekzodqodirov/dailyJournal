@@ -18,4 +18,11 @@ The core (JV-11):
 * ``outbox`` — the one outbound chokepoint: the only code that creates
   ``outbox_messages`` rows or changes their state.
 * ``status`` — what ``/jarvis`` shows.
+
+The red lines (JV-13), pure:
+
+* ``redlines`` — the deterministic inbound signals and the binding output
+  guard (RED LINE 1 and 2, rule 14); ``outbox`` registers it with ``gate``.
+* ``stalls`` — the fixed stall templates the client gets while the owner
+  decides.
 """

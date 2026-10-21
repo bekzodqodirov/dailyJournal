@@ -121,6 +121,13 @@ def _canonical(match: re.Match[str]) -> str:
     return _canonical_prefix(match.group("p")) + digits
 
 
+def verbatim_client_code(match: re.Match[str]) -> str:
+    """A matched code with its prefix canonical and its digits exactly as
+    typed, leading zeros kept: 'гс-0367' → 'GS0367'. Rule 14 compares codes
+    this way: an AI draft may repeat the client's digits, never change them."""
+    return _canonical_prefix(match.group("p")) + match.group("d")
+
+
 def _counts(match: re.Match[str]) -> bool:
     tail = match.group("tail")
     return tail == "" or tail.lower() in UZ_SUFFIXES

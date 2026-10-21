@@ -17,44 +17,86 @@ log = logging.getLogger(__name__)
 
 AMOUNT_UNVERIFIED = "‹summa tekshirilmadi›"
 
-_SCALE = {
+# --- the one currency table (JV-13) ---------------------------------------------
+#
+# Every word and symbol that names a currency or a scale, for every reader of
+# money in free text: this module's money_mentions, the `/tuzat` amount parser
+# (records.py), the SMS money reader (through records) and the red-line guard
+# (miya/jarvis/redlines.py). Extend it here and nowhere else. Keys are
+# lower-case; a value is an ISO code, which need not be a stored Currency
+# (records keeps only the ones it can store).
+SCALE_WORDS: dict[str, Decimal] = {
     "mln": Decimal(1_000_000),
     "million": Decimal(1_000_000),
     "млн": Decimal(1_000_000),
+    "миллион": Decimal(1_000_000),
+    "limon": Decimal(1_000_000),
+    "лимон": Decimal(1_000_000),
     "mlrd": Decimal(1_000_000_000),
     "milliard": Decimal(1_000_000_000),
+    "млрд": Decimal(1_000_000_000),
+    "миллиард": Decimal(1_000_000_000),
     "ming": Decimal(1_000),
+    "минг": Decimal(1_000),
     "тыс": Decimal(1_000),
     "k": Decimal(1_000),
 }
-_CURRENCY = {
+CURRENCY_WORDS: dict[str, str] = {
     "usd": "USD",
     "dollar": "USD",
+    "dollor": "USD",
     "$": "USD",
     "доллар": "USD",
+    "долл": "USD",
+    "у.е.": "USD",
+    "бакс": "USD",
+    "бакса": "USD",
+    "баксов": "USD",
+    "baks": "USD",
     "so'm": "UZS",
     "so‘m": "UZS",
+    "so’m": "UZS",
     "som": "UZS",
     "sum": "UZS",
     "uzs": "UZS",
     "сум": "UZS",
+    "сўм": "UZS",
     "yuan": "CNY",
     "cny": "CNY",
     "¥": "CNY",
     "юань": "CNY",
     "rubl": "RUB",
-    "руб": "RUB",
     "rub": "RUB",
+    "ruble": "RUB",
+    "руб": "RUB",
+    "рубль": "RUB",
+    "₽": "RUB",
     "won": "KRW",
+    "von": "KRW",
     "krw": "KRW",
+    "вон": "KRW",
+    "₩": "KRW",
+    "eur": "EUR",
+    "euro": "EUR",
+    "evro": "EUR",
+    "евро": "EUR",
+    "€": "EUR",
+    "tenge": "KZT",
+    "kzt": "KZT",
+    "тенге": "KZT",
+    "₸": "KZT",
 }
-_NUMBER = r"\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
+# The symbols among them: written before the figure ($300) or after it (300$).
+CURRENCY_SYMBOLS = "".join(word for word in CURRENCY_WORDS if len(word) == 1)
+
+_SCALE = SCALE_WORDS
+_CURRENCY = CURRENCY_WORDS
+_NUMBER = r"\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
 _SCALES = "|".join(sorted(map(re.escape, _SCALE), key=len, reverse=True))
-_CURRENCIES = "|".join(
-    sorted((re.escape(c) for c in _CURRENCY if c not in "$¥"), key=len, reverse=True)
-)
+_CURRENCIES = "|".join(sorted((re.escape(c) for c in _CURRENCY), key=len, reverse=True))
+_SYMBOLS = "".join(re.escape(c) for c in CURRENCY_SYMBOLS)
 MONEY_RE = re.compile(
-    rf"(?P<pre>[$¥])\s?(?P<n1>{_NUMBER})(?:\s?(?P<s1>{_SCALES})\b)?"
+    rf"(?P<pre>[{_SYMBOLS}])\s?(?P<n1>{_NUMBER})(?:\s?(?P<s1>{_SCALES})\b)?"
     rf"|(?<![\w.,])(?P<n2>{_NUMBER})\s?(?P<s2>{_SCALES})?(?:\s?(?P<c2>{_CURRENCIES}))?"
     rf"(?![\w])",
     re.IGNORECASE,
