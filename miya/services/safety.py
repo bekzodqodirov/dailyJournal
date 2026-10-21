@@ -736,6 +736,11 @@ R_LOGIN_PAGE = "login_page"
 R_HTML_FILE = "html_file"
 R_MONEY_PRETEXT = "money_pretext"
 R_QR_RECEIVE = "qr_receive"
+R_VOTE_LINK = "vote_link"
+R_GIFT_LINK = "gift_link"
+R_FEE_LINK = "fee_link"
+R_ADVANCE_FEE = "advance_fee"
+R_PROFIT_PROMISE = "profit_promise"
 
 HARD_REASONS = frozenset(
     {
@@ -758,6 +763,11 @@ HARD_REASONS = frozenset(
         R_HTML_FILE,
         R_MONEY_PRETEXT,
         R_QR_RECEIVE,
+        R_VOTE_LINK,
+        R_GIFT_LINK,
+        R_FEE_LINK,
+        R_ADVANCE_FEE,
+        R_PROFIT_PROMISE,
     }
 )
 
@@ -778,6 +788,7 @@ R_SCRIPT_SWITCH = "script_switch"
 R_PRETEXT = "pretext"
 R_MONEY_ASK = "money_ask"
 R_JOB_AD = "job_ad"
+R_AD_CONTACT = "ad_contact"
 
 SOFT_WEIGHTS: dict[str, int] = {
     R_SHORTENER: 25,
@@ -796,6 +807,7 @@ SOFT_WEIGHTS: dict[str, int] = {
     R_PRETEXT: 20,
     R_MONEY_ASK: 20,
     R_JOB_AD: 25,
+    R_AD_CONTACT: 20,
 }
 
 # Possible hijack: a contact with history suddenly sends what they never did.
@@ -914,6 +926,12 @@ SAFE_DOMAINS = SENSITIVE_SAFE_DOMAINS | frozenset(
         "mobi.uz",
         "uzmobile.uz",
         "olx.uz",
+        "olx.kz",
+        "olx.ua",
+        "olx.pl",
+        "olx.com",
+        # Telegram's own marketplace for usernames, Premium and Stars
+        "fragment.com",
         "korzinka.uz",
         "express24.uz",
         "kun.uz",
@@ -990,6 +1008,8 @@ BRAND_TOKENS = frozenset(
         "tamozhnia",
         "telegram",
         "whatsapp",
+        # the classifieds site whose «safe delivery» page is a common phish
+        "olx",
     }
 )
 _BRAND_AFFIXES = frozenset(
@@ -1057,6 +1077,7 @@ _WORD_BRANDS = frozenset(
         "tamozhnya",
         "tamojnya",
         "tamozhnia",
+        "olx",
     }
 )
 # A login or verify page: on a free host, a cheap TLD or a bare IP address it
@@ -1363,10 +1384,24 @@ def _mixed_script(label: str) -> bool:
 
 def _brand_hit(labels: list[str]) -> bool:
     """A brand name in any label but the top-level one. «gov» right under a
-    country code is that country's own government registry («gov.kz»)."""
+    country code is that country's own government registry («gov.kz»).
+
+    An everyday-word brand counts in a company's name too when it sits in
+    the subdomains of a login or verify site, or before a fake «.uz» ending
+    («uzum-market.uz.login-verify.net»): no shop's own site is built so. A
+    company's own portal («login.humo-trans.uz») has the brand in its name.
+    """
     last = len(labels) - 2
     names = [lb for i, lb in enumerate(labels[:-1]) if not (i == last and lb == "gov")]
-    return any(_brand_in_label(label) or _confused_brand(label) for label in names)
+    if any(_brand_in_label(label) or _confused_brand(label) for label in names):
+        return True
+    own = len(_labels(registrable(".".join(labels))))
+    sub = labels[: len(labels) - own]
+    if not ("uz" in sub[1:] or _credential_host(labels[len(sub) : -1])):
+        return False
+    return any(
+        part in _WORD_BRANDS for label in sub for part in re.split(r"[-_0-9]+", label)
+    )
 
 
 # Digits that pass for letters in a name («te1egram», «0ctobank»).
@@ -1691,7 +1726,8 @@ _SMS_DIGITS = re.compile(
 # not «tell me what an SMS said».
 _SMS_OUT = re.compile(r"(?<![\w'])(?:sms|смс) (?:qilib|қилиб|килиб)(?![\w'])")
 _ARRIVED_CODE = re.compile(
-    r"(?<![\w'])(?:kelgan kod|kod\w* kelgan|келган код|код\w* келган|пришедш\w* код"
+    r"(?<![\w'])(?:kelgan (?:\d+ (?:xonali |ta )?|sms ?)?kod|kod\w* kelgan"
+    r"|келган (?:\d+ (?:хонали |та )?|смс ?)?код|код\w* келган|пришедш\w* код"
     r"|код\w*,? (?:котор\w+ )?(?:вам |тебе )?приш(?:ел|ла|ло|ли)(?![\w']))"
 )
 # Codes that are no one-time code: a client's GS code, a tariff (HS, ТН ВЭД)
@@ -1737,7 +1773,10 @@ _IN_PERSON = re.compile(
     r"|(?:qo'lingizga ol(?:gan|ganingiz)|қўлингизга ол(?:ган|ганингиз))\w*"
     r"|(?:yuk|tovar|posilka)\w* ol(?:gan|ganingiz)dan (?:keyin|so'ng)"
     r"|(?:юк|товар|посилка)\w* ол(?:ган|ганингиз)дан (?:кейин|сўнг)"
-    r"|после получения (?:груза|посылки|товара)|получив (?:груз|посылку|товар))"
+    r"|после получения (?:груза|посылки|товара)|получив (?:груз|посылку|товар)"
+    # A courier at the door who hands the parcel over for the code.
+    r"|(?:eshik|эшик) oldida\w*|эшик олдида\w*|у (?:двери|подъезда|ворот)"
+    r"|(?:topshiraman|топшираман|передам (?:груз|посылку|товар)))"
 )
 _HERE = re.compile(
     r"(?<![\w'])(?:сюда|мне|в (?:этот |наш )?чат|menga|менга|shu yerga|bu yerga"
@@ -1822,12 +1861,18 @@ _LATIN_ASK = (
     r"(?:ing|ingiz|gin|sangiz|asizmi|ib (?:bering|yuboring|jo'nating|qo'ying)|voring)"
 )
 _CYRILLIC_ASK = r"(?:инг|ингиз|гин|сангиз|асизми|иб (?:беринг|юборинг|қўйинг)|воринг)"
+# «Can you / can't you send it?»: «yubora olasizmi», «aytolmaysanmi», «tashlab
+# yuborolmaysanmi». Never «yubora olaman» (I can).
+_LATIN_CAN_ASK = r"(?:a ?| )?ol(?:asiz|asan|maysiz|maysan)(?:mi|lar)?"
+_CYRILLIC_CAN_ASK = r"(?:а ?| )?ол(?:асиз|асан|майсиз|майсан)(?:ми|лар)?"
 _REQUEST_VERB = re.compile(
     r"(?<![\w'])(?:"
     # «yubor», «ayt» alone are imperatives too; a bare «yoz» is the summer.
     rf"(?:yubor|jo'nat|ayt|kirit){_LATIN_ASK}?"
     rf"|yoz{_LATIN_ASK}"
     r"|tashla(?:ng|ngiz|gin|sangiz|ysizmi|b (?:bering|yuboring|qo'ying)|voring)?"
+    rf"|(?:yubor|ayt|yoz|kirit|jo'nat|tashla(?:y|b yubor)){_LATIN_CAN_ASK}"
+    rf"|(?:юбор|айт|ез|кирит|жўнат|ташла(?:й|б юбор)){_CYRILLIC_CAN_ASK}"
     rf"|(?:юбор|жўнат|айт|кирит){_CYRILLIC_ASK}?"
     rf"|ез{_CYRILLIC_ASK}"
     r"|ташла(?:нг|нгиз|гин|сангиз|йсизми|б (?:беринг|юборинг)|воринг)?"
@@ -1897,6 +1942,22 @@ _LURE = _markers(
         "guruhlarga reklama",
         "reklama tarqat",
         "рассылка по группам",
+        # free, cheap, quick credit: a shop's or a lender's advert
+        "бепул",
+        "arzon narxda",
+        "arzon narxlarda",
+        "eng arzon narx",
+        "по низким ценам",
+        "низкие цены",
+        "кредит за",
+        "без справок",
+        "без поручител",
+        "микрозайм",
+        "mikroqarz",
+        "aviabilet",
+        "авиабилет",
+        "розыгрыш",
+        "giveaway",
     )
 )
 # Earnings promised by the day or the month, or as a percentage: «kunlik 40%
@@ -1912,7 +1973,8 @@ _EARNINGS = re.compile(
 # Trade words that hold an advert stem: «акциз» (excise) is no «акция», and
 # free storage days are a freight term. Removed before the lure is read.
 _NOT_LURE = re.compile(
-    r"(?<![\w'])(?:(?:акциз|aktsiz|akciz)\w*|бесплатн\w* хранени\w*|bepul saqla\w*)"
+    r"(?<![\w'])(?:(?:акциз|aktsiz|akciz)\w*|бесплатн\w* хранени\w*|bepul saqla\w*"
+    r"|бепул сақла\w*)"
 )
 _URGENCY = _markers(
     (
@@ -2003,6 +2065,26 @@ _PROMO = _markers(
         "тарқатамиз",
         "разошлем",
         "разместим рекламу",
+        # a bot or a channel to join, reach or likes for sale, goods for sale,
+        # a service pitched «for your business»
+        "подпишись",
+        "botimizga",
+        "ботимизга",
+        "нашего бота",
+        "продвижение",
+        "раскрутк",
+        "накрутк",
+        "рассылка по",
+        "layklar",
+        "лайки",
+        r"sotiladi\b",
+        r"сотилади\b",
+        "продается",
+        "оптом от производителя",
+        "для вашего бизнеса",
+        "biznesingiz uchun",
+        "kompaniyalari uchun",
+        "компаниялари учун",
     )
 )
 # A job advert: earnings from home, no experience needed, money passed through
@@ -2028,6 +2110,17 @@ _JOB_AD = _markers(
         "подработк",
         "через вашу карту",
         "work from home",
+        # a vacancy board's words; «ish bormi?» is a job seeker's question
+        r"ish bor\b",
+        r"иш бор\b",
+        "vakansiya",
+        "вакансия",
+        "вакансии",
+        "ishga joylash",
+        "ишга жойлаш",
+        "maosh",
+        "маош",
+        "зарплата от",
     )
 )
 # «Is this you?» asked on its own: the phrase ends its clause, so «bu sizmi
@@ -2119,12 +2212,18 @@ _LOAN_NEED = _markers(
         "нужны деньги",
         "нужно денег",
         "срочно деньги",
-        "выручи",
+        r"выручи\b",
+        r"выручите\b",
+        r"выручай\b",
     )
 )
 _LOAN_SEND: list[re.Pattern[str]] = [
     *_markers(("kartamga", "картамга", "в долг", "qarzga", "v dolg")),
-    re.compile(r"(?<![\w'])(?:скин|перевед|перекин)\w*(?: \S+){0,3}? на (?:мою )?карт"),
+    # Imperatives only: «скинул на карту» (sent) is a repayment, not an ask.
+    re.compile(
+        r"(?<![\w'])(?:скинь|скиньте|переведи|переведите|перекинь|перекиньте)"
+        r"(?: \S+){0,3}? на (?:мою )?карт"
+    ),
 ]
 _LOAN_PROMISE = _markers(
     (
@@ -2152,6 +2251,11 @@ _LOAN_TRADE = _markers(
         "предоплат",
         "оплат",
         "to'lov",
+        "to'lay",
+        "to'ladi",
+        "тўлов",
+        "тўлай",
+        "тўлади",
         "har doimgidek",
         "как в прошлый раз",
         "как обычно",
@@ -2159,6 +2263,71 @@ _LOAN_TRADE = _markers(
         "qarzim",
         "поддон",
     )
+)
+# Borrowing asked in the forms the fixed markers miss: «qarzga 200$ bera
+# olasanmi», «qarz berolasizmi». With trade around it («yukni qarzga bera
+# olasizmi») it is shipping on credit.
+_LOAN_ASK_FORMS = re.compile(
+    r"(?<![\w'])(?:qarz(?:ga)? (?:\S+ ){0,3}?bera ?ol(?:as|mas)\w*"
+    r"|қарз(?:га)? (?:\S+ ){0,3}?бера ?ол(?:ас|мас)\w*)"
+)
+# Money asked to be sent: «tashlab yubor», «ташлаб туринг», «скинь», «выручи».
+# A request only: never «tashlab beraman» (I will send) or «pul tashladim».
+_LOAN_GIVE = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:tashlab|o'tkazib|jo'natib) (?:yubor(?:ing|gin|asizmi|asanmi)?|tur(?:ing|gin)?"
+    r"|ber(?:ing|gin)?|bera ?ol(?:as|mas)(?:iz|an)\w*|qo'y(?:ing|gin))"
+    r"|(?:ташлаб|ўтказиб|жўнатиб) (?:юбор(?:инг|гин)?|тур(?:инг|гин)?|бер(?:инг|гин)?"
+    r"|бера ?ол(?:ас|мас)(?:из|ан)\w*)"
+    r"|berib tur(?:ing|gin)?|бериб тур(?:инг|гин)?"
+    r"|скинь(?:те)?|перекинь(?:те)?|кинь(?:те)?|переведи(?:те)?|выручи(?:те)?"
+    r"|занять|одолжить|lend me|send me|pay (?:this|it|that) for me"
+    r")(?![\w'])"
+)
+# A sum, or money by name.
+_LOAN_MONEY = re.compile(
+    r"(?<![\w'])\d[\d ]*(?:[.,]\d+)? ?(?:ming|минг|mln|млн|million|миллион\w*|тыс\w*"
+    r"|k|к|\$|so'm|сум|сўм|dollar\w*|доллар\w*|руб\w*|usd)(?![\w'])"
+    r"|\$ ?\d|(?<![\w'])(?:pul\w*|пул\w*|деньг\w*|денег|money|cash)(?![\w'])"
+    r"|pay (?:this|it|that) for me"
+)
+# A loan's term, a repayment by another name.
+_LOAN_TERM = re.compile(
+    r"(?<![\w'])(?:на пару дней|i'?ll return|i will return|pay you back|give it back"
+    r"|qaytarib beraman)(?![\w'])"
+)
+# The hijacker's cover story: a broken or another phone, a blocked card, abroad,
+# a friend's card to send to, «I'll explain later», «tell no one». A friend's
+# card to pay *from* («xotinimning kartasidan») is a client paying.
+_LOAN_COVER = re.compile(
+    r"(?<![\w'])(?:"
+    r"telefonim (?:buzil|ishlamay|yo'qol|o'g'irla)\w*"
+    r"|телефоним (?:бузил|ишламай|йўқол)\w*"
+    r"|телефон (?:сломал|разбил|потерял|украли)\w*|(?:сломал|разбил|потерял)\w* телефон"
+    r"|(?:boshqa|begona) (?:telefon|raqam|nomer)dan"
+    r"|(?:бошқа|бегона) (?:телефон|рақам|номер)дан"
+    r"|shu (?:raqam|nomer)dan yoz\w*|шу (?:рақам|номер)дан ез\w*"
+    r"|с (?:другого|чужого) (?:номера|телефона)"
+    r"|(?:kartam|картам)(?: \S+)? (?:bloklan|ishlamay|ишламай|блоклан)\w*"
+    r"|(?:моя |у меня )?карта (?:не проходит|не работает|заблокир\w*)"
+    r"|my card (?:is )?(?:blocked|not working|doesn'?t work)"
+    r"|chet eldaman|чет элдаман|за границей|abroad"
+    r"|(?:do'st|o'rtog'|tanish)\w*ning kartasiga|(?:дўст|ўртоғ|таниш)\w*нинг картасига"
+    r"|kartamga emas|картамга эмас|на другого человека"
+    r"|карт\w* (?:друга|подруги|знакомого)"
+    r"|потом объясню|keyin tushuntiraman|кейин тушунтираман"
+    r"|никому не говори\w*|hech kimga aytma\w*|ҳеч кимга айтма\w*"
+    r")"
+)
+# A money mule: the reader's card asked for, money to land on it, then passed
+# on to the writer («karta raqamingni tashla ... keyin menga o'tkazib berasan»).
+_LOAN_MULE = re.compile(
+    r"(?<![\w'])(?:karta raqaming(?:iz)?ni|kartang(?:iz)?ni|карта рақаминг(?:из)?ни"
+    r"|номер (?:твоей |вашей )?карты|твою карту|вашу карту)"
+    r".*(?<![\w'])(?:menga|менга|мне) (?:\S+ )?"
+    r"(?:o'tkazib (?:berasan|berasiz|bering|yuborasan|yuborasiz)"
+    r"|ўтказиб (?:берасан|берасиз|беринг)"
+    r"|переведешь|перекинешь|скинешь|переведете|перекинете|скинете)(?![\w'])"
 )
 # Social engineering with no link (owner decision: hard only in a strong
 # combination). A pretext: a new number «it's me», an officer of the customs
@@ -2272,17 +2441,118 @@ _RECEIVE = re.compile(
     r"(?<![\w'])(?:qabul qilish uchun|qabul qilib olish|olish uchun|қабул қилиш учун"
     r"|олиш учун|чтобы получить|для получения|to receive)"
 )
+# A vote for a niece in a contest, by a link: the account-theft lure.
+_VOTE_ASK = re.compile(
+    r"(?<![\w'])(?:проголосу\w*|голосуй\w*|отда\w* (?:сво\w* )?голос\w*"
+    r"|ovoz (?:bering|bersangiz|berib yuboring|beringlar)|овоз (?:беринг|берсангиз)"
+    r"|vote for)(?![\w'])"
+)
+_CONTEST = re.compile(
+    r"(?<![\w'])(?:конкурс|голосовани|tanlov|konkurs|танлов|contest|vote|golos|ovoz|овоз)"
+)
+# A gift in a known name: Telegram Premium, a Payme prize. A cashback or a
+# bonus is how a shop's own payment page talks too; those are left to the
+# domain rules.
+_GIFT_BRAND = re.compile(
+    r"(?<![\w'])(?:telegram|телеграм|payme|пейми|uzcard|узкард|paynet|пайнет|olx|олх"
+    r"|uzum (?:market|bank)|узум (?:маркет|банк))"
+)
+_GIFT = re.compile(
+    r"(?<![\w'])(?:sovg'a|совға|подар|gift|premium|премиум|stars|звезд|yutuq|ютуқ"
+    r"|sovrin|совурин|приз(?:ы|а|ов)?(?![\w']))"
+)
+# A parcel held, a customs duty to pay.
+_PARCEL_FEE = re.compile(
+    r"(?<![\w'])(?:"
+    r"(?:посылк|груз|заказ|отправлени|parcel|package|shipment|jo'natma|posilka|buyurtma"
+    r"|yuk|юк|посилка|буюртма)\w* (?:\S+ ){0,3}?(?:задержан|ushlab qolin|to'xtatil|held"
+    r"|on hold|ушлаб қолин|тўхтатил)"
+    r"|пошлин|таможенн\w* (?:сбор|платеж)|boj to'lov|bojxona to'lov|божхона тўлов"
+    r"|customs (?:fee|duty)|import duty"
+    r")"
+)
+_PAY_ASK = re.compile(
+    r"(?<![\w'])(?:to'lov qiling|тўлов қилинг|to'lang|тўланг|оплатите|оплати|внесите"
+    r"|переведите|pay|to'lovni amalga oshiring|depozit qiling|депозит қилинг"
+    r"|пополните|deposit)(?![\w'])"
+)
+# A prize won, or money promised per like or per task.
+_PRIZE_WON = re.compile(
+    r"(?<![\w'])(?:yutib oldingiz|yutdingiz|g'olib(?:i)? bo'ldingiz"
+    r"|ютиб олдингиз|ютдингиз"
+    r"|ғолиб(?:и)? бўлдингиз|вы выиграли|выиграли|стали победител\w*|вы победител\w*"
+    r"|you (?:have )?won|lotereya|лотере)"
+)
+_TASK_PAY = re.compile(
+    r"(?<![\w'])(?:(?:har bir|ҳар бир|за кажд\w*|for (?:each|every))"
+    r" (?:layk|лайк|like|vazifa|вазифа|задани|отзыв|sharh|izoh|просмотр|подписк|obuna"
+    r"|обуна|repost|репост|review)"
+    r"|(?:oddiy|оддий|простое|простые|easy|simple) (?:vazifa|вазифа|задани|task))"
+)
+_UPFRONT = re.compile(
+    r"(?<![\w'])(?:depozit|депозит|deposit|взнос|пополни|to'lov qiling|тўлов қилинг"
+    r"|to'lang|тўланг|оплатите|внесите|переведите|pay (?:a |the )?(?:fee|deposit))"
+)
+_SUM = re.compile(
+    r"(?<![\w'])\d[\d ]*(?:[.,]\d+)? ?(?:ming|минг|mln|млн|тыс\w*|\$|so'm|сум|сўм"
+    r"|dollar\w*|доллар\w*|usdt|usd)(?![\w'])|\$ ?\d"
+)
+# Profit guaranteed, or multiplied in days: «3 kunda 300% foyda».
+_GUARANTEED = re.compile(
+    r"(?<![\w'])(?:kafolatlangan (?:daromad|foyda)|кафолатланган (?:даромад|фойда)"
+    r"|гарантированн\w* (?:доход|прибыл)|guaranteed (?:profit|income|return)"
+    r"|\d+ ?(?:kunda|кунда|дн\w*|days?) (?:\S+ ){0,2}?\d+ ?%"
+    r"|\d+ ?% (?:\S+ )?(?:foyda|фойда|прибыл\w*|доход\w*|profit) (?:за|in) \d+)"
+)
+_INVEST = re.compile(
+    r"(?<![\w'])(?:investitsiya|инвестиц|invest|usdt|kripto|крипт|bitcoin|биткоин"
+    r"|trading|трейдинг|depozit|депозит)"
+)
+# An advert's call to action pointing at a phone, a handle or a site: «Tel:
+# 71 200 00 00», «Yozing: @…», «Каталог в канале: https://t.me/…»; or a
+# channel, a vacancy, a service pitched with a handle or a channel to go to.
+# «Batafsil», «подробнее» are how a client writes too. A client asks
+# questions; an advert asks none, so a «?» anywhere keeps this quiet. A
+# forward carries someone else's contact by design (a supplier's offer passed
+# on): it is the forward signal's to weigh.
+_AD_CTA = re.compile(
+    r"(?<![\w'])(?:tel|telefon|тел|телефон|yozing|ezing|пишите|звоните|qo'ng'iroq qiling"
+    r"|қўнғироқ қилинг|записывайтесь|заказывайте|бронируйте|обращайтесь|murojaat\w*"
+    r"|мурожаат\w*|bron qilish|бронь|buyurtma uchun"
+    r"|буюртма учун|katalog|каталог|portfolio|портфолио|demo|демо|contact us|call us)"
+    r"(?![\w'])[\s:.,!—–-]*(?:\S+ ){0,3}?"
+    r"(?:@\w{3,}|https?://|t\.me/|www\.|\+?\d[\d ()-]{7,}\d)"
+)
+_HANDLE = re.compile(r"(?<![\w])@\w{3,}")
 _MENTION_OR_TAG = re.compile(r"(?<![\w])[#@]\w+")
 _MASS_LINKS = 3
 _MASS_TAGS = 5
 
 
 def is_loan_request(text: str | None) -> bool:
+    """Money borrowed, the hijacked account's usual ask.
+
+    An outright ask, or a money mule's «send it to me after», is one alone.
+    So are two of the weaker words (a need, money to my card, a promise to
+    repay) with no trade around them, and money asked to be sent — a sum or
+    money by name — with a promise to repay or a cover story (a broken
+    phone, a blocked card, a friend's card, «tell no one»). Around trade
+    words (a balance, a prepayment, «как в прошлый раз») it takes both.
+    """
     folded = _fold(text or "")
-    if _any(_LOAN_ASK, folded):
+    if _any(_LOAN_ASK, folded) or _LOAN_MULE.search(folded):
+        return True
+    trade = _any(_LOAN_TRADE, folded)
+    if _LOAN_ASK_FORMS.search(folded) and not trade:
         return True
     weak = sum(_any(group, folded) for group in (_LOAN_NEED, _LOAN_SEND, _LOAN_PROMISE))
-    return weak >= 2 and not _any(_LOAN_TRADE, folded)
+    if weak >= 2 and not trade:
+        return True
+    if not (_LOAN_GIVE.search(folded) and _LOAN_MONEY.search(folded)):
+        return False
+    promise = _any(_LOAN_PROMISE, folded) or bool(_LOAN_TERM.search(folded))
+    cover = bool(_LOAN_COVER.search(folded))
+    return (promise and cover) if trade else (promise or cover)
 
 
 def has_link(text: str | None) -> bool:
@@ -2499,6 +2769,50 @@ def _qr_receive(folded: str) -> bool:
     return bool(_SENT_MONEY.search(folded) and _RECEIVE.search(folded))
 
 
+def _hidden_link(found: FoundUrl) -> bool:
+    """A link whose owner hides: a shortener, a free host, a cheap TLD, a
+    bare address, punycode."""
+    labels = _labels(found.host)
+    return (
+        is_short_link(found)
+        or (bool(labels) and labels[-1] in CHEAP_TLDS)
+        or _public_ip(found.host)
+        or "xn--" in found.host
+    )
+
+
+def _vote_link(folded: str, risky: Sequence[FoundUrl]) -> bool:
+    """«Vote for my niece» with a link off the allowlist, a contest named in
+    the text or in the link."""
+    if not risky or not _VOTE_ASK.search(folded):
+        return False
+    rest = _VOTE_ASK.sub(" ", folded)
+    in_link = any(_CONTEST.search(f"{u.host}{u.path}") for u in risky)
+    return in_link or bool(_CONTEST.search(rest))
+
+
+def _lure_hits(folded: str, risky: Sequence[FoundUrl]) -> list[str]:
+    """The advance-fee family, each with no innocent reading.
+
+    A gift in a known name (Telegram Premium, a Payme bonus) with a link off
+    the allowlist; a parcel held or a duty to pay through a hidden link; a
+    prize won or money per like, with a sum to pay first; profit guaranteed
+    or multiplied in days, on an investment.
+    """
+    hits: list[str] = []
+    if risky and _GIFT_BRAND.search(folded) and _GIFT.search(folded):
+        hits.append(R_GIFT_LINK)
+    hidden = any(_hidden_link(u) for u in risky)
+    if hidden and _PARCEL_FEE.search(folded) and _PAY_ASK.search(folded):
+        hits.append(R_FEE_LINK)
+    reward = _PRIZE_WON.search(folded) or _TASK_PAY.search(folded)
+    if reward and _UPFRONT.search(folded) and _SUM.search(folded):
+        hits.append(R_ADVANCE_FEE)
+    if _GUARANTEED.search(folded) and _INVEST.search(folded):
+        hits.append(R_PROFIT_PROMISE)
+    return hits
+
+
 def _text_hits(
     text: str, features: MessageFeatures, safe: frozenset[str]
 ) -> tuple[list[str], list[str]]:
@@ -2515,15 +2829,25 @@ def _text_hits(
         hard.append(R_PHOTO_LURE)
     if _qr_receive(folded):
         hard.append(R_QR_RECEIVE)
+    if _vote_link(folded, risky_urls):
+        hard.append(R_VOTE_LINK)
+    hard += _lure_hits(folded, risky_urls)
     pretext_hard, pretext_soft = _money_pretext(folded, features)
     hard += pretext_hard
     soft += pretext_soft
     if _any(_LURE, _NOT_LURE.sub(" ", folded)) or _EARNINGS.search(folded):
         soft.append(R_LURE)
-    if _any(_PROMO, folded):
+    promo = _any(_PROMO, folded)
+    job_ad = _any(_JOB_AD, folded)
+    if promo:
         soft.append(R_PROMO)
-    if _any(_JOB_AD, folded):
+    if job_ad:
         soft.append(R_JOB_AD)
+    if "?" not in folded and not features.forwarded:
+        channel = any(u.host == "t.me" or u.host.endswith(".t.me") for u in features.urls)
+        reach = channel or bool(_HANDLE.search(folded))
+        if _AD_CTA.search(folded) or ((promo or job_ad) and reach):
+            soft.append(R_AD_CONTACT)
     if _any(_URGENCY, folded):
         soft.append(R_URGENCY)
     tags = len(_MENTION_OR_TAG.findall(folded))

@@ -217,6 +217,81 @@ SCAM: list[dict] = [
     # «Is this you in the video?», «your photo is being spread», with a link.
     case("Bu sizmi videoda? 😱 https://telegra.ph/Video-test-1", "scam", "photo_lure"),
     case("Расмингизни тарқатишибди, қаранг! https://bit.ly/test4", "scam", "photo_lure"),
+    # A one-time code that came «from Telegram», «5 xonali», and asked for with
+    # «can't you send it?»; a known contact gets no pass.
+    case(
+        "Akkauntingiz xavfsizligi uchun Telegram'dan kelgan 5 xonali kodni shu yerga "
+        "yozing",
+        "scam",
+        "code_request",
+    ),
+    case(
+        "Menga SMS kod keldi, adashib sening raqamingni yozibman. Kodni tashlab "
+        "yuborolmaysanmi?",
+        "scam",
+        "code_request",
+        **KNOWN,
+    ),
+    # A vote for a niece by a link off the allowlist, from a known contact too.
+    case(
+        "Проголосуй, пожалуйста, за мою племянницу в конкурсе 🙏 "
+        "https://golos-test.online/vote?id=1",
+        "scam",
+        "vote_link",
+        **KNOWN,
+    ),
+    case(
+        "Ovoz bering iltimos, jiyanim tanlovda qatnashyapti: https://tanlov-test.online/v/1",
+        "scam",
+        "vote_link",
+    ),
+    # A gift in Telegram's name, off Telegram's sites.
+    case(
+        "🎁 Sizga Telegram Premium sovg'a qilindi! Faollashtirish: "
+        "https://t-premium-test.ru/activate",
+        "scam",
+        "gift_link",
+    ),
+    # A parcel held at the customs, the duty paid through a short link.
+    case(
+        "Ваша посылка задержана на таможне. Оплатите пошлину 89 000 сум по ссылке "
+        "bit.ly/testFee1",
+        "scam",
+        "fee_link",
+    ),
+    # A prize won, money per like: a sum to pay first.
+    case(
+        "Lotereya g'olibi bo'ldingiz! Sovrin — avtomobil. Rasmiylashtirish uchun "
+        "300 000 so'm to'lov qiling",
+        "scam",
+        "advance_fee",
+    ),
+    case(
+        "Oddiy vazifa: har bir layk uchun 50 000 so'm. Boshlash uchun 200 000 so'm "
+        "depozit qiling",
+        "scam",
+        "advance_fee",
+    ),
+    # Profit guaranteed or multiplied in days, on an investment.
+    case(
+        "Investitsiya qiling — 3 kunda 300% foyda! Kafolatlangan daromad, USDT: "
+        "https://profit-test.com",
+        "scam",
+        "profit_promise",
+    ),
+    # OLX by name beside a lure word, and an everyday-word brand under a login
+    # site or before a fake «.uz» ending.
+    case(
+        "Xaridor to'lovni amalga oshirdi, pulni olish uchun: "
+        "https://olx-uz.delivery-test.cc/pay/1",
+        "scam",
+        "brand_domain",
+    ),
+    case(
+        "Buyurtmangiz omborga keldi, tasdiqlang: https://uzum-market.uz.login-test.net/id",
+        "scam",
+        "brand_domain",
+    ),
 ]
 
 
@@ -298,17 +373,97 @@ SPAM: list[dict] = [
     # A pretext and money to a card from a stranger, with no pressure: spam,
     # not the hard rule.
     case("Yangi raqamim, shu kartaga 500 ming tashlang 9860 0000 3333 4444", "spam"),
+    # An advert's call to action: a phone, a handle, a channel or a site to go
+    # to, with an advert's words.
+    case(
+        "🔥 AKSIYA! Barcha smartfonlarga 20% chegirma. Do'konimiz: Chilonzor. "
+        "Tel: 71 000 00 00",
+        "spam",
+    ),
+    case(
+        "Курсы английского языка! Первое занятие бесплатно 🎓 Записывайтесь: "
+        "+998 71 000 00 01",
+        "spam",
+    ),
+    case("Sotiladi: Damas 2019, holati a'lo. Narxi 7500$. Tel: 90 000 00 00", "spam"),
+    case(
+        "Kanalimizga obuna bo'ling! Eng so'nggi yangiliklar: https://t.me/test_news",
+        "spam",
+    ),
+    case("ISH BOR! Kuryerlar kerak, maosh 8 mln dan. Batafsil: @test_ish_bot", "spam"),
+    case(
+        "Продвижение вашего бизнеса в Telegram! Рассылка по 100 000 номерам. "
+        "Пишите @test_promo",
+        "spam",
+    ),
+    case(
+        "Кредит за 15 минут! Без справок и поручителей 💰 https://kredit-test.top",
+        "spam",
+    ),
+    case(
+        "Arzon aviabiletlar! Toshkent–Istanbul 199$ dan ✈️ Bron qilish: @test_avia", "spam"
+    ),
+    case(
+        "Турецкий текстиль оптом от производителя! Каталог в канале: "
+        "https://t.me/test_optom",
+        "spam",
+    ),
+    case("📢 Yangi vakansiyalar har kuni! Botimizga /start bosing", "spam", via_bot=True),
 ]
 
 
 # --- a contact with history suddenly unlike themselves ----------------------------
 
 HIJACK: list[dict] = [
+    case(
+        "Братан выручи, скинь 2 млн на карту, завтра верну",
+        "hijack",
+        "hijack_loan",
+        **KNOWN,
+    ),
     case("Aka, pul kerak edi, qarz berib turing ertaga qaytaraman", "hijack", **KNOWN),
     case("Mana ko'ring: https://bit.ly/3abcde", "hijack", **KNOWN),
     case("", "hijack", attachment="hisob_faktura.html", **KNOWN),
     # Money to my card and a promise to repay, with no trade around it.
     case("Привет, можешь скинуть 2000 на карту? Завтра верну", "hijack", **KNOWN),
+    # Money asked to be sent, with a promise to repay or a cover story: a broken
+    # phone, a blocked card, a friend's card, «tell no one»; around trade words
+    # it takes both.
+    case(
+        "Ака, телефоним бузилиб қолди, бошқа телефондан ёзаяпман. 300 минг ташлаб "
+        "туринг, кечқурун қайтараман",
+        "hijack",
+        **KNOWN,
+    ),
+    case(
+        "Bro Click orqali 700 ming tashlab yubor, kartam bloklanib qoldi",
+        "hijack",
+        **KNOWN,
+    ),
+    case(
+        "1 mln zudlik bilan kerak edi. Mening kartamga emas, do'stimning kartasiga "
+        "tashlab yuboring",
+        "hijack",
+        **KNOWN,
+    ),
+    case(
+        "Мне нужно срочно оплатить, моя карта не проходит. Скинь 800к на "
+        "5614 0000 0000 7890, завтра верну",
+        "hijack",
+        **KNOWN,
+    ),
+    case(
+        "Слушай, выручи, 1 млн на пару дней. Только никому не говори", "hijack", **KNOWN
+    ),
+    case("Hey, qarzga 200$ bera olasanmi? Kartam ishlamayapti", "hijack", **KNOWN),
+    case("Can you pay this for me? I'll return tonight", "hijack", **KNOWN),
+    # A money mule: the reader's card, then «pass it on to me».
+    case(
+        "O'zingning karta raqamingni tashla, 2 mln tashlab qo'yishadi, keyin menga "
+        "o'tkazib berasan",
+        "hijack",
+        **KNOWN,
+    ),
     # A goo.gl link that is no Google Maps one is still a short link.
     case("Mana ko'ring: https://goo.gl/TestAb12", "hijack", **KNOWN),
 ]
@@ -317,6 +472,20 @@ HIJACK: list[dict] = [
 # --- ordinary business: never flagged ---------------------------------------------
 
 BENIGN: list[dict] = [
+    # A known contact repaying a debt: past tense, no ask.
+    case(
+        "Возвращаю долг, 1 500 000 сум скинул на карту, спасибо что выручил",
+        "ok",
+        **KNOWN,
+    ),
+    # A courier at the door hands the parcel over for the delivery code.
+    case(
+        "Салом, посилкангизни олиб келдим, эшик олдидаман. "
+        "Телефонга келган кодни айтсангиз топшираман",
+        "ok",
+        prior_messages=2,
+        owner_wrote_before=True,
+    ),
     case("Assalomu alaykum, GS367 yuki qachon keladi?", "ok"),
     case("Konteyner yo'lda, ertaga Toshkentda bo'ladi", "ok", **KNOWN),
     case("Karta raqamingizni tashlang, pulni o'tkazaman", "ok"),
@@ -541,4 +710,74 @@ BENIGN: list[dict] = [
     case("Ish taklifi bormi? Haydovchiman, tajriba 10 yil", "ok"),
     case("Uydan turib buyurtma bermoqchiman, srochno kerak", "ok"),
     case("Faqat shu oy ichida to'lab qo'ysam bo'ladimi?", "ok", **KNOWN),
+    # A known client's payment talk: what they will send, a refund or a driver's
+    # card with trade words, shipping on credit, a blocked card with no money
+    # asked, a relative's card paid *from*, a broken phone with no ask.
+    case("Aka, ertaga 2 mln tashlab beraman, qarzni yopaman", "ok", **KNOWN),
+    case(
+        "Karta raqamingizni tashlang, pulni o'tkazaman, keyin menga chekni tashlab "
+        "bering",
+        "ok",
+        **KNOWN,
+    ),
+    case("Остаток 500$ скиньте на карту водителя, он сегодня на границе", "ok", **KNOWN),
+    case("Yukni qarzga bera olasizmi? Sotib bo'lib pulini beraman", "ok", **KNOWN),
+    case("Kartam bloklandi, to'lovni ertaga tashlab yuboraman", "ok", **KNOWN),
+    case(
+        "Akamning kartasidan 1 mln o'tkazib yuboring deb aytdim, u to'laydi, kartam "
+        "bloklangan",
+        "ok",
+        **KNOWN,
+    ),
+    case("Telefonim buzildi, shu raqamdan yozyapman. Yuk qachon keladi?", "ok", **KNOWN),
+    case("Можете занять место на складе под 3 поддона до пятницы?", "ok", **KNOWN),
+    # A client's own phone and a question, a forwarded supplier's catalogue, a
+    # carrier's handle, «the cheapest price?» in a hurry: no advert's call.
+    case(
+        "Assalomu alaykum, men Akmal, tel: +998 90 000 00 00. Xitoydan 200 kg yuk bor, "
+        "chegirma bormi?",
+        "ok",
+    ),
+    case(
+        "Добрый день! Акция до конца месяца: скидка 10% на всю партию. Каталог: "
+        "https://supplier-test.com/catalog",
+        "ok",
+        forwarded=True,
+    ),
+    case(
+        "Мы транспортная компания, возим сборные грузы Китай–Ташкент. Пишите: "
+        "@test_cargo_manager",
+        "ok",
+    ),
+    case("Assalomu alaykum. Eng arzon narx qancha bo'ladi 1 kg ga? Srochno kerak", "ok"),
+    case("Бепул сақлаш неча кун? Тошкент омборида 5 кунми?", "ok"),
+    # Near the new hard rules: a gift with no link or on Telegram's own site,
+    # a duty paid on the government site, a deposit per kilogram, a tender
+    # won, guaranteed delivery, a company portal's login page, «ovoz bering»
+    # (call me) with a site, a vote on 2GIS, a code by «can you send it», a
+    # cargo's code, a real OLX listing.
+    case("Telegram Premium sovg'a qildim senga 😄", "ok", **KNOWN),
+    case("Telegram Premium shu yerda olinadi: https://fragment.com/premium", "ok"),
+    case(
+        "Посылка задержана на таможне, пошлину оплатите через "
+        "https://my.gov.uz/ru/service/411",
+        "ok",
+        **KNOWN,
+    ),
+    case("Har bir kg uchun 2$, oldindan 500$ depozit qiling, keyin yuklaymiz", "ok"),
+    case("Tenderda g'olib bo'ldik, endi 300 000 so'm to'lov qilamiz", "ok", **KNOWN),
+    case("Kafolatlangan yetkazib berish, 3 kunda 30% chegirma bilan", "ok"),
+    case("Bizning mijozlar portali: https://login.humo-trans-test.uz", "ok"),
+    case("Ovoz bering, sayt shu: https://cargo-x-test.uz", "ok", **KNOWN),
+    case(
+        "Проголосуйте за нас в рейтинге 2ГИС: https://2gis.uz/tashkent/firm/70000001234567",
+        "ok",
+    ),
+    case("Kodimni yubora olasizmi? GS kodim esimda yo'q", "ok", **KNOWN),
+    case("Omborga kelgan 5 ta yukning kodini yozing", "ok", **KNOWN),
+    case(
+        "OLX'da e'lon berdim, yukni sizlar orqali jo'nataman: "
+        "https://www.olx.uz/d/obyavlenie/test-123",
+        "ok",
+    ),
 ]

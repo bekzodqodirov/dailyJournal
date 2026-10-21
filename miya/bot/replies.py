@@ -308,6 +308,13 @@ SCAM_REASON_LABELS: dict[str, str] = {
         "o'zini tanish yoki xodim deb tanitib, shoshilinch pul so'ralyapti"
     ),
     safety.R_QR_RECEIVE: "«pulni olish uchun QR skanerlang» degan aldov",
+    safety.R_VOTE_LINK: (
+        "«tanlovda ovoz bering» degan havola (akkauntni o'g'irlash usuli)"
+    ),
+    safety.R_GIFT_LINK: "tanish nomdan sovg'a va begona havola",
+    safety.R_FEE_LINK: "«posilka ushlab qolindi, boj to'lang» degan yashirin havola",
+    safety.R_ADVANCE_FEE: "yutuq yoki daromad va'da qilinib, oldindan pul so'ralyapti",
+    safety.R_PROFIT_PROMISE: "kafolatlangan yoki juda katta foyda va'da qilinyapti",
 }
 SCAM_REASON_FALLBACK = "shubhali belgilar"
 SCAM_REASONS_SHOWN = 2
