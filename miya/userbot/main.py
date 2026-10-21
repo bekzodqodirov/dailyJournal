@@ -201,18 +201,20 @@ READER_FLOOD_RETRIES = 3
 READER_FLOOD_ERRORS = (FloodWaitError, FloodPremiumWaitError)
 
 
-async def _reader_call[T](call: Callable[[], Awaitable[T]]) -> T:
-    """One read from Telegram (a media download, an approved re-read) that
-    waits out a flood wait the client did not, up to READER_FLOOD_RETRIES
-    times, each no longer than Telethon's default: with the sender on, the
-    client sleeps only USERBOT_FLOOD_SLEEP_SECONDS, and the reader must not
-    lose a voice note over a 20 s wait. A longer one, or one more, is raised."""
-    for attempt in range(READER_FLOOD_RETRIES + 1):
+async def _reader_call[T](
+    call: Callable[[], Awaitable[T]], *, retries: int = READER_FLOOD_RETRIES
+) -> T:
+    """One read from Telegram (a live media download) that waits out a flood
+    wait the client did not, up to ``retries`` times, each no longer than
+    Telethon's default: with the sender on, the client sleeps only
+    USERBOT_FLOOD_SLEEP_SECONDS, and the reader must not lose a voice note
+    over a 20 s wait. A longer one, or one more, is raised."""
+    for attempt in range(retries + 1):
         try:
             return await call()
         except READER_FLOOD_ERRORS as exc:
             seconds = int(exc.seconds or 0)
-            if seconds > READER_FLOOD_SLEEP_SECONDS or attempt == READER_FLOOD_RETRIES:
+            if seconds > READER_FLOOD_SLEEP_SECONDS or attempt == retries:
                 raise
             log.warning(
                 "reader waits out a flood wait",
@@ -238,16 +240,19 @@ async def fetch_media(
     writer in the system. So the slow work happens here, with nothing held,
     and only the results are persisted afterwards.
 
-    ``pause_on_flood``: a flood wait the reader did not wait out is raised
-    instead of ending as a failure, so an approved file stays approved for
-    the next pass (``fetch_approved``).
+    ``pause_on_flood`` (``fetch_approved``): a flood wait is not waited out
+    here but raised, instead of ending as a failure, so the approved file
+    waits for the next pass.
     """
     if not plan.download:
         return MediaOutcome(skip_reason=plan.skip_reason, risk=plan.risk)
 
     path = _media_path(suffix)
     try:
-        await _reader_call(partial(client.download_media, message, file=str(path)))
+        await _reader_call(
+            partial(client.download_media, message, file=str(path)),
+            retries=0 if pause_on_flood else READER_FLOOD_RETRIES,
+        )
     except Exception as exc:
         # No partial file is left behind: purge_old_media knows only the
         # files an interaction points to.
@@ -1422,12 +1427,37 @@ def _message_meta(message: object, monitor: ChatMonitor) -> dict:
 APPROVED_POLL_SECONDS = 60
 
 
-def _approved_paused(exc: Exception, interaction_id: int) -> None:
+# A flood wait on an approved file ends the pass and is waited out by the
+# next one, never inside it: the heartbeat beats once a pass. A short wait
+# counts against the file; a big one restarts from zero each pass and can
+# meet the same wait every time, so after this many it goes to review and
+# the files behind it move on.
+APPROVED_FLOOD_PASSES = 5
+
+
+async def _approved_flood(exc: Exception, interaction_id: int) -> None:
+    """A flood wait on one approved file: a long one (the whole account
+    waits) leaves it as it is; a short one counts, up to
+    APPROVED_FLOOD_PASSES, after which it is DONE with error 'flood' and in
+    needs_review, like a failed download."""
     seconds = int(getattr(exc, "seconds", 0) or 0)
     log.warning(
         "approved media fetch paused: Telegram asked for a wait",
         extra={"seconds": seconds, "interaction": interaction_id},
     )
+    if seconds > READER_FLOOD_SLEEP_SECONDS:
+        return
+    async with session_scope() as session:
+        interaction = await session.get(Interaction, interaction_id)
+        if interaction is None:
+            return
+        approval = (interaction.media or {}).get("approval") or {}
+        passes = int(approval.get("flood_passes") or 0) + 1
+        if passes < APPROVED_FLOOD_PASSES:
+            approvals.set_state(interaction, approvals.APPROVED, flood_passes=passes)
+            return
+        await persist_media(session, interaction, MediaOutcome(failed=True))
+        approvals.set_state(interaction, approvals.DONE, error="flood")
 
 
 async def fetch_approved(client: TelegramClient) -> int:
@@ -1449,12 +1479,12 @@ async def fetch_approved(client: TelegramClient) -> int:
         filename = media.get("filename")
         try:
             message = await _reader_call(
-                partial(client.get_messages, chat_id, ids=message_id)
+                partial(client.get_messages, chat_id, ids=message_id), retries=0
             )
         except READER_FLOOD_ERRORS as exc:
-            # A long wait is no proof the message is gone: it and the rest of
-            # this pass stay approved, and the next pass tries them again.
-            _approved_paused(exc, interaction_id)
+            # A wait is no proof the message is gone: it and the rest of this
+            # pass stay approved, and the next pass tries them again.
+            await _approved_flood(exc, interaction_id)
             break
         except Exception:
             log.exception("could not re-read approved message %s", message_id)
@@ -1476,7 +1506,7 @@ async def fetch_approved(client: TelegramClient) -> int:
                 client, message, plan, _suffix_for(kind, filename), pause_on_flood=True
             )
         except READER_FLOOD_ERRORS as exc:
-            _approved_paused(exc, interaction_id)
+            await _approved_flood(exc, interaction_id)
             break
 
         async with session_scope() as session:

@@ -1024,27 +1024,30 @@ async def test_an_approved_installer_is_still_never_fetched(session, media_in_tm
     assert row.meta["safety_notice"] == "dangerous_file"
 
 
+def _approved_pdf(mid: int, *, minutes_ago: int = 5) -> m.Interaction:
+    return m.Interaction(
+        source=InteractionSource.telegram_userbot,
+        direction=Direction.in_,
+        tg_chat_id=CHAT,
+        occurred_at=datetime.now(TZ) - timedelta(minutes=minutes_ago),
+        media={
+            "type": "document",
+            "filename": f"hisob{mid}.pdf",
+            "size": 90_000_000,
+            "processed": False,
+            "approval": {"state": approvals.APPROVED, "reason": "too_large"},
+        },
+        meta={"tg_message_id": mid},
+    )
+
+
 async def test_a_long_flood_wait_leaves_an_approved_file_queued(session, media_in_tmp):
-    """A flood wait on the re-read is no proof the message is gone: the row
-    stays approved for the next pass, not DONE with error 'gone'."""
+    """A long flood wait on the re-read or the download is the whole
+    account waiting, no proof the message is gone: the row stays approved,
+    uncounted, for the next pass, not DONE with error 'gone'."""
     from telethon.errors import FloodPremiumWaitError, FloodWaitError
 
-    session.add(
-        m.Interaction(
-            source=InteractionSource.telegram_userbot,
-            direction=Direction.in_,
-            tg_chat_id=CHAT,
-            occurred_at=datetime.now(TZ) - timedelta(minutes=5),
-            media={
-                "type": "document",
-                "filename": "hisob.pdf",
-                "size": 90_000_000,
-                "processed": False,
-                "approval": {"state": approvals.APPROVED, "reason": "too_large"},
-            },
-            meta={"tg_message_id": 15},
-        )
-    )
+    session.add(_approved_pdf(15))
     await session.commit()
 
     class _WaitingClient(_Client):
@@ -1056,10 +1059,9 @@ async def test_a_long_flood_wait_leaves_an_approved_file_queued(session, media_i
     assert approvals.state_of(row) == approvals.APPROVED
     assert not row.needs_review
 
-    # The same for a long wait on the download itself.
     class _SlowDownload(_Client):
         async def get_messages(self, chat_id, ids):
-            return _tg_document(ids, "hisob.pdf")
+            return _tg_document(ids, f"hisob{ids}.pdf")
 
         async def download_media(self, message, file=None):
             raise FloodPremiumWaitError(request=None, capture=3600)
@@ -1067,7 +1069,52 @@ async def test_a_long_flood_wait_leaves_an_approved_file_queued(session, media_i
     assert await userbot.fetch_approved(_SlowDownload()) == 0
     row = await _row(session, 15)
     assert approvals.state_of(row) == approvals.APPROVED
+    assert "flood_passes" not in row.media["approval"]
     assert not row.needs_review
+
+
+async def test_a_file_that_keeps_meeting_short_waits_goes_to_review(
+    session, media_in_tmp, monkeypatch
+):
+    """A big file restarted from zero each pass can meet the same short wait
+    every time. Nothing sleeps inside the pass; after APPROVED_FLOOD_PASSES
+    the file is DONE with error 'flood' and in review, and the file behind
+    it is fetched on the next pass instead of waiting forever."""
+    from telethon.errors import FloodPremiumWaitError
+
+    async def _no_sleep(seconds):
+        raise AssertionError("an approved pass slept")
+
+    monkeypatch.setattr(userbot.asyncio, "sleep", _no_sleep)
+    session.add(_approved_pdf(16, minutes_ago=6))
+    session.add(_approved_pdf(17, minutes_ago=5))
+    await session.commit()
+
+    class _Throttled(_Client):
+        async def get_messages(self, chat_id, ids):
+            return _tg_document(ids, f"hisob{ids}.pdf")
+
+        async def download_media(self, message, file=None):
+            if message.id == 16:
+                raise FloodPremiumWaitError(request=None, capture=20)
+            await super().download_media(message, file)
+
+    client = _Throttled(b"%PDF-1.7 hisob")
+    for passes in range(1, userbot.APPROVED_FLOOD_PASSES):
+        assert await userbot.fetch_approved(client) == 0
+        row = await _row(session, 16)
+        assert approvals.state_of(row) == approvals.APPROVED
+        assert row.media["approval"]["flood_passes"] == passes
+        assert approvals.state_of(await _row(session, 17)) == approvals.APPROVED
+
+    assert await userbot.fetch_approved(client) == 0
+    row = await _row(session, 16)
+    assert approvals.state_of(row) == approvals.DONE
+    assert row.media["approval"]["error"] == "flood"
+    assert row.needs_review
+
+    assert await userbot.fetch_approved(client) == 1
+    assert approvals.state_of(await _row(session, 17)) == approvals.DONE
 
 
 async def test_a_warning_shows_a_spoofed_name_as_it_really_is(session):

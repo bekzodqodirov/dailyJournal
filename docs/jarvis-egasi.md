@@ -46,10 +46,12 @@ Buyruqlarni **bittadan** yozing va har biridan keyin natijaga qarang. To'liq tar
 
    ```
    cd miya
+   git rev-parse --short HEAD
    git fetch
    ```
 
-   Xatosiz o'tsin. «Permission denied (publickey)» desa, bir marta
+   Birinchi buyruq chiqargan qisqa kodni yozib qo'ying (hozirgi versiya). `git fetch`
+   xatosiz o'tsin. «Permission denied (publickey)» desa, bir marta
    `git config core.sshCommand "ssh -i $HOME/.ssh/miya_deploy -o IdentitiesOnly=yes"`,
    keyin yana `git fetch`.
 
@@ -71,8 +73,10 @@ Buyruqlarni **bittadan** yozing va har biridan keyin natijaga qarang. To'liq tar
 
    - `make update` zaxira oladi, kodni tortadi va bazani o'zi yangilaydi (migratsiyalar). Hech
      qanday SQL yozish kerak emas.
+   - O'rtada «✅ Hammasi joyida — endi: make up» chiqsa, hech narsa yozmang — davom etadi.
    - «Stopped» qatorlaridan oldin to'xtasa (zaxira yoki `git pull` xatosi): tuzating va yana
-     `make update`. Keyin to'xtasa: tuzating, keyin `make up`.
+     `make update`. Keyin to'xtasa: tuzating, keyin `make up`. Migratsiya xatosida eski
+     versiyaga qaytish: `git checkout <yozib olgan kod>` va `make up`.
    - `make doctor` «.env faylida N ta yangi sozlama yo'q» deb bitta ⚠️ qator chiqarsa — bu
      normal: ular standart qiymat bilan ishlaydi. Faqat ❌ qolmasin.
    - `.env` da `REPORT_TIME=19:00` bo'lsa, `REPORT_TIME=20:00` qiling, keyin `make reload`.
