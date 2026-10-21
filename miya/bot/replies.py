@@ -2303,6 +2303,9 @@ def _morning_brief_text(brief: MorningBrief) -> str:
     if getattr(brief, "code_suggestions", 0):
         # Pulled, never pushed (WP-33): a count, no buttons, not a question.
         parts.append(CODE_SUGGESTIONS_LINE.format(n=brief.code_suggestions))
+    jarvis = jarvis_brief_lines(getattr(brief, "jarvis", None))
+    if jarvis:
+        parts.append("\n".join(jarvis))
     if unsafe:
         parts.append(unsafe)
     line = queue_line(getattr(brief, "queue", None))
@@ -3361,6 +3364,11 @@ JARVIS_FIELD_LABELS = {
     "guard": "tekshiruv",
     "hold": "kutish",
     "owner_told": "sizga aytildi",
+    "card": "karta",
+    "alert": "ogohlantirish",
+    "snooze": "eslatish",
+    "body": "matn",
+    "authored_by": "muallif",
     "person_id": "shaxs",
     "warned_personal": "shaxsiy chat ogohlantirishi",
     "warned_safety": "xavf ogohlantirishi",
@@ -3441,6 +3449,287 @@ def jarvis_takeover_notice(kind: str, name: str | None = None) -> str:
     if kind == "draft_edited":
         return JARVIS_CLIENT_EDITED
     return JARVIS_OWN_REPLY_DRAFT
+
+
+# --- draft and escalation cards (JV-18) ----------------------------------------------
+#
+# The values come from miya.jarvis.cards.Card, passed in plainly (rule 20). The
+# client's words and names are theirs to choose: shown through _shown. The
+# text a client would get is shown exactly (escaped, never clipped).
+
+JARVIS_CHANNEL_LABELS = {"telegram": "Telegram", "whatsapp": "WhatsApp", "gmail": "Gmail"}
+JARVIS_DRAFT_HEADER = "✍️ Qoralama j{id} · {ism} · {kanal}"
+JARVIS_DRAFT_CLIENT = "💬 Mijoz ({vaqt}): «{xabar}»"
+JARVIS_DRAFT_BODY = "🤖 Javob: «{qoralama}»"
+JARVIS_COPY_FOOTER = "📋 Yuborish hali ulanmagan — matnni nusxa olib o'zingiz yuboring."
+JARVIS_BUTTON_SEND = "✅ Yuborish"
+JARVIS_BUTTON_EDIT = "✏️ Tahrirlash"
+JARVIS_BUTTON_OWN = "🙋 O'zim yozaman"
+JARVIS_BUTTON_CANCEL = "✖️ Bekor"
+JARVIS_EDIT_HINT = (
+    "✏️ Yangi matnni shu qoralamaga reply qilib yozing yoki ovozli xabar yuboring."
+)
+JARVIS_ESCALATION_HEADER = "⚠️ {ism} {sabab} · {kanal}"
+JARVIS_ESCALATION_WHO = "👤 {ism}{kod}"
+JARVIS_ESCALATION_CLIENT = "💬 «{xabar}» ({vaqt})"
+JARVIS_ESCALATION_SUMMARY = "📝 {qisqacha}"
+JARVIS_ESCALATION_MONEY = "💰 Hisob: {faktlar}"
+JARVIS_NO_OPEN_DEBT = "Ochiq qarz yo'q"
+JARVIS_ESCALATION_REPLY = "🤖 {holat}: «{stall}»"
+JARVIS_REPLY_SENT = "Mijozga yuborildi"
+JARVIS_REPLY_READY = "Yuborishga tayyor"
+JARVIS_ESCALATION_FOOTER = (
+    "O'z javobingizni shu xabarga reply qilib yozsangiz, «Tasdiqlash va yuborish» "
+    "aynan shuni yuboradi."
+)
+# Why the client's message came to the owner, by escalation reason.
+JARVIS_REASON_LABELS = {
+    "price": "narx so'rayapti",
+    "discount": "chegirma so'rayapti",
+    "payment_terms": "to'lov shartini so'rayapti",
+    "deadline": "muddat so'rayapti",
+    "promise": "va'da yoki kafolat so'rayapti",
+    "guarantee": "va'da yoki kafolat so'rayapti",
+    "payment_claim": "to'lov qilganini aytyapti",
+    "identity": "bot emasmi deb so'rayapti",
+    "complaint": "shikoyat qilyapti",
+    "other": "boshqa savol",
+}
+JARVIS_REASON_OTHER = "boshqa savol"
+JARVIS_BUTTON_APPROVE = "✅ Tasdiqlash va yuborish"
+JARVIS_BUTTON_WRITE = "✍️ O'zim javob yozaman"
+JARVIS_BUTTON_SNOOZE = "⏰ 1 soatdan keyin eslat"
+JARVIS_QUEUED = "⏳ Navbatga qo'yildi — {kanal} orqali yuboriladi"
+JARVIS_OWN = "🙋 Mayli, o'zingiz yozasiz. {ism} chatida MIYA {soat} soat jim turadi."
+JARVIS_SNOOZED = "⏰ Soat {vaqt} da yana eslataman."
+JARVIS_REMINDER = "⏰ Eslatma ({n}-marta): {ism} hali javob kutyapti"
+JARVIS_STALE = "Bu qoralama eskirdi."
+JARVIS_ANSWERED = "Allaqachon javob berilgan."
+JARVIS_OWNER_TEXT_WARNING = (
+    "⚠️ Matningizda narx yoki muddat bor — bu sizning so'zingiz sifatida yuboriladi."
+)
+# The owner's own words into a chat marked personal (the JV-20 wording).
+JARVIS_PERSONAL_WARNING = (
+    "🔒 Bu shaxsiy chat — matn sizning nomingizdan aynan shunday ketadi."
+)
+JARVIS_DRAFT_CAP = (
+    "Bugungi qoralama limiti tugadi ({cap}). Qolganlari ertalabki xulosada."
+)
+# Past JARVIS_ESCALATION_DAILY_CAP the day's further alerts are one message,
+# a line per escalation.
+JARVIS_ALERT_FOLD = "⚠️ Bugungi eskalatsiya limiti tugadi ({cap}). Qolganlari:"
+JARVIS_CANCELLED = "✖️ Bekor qilindi"
+# The morning brief's lines (JV-22 wording) for what the cards left to it:
+# escalations the snooze limit sent there, chats whose drafts came over the cap.
+JARVIS_BRIEF_ESCALATIONS = "⚠️ Ochiq eskalatsiyalar: {items}"
+JARVIS_BRIEF_ESCALATION = "{ism} ({sabab}, {qachondan})"
+JARVIS_BRIEF_UNANSWERED = "📨 Javobsiz chatlar: {n} — {ismlar}"
+# How much of one client message a card quotes.
+JARVIS_CLIENT_SHOWN_CHARS = 300
+# The room a card leaves under TELEGRAM_LIMIT for what joins it later: the
+# line a tap adds under it, a snooze's reminder line above it.
+JARVIS_CARD_ROOM = 200
+# The owner's reply to a card would make a card too long to show whole.
+JARVIS_TOO_LONG = "✂️ Matn juda uzun, kartaga sig'maydi — qisqaroq qilib qayta yozing."
+
+
+def jarvis_channel_label(channel: str | None) -> str:
+    return JARVIS_CHANNEL_LABELS.get(channel or "", channel or "")
+
+
+def jarvis_reasons(reasons) -> str:
+    """«narx so'rayapti, muddat so'rayapti»: each reason once, in order."""
+    labels = [JARVIS_REASON_LABELS.get(r, JARVIS_REASON_OTHER) for r in reasons or ()]
+    return ", ".join(dict.fromkeys(labels)) or JARVIS_REASON_OTHER
+
+
+def _jarvis_name(name: str | None) -> str:
+    return _shown(name or JARVIS_UNNAMED_CLIENT)
+
+
+def _client_words(text: str) -> str:
+    value = " ".join((text or "").split())
+    if len(value) > JARVIS_CLIENT_SHOWN_CHARS:
+        value = value[: JARVIS_CLIENT_SHOWN_CHARS - 1].rstrip() + "…"
+    return _shown(value)
+
+
+def _card_when(at: datetime) -> str:
+    """«14:05» today, «20-okt 14:05» before."""
+    local = at.astimezone(settings.tz)
+    if local.date() == datetime.now(settings.tz).date():
+        return clock(local)
+    return f"{short_date(local.date())} {clock(local)}"
+
+
+def _card_body(card) -> str:
+    """The exact text the client would get. In copy mode it is tap-to-copy."""
+    body = escape(card.body or "")
+    return f"<code>{body}</code>" if card.copy_mode else body
+
+
+def _owner_warnings(card) -> list[str]:
+    lines: list[str] = []
+    if card.owner_text and card.redline_warning:
+        lines.append(JARVIS_OWNER_TEXT_WARNING)
+    if card.owner_text and card.personal_warning:
+        lines.append(JARVIS_PERSONAL_WARNING)
+    note = card.safety if card.owner_text else None
+    if note is not None:
+        who = card.name
+        lines.append(
+            hijack_warning(who=who)
+            if note.verdict == safety.VERDICT_HIJACK
+            else scam_warning(who=who, reasons=note.reasons)
+        )
+    return lines
+
+
+def _jarvis_money(balances) -> str:
+    """The client's open balances, from the ledger: «→ senga: 5 mln so'm»."""
+    if not balances:
+        return JARVIS_NO_OPEN_DEBT
+    parts = []
+    for b in balances:
+        arrow = "→ senga" if b.direction is DebtDirection.they_owe_me else "← sen"
+        parts.append(f"{arrow}: {money(b.amount, b.currency)}")
+    return " · ".join(parts)
+
+
+def jarvis_escalation_header(card) -> str:
+    return JARVIS_ESCALATION_HEADER.format(
+        ism=_jarvis_name(card.name),
+        sabab=jarvis_reasons(card.reasons),
+        kanal=jarvis_channel_label(card.channel),
+    )
+
+
+def jarvis_card(card) -> str:
+    """A draft card (``j``) or an escalation alert (``e``) as the owner reads
+    it. The figures come from SQL (``card.balances``); the summary is shown
+    only when it holds none. A card is never clipped (it shows the exact
+    text and its warnings): while it would not fit one message with room for
+    a tap's line, the quoted client messages go, oldest first."""
+    messages = list(card.messages)
+    text = _jarvis_card_text(card, messages)
+    while messages and len(text) > TELEGRAM_LIMIT - JARVIS_CARD_ROOM:
+        messages.pop(0)
+        text = _jarvis_card_text(card, messages)
+    return text
+
+
+def jarvis_card_fits(card) -> bool:
+    """The card goes out whole, with room for the line a tap adds under it
+    and a reminder's line above it."""
+    return len(jarvis_card(card)) <= TELEGRAM_LIMIT - JARVIS_CARD_ROOM
+
+
+def _jarvis_card_text(card, messages) -> str:
+    lines: list[str] = []
+    if card.reminder:
+        lines += [
+            JARVIS_REMINDER.format(n=card.reminder, ism=_jarvis_name(card.name)),
+            "",
+        ]
+    if card.kind == "draft":
+        lines.append(
+            JARVIS_DRAFT_HEADER.format(
+                id=card.id,
+                ism=_jarvis_name(card.name),
+                kanal=jarvis_channel_label(card.channel),
+            )
+        )
+        lines += [
+            JARVIS_DRAFT_CLIENT.format(vaqt=_card_when(m.at), xabar=_client_words(m.text))
+            for m in messages
+        ]
+        lines.append(JARVIS_DRAFT_BODY.format(qoralama=_card_body(card)))
+        lines += _owner_warnings(card)
+        if card.copy_mode:
+            lines.append(JARVIS_COPY_FOOTER)
+        return "\n".join(lines)
+    kod = f" · {_shown(card.code)}" if card.code else ""
+    lines += [
+        jarvis_escalation_header(card),
+        JARVIS_ESCALATION_WHO.format(ism=_jarvis_name(card.name), kod=kod),
+    ]
+    lines += [
+        JARVIS_ESCALATION_CLIENT.format(
+            xabar=_client_words(m.text), vaqt=_card_when(m.at)
+        )
+        for m in messages
+    ]
+    if card.summary:
+        lines.append(JARVIS_ESCALATION_SUMMARY.format(qisqacha=_shown(card.summary)))
+    lines.append(JARVIS_ESCALATION_MONEY.format(faktlar=_jarvis_money(card.balances)))
+    if card.body:
+        lines.append(
+            JARVIS_ESCALATION_REPLY.format(
+                holat=JARVIS_REPLY_SENT if card.body_sent else JARVIS_REPLY_READY,
+                stall=_card_body(card),
+            )
+        )
+    lines += _owner_warnings(card)
+    lines.append(JARVIS_COPY_FOOTER if card.copy_mode else JARVIS_ESCALATION_FOOTER)
+    return "\n".join(lines)
+
+
+def jarvis_card_outcome(card_text: str, outcome: str) -> str:
+    """The card with what the owner's tap came to under it."""
+    return f"{card_text}\n\n{outcome}"
+
+
+def jarvis_queued(channel: str | None) -> str:
+    return JARVIS_QUEUED.format(kanal=jarvis_channel_label(channel))
+
+
+def _hours(minutes: int) -> str:
+    hours = Decimal(minutes) / Decimal(60)
+    if hours == hours.to_integral_value():
+        return str(int(hours))
+    return f"{hours.quantize(Decimal('0.1'))}".replace(".", ",")
+
+
+def jarvis_own(name: str | None, minutes: int) -> str:
+    return JARVIS_OWN.format(ism=_jarvis_name(name), soat=_hours(minutes))
+
+
+def jarvis_snoozed(until: datetime) -> str:
+    return JARVIS_SNOOZED.format(vaqt=clock(until))
+
+
+def jarvis_draft_cap(cap: int) -> str:
+    return JARVIS_DRAFT_CAP.format(cap=cap)
+
+
+def jarvis_fold(cards, cap: int) -> str:
+    """The day's alerts past the cap, one line each."""
+    lines = [JARVIS_ALERT_FOLD.format(cap=cap)]
+    lines += [jarvis_escalation_header(card) for card in cards]
+    return clip("\n".join(lines))
+
+
+def jarvis_brief_lines(items) -> list[str]:
+    """The morning brief's lines for cards.BriefItems."""
+    if items is None:
+        return []
+    lines: list[str] = []
+    if items.escalations:
+        shown = "; ".join(
+            JARVIS_BRIEF_ESCALATION.format(
+                ism=_jarvis_name(e.name),
+                sabab=jarvis_reasons(e.reasons),
+                qachondan=_card_when(e.since),
+            )
+            for e in items.escalations
+        )
+        lines.append(JARVIS_BRIEF_ESCALATIONS.format(items=shown))
+    if items.unanswered:
+        names = ", ".join(_jarvis_name(n) for n in items.unanswered)
+        lines.append(
+            JARVIS_BRIEF_UNANSWERED.format(n=len(items.unanswered), ismlar=names)
+        )
+    return lines
 
 
 # --- the responder in observation mode (JV-16) -------------------------------------

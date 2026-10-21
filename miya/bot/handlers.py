@@ -1035,6 +1035,239 @@ async def cmd_shadow_drafts(message: Message) -> None:
     await _safe_answer(message, body)
 
 
+# --- draft and escalation cards (JV-18) ----------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20). The
+# jv: and je: buttons are not in _button_handlers, so a typed batch answer
+# («hammasi ha») can never approve a send. A tap is honoured only from the card
+# the row is shown on now, under the row's lock; a second tap is stale.
+
+
+class _CardNotShown(Exception):
+    """The re-rendered card did not reach the owner: the new words are rolled
+    back, so the text a tap would send is always the one a card shows."""
+
+
+class _CardTooLong(Exception):
+    """With the owner's words the card would not fit one message whole: the
+    words are rolled back (a card is never clipped)."""
+
+
+def _jarvis_tap_args(data: str | None) -> tuple[str, int | None]:
+    parts = (data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    ident = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    return action, ident
+
+
+def _jarvis_refusal(code: str) -> str:
+    return {
+        "stale": replies.JARVIS_STALE,
+        "answered": replies.JARVIS_ANSWERED,
+        "copy": replies.JARVIS_COPY_FOOTER,
+        "edit": replies.JARVIS_EDIT_HINT,
+        "too_long": replies.JARVIS_TOO_LONG,
+    }.get(code, replies.JARVIS_FAILED)
+
+
+def _jarvis_outcome(result) -> str | None:
+    """The line a tap's card shows under it, or None when the card stays."""
+    if result.code == "queued":
+        return replies.jarvis_queued(result.channel)
+    if result.code == "own":
+        return replies.jarvis_own(result.name, settings.jarvis_takeover_minutes)
+    if result.code == "cancelled":
+        return replies.JARVIS_CANCELLED
+    if result.code == "snoozed":
+        if result.to_brief:
+            return replies.JARVIS_SNOOZED.format(vaqt=settings.morning_brief_time)
+        return replies.jarvis_snoozed(result.until)
+    return None
+
+
+async def _strip_buttons(message) -> None:
+    """A card that is no longer the one to tap loses its buttons (cosmetic:
+    a tap on it is stale anyway)."""
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.debug("could not take the buttons off an old card", exc_info=True)
+
+
+async def _jarvis_tap(callback: CallbackQuery, kind: str) -> None:
+    from miya.jarvis import cards as jarvis_cards
+
+    action, ident = _jarvis_tap_args(callback.data)
+    message = callback.message
+    if ident is None:
+        await _ack(callback)
+        return
+    message_id = getattr(message, "message_id", None)
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            if kind == jarvis_cards.DRAFT_CARD:
+                card = await jarvis_cards.draft_card(session, ident)
+                result = await jarvis_cards.tap_draft(
+                    session, ident, action, message_id=message_id, now=now
+                )
+            else:
+                card = await jarvis_cards.escalation_card(session, ident)
+                result = await jarvis_cards.tap_escalation(
+                    session, ident, action, message_id=message_id, now=now
+                )
+    except Exception as exc:
+        log.error(
+            "jarvis card tap failed",
+            extra={
+                "card_kind": kind,
+                "card_action": action,
+                "ref_id": ident,
+                "error": type(exc).__name__,
+            },
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    outcome = _jarvis_outcome(result)
+    if outcome is None or card is None:
+        if message is not None:
+            if result.code in ("stale", "answered"):
+                await _strip_buttons(message)
+            await _safe_answer(message, _jarvis_refusal(result.code))
+        await _ack(callback)
+        return
+    text = replies.jarvis_card_outcome(replies.jarvis_card(card), outcome)
+    if result.code in ("snoozed", "queued") and result.card is not None:
+        # The alert stays tappable: after a snooze (send, write; the snooze
+        # comes back later), or when ✅ approved only the holding reply.
+        try:
+            await message.edit_text(text, reply_markup=keyboards.jarvis_card(result.card))
+        except Exception:
+            log.debug("could not edit the snoozed card", exc_info=True)
+        await _ack(callback)
+        return
+    await _edit_callback(callback, text)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_DRAFT_PREFIX}:"))
+async def on_jarvis_draft_button(callback: CallbackQuery) -> None:
+    """✅ Yuborish / ✏️ Tahrirlash / 🙋 O'zim yozaman / ✖️ Bekor under a draft
+    card (JV-18). Not in ``_button_handlers``."""
+    await _jarvis_tap(callback, "draft")
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_ESCALATION_PREFIX}:"))
+async def on_jarvis_escalation_button(callback: CallbackQuery) -> None:
+    """✅ Tasdiqlash va yuborish / ✍️ O'zim javob yozaman / ⏰ 1 soatdan keyin
+    eslat under an escalation alert (JV-18). Not in ``_button_handlers``."""
+    await _jarvis_tap(callback, "escalation")
+
+
+def _replied_id(message: Message) -> int | None:
+    """The bot message this one replies to, only in the owner's private chat
+    with the bot: cards go only there, and a message id from any other chat
+    (a group the bot is in) is not a card's, whatever its number."""
+    chat = getattr(message, "chat", None)
+    owner = settings.owner_telegram_id
+    if owner is None or getattr(chat, "id", None) != owner:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None) if reply is not None else None
+    return reply_id if isinstance(reply_id, int) else None
+
+
+async def _replies_to_card(session, message: Message) -> bool:
+    """Is this message the owner's reply to a Jarvis card? Never with Jarvis
+    off (rule 20: then miya.jarvis is not imported at all)."""
+    reply_id = _replied_id(message)
+    if not settings.jarvis_enabled or reply_id is None:
+        return False
+    from miya.jarvis import cards as jarvis_cards
+
+    try:
+        async with session.begin_nested():
+            return await jarvis_cards.find_card(session, reply_id) is not None
+    except Exception as exc:
+        # Contained: the voice note is then handled as any other.
+        log.error(
+            "jarvis card lookup failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        return False
+
+
+async def _jarvis_card_reply(
+    message: Message, text: str | None, *, interaction_id: int | None = None
+) -> bool:
+    """The owner replied to a draft card or an escalation alert with their own
+    words (typed, or a voice note's transcript): they become the text, the
+    owner's (flagged by the guard, never blocked), and the card is shown again
+    with them, right under the reply; the old card loses its buttons. False
+    when the message replies to no card."""
+    reply_id = _replied_id(message)
+    if not settings.jarvis_enabled or reply_id is None:
+        return False
+    from miya.jarvis import cards as jarvis_cards
+
+    try:
+        async with session_scope() as session:
+            ref = await jarvis_cards.find_card(session, reply_id)
+    except Exception as exc:
+        # Contained: a lookup that fails costs the owner nothing, the message
+        # is then handled as any other.
+        log.error(
+            "jarvis card lookup failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        return False
+    if ref is None:
+        return False
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            result = await jarvis_cards.owner_reply(
+                session, ref, text or "", now=now, interaction_id=interaction_id
+            )
+            if result.code == "edited" and result.card is not None:
+                if not replies.jarvis_card_fits(result.card):
+                    raise _CardTooLong
+                sent = await _safe_answer(
+                    message,
+                    replies.jarvis_card(result.card),
+                    reply_markup=keyboards.jarvis_card(result.card),
+                )
+                if sent is None:
+                    raise _CardNotShown
+                await jarvis_cards.recarded(
+                    session, result.card, message_id=sent.message_id, now=now
+                )
+    except _CardTooLong:
+        log.info(
+            "the owner's words do not fit a card",
+            extra={"card_kind": ref.kind, "ref_id": ref.id},
+        )
+        await _safe_answer(message, replies.JARVIS_TOO_LONG)
+        return True
+    except _CardNotShown:
+        log.warning("the edited card did not reach the owner", extra={"ref_id": reply_id})
+        await _safe_answer(message, replies.JARVIS_FAILED)
+        return True
+    except Exception as exc:
+        log.error(
+            "reply to a jarvis card failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        await _safe_answer(message, replies.JARVIS_FAILED)
+        return True
+    if result.code != "edited":
+        await _safe_answer(message, _jarvis_refusal(result.code))
+        return True
+    await _strip_buttons(message.reply_to_message)
+    return True
+
+
 # --- personal chats and group replies (JV-12) ---------------------------------------
 #
 # miya.jarvis is imported inside each handler, never at startup (rule 20).
@@ -3517,6 +3750,10 @@ async def _batch_reply(message: Message) -> bool:
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     await _typing(message)
+    if await _jarvis_card_reply(message, message.text):
+        # The owner's own words for a Jarvis card (JV-18), ahead of the
+        # code lookup and the batch reply: a reply to a card is its text.
+        return
     lookup = client_codes.canonical_lookup(
         (message.text or "").strip().rstrip("?").strip()
     )
@@ -3629,17 +3866,32 @@ async def on_voice(message: Message, bot: Bot) -> None:
         text = await transcribe_into(session, interaction, path)
         keyboard = None
         asked = None
+        card_reply = False
         if text is None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
-            asked = await _spoken_question(session, interaction, text, message)
-            if asked is not None:
-                reply = asked
+            card_reply = await _replies_to_card(session, message)
+            if card_reply:
+                # The owner spoke their words for a Jarvis card (JV-18): the
+                # transcript is the text, never a note or a question.
+                interaction.processed = True
+                interaction.meta = {**(interaction.meta or {}), "kind": "jarvis_reply"}
+                reply = ""
             else:
-                result = await process_interaction(session, interaction)
-                reply, keyboard = _receipt(result)
+                asked = await _spoken_question(session, interaction, text, message)
+                if asked is not None:
+                    reply = asked
+                else:
+                    result = await process_interaction(session, interaction)
+                    reply, keyboard = _receipt(result)
         interaction_id = interaction.id
+    if card_reply:
+        if not await _jarvis_card_reply(message, text, interaction_id=interaction_id):
+            # The card could not be read again: the note is not lost, but the
+            # owner is told their words did not reach it.
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        return
     if asked is not None:
         await _send_answer(message, reply, interaction_id)
         return

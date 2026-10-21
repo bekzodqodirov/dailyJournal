@@ -8,7 +8,8 @@ an unknown spend counts as over the cap: above it Jarvis only escalates with
 fixed templates and makes no model call, so failing that way is safe.
 
 ``ask`` is how the responder's calls (JV-16: ``jarvis_intent``,
-``jarvis_draft``, ``jarvis_guard``) reach a model: it refuses over the cap
+``jarvis_draft``, ``jarvis_guard``) and the alert's summary (JV-18:
+``jarvis_summary``) reach a model: it refuses over the cap
 before anything is sent, sends no tools, and records the usage in a
 transaction of its own, so a spend is counted even when the run that made it
 fails later (the cap never undercounts).
@@ -44,12 +45,15 @@ JARVIS_OPERATIONS: Final = (
     "jarvis_command",
     "jarvis_style",
     "jarvis_kb",
+    "jarvis_summary",
 )
 COST_CAP_CODE: Final = "cost_cap"
 # The responder's three calls (JV-16).
 INTENT_OPERATION: Final = "jarvis_intent"
 DRAFT_OPERATION: Final = "jarvis_draft"
 GUARD_OPERATION: Final = "jarvis_guard"
+# The escalation alert's digit-free summary line (JV-18).
+SUMMARY_OPERATION: Final = "jarvis_summary"
 # A model that declines to answer says so in the stop reason.
 REFUSAL_STOP: Final = "refusal"
 
@@ -206,6 +210,7 @@ __all__ = [
     "INTENT_OPERATION",
     "JARVIS_OPERATIONS",
     "REFUSAL_STOP",
+    "SUMMARY_OPERATION",
     "CostCapReached",
     "ModelUnavailable",
     "Spend",

@@ -25,7 +25,19 @@ Jobs:
                    the owner-first window, gets a style-cloned draft or an
                    escalation with a stall, stored as the mode says (shadow
                    until the owner raises it); over the cost cap only stalls
-                   and escalations, and the owner is told once a day
+                   and escalations, and the owner is told once a day. In draft
+                   and auto mode a red-line message is escalated as soon as the
+                   debounce ends and its alert goes out in the same run (JV-18
+                   1a; only the stall waits for the owner-first window), and a
+                   new draft's card goes out the same way
+  * jarvis_cards — every minute, only with JARVIS_ENABLED; the owner's cards
+                   (JV-18): retries escalation alerts and draft cards that did
+                   not go out, alerts a snoozed escalation again once its hour
+                   is up (the snooze is a DB row, not a scheduler timer), folds
+                   alerts past JARVIS_ESCALATION_DAILY_CAP into one message,
+                   tells the owner once a day that the draft cap was reached,
+                   and expires escalations the snooze limit sent to the morning
+                   brief once a brief named them; silent in quiet hours
   * style_refresh — every 10 min, only with JARVIS_ENABLED; builds the
                    owner's style profile (JV-14) once a requested history
                    import is read and tells the owner it is ready, and
@@ -107,7 +119,7 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import keyboards, notices, replies
-from miya.bot.formatting import clip, clock, escape, short_date
+from miya.bot.formatting import TELEGRAM_LIMIT, clip, clock, escape, short_date
 from miya.config import settings
 from miya.db.enums import ChatType
 from miya.db.models import (
@@ -609,11 +621,111 @@ async def jarvis_takeover_notices(bot: Bot, *, now: datetime | None = None) -> i
 JARVIS_COST_STOP_KIND = "jarvis_cost_stop"
 
 
+class JarvisPresenter:
+    """The bot side of miya.jarvis.cards (JV-18): renders a card with
+    replies.jarvis_card and keyboards.jarvis_card and delivers it with
+    ``deliver``; returns the bot message's id, None when Telegram did not take
+    it (the sweep retries)."""
+
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def card(self, card, *, silent: bool, reply_to: int | None = None):
+        text = replies.jarvis_card(card)
+        if len(text) > TELEGRAM_LIMIT:
+            # deliver() would clip it: a card shows its text and warnings
+            # whole or not at all (nothing is recorded as shown).
+            log.error(
+                "jarvis card too long to show",
+                extra={"card_kind": card.kind, "ref_id": card.id, "chars": len(text)},
+            )
+            return None
+        ok, sent = await deliver(
+            self.bot,
+            text,
+            reply_markup=keyboards.jarvis_card(card),
+            silent=silent,
+            reply_to=reply_to,
+        )
+        return sent.message_id if ok and sent is not None else None
+
+    async def fold(self, cards, *, cap: int, silent: bool, edit: int | None):
+        text = replies.jarvis_fold(cards, cap)
+        if edit is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text, chat_id=settings.owner_telegram_id, message_id=edit
+                )
+                return edit
+            except Exception as exc:
+                # Deleted, or too old to edit: the fold starts a new message.
+                log.info(
+                    "folded alert not edited",
+                    extra={"message_id": edit, "error": type(exc).__name__},
+                )
+        ok, sent = await deliver(self.bot, text, silent=silent)
+        return sent.message_id if ok and sent is not None else None
+
+    async def draft_cap(self, *, cap: int, silent: bool) -> bool:
+        return await notify(self.bot, replies.jarvis_draft_cap(cap), silent=silent)
+
+    async def edit(self, card, *, message_id: int) -> bool:
+        """The card on screen, rendered again in place (its summary came);
+        its buttons stay. False when Telegram did not take the edit."""
+        text = replies.jarvis_card(card)
+        if len(text) > TELEGRAM_LIMIT:
+            return False
+        try:
+            await self.bot.edit_message_text(
+                text,
+                chat_id=settings.owner_telegram_id,
+                message_id=message_id,
+                reply_markup=keyboards.jarvis_card(card),
+            )
+            return True
+        except Exception as exc:
+            log.info(
+                "jarvis card not edited",
+                extra={"message_id": message_id, "error": type(exc).__name__},
+            )
+            return False
+
+
+async def jarvis_cards_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The owner's cards (JV-18): undelivered escalation alerts and draft
+    cards, snoozed escalations whose time is up, the draft-cap notice, and
+    escalations a morning brief already named. Registered only with
+    JARVIS_ENABLED; miya.jarvis is imported here, not at startup (rule 20).
+    The sweep contains each row on its own (rule 25)."""
+    from miya.jarvis import cards
+
+    now = now or datetime.now(settings.tz)
+    try:
+        await cards.sweep(JarvisPresenter(bot), now=now)
+    except Exception as exc:
+        log.error("jarvis cards sweep failed", extra={"error": type(exc).__name__})
+
+
+async def _jarvis_card_now(bot: Bot, outcome, *, now: datetime) -> None:
+    """A responder outcome's card, in the same run (JV-18 1a): the alert of
+    an escalation it opened, the card of a draft it stored. A push into an
+    open escalation is no new alert. cards never raises."""
+    from miya.jarvis import cards, responder
+
+    presenter = JarvisPresenter(bot)
+    if outcome.escalation_id is not None and outcome.code != responder.REPEAT:
+        await cards.alert_now(presenter, outcome.escalation_id, now=now)
+    if outcome.code == responder.DRAFTED:
+        for row_id in outcome.outbox_ids:
+            await cards.card_now(presenter, row_id, now=now)
+
+
 async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
     """The responder (JV-16): the chats whose debounce and owner-first window
-    are over get a draft or an escalation, stored in the mode's state. When
-    the cost cap stopped a draft, the owner is told once a day that Jarvis
-    only forwards to them until tomorrow.
+    are over get a draft or an escalation, stored in the mode's state; each
+    new escalation's alert and each new draft's card goes out in this same
+    run (JV-18 1a). When the cost cap stopped a draft, the owner is told once
+    a day that Jarvis only forwards to them until tomorrow.
 
     Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
     startup (rule 20). The run contains each chat on its own (rule 25); a
@@ -622,8 +734,12 @@ async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
     from miya.jarvis import responder
 
     now = now or datetime.now(settings.tz)
+
+    async def alert(outcome) -> None:
+        await _jarvis_card_now(bot, outcome, now=now)
+
     try:
-        result = await responder.run(now=now)
+        result = await responder.run(now=now, alert=alert)
     except Exception as exc:
         log.error("jarvis responder run failed", extra={"error": type(exc).__name__})
         return
@@ -2142,6 +2258,14 @@ async def run() -> None:
             IntervalTrigger(seconds=15),
             args=[bot],
             id="jarvis_respond",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            jarvis_cards_job,
+            IntervalTrigger(minutes=1),
+            args=[bot],
+            id="jarvis_cards",
             max_instances=1,
             coalesce=True,
         )

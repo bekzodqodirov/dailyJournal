@@ -24,13 +24,17 @@ JV-16).
    silence: the escalation's history grows), the per-chat cap, the AI turn
    limit, the cost cap. An open
    escalation holds the chat only until the owner writes in it (resolved,
-   ``auto:own``) or, still ``open``, for JARVIS_DRAFT_EXPIRY_HOURS (expired).
+   ``auto:own``) or, still ``open`` (or ``owner_replying``: the owner said on
+   its card they would write, JV-18), for JARVIS_DRAFT_EXPIRY_HOURS (expired).
 4. **Deterministic signals first** (``redlines.classify_inbound``): a price,
    deadline, promise, guarantee, payment claim, identity, complaint, legal
    or other-people message opens an escalation and queues a stall; no model
    is called. An injection tripwire sends the chat to the owner with no
    stall and no model call. So a courtesy-only reply is never made for such
-   a message.
+   a message. In ``draft`` and ``auto`` mode such a message does not wait
+   for the owner-first window (JV-18 1a): it is escalated as soon as the
+   debounce ends, so the owner's alert goes out at once (``run(alert=…)``),
+   and only the stall is held (``not_before``) until the window ends.
 5. Otherwise the **intent** (deterministic greeting, else EXTRACT_MODEL),
    **KB retrieval** (only entries whose answer passes the reply role: a
    verbatim quote of one is auto-safe), and a **draft** by REASON_MODEL with
@@ -55,7 +59,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Final
@@ -109,12 +113,25 @@ HANDLED_LOOKBACK: Final = timedelta(days=2)
 _monotonic = time.monotonic
 
 BY: Final = "auto:policy"
+# The modes whose escalations are alerted to the owner (JV-18 1a): there a
+# red-line message is escalated as soon as the debounce ends, and only the
+# stall waits for the owner-first window. In shadow nothing is shown, so the
+# responder keeps the window for everything.
+ALERT_MODES: Final = ("draft", "auto")
 # Who closed an escalation the responder settled by its age
 # (JARVIS_DRAFT_EXPIRY_HOURS); the owner's own message closes one through
 # chat_state.resolve_escalation (``auto:own``).
 BY_EXPIRY: Final = "auto:expiry"
 OPEN: Final = "open"
+OWNER_REPLYING: Final = "owner_replying"
+# The escalation states the responder lets expire after
+# JARVIS_DRAFT_EXPIRY_HOURS: still waiting for the owner, or the owner said
+# they would write and never did (JV-18). A snoozed one comes back as open.
+EXPIRING: Final = (OPEN, OWNER_REPLYING)
 EXPIRED: Final = "expired"
+# The code of a shadow-mode escalation closed once the chat's mode alerts.
+MODE_CHANGED: Final = "mode_changed"
+SHADOW_MODE: Final = "shadow"
 OTHER: Final = "other"
 STALL_INTENT: Final = "stall"
 REPEAT_FIELD: Final = "repeat"
@@ -330,6 +347,9 @@ class _Chat:
     burst_ids: list[int] = field(default_factory=list)
     # The owner's latest own message in this chat (before the burst).
     owner_at: datetime | None = None
+    # Read before the owner-first window ended (JV-18 1a): the escalation and
+    # its alert are made now, the client's stall waits until then.
+    stall_after: datetime | None = None
 
 
 def message_text(interaction: Interaction) -> str:
@@ -538,6 +558,14 @@ def _repeat(
     ]
 
 
+def _opened_unseen(escalation: Escalation) -> bool:
+    """Opened in shadow mode (its creation entry says so) and never alerted."""
+    history = escalation.history or []
+    first = history[0] if history else None
+    mode = first.get("mode") if isinstance(first, dict) else None
+    return mode == SHADOW_MODE and escalation.alerted_at is None
+
+
 def escalation_expiry() -> timedelta:
     return timedelta(hours=settings.jarvis_draft_expiry_hours)
 
@@ -548,9 +576,13 @@ async def _settle_escalation(
     """Close the chat's open escalation when it no longer holds the chat: the
     owner wrote in the chat after it opened (resolved, ``auto:own``: the
     userbot's signal does it at once, JV-17, and this catches a message
-    stored without one), or an ``open`` one is older than
-    JARVIS_DRAFT_EXPIRY_HOURS (expired). Otherwise one model failure or
-    tripwire would mute the chat for good. Contained: a failure is logged
+    stored without one), or an ``open`` one (or one the owner said on its
+    card they would write, JV-18) is older than JARVIS_DRAFT_EXPIRY_HOURS
+    (expired). Otherwise one model failure or
+    tripwire would mute the chat for good. One opened in shadow mode, which
+    the owner was never shown, closes (``mode_changed``) as soon as the chat
+    is in an alerting mode: a new push then opens one the cards alert,
+    instead of becoming a repeat nobody sees. Contained: a failure is logged
     with the ids and the escalation is left as it was."""
     if chat.owner_at is not None:
         resolved = await chat_state.resolve_escalation(
@@ -566,11 +598,15 @@ async def _settle_escalation(
                 return
             escalation_id = escalation.id
             old = escalation.state
-            if old != OPEN or escalation.created_at > now - escalation_expiry():
+            switched = _opened_unseen(escalation) and chat.mode in ALERT_MODES
+            if not switched and (
+                old not in EXPIRING or escalation.created_at > now - escalation_expiry()
+            ):
                 return
+            code = MODE_CHANGED if switched else EXPIRED
             history = [
                 *(escalation.history or []),
-                _entry("state", EXPIRED, now=now, code=EXPIRED, old=old, by=BY_EXPIRY),
+                _entry("state", EXPIRED, now=now, code=code, old=old, by=BY_EXPIRY),
             ]
             await session.execute(
                 sa.update(Escalation)
@@ -588,7 +624,7 @@ async def _settle_escalation(
                 extra={
                     "chat_key": chat.chat_key,
                     "escalation_id": escalation_id,
-                    "code": EXPIRED,
+                    "code": code,
                 },
             )
     except Exception as exc:
@@ -619,8 +655,12 @@ async def _escalate(
     history: no second stall) and queue a stall when ``stall``. The stall
     answers ``stall_for``, what the client asked (a price, a deadline); with
     nothing there it is the owner's default stall, as for a draft the guard
-    refused."""
+    refused. A chat read before its owner-first window ended
+    (``chat.stall_after``) gets the stall scheduled for the window's end:
+    the owner's own message before then cancels it."""
     wanted = _reasons(reasons)
+    if chat.stall_after is not None:
+        detail = {**dict(detail or {}), "stall_after": chat.stall_after.isoformat()}
     try:
         async with session.begin_nested():
             escalation = await _open_escalation(session, chat.chat_key)
@@ -675,7 +715,14 @@ async def _escalate(
     )
     ids: tuple[int, ...] = ()
     if stall:
-        row_id = await _queue_stall(session, chat, stall_for, escalation.id, now=now)
+        row_id = await _queue_stall(
+            session,
+            chat,
+            stall_for,
+            escalation.id,
+            now=now,
+            not_before=chat.stall_after,
+        )
         ids = (row_id,) if row_id is not None else ()
     return Outcome(
         chat.chat_key, code, ids, escalation_id=escalation.id, cost_capped=cost_capped
@@ -689,10 +736,12 @@ async def _queue_stall(
     escalation_id: int,
     *,
     now: datetime,
+    not_before: datetime | None = None,
 ) -> int | None:
     """The one stall of a new escalation: a fixed template (or the owner's
     override that passes the stall role) in the client's script and the
-    owner's form of address for them. Never generated, never a model call."""
+    owner's form of address for them. Never generated, never a model call.
+    ``not_before`` holds it until the owner-first window ends."""
     honorific: str | None = None
     overrides: dict[str, str] = {}
     try:
@@ -715,6 +764,7 @@ async def _queue_stall(
         body=chosen.text,
         now=now,
         escalation_id=escalation_id,
+        not_before=not_before,
     )
 
 
@@ -729,6 +779,7 @@ async def _propose(
     escalation_id: int | None = None,
     kb_entry_ids: Sequence[int] = (),
     model_verdict: str | None = None,
+    not_before: datetime | None = None,
 ) -> int | None:
     """``outbox.create``, contained: the row's id, or None when none was
     stored (the mode is off for this intent, or the write failed)."""
@@ -748,6 +799,7 @@ async def _propose(
                 escalation_id=escalation_id,
                 kb_entry_ids=list(kb_entry_ids),
                 model_verdict=model_verdict,
+                not_before=not_before,
             )
             return row.id
     except outbox.JarvisDisabled as exc:
@@ -861,11 +913,19 @@ async def _load(
         return Outcome(key, NOTHING)
     ready = burst[0].occurred_at + owner_first()
     composing = state.owner_composing_at
-    if composing is not None and composing + gate.COMPOSING_HOLD > now:
+    typing = composing is not None and composing + gate.COMPOSING_HOLD > now
+    if typing and composing is not None:
         # The owner is typing in the chat (JV-17): look again once they stop.
         ready = max(ready, composing + gate.COMPOSING_HOLD)
+    stall_after: datetime | None = None
     if now < ready:
-        return ready
+        if typing or mode not in ALERT_MODES or not escalates_at_once(burst):
+            # Typing, the owner is on it already: no alert to interrupt them.
+            return ready
+        # The spec's «immediately» (JV-18 1a): a message only the owner may
+        # answer is escalated, and alerted, as soon as the debounce ends; only
+        # the client-facing stall waits for the owner-first window.
+        stall_after = ready
     trigger = burst[-1]
     return _Chat(
         chat_key=key,
@@ -878,7 +938,21 @@ async def _load(
         text="\n".join(t for t in (message_text(m) for m in burst) if t),
         burst_ids=[m.id for m in burst],
         owner_at=owner_at,
+        stall_after=stall_after,
     )
+
+
+def escalates_at_once(burst: Sequence[Interaction]) -> bool:
+    """Does this burst go to the owner on a deterministic signal alone (a red
+    line, an identity or complaint question, an injection tripwire), with no
+    model call? Then its escalation need not wait for the owner-first window.
+    A burst the shield flagged never escalates."""
+    if any(unsafe(m) for m in burst):
+        return False
+    signals: set[redlines.Signal] = set()
+    for message in burst:
+        signals |= redlines.classify_inbound(message_text(message))
+    return bool(redlines.escalation_reasons(signals)) or "injection" in signals
 
 
 async def _decide(
@@ -1149,10 +1223,21 @@ class RunResult:
         return any(o.cost_capped for o in self.outcomes)
 
 
-async def run(*, now: datetime, limit: int = BATCH) -> RunResult:
+async def run(
+    *,
+    now: datetime,
+    limit: int = BATCH,
+    alert: Callable[[Outcome], Awaitable[object]] | None = None,
+) -> RunResult:
     """One ``jarvis_respond`` tick: claim the due chats, then read each in
     a transaction of its own. One chat that fails is logged with its ids and
-    the others go on (rule 25)."""
+    the others go on (rule 25).
+
+    ``alert`` gets each chat's outcome as soon as that chat's transaction
+    committed (JV-18 1a: the owner's card or escalation alert goes out in the
+    same run, never after the other chats' model calls). It is contained: a
+    failure is logged with the ids and the run goes on; the card sweeper
+    (``jarvis_cards``) retries whatever it did not deliver."""
     started = _monotonic()
     async with session_scope() as session:
         candidates = await claim_due(session, now=now, limit=limit)
@@ -1174,7 +1259,8 @@ async def run(*, now: datetime, limit: int = BATCH) -> RunResult:
             continue
         try:
             async with session_scope() as session:
-                outcomes.append(await respond(session, candidate, now=chat_now))
+                outcome = await respond(session, candidate, now=chat_now)
+            outcomes.append(outcome)
         except Exception as exc:
             log.error(
                 "responder failed for one chat",
@@ -1184,7 +1270,25 @@ async def run(*, now: datetime, limit: int = BATCH) -> RunResult:
                     "error": type(exc).__name__,
                 },
             )
+            continue
+        if alert is not None:
+            await _alert(alert, outcome)
     return RunResult(claimed=len(candidates), outcomes=tuple(outcomes))
+
+
+async def _alert(alert: Callable[[Outcome], Awaitable[object]], outcome: Outcome) -> None:
+    try:
+        await alert(outcome)
+    except Exception as exc:
+        log.error(
+            "owner alert failed for one chat",
+            extra={
+                "chat_key": outcome.chat_key,
+                "escalation_id": outcome.escalation_id,
+                "outbox_ids": list(outcome.outbox_ids),
+                "error": type(exc).__name__,
+            },
+        )
 
 
 __all__ = [
@@ -1195,6 +1299,7 @@ __all__ = [
     "RunResult",
     "claim_due",
     "enqueue_candidate",
+    "escalates_at_once",
     "fresh",
     "message_text",
     "respond",

@@ -8,7 +8,11 @@ not a second one), questions nobody answered, missed calls, undated
 commitments that have been sitting, counterparties who went quiet with
 something open, one line counting what still waits for the owner's tap
 (WP-19: the brief tells; the numbered question batch after it asks), and
-one counting yesterday's spam and scam that MIYA left alone (JV-09).
+one counting yesterday's spam and scam that MIYA left alone (JV-09), and
+with JARVIS_ENABLED what the cards left to it (JV-18): escalations the owner
+snoozed JARVIS_SNOOZE_MAX times, and the chats whose drafts came over
+JARVIS_DRAFT_DAILY_CAP. miya.jarvis is imported only then (rule 20), and a
+failure there never costs the brief.
 
 Rendering is replies.morning_brief; this module only gathers.
 """
@@ -60,6 +64,9 @@ class MorningBrief:
     # Yesterday's incoming spam and scam (JV-09): one count line, never a
     # push, and on its own not a reason to send the brief.
     unsafe_ignored: int = 0
+    # What the Jarvis cards left to the brief (JV-18, cards.BriefItems);
+    # None with Jarvis off.
+    jarvis: Any = None
 
     @property
     def day(self) -> date:
@@ -73,6 +80,7 @@ class MorningBrief:
             or (self.loops is not None and not self.loops.is_empty())
             or (self.queue is not None and self.queue.waiting > 0)
             or self.money_review
+            or (self.jarvis is not None and not self.jarvis.is_empty())
         )
 
 
@@ -95,6 +103,7 @@ async def gather(session: AsyncSession, *, now: datetime | None = None) -> Morni
         media_expired=await approvals.expired_since(session, now - timedelta(hours=24)),
         system_problems=await _system_problems(session, now),
         unsafe_ignored=await _unsafe_yesterday(session, day),
+        jarvis=await _jarvis_items(session, now),
     )
 
 
@@ -162,6 +171,25 @@ async def _unsafe_yesterday(session: AsyncSession, day: date) -> int:
             exc_info=True,
         )
         return 0
+
+
+async def _jarvis_items(session: AsyncSession, now: datetime) -> Any:
+    """What the Jarvis cards left to the brief (JV-18); None with Jarvis off
+    or when the read fails, so the brief still goes out."""
+    if not settings.jarvis_enabled:
+        return None
+    try:
+        from miya.jarvis import cards
+
+        async with session.begin_nested():
+            return await cards.brief_items(session, now=now)
+    except Exception as exc:
+        log.warning(
+            "the brief's Jarvis lines failed: %s",
+            type(exc).__name__,
+            extra={"error": type(exc).__name__},
+        )
+        return None
 
 
 async def _system_problems(session: AsyncSession, now: datetime) -> int | None:

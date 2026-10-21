@@ -66,4 +66,13 @@ The owner first (JV-17):
   and the client's (an edit, a deletion) turned into chat state and outbox
   changes: the owner's own message cancels the chat's drafts, closes its
   escalation and pauses the AI there for JARVIS_TAKEOVER_MINUTES.
+
+The cards (JV-18):
+
+* ``cards`` — what the owner sees and taps: draft cards and escalation
+  alerts (the latter at once, in the responder's run), their buttons under a
+  row lock, the owner's own words by reply, the snooze as a DB row, the
+  daily alert fold and the copy mode until a channel can send. The worker's
+  ``jarvis_cards`` job and the bot's ``jv:``/``je:`` handlers import it when
+  they run.
 """

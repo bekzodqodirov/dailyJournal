@@ -30,6 +30,7 @@ from miya.db import models as m
 from miya.db.enums import ChatType, DebtDirection, Direction, InteractionSource
 from miya.db.session import session_scope
 from miya.jarvis import (
+    cards,
     chatkey,
     costs,
     draft,
@@ -82,6 +83,7 @@ class FakeClient:
         self.intent: object = '{"intent": "info_gathering"}'
         self.draft: object = _reply(GREETING_REPLY)
         self.guard: object = PASS_GUARD
+        self.summary: object = "Mijoz narxni bilmoqchi"
         self.calls: list[tuple[str, dict]] = []
         self.messages = self
 
@@ -97,6 +99,8 @@ class FakeClient:
             role, answer = "intent", self.intent
         elif system == guard.SYSTEM_PROMPT:
             role, answer = "guard", self.guard
+        elif system == cards.SUMMARY_PROMPT:
+            role, answer = "summary", self.summary
         else:
             assert system.startswith(draft.BASE_PROMPT), system[:80]
             role, answer = "draft", self.draft
@@ -741,7 +745,7 @@ async def test_the_owner_hears_about_the_cost_stop_once_a_day(session, on, monke
         told.append(text)
         return True
 
-    async def _capped(*, now):
+    async def _capped(*, now, alert=None):
         return responder.RunResult(
             claimed=1,
             outcomes=(responder.Outcome("tg:1", responder.COST_CAP, cost_capped=True),),

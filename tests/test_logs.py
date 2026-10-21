@@ -506,3 +506,22 @@ def test_the_api_lets_uvicorn_log_through_the_root_handler(monkeypatch):
     runpy.run_module("miya.api", run_name="__main__")
     assert len(calls) == 1
     assert "log_config" in calls[0] and calls[0]["log_config"] is None
+
+
+def test_no_module_defines_a_top_level_name_twice():
+    """A second ``def`` with the same name silently replaces the first for
+    every caller in the module (JV-18 once shadowed the receipt card's date
+    helper this way); ruff's F811 only catches an unused first definition."""
+    root = Path(__file__).resolve().parents[1] / "miya"
+    duplicates = []
+    for path in sorted(root.rglob("*.py")):
+        seen: dict[str, int] = {}
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                if node.name in seen:
+                    duplicates.append(
+                        f"{path.relative_to(root.parent)}:{node.lineno} {node.name} "
+                        f"(first at {seen[node.name]})"
+                    )
+                seen.setdefault(node.name, node.lineno)
+    assert duplicates == []

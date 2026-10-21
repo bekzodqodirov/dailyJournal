@@ -126,6 +126,13 @@ BAD_APPROVER: Final = "bad_approver"
 MODEL_BLOCK: Final = "model_block"
 MODEL_PASS: Final = "pass"
 ORIGINS: Final = ("auto_reply", "stall", "owner_command", "escalation")
+# The owner's own reply to an escalation card (JV-18).
+ESCALATION_ORIGIN: Final = "escalation"
+# history ``field`` of a card shown to the owner (JV-18): its message id.
+CARD_FIELD: Final = "card"
+# history ``field`` of the owner's own words replacing a draft's text.
+BODY_FIELD: Final = "body"
+AUTHOR_FIELD: Final = "authored_by"
 AUTHORS: Final = (gate.AI, gate.OWNER)
 
 # A held row with no end in sight (a kill switch, an open-ended pause) is
@@ -837,8 +844,9 @@ async def create(
         origin=origin, interaction_id=source_id, chat_key=chat_key, body_sha256=sha
     )
     existing = await _by_key(session, key)
-    while existing is not None and _edited_away(existing):
-        # A client edit expired that row (JV-17): this is the fresh draft.
+    while existing is not None and _superseded(existing):
+        # A client edit expired that row (JV-17), or the owner's earlier
+        # reply with the same words was taken back (JV-18): this is new.
         revision += 1
         if revision > MAX_REVISIONS:
             raise OutboxError("too_many_revisions")
@@ -933,6 +941,20 @@ def _edited_away(row: OutboxMessage) -> bool:
     """Expired because the client edited the message it answered, or
     deleted part of its burst (JV-17)."""
     return row.state == EXPIRED and row.last_error in REDRAFT_CODES
+
+
+def _superseded(row: OutboxMessage) -> bool:
+    """A stored row that the same proposal made again does not repeat: one
+    a client edit expired (JV-17), or the owner's own reply to an escalation
+    card that was cancelled or expired since (JV-18): the owner writing the
+    same words again is a new reply, never the old row."""
+    if _edited_away(row):
+        return True
+    return (
+        row.origin == ESCALATION_ORIGIN
+        and row.authored_by == gate.OWNER
+        and row.state in (CANCELLED, EXPIRED)
+    )
 
 
 async def _by_key(session: AsyncSession, key: str) -> OutboxMessage | None:
@@ -1182,6 +1204,85 @@ async def record_warning(
         raise AlreadyAnswered(str(row_id))
     _note(row, kind, None, value, by=by, now=now)
     await session.flush()
+    return row
+
+
+@dataclass(frozen=True, slots=True)
+class CardWarnings:
+    """What the card of an owner-authored row must show before the gate
+    lets the row through (§3.2): the chat is personal, or a message in it was
+    flagged by the shield (the ids, newest last)."""
+
+    personal: bool = False
+    unsafe_ids: tuple[int, ...] = ()
+
+
+async def card_warnings(session: AsyncSession, row: OutboxMessage) -> CardWarnings:
+    """The warnings an owner-authored row's card carries (JV-18), read from
+    the same rules and shield verdicts the gate reads at the claim."""
+    rules = await _rules(session, row)
+    trigger = await _trigger(session, row)
+    return CardWarnings(
+        personal=policy.never_rule(rules) is not None,
+        unsafe_ids=await unsafe_inbound(session, row, trigger),
+    )
+
+
+async def mark_carded(
+    session: AsyncSession,
+    row_id: int,
+    *,
+    message_id: int,
+    now: datetime,
+    by: str = BY_POLICY,
+) -> OutboxMessage | None:
+    """The owner was shown this row on a card (JV-18): the card's bot
+    message id, so a reply to it edits the row, a tap is honoured only from
+    it, and a JV-17 notice answers it. Every card shown is in the history.
+    None when the row is gone."""
+    row = await _locked(session, row_id)
+    if row is None:
+        return None
+    old = row.card_tg_message_id
+    row.card_tg_message_id = message_id
+    _note(row, CARD_FIELD, old, message_id, by=by, now=now)
+    await session.flush()
+    return row
+
+
+async def owner_text(
+    session: AsyncSession, row_id: int, *, body: str, by: str, now: datetime
+) -> OutboxMessage:
+    """The owner's own words replace a draft's text (JV-18: a reply to its
+    card, typed or spoken). The row becomes the owner's (``authored_by``),
+    the AI's words stay in ``ai_body``, and the guard runs in the ``owner``
+    role, which flags and never blocks; its verdict is bound to the new body
+    (the model guard read the old one, so its verdict goes). Only a draft
+    takes new words: a row that moved on raises ``AlreadyAnswered``."""
+    if not gate.plain_text(body):
+        raise NotPlainText(gate.PAYLOAD_NOT_TEXT)
+    row = await _locked(session, row_id)
+    if row is None or row.state != DRAFT:
+        raise AlreadyAnswered(str(row_id))
+    old_sha = row.body_sha256
+    if row.authored_by != gate.OWNER:
+        if row.ai_body is None:
+            row.ai_body = row.body
+        _note(row, AUTHOR_FIELD, row.authored_by, gate.OWNER, by=by, now=now)
+        row.authored_by = gate.OWNER
+    row.body = body
+    owned = gate.run_guard(
+        gate.registered_guard(),
+        body,
+        role="owner",
+        allowed_tokens=await allowed_tokens(session, row),
+    )
+    _bind(row, owned, kb_ids=())
+    _log_guard_error(row, owned)
+    row.last_error = None
+    _note(row, BODY_FIELD, old_sha, row.body_sha256, by=by, now=now)
+    await session.flush()
+    log.info("outbox row took the owner's words", extra={"outbox_id": row.id})
     return row
 
 
@@ -1814,7 +1915,9 @@ __all__ = [
     "APPROVED",
     "BLOCKED",
     "CANCELLED",
+    "CARD_FIELD",
     "DRAFT",
+    "ESCALATION_ORIGIN",
     "EXPIRED",
     "FAILED",
     "PENDING",
@@ -1827,6 +1930,7 @@ __all__ = [
     "UNKNOWN",
     "AlreadyAnswered",
     "Approval",
+    "CardWarnings",
     "ClaimedSend",
     "IllegalTransition",
     "JarvisDisabled",
@@ -1837,6 +1941,7 @@ __all__ = [
     "allowed_tokens",
     "approve",
     "cancel",
+    "card_warnings",
     "channel_send_enabled",
     "chat_facts",
     "claim_ready",
@@ -1847,7 +1952,9 @@ __all__ = [
     "expire_edited",
     "fail",
     "idempotency_key",
+    "mark_carded",
     "mark_told",
+    "owner_text",
     "pacing_for",
     "preview",
     "quiet_until",

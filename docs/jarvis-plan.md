@@ -754,7 +754,8 @@ marked read only when a reply is actually sent.
 ### 5.9 Audit
 
 `history` JSONB on every Jarvis row; `usage_log` operations `jarvis_intent`, `jarvis_draft`,
-`jarvis_guard`, `jarvis_command`, `jarvis_style`, `jarvis_kb`, `receipt_vision`; structured logs
+`jarvis_guard`, `jarvis_command`, `jarvis_style`, `jarvis_kb`, `jarvis_summary` (JV-18),
+`receipt_vision`; structured logs
 with ids and counts; `/jarvis tarix` shows the last 20 actions.
 
 ---
@@ -1950,6 +1951,57 @@ in copy mode.
 
 **Acceptance.** Cards work end to end in copy mode. Owner check: one real draft card in the first
 week.
+
+**As built.** `miya/jarvis/cards.py` (mypy strict) builds plain `Card` values from SQL and records
+what was shown; the bot renders them (`replies.jarvis_card`, `keyboards.jarvis_card`) through a
+`Presenter` (`worker.JarvisPresenter`, over `deliver()`). 1a: in `draft` and `auto` mode a burst
+with a deterministic escalating signal or an injection tripwire (`responder.escalates_at_once`,
+no model call) is escalated as soon as the debounce ends; its stall is created with `not_before` at
+the owner-first window's end (the owner's own message before then cancels it), the creation
+entry records `stall_after`, and `responder.run(alert=…)` hands each chat's outcome to
+`cards.alert_now`/`cards.card_now` right after that chat's transaction commits. Shadow mode keeps
+the window for everything, and no early alert interrupts an owner who is typing in the chat. Only
+escalations whose creation entry says `draft` or `auto` are ever alerted. A tap is honoured only
+from the card the row is shown on now (`card_tg_message_id`, `alert_tg_message_id`); every card
+and alert shown is a history entry (`card`, `alert` with `card`/`fold`/`realert`), so a reply to
+an older one still finds its row. A reply to a card is intercepted first in `on_text` (ahead of the
+code lookup and `_batch_reply`) and after transcription in `on_voice` (the note is stored
+`processed` with `meta.kind='jarvis_reply'`); the card is shown again as a new message right under
+the reply and the old card loses its buttons; if that card does not reach the owner the new words
+are rolled back, so a tap always sends the text a card shows. A draft takes the words in place
+(`outbox.owner_text`: `authored_by='owner'`, `ai_body` kept, the owner-role verdict bound to the
+new body); an escalation gets its own reply row (`origin='escalation'`, the waiting stall
+cancelled with `owner_text`), and `outbox.create` makes a fresh revision when the owner writes the
+same words again after such a row was cancelled. Owner-text cards show the red-line flag warning,
+JV-20's «🔒 Bu shaxsiy chat …» and the JV-09 scam or hijack warning when they apply, and
+`cards.record_shown` writes `warned_personal`/`warned_safety` on the row the gate checks. «🙋»
+cancels the waiting rows (`owner_will_write`), sets `owner_replying` (which the responder lets
+expire after JARVIS_DRAFT_EXPIRY_HOURS) and pauses the AI (`chat_state.pause_ai`). The snooze that
+reaches JARVIS_SNOOZE_MAX sends the escalation to the morning brief (`to_brief`, «Soat
+{MORNING_BRIEF_TIME} da yana eslataman»), and it expires (`briefed`) once a brief was delivered
+after that. The brief's lines use JV-22's wording («⚠️ Ochiq eskalatsiyalar», «📨 Javobsiz
+chatlar» for the drafts over JARVIS_DRAFT_DAILY_CAP); JV-22 widens them. Strings the WP does not
+give: the fold header «⚠️ Bugungi eskalatsiya limiti tugadi ({cap}). Qolganlari:» (then the
+card header line per escalation, one message a day edited in place) and «✖️ Bekor qilindi» under
+a cancelled card, and «✂️ Matn juda uzun, kartaga sig'maydi — qisqaroq qilib qayta yozing.»
+for an owner reply that would make the card too long. The summary (`escalations.summary`, «📝»)
+is one EXTRACT_MODEL sentence (`cards.write_summary`, usage operation `jarvis_summary`, inside
+the cost cap) read from the chat's envelope right after the alert went out, never before it;
+it is kept only when `recaps.clean_prose` finds no figure, stored on the escalation (every
+later card shows it) and edited into the alert on screen when nothing happened to it since; a
+refused or failed summary costs the alert nothing. The card also quotes the client's last
+three messages of the escalation. «💰 Hisob» shows the ledger's open balances
+(`queries.open_debts`); a counterparty's pending claims are not facts and are left out. A card
+is never clipped: the quoted client lines go oldest first while it would not fit one message,
+the owner's text is at most `cards.OWNER_TEXT_MAX` (2000) characters, and a card that would
+still not fit is refused whole (`too_long`, nothing recorded as shown). A card without a
+resolved person names the chat by its own title. ✅ on an escalation whose only waiting row is
+the stall approves the stall and keeps the escalation open (`stall_approved`): the client's
+question is still the owner's. An escalation opened in shadow mode and never alerted closes
+(`mode_changed`) as soon as its chat is read in `draft` or `auto` mode, so a new push opens one
+that is alerted. The brief's unanswered chats are the capped drafts of the last day still
+waiting or expired unanswered, in chats the owner has not written in since. Drafts still expire
+in `jarvis_outbox` (`outbox.expire_due`); `jarvis_cards` does not expire them a second time.
 
 ---
 

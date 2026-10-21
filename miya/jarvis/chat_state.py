@@ -440,6 +440,44 @@ async def owner_wrote_at(
     )
 
 
+async def pause_ai(
+    session: AsyncSession,
+    chat_key: str,
+    *,
+    channel: str,
+    person_id: int | None,
+    now: datetime,
+) -> datetime:
+    """The owner said they will write in this chat themselves (JV-18: «🙋
+    O'zim yozaman» on a card): the AI stays silent there for
+    JARVIS_TAKEOVER_MINUTES from now. The pause only moves forward. Returns
+    when it ends."""
+    until = now + takeover()
+    insert = pg_insert(JarvisChatState).values(
+        chat_key=chat_key,
+        channel=channel,
+        person_id=person_id,
+        ai_paused_until=until,
+    )
+    await session.execute(
+        insert.on_conflict_do_update(
+            index_elements=[JarvisChatState.chat_key],
+            set_={
+                "person_id": sa.func.coalesce(
+                    JarvisChatState.person_id, insert.excluded.person_id
+                ),
+                "ai_paused_until": sa.func.greatest(
+                    JarvisChatState.ai_paused_until, insert.excluded.ai_paused_until
+                ),
+                "updated_at": sa.func.now(),
+            },
+        )
+    )
+    await session.flush()
+    log.info("owner will write the chat themselves", extra={"chat_key": chat_key})
+    return until
+
+
 # --- the owner read, the owner is typing ------------------------------------------
 
 
@@ -970,6 +1008,7 @@ __all__ = [
     "owner_read",
     "owner_wrote",
     "owner_wrote_at",
+    "pause_ai",
     "resolve_escalation",
     "takeover",
     "untold",

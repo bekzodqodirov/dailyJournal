@@ -1122,3 +1122,60 @@ def kb_suggestion(entry_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- draft and escalation cards (JV-18) ----------------------------------------------
+#
+# jv:y|e|o|n:<outbox id> under a draft card (send, edit, I'll write, cancel) and
+# je:y|o|s:<escalation id> under an escalation alert (approve and send, I'll
+# write, remind in an hour). Id-only payloads. Not in
+# handlers._button_handlers: a typed batch answer («hammasi ha») never
+# approves a send. The action letters are miya.jarvis.cards's (a test holds
+# them together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_DRAFT_PREFIX = "jv"
+JARVIS_ESCALATION_PREFIX = "je"
+JARVIS_SEND = "y"
+JARVIS_EDIT = "e"
+JARVIS_OWN = "o"
+JARVIS_CANCEL = "n"
+JARVIS_SNOOZE = "s"
+
+
+def _jarvis_button(
+    text: str, prefix: str, action: str, ident: int
+) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text, callback_data=f"{prefix}:{action}:{int(ident)}"
+    )
+
+
+def jarvis_card(card) -> InlineKeyboardMarkup | None:
+    """The buttons of a cards.Card. The send button only when the channel's
+    sender is ready and a text waits (copy mode has none)."""
+    if card.kind == "draft":
+        prefix = JARVIS_DRAFT_PREFIX
+        first = [_jarvis_button(replies.JARVIS_BUTTON_EDIT, prefix, JARVIS_EDIT, card.id)]
+        if card.can_send:
+            first.insert(
+                0,
+                _jarvis_button(replies.JARVIS_BUTTON_SEND, prefix, JARVIS_SEND, card.id),
+            )
+        second = [
+            _jarvis_button(replies.JARVIS_BUTTON_OWN, prefix, JARVIS_OWN, card.id),
+            _jarvis_button(replies.JARVIS_BUTTON_CANCEL, prefix, JARVIS_CANCEL, card.id),
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=[first, second])
+    prefix = JARVIS_ESCALATION_PREFIX
+    rows = []
+    if card.can_send:
+        rows.append(
+            [_jarvis_button(replies.JARVIS_BUTTON_APPROVE, prefix, JARVIS_SEND, card.id)]
+        )
+    row = [_jarvis_button(replies.JARVIS_BUTTON_WRITE, prefix, JARVIS_OWN, card.id)]
+    if card.can_snooze:
+        row.append(
+            _jarvis_button(replies.JARVIS_BUTTON_SNOOZE, prefix, JARVIS_SNOOZE, card.id)
+        )
+    rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)

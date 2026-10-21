@@ -273,6 +273,16 @@ class Settings(BaseSettings):
     # How long Jarvis stays silent in a chat after the owner writes there.
     jarvis_takeover_minutes: int = Field(default=120, ge=0, le=10080)
 
+    # --- Cards (JV-18) ----------------------------------------------------
+    # «⏰ 1 soatdan keyin eslat»: a snoozed escalation alert comes back this
+    # many minutes after the owner's tap.
+    jarvis_escalation_snooze_minutes: int = Field(default=60, ge=1, le=1440)
+    # The snooze that reaches this count sends the escalation to the morning
+    # brief instead of another alert.
+    jarvis_snooze_max: int = Field(default=3, ge=1, le=20)
+    # Escalation alerts a day; past it the rest fold into one message.
+    jarvis_escalation_daily_cap: int = Field(default=30, ge=0, le=1000)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

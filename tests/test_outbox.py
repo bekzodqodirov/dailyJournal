@@ -2140,11 +2140,13 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
     off = await jobs(False)
     assert off and not [job for job in off if job.startswith("jarvis")]
     on = await jobs(True)
-    # The owner-style refresh (JV-14), the knowledge-base job (JV-15) and the
-    # responder (JV-16) import miya.jarvis: Jarvis-only too.
+    # The owner-style refresh (JV-14), the knowledge-base job (JV-15), the
+    # responder (JV-16) and the cards (JV-18) import miya.jarvis: Jarvis-only
+    # too.
     assert set(on) - set(off) == {
         "jarvis_outbox",
         "jarvis_respond",
+        "jarvis_cards",
         "style_refresh",
         "kb_mining",
     }
