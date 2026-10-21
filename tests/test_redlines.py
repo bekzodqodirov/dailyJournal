@@ -31,8 +31,13 @@ from tests.fixtures import redline_corpus as corpus
 ROOT = Path(__file__).resolve().parents[1]
 TOKENS = corpus.ALLOWED_TOKENS
 
-ALL_BLOCK = [*corpus.OUTBOUND_BLOCK, *corpus.HOLDOUT_BLOCK]
-ALL_PASS = [*corpus.OUTBOUND_PASS, *corpus.SAFE_MORE, *corpus.HOLDOUT_PASS]
+ALL_BLOCK = [*corpus.OUTBOUND_BLOCK, *corpus.HOLDOUT_BLOCK, *corpus.REDTEAM3_BLOCK]
+ALL_PASS = [
+    *corpus.OUTBOUND_PASS,
+    *corpus.SAFE_MORE,
+    *corpus.HOLDOUT_PASS,
+    *corpus.REDTEAM3_PASS,
+]
 
 
 def _verdict(text: str, role: gate.GuardRole = "reply") -> redlines.Verdict:
@@ -97,6 +102,35 @@ def test_corpus_blocks(case):
 @pytest.mark.parametrize("case", ALL_PASS, ids=lambda c: c.text[:40])
 def test_corpus_passes(case):
     _expect(case, case.text)
+
+
+def test_redteam3_stall_role():
+    """The third red team's stalls with a promise, a time or a status in them
+    are refused in the stall role too, and its safe deferrals pass there."""
+    latin_only = {c.text for c in corpus.REDTEAM3_BLOCK if c.latin_only}
+    for text in corpus.REDTEAM3_STALL:
+        assert not _verdict(text, "stall").passed, text
+        cyrillic = None if text in latin_only else _cyrillic(text)
+        if cyrillic is not None:
+            assert not _verdict(cyrillic, "stall").passed, cyrillic
+    for text in corpus.REDTEAM3_STALL_PASS:
+        assert _verdict(text, "stall").passed, (text, _verdict(text, "stall"))
+    blocked = {c.text for c in corpus.REDTEAM3_BLOCK}
+    assert set(corpus.REDTEAM3_STALL) <= blocked | {
+        c.text for c in [*corpus.OUTBOUND_BLOCK, *corpus.HOLDOUT_BLOCK]
+    }
+
+
+def test_redteam3_long_text_is_fast():
+    """The longest text the guard may meet reads well under a second."""
+    import time
+
+    text = "Aka, yuk qayerdan qayerga, necha kilo? Yukingiz yo'ldaku, xavotir qimang. "
+    text = (text * 60)[:4096]
+    for role in ("reply", "owner", "kb"):
+        start = time.perf_counter()
+        _verdict(text, role)
+        assert time.perf_counter() - start < 1.0, role
 
 
 def test_owner_stall_passes():
@@ -316,6 +350,8 @@ def test_every_lexicon_entry_blocks():
         redlines.DISCOUNT,
         redlines.PAYMENT_TERMS,
         redlines.PAYMENT_CLAIM,
+        redlines.SAME_AS,
+        redlines.PER_UNIT,
         redlines.SELF_DISCLOSURE,
         *(lexicon for _flag, lexicon in redlines.TOPICS),
     ]

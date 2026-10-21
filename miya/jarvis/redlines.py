@@ -25,7 +25,14 @@ same Latin) and Russian, written as people write them and normalised at
 import like ``text.STOPWORDS``. A generic commitment backstop catches every
 first-person future verb («olib boraman», «hal qilamiz»); the stall-verb
 allowlist («aniqlashtirib», «bilib», «yozaman», «xabar beraman»…) is taken
-out of it, and those verbs pass only without a TIME hit. A disguised word
+out of it, and those verbs pass only without a TIME hit. Verb forms that
+report a status the AI cannot know are refused by their endings, not one by
+one: the Uzbek past, evidential, perfect, hearsay and progressive («yetdi»,
+«kepti», «ortilgan», «kelgandir», «kelopti»), the cargo somewhere («yuk
+Xorgosda»), the Russian past, third person and its reflexive («зашли»,
+«привезут», «всё решится»); a question word shields only what follows it.
+Glued particles («yo'ldaku») come off first, and an «o'» may be typed «u»
+(«yuq», «тулов»). A disguised word
 is read back too: split into pieces («er ta ga», «yetkaz amiz», a line
 break inside a word), hyphenated letter by letter, or stretched
 («ertaaga»). Figures in any shape are refused: digits of
@@ -61,7 +68,7 @@ from miya.services.text import (
 
 # Bumped whenever a lexicon or a rule changes, so a stored verdict says which
 # checker made it (outbox_messages.guard.checker_version).
-CHECKER_VERSION: Final = "redlines-2"
+CHECKER_VERSION: Final = "redlines-3"
 
 # The longest AI reply (§5.2).
 MAX_CHARS: Final = 400
@@ -177,12 +184,52 @@ def _ye(part: str) -> str:
     return "(?:ye|e)".join(re.escape(piece) for piece in part.split("ye"))
 
 
+# Where an entry has «o'» (Cyrillic «ў»), a writer on a Russian keyboard or
+# in a hurry types «u» («yuq», «junatdim», «тулов», «хуп»): the entry matches
+# both. The mark stands in for that «o» while the entry is normalised.
+_O_MARK: Final = "\x00"
+_LOOSE: Final = re.compile(r"(?<![a-z0-9\x00])-+|-+(?![a-z0-9\x00])")
+
+
+def _marked(word: str) -> str:
+    """``word`` normalised like ``normalise_for_search``, every «o'» marked."""
+    text = to_latin(fold_apostrophes(unicodedata.normalize("NFKC", word)).casefold())
+    text = text.replace("o'", _O_MARK).replace("'", "")
+    text = re.sub(r"[^a-z0-9\x00-]+", " ", text)
+    text = _LOOSE.sub(" ", text)
+    return text.translate(_FOLD)
+
+
+_FOLD: Final = str.maketrans({"q": "k", "w": "v"})
+
+
+def _o_variants(norm: str) -> tuple[str, ...]:
+    """A marked form as plain text: with «o», and with «u» where it was «o'»."""
+    plain = norm.replace(_O_MARK, "o")
+    typed = norm.replace(_O_MARK, "u")
+    return (plain,) if typed == plain else (plain, typed)
+
+
+def _words(raw: str) -> frozenset[str]:
+    """Exact word forms (a lexicon block), normalised, with «o'» also as
+    «u»."""
+    return frozenset(
+        form
+        for word in _entries(raw)
+        for form in _o_variants(_marked(word).strip())
+        if form
+    )
+
+
 def _word_pattern(word: str) -> str:
     """One entry word as a regex. Uzbek writers swap «h» and «x» («xafta»,
-    «hammasi»/«xammasi»), so either letter matches both."""
+    «hammasi»/«xammasi»), so either letter matches both; an «o'» may be
+    typed «u»."""
     prefix = word.endswith("*")
-    norm = normalise_for_search(word.rstrip("*"))
-    piece = r"\s+".join(_ye(part) for part in norm.split())
+    norm = _marked(word.rstrip("*"))
+    piece = r"\s+".join(
+        "[ou]".join(_ye(part) for part in token.split(_O_MARK)) for token in norm.split()
+    )
     piece = re.sub(r"[hx]", "[hx]", piece)
     return piece + (r"[a-z0-9]*" if prefix and piece else "")
 
@@ -227,6 +274,8 @@ class Lexicon:
         return self.union is not None and self.union.search(words) is not None
 
     def hits(self, words: str) -> list[tuple[str, tuple[int, int]]]:
+        if not self.hit(words):
+            return []
         return [
             (entry, match.span())
             for entry, pattern in self.patterns
@@ -252,7 +301,7 @@ TIME = Lexicon.of(
     dekabr*, vaqtida, vaqtgacha, vaqtda, darhol, zudlik*, shoshilinch*, kechik*,
     kechikmay*, сегодня*, завтра*, послезавтра, вчера, утром, утра, утро, вечером,
     вечера, вечер, вечеру, ночью, днём, днем, дня, дней, день, дню, час, часа, часов,
-    часам, часу, часик*, полчаса, минут*, секунд*, недел*, месяц*, год, года, году, лет,
+    часам, часу, часик*, полчаса, минут*, секунд*, недел*, месяц*, год, года, году,
     понедельник*, вторник*, среда, среду, среды, четверг*, пятниц*, суббот*, воскресен*,
     январ*, феврал*, март*, апрел*, мая, май, июн*, июл*, август*, сентябр*, октябр*,
     ноябр*, декабр*, обед*, вовремя, сразу, немедленно, срочно, в течение, через,
@@ -265,14 +314,29 @@ TIME = Lexicon.of(
     ertga*, zavtro, оперативно, моментально, мгновенно, щас, выходн*, праздник*,
     полдень, полудня, утру, вечерком, утречком, денёк, денек, деньк*, летом, зимой,
     весной, осенью, ждать не придется, ждать не придётся, не придется ждать,
-    не придётся ждать
+    не придётся ждать,
+    navro'z*, navruz*, навруз*, hayit*, ramazon*, рамазан*, qurbon*, курбан*,
+    shomdan, shomgacha, shom payti, xufton*, asrdan, asrgacha, bomdod*, pishin*,
+    iftor*, saharlik*, namoz*, намаз*, choshgoh*, ishdan keyin, ishdan so'ng,
+    ishdan chiqib, sal o'tib, sal keyin, salgina, hadem*, vaqt ichida, fursat*,
+    qorong'i*, tuni, kelasi hafta*, kelasi hapta*, kelasi oy*, kelasi yil*,
+    keyingi hafta, ertege, ertalap*, kechqurin*, saat*,
+    daqqa*, sekunt*, hapta*, oyni, oxirida, oxiriga, oxirlari*, oy boshi*,
+    hafta boshi*, oktabr*, sentabr*, noabr*, shamba*, yakshamba*, dushamba*,
+    seshamba*, chorshamba*, payshamba*, peyshanba*, panshanba*, charshanba*,
+    charshamba*, juma*, zaftr*, zavtr*, sevodnya, sivodnya, sodnya, syodnya, sednya,
+    сёдня, седня, ща, счас, тотчас, немедля, по-быстрому, пораньше, попозже, вот-вот,
+    послезавтр*, за ночь, полнедел*, полмесяц*, полгода, полсуток, ненадолго, ужин*,
+    вечерк*, вечерочк*, после, числ*, bystr*, bistr*, tezlashtir*, chaqqon*, nafasda,
+    ko'z ochib*, to'ydan, to'yda, to'ygacha, to'yidan, ovqatdan, bir zum*,
+    до закрытия, займёт, займет, вскорости
     """,
     english="""
     today, tomorrow, tonight, yesterday, morning, evening, noon, week*, month*, hour*,
     minute*, day, days, asap, soon, deadline*, monday, tuesday, wednesday, thursday,
     friday, saturday, sunday, on time, right away, immediately, afternoon, eod,
     shortly, quickly, overnight, tonite, tmrw, tmr, in no time, take long, not long,
-    wait long
+    wait long, before you know it, close of business, cob, take ages, ages, wont take
     """,
 )
 
@@ -297,10 +361,10 @@ GUARANTEE = Lexicon.of(
     tashvish qilmang, tashvishlanmang, ishonavering, ishonchingiz komil,
     ishonchim komil, ishonch bilan, ishonchli, ishoning, ishonaman, tinch bo'ling,
     xotirjam*, tashvish yo'q, yuz foiz, yuz protsent, ta'minla*, ta'minlan*, bexatar,
-    sug'urta*, точно, обязательно, наверняка, безусловно, без проблем, нет проблем,
+    точно, обязательно, наверняка, безусловно, без проблем, нет проблем,
     не переживайте, не волнуйтесь, не беспокойтесь, уверяю, ручаюсь, железно,
     стопроцентно, сто процентов, можете не сомневаться, не сомневайтесь, без вопросов,
-    можете быть уверены, уверен*, не подвед*, страхов*, застрахов*, albatda, albatt*,
+    можете быть уверены, уверен*, не подвед*, albatda, albatt*,
     hammasi joyida, hammasi nazoratda, nazoratda, qasam*, vallohi, valloh, xudo haqi,
     даю слово, слово даю, честное слово, клянусь, гарантир*, bemalol, gap yo'q,
     hech gap emas, muammo emas, problem yo'q, problema yo'q, masala yo'q, qiyin emas,
@@ -309,12 +373,36 @@ GUARANTEE = Lexicon.of(
     qo'rqmang, bezovta bo'lmang, hayajonlanmang, asabiylashmang, однозначно,
     непременно, будьте спокойны, под контролем, в порядке, всё нормально,
     все нормально, не бойтесь, положиться, надёжно, надежно, зуб даю, не вопрос,
-    разумеется, естественно, само собой, без сомнени*
+    разумеется, естественно, само собой, без сомнени*,
+    ko'nglingiz*, xavotir*, bexavotir*, tashvish*, qayg'ur*, siqilma*, cho'chima*,
+    bosh qotirma*, xatirjam*, xotirjem*, xatirjem*, bexavf*, xavfsiz*, omonat*,
+    omon-omon, nazorat*, ishonib*, ishona*, ishonchiz*, ishonchingiz komil,
+    suyanaver*, suyaning, hechqisi*, hech qisi*, gapyo'q, gap yo'q*, muammo* yo'q,
+    muammo* yo'k, problem* yo'q, shubha* yo'q, hojat yo'q, o'rin yo'q, sabab yo'q,
+    qiyin joyi*, o'z joyida, joyida, joy-joyida, a'lo darajada, hammasi zo'r,
+    hammasi yaxshi, hammasi bor, nazorat ostida, so'zim so'z,
+    erkak so'zi*, gapim gap, aniq gap, gumon qilma*, albat*, albet*, tochna, tochno,
+    abizatel*, abyazatel*, obezatel*, obizatel*, obyazatel*, bazaru net,
+    bez bazara, без базара, базару нет, без б, stopudov*, стопудов*, puchkom, пучком,
+    chiki-puki, чики-пуки, tip-top, тип-топ, ne parsya, не парься, не парьтесь,
+    ne kipishuy, не кипишуй, ne volnuysya, не волнуйся, волнова*, ne bespokoysya,
+    не беспокойся, chestno, честно, схвачено, на мази, чётко, четко, в ажуре, железоб*,
+    как часы, будь спок, спокойн*, пережива*, в безопасност*, надёжн*, надежн*,
+    проблем нет, никаких проблем, не проблема, вопросов нет, не страшно,
+    без задерж*, расслаб*, tinchlan*, tinch bo'lsin, g'am yema*, tashvish tort*,
+    yaxshi xabar*, xushxabar*, quvonarli*, ijobiy*, yoqadigan, хорош* новост*,
+    обрад*, порад*, доволь*, пожалеете, останетесь, yo'qolgan*, yo'qolmagan*,
+    yo'qolishi*, yo'qoladi, yo'qolmaydi, yo'qoldi, norozi*, afsuslan*,
+    hech qachon, hamisha*, mamnun, butun, butun-butun, odatiy*, zarar*, qopla*,
+    javobgar*, mas'uliyat*, zimma*, bizni bilasiz*, oson, mumkin emas, mutlaq*,
+    ko'z qorachig'*, подвод*, опаздыва*, жаловал*, не обидим, по-честному,
+    не задерж*, sinmagan, singan, buzilmagan, kafil*
     """,
     english="""
     guarante*, sure, surely, definitely, certainly, of course, no problem*,
     no worries, dont worry, trust me, insured, absolutely, no doubt, rest assured,
-    count on, covered, its fine
+    count on, covered, its fine, safe, nothing to worry, worry, been late,
+    clockwork
     """,
 )
 
@@ -325,19 +413,19 @@ PROMISE = Lexicon.of(
     "promise",
     """
     va'da*, so'z beraman, so'z beramiz, kelishdik, kelishamiz, kelishildi, kelishaylik,
-    kelishib olamiz, kelishuv*, mayli, xo'p, xop, hop, ha, xa, bo'p, да, ага, угу,
-    постара*, shartnoma*, kontrakt*, контракт*, ok, okey, okay, bo'ldi, bo'pti,
-    bo'p qoladi, bo'lib qoladi, tayyor*, hal qil*, hal bo'l*, yuboraman, yubordim,
+    kelishib olamiz, mayli, xo'p, xop, hop, ha, xa, bo'p, да, ага, угу,
+    постара*, ok, okey, okay, bo'ldi, bo'pti,
+    bo'p qoladi, bo'lib qoladi, hal qil*, hal bo'l*, yuboraman, yubordim,
     yubordik, yuborildi, yo'lda, jo'natdim, jo'natdik, jo'natildi, tashladim, tashladik,
     yetkazdim, yetkazdik, yetkazildi, yuklandi, yuklatdim, yetib keldi, yetib bordi,
     qildim, qildik, qilindi, qo'ydim, qo'ydik, jo'nadi, chiqdi, ketdi, обещ*,
-    договорились, договоримся, договор, по рукам, ладно, хорошо, конечно, окей, ок,
+    договорились, договоримся, по рукам, ладно, хорошо, конечно, окей, ок,
     сделаем, сделаю, сделано, отправлю, отправим, отправлено, отправил, отправили,
     отправлен, отправлена, отправлены, загружен*, вышлю, вышлем, пришлю, пришлём, скину,
     скинем, скинул, привезу, привезём, привезем, доставим, доставлю, доставлен*,
     доставят, отгрузим, отгружу, отгружено, верну, вернём, вернем, переведу, переведём,
     посчитаю, посчитаем, подготовлю, подготовим, оформлю, оформим, решим, решу, будем,
-    буду, готов*, приеду, приедем, прибудет, придет, придёт, дойдет, дойдёт, получите,
+    буду, приеду, приедем, прибудет, придет, придёт, дойдет, дойдёт, получите,
     получит, в пути, в дороге, едет, едут, выехал*, загрузил*, погрузил*, прибыл*,
     прибуд*, inshaalloh, inshalloh, inshaallah, иншаллах, иншааллах, xudo xohlasa,
     alloh xohlasa, kanechno, канечно, bezproblem*, беспроблем*, inshaolloh,
@@ -349,13 +437,30 @@ PROMISE = Lexicon.of(
     пойдёт, пойдет, годится, соглас*, принято, норм, нормально, на подходе,
     подъезжа*, прибыва*, везём, везем, грузим, организуем, устроим, уладим, можем,
     справимся, берёмся, беремся, возьмёмся, возьмемся, займёмся, займемся,
-    растамож*, выпустили, оформили, отгрузили, привезли, доставили, сдали, передали,
-    выдали, передадим, сдадим
+    растаможим, растаможу, растаможили, растаможил, растаможен*, растаможат,
+    выпустили, оформили, отгрузили, привезли, доставили, сдали, передали,
+    выдали, передадим, сдадим,
+    bo'lsin, ma'qul*, rozi, davay, давай, давайте, kanechn*, kaneshn*, konechn*,
+    xarasho, xorosho, harasho, prinyal*, oke, okei, kk, dagavaril*, dogovoril*,
+    верно, правильно, так и есть, именно так, замётано, bo'lar, bo'laveradi,
+    iloji bor, imkoni bor, imkon bor, shekilli, bo'lishi kerak, bo'lishi mumkin,
+    mo'ljal*, reja bo'yicha, po grafiku, по графику, keyingi mashina*, navbatdagi*,
+    keyingi partiya*, keyingi reys*, следующ* машин*, следующ* отправк*,
+    следующ* рейс*, первой же, первой машин*, первой загрузк*, экспресс*, на себя,
+    лично, прослеж*, позабоч*, позабот*, подстрах*, застраху*, страху*,
+    bizga qo'yib*, biz tomondan, qolgani*, bizning ishimiz, kelib olaver*,
+    olib ketaver*, kelib oling, olib ketishingiz, забира*, заберите,
+    можете забрать, к дому, до дома, прямо домой, домой, до двери, uyingizga*,
+    shu jumladan, ham ichida, haqi ichida, narxi ichida, tamojnya ichida,
+    bilan birga, ustiga hech*, от нас, учтен*, учтён*, решён, решено, решена,
+    будут, будете, еду, везу, беру, дадим, дадут, возьму, решаем*, to'g'ri,
+    zakinu, vozmu, ничего не меняется
     """,
     english="""
     promise*, will, shall, gonna, we can, i can, deliver*, sent, shipped,
     on the way, agreed, deal, done, ready, okay, yes, yep, yeah, yup, well, ill, itll,
-    on it, handle*, ship*, arriv*, coming
+    on it, handle*, arriv*, coming, came in, got it, its in, landed, showing,
+    cleared, left the, should be
     """,
 )
 
@@ -370,7 +475,12 @@ PROMISE_THIRD = Lexicon.of(
     beriladi, qaytariladi, qilinadi, olinadi, boradi, olib boradi, будет, omborda,
     omborimizda, bojxonada, chegarada, на складе, на таможне, на границе,
     jo'natilgan, yuborilgan, yetkazilgan, yuklangan, yetib kelgan, yetib borgan,
-    kelgan, ketgan, chiqqan, пришёл, пришел, дошёл, дошел, на месте
+    kelgan, ketgan, chiqqan, пришёл, пришел, дошёл, дошел, на месте,
+    tayyor, tayyorlab*, tayyorlan*, tayyorlay*, tayyorlad*, готов*, уже, allaqachon,
+    allakachon, bizdan, почти, близко
+    """,
+    english="""
+    ship*
     """,
 )
 
@@ -397,11 +507,33 @@ MONEY = Lexicon.of(
     hisoblab beraman, hisoblab beramiz, hammasi ichida, qimat*, полцен*, нисколько,
     полмиллион*, полтысяч*, полмлн, hamyonbop*, bekorga, muft, muftga, muftasiga,
     muftdan, gratis, халяв*, arzimas*, ko'kda, ko'kidan, ko'kiga, ko'kini, kusok,
-    sotka*, сотк*, косар*, лям, ляма, лямов, тыща, тыщу, тыщ, полтос*
+    sotka*, сотк*, косар*, лям, ляма, лямов, тыща, тыщу, тыщ, полтос*,
+    haq, haqi, kira haqi, kirasi, yevro*, euro*, dolar*, zelyon*, зелён*, зелен*,
+    babk*, бабк*, babl*, бабл*, lave, лавэ, лаве, evrik*, еврик*, rubas*, рубас*,
+    по-божески, po-bojeski, по-братски, po-bratski, разорит*, переплач*, доплат*,
+    доплач*, вдвое, втрое, вполцен*, средств*, бюджет*, deshov*, deshev*, nedarag*,
+    nedorag*, darog*, cho'ntag*, arzimagan, prosent*, pratsent*, prasent*, лямчик*,
+    тыщи, тысчонк*, стольник*, чирик*, червон*, четвертак*, соточк*, косых
     """,
     english="""
     price*, cost*, cheap*, expensive, free, cent, cents, fee, fees, tariff*, bucks,
     buck, grand, quid, affordable
+    """,
+)
+
+# RL2 — «the same as last time», «as agreed», «as usual»: a price or terms
+# stated by reference. Read in drafts only (a client may well say it).
+SAME_AS = Lexicon.of(
+    "price",
+    """
+    avvalgi*, o'tgan safar*, oldingi safar*, o'sha-o'sha, o'shancha, o'shanaqa,
+    shuncha, bir xil, o'zgarish yo'q, eski*, odatdagi*, в прошлый раз, прошл* раз,
+    как обычно, как всегда, как раньше, по-прежнему, по-старому, прежн*, те же,
+    та же, тот же, то же, столько же, без изменений, в силе
+    """,
+    english="""
+    same as, same rate, like before, as before, as usual, last time, as we discussed,
+    as discussed, as agreed
     """,
 )
 
@@ -411,7 +543,9 @@ DISCOUNT = Lexicon.of(
     arzonlashtir*, arzonroq, kamaytir*, narxni tushir*, narxini tushir*, aksiya*,
     bonus*, promokod*, промокод*, sovg'a*, подар*, уступ*, торг*, поторг*, подешевле,
     дешевле, акци*, бонус*, maxsus taklif*, maxsus narx*, imtiyoz*, keshbek*,
-    кешбэк*, кэшбэк*, скидочк*, спеццен*, спецпредлож*, льгот*, распродаж*
+    кешбэк*, кэшбэк*, скидочк*, спеццен*, спецпредлож*, льгот*, распродаж*,
+    skidon*, скидон*, yengillik*, siz uchun maxsus, siz uchun alohida, sizga alohida,
+    sizga maxsus, alohida narx*, doimiy mijoz*, e'tibor boshqa*
     """,
     english="""
     discount*, sale, promo*, special offer, cashback, bargain, markdown, reduced
@@ -421,20 +555,29 @@ DISCOUNT = Lexicon.of(
 PAYMENT_TERMS = Lexicon.of(
     "payment_terms",
     """
-    to'la*, to'lash*, to'lang, nasiya*, qarz*, shartlar*, shartlari*, bo'lib to'la*,
-    oldindan to'lov*, avans*, predoplat*, naqd*, karta*, kartochka*, hisob raqam*,
-    perechisl*, click, payme, uzcard, humo, paynet, предоплат*, рассрочк*, в долг, долг,
+    to'la*, to'lash*, to'lang, nasiya*, qarz*, bo'lib to'la*,
+    oldindan to'lov*, avans*, predoplat*, naqd*, karta*, kartochk*, hisob raqam*,
+    perechisl*, click, payme, uzcard, humo, paynet, предоплат*, рассроч*, в долг, долг,
     долга, долгу, наличн*, наличк*, nalichka*, нал, безнал*, карт, карта, карту, картой,
     карте, карты, перевод*, перечисл*, реквизит*, счет, счёт, oldindan, o'tkazing,
     o'tkazasiz, o'tkazsangiz, hisobimga, hisobimizga, hisobga, hisobingizga,
     hisob-kitob*, hisob kitob*, bo'lib-bo'lib, qismlarga, qism-qism, balans*,
-    hisobimizda, hisobingizda, plastikka, plastik karta*, долгов, долги, долгами,
+    hisobimizda, hisobingizda, plastik*, долгов, долги, долгами,
     платеж*, платёж*, расчет*, расчёт*, рассчита*, сочтёмся, сочтемся, частям*,
-    частями, пополам, по факту
+    частями, пополам, по факту,
+    kesh, keshda, keshem, кэш*, usdt, kripta*, крипт*, terminal orqali, kaspi*,
+    vestern*, western*, zolotaya korona, alipay, vechat, apelsin orqali, peyme*,
+    peymi*, пейми*, пейме*, klik*, клик*, uzkard*, узкард*, kartichk*, карточк*,
+    nasya*, predaplat*, pridoplat*, pridaplat*, zaklad*, заклад*, nalom, налом,
+    nalichn*, keyin bersangiz, keyinroq bersangiz, kelgach bersangiz, bersangiz ham,
+    kelganda, avval tashla*, oldin tashla*, oldin to'la*, avval to'la*, tashlasangiz,
+    avvaldan, bir qismi*, keyin hisob*, hisobda, eski hisob*, расплат*, отдадите,
+    частичн*, вперёд, вперед, реализац*, отсроч*, потом бабки, сначала груз,
+    keyin to'la*
     """,
     english="""
     prepay*, cash, card, invoice*, installment*, payment*, pay, transfer*, upfront,
-    up front, deposit*, settle*, on arrival, on delivery
+    up front, deposit*, settle*, on arrival, on delivery, wechat, pay later
     """,
 )
 
@@ -448,10 +591,14 @@ PAYMENT_CLAIM = Lexicon.of(
     оплачен, пришло, пришла, прошла, прошло, kelibdi, kelipti, kelibti, o'tibdi,
     o'tipti, o'tibti, tushipti, tushibti, tushyapti, tasdiqlandi, tasdiqlangan,
     tasdiqladik, tasdiqladim, ko'rindi, ko'rinyapti, пришли, дошли, дошло, дошла,
-    дошёл, упали, упало, на счету, подтвержден*, подтвердили
+    дошёл, упали, упало, на счету, подтвержден*, подтвердили,
+    hammasi to'g'ri, skrin*, скрин*, to'liq ekan, kam emas, ortig'i bilan, yetarli,
+    kifoya, hisob to'g'ri, hisobingiz toza, hisob yopiq, видно, видим,
+    средства у нас, ko'rinib turibdi, ko'rinib qoldi, kirdi, kiribdi, kepti
     """,
     english="""
-    paid, received, money arrived, funds, credited, came through, money came
+    paid, received, money arrived, funds, credited, came through, money came,
+    it all came, got it all
     """,
 )
 
@@ -483,7 +630,15 @@ GREETINGS = Lexicon.of(
     добрый вечер, доброе утро, доброй ночи, спокойной ночи, хорошего дня,
     хорошего вечера, удачного дня, хорошего вам дня, всего доброго,
     добро пожаловать, bemalol yozing, bemalol yozavering, bemalol so'rang,
-    bemalol murojaat*
+    bemalol murojaat*, xayrli oqshom*, ertalabingiz xayrli*, kechingiz xayrli*,
+    oqshomingiz xayrli*, kuningiz xayrli bo'lsin, xayrli bo'lsin, muborak bo'lsin,
+    yangi yilingiz bilan, yangi yil muborak, yangi yilingiz muborak,
+    bayramingiz muborak, bayramingiz bilan, hayitingiz muborak, ramazon muborak,
+    juma kuningiz muborak, с праздником, с наступающим, с новым годом,
+    хороших выходных, приятных выходных, будем рады помочь, рады помочь,
+    ma'lumot yetarli, ma'lumotlar yetarli, для расчёта, для расчета,
+    yaxshi o'tsin, omad yor bo'lsin, rozi bo'lsin, baraka topsin, baraka bersin,
+    salomat bo'lsin
     """,
 )
 
@@ -513,57 +668,50 @@ _TOPIC_RAW: Final[Mapping[Flag, str]] = {
     "price": """
         narx*, narh*, baho, bahosi, bahosini, baxo*, qiymat*, tarif*, prays*, pul*, цена,
         цены, цену, цене, ценой, ценам, ценах, ценник*, стоимост*, mablag'*, деньги,
-        денег, деньгам, деньгами, деньгах
+        денег, деньгам, деньгами, деньгах, stavk*, ставк*, расценк*, rate*
         """,
     "deadline": """
         muddat*, srok*, срок*
         """,
     "payment_terms": """
-        to'lov*, оплат*
+        to'lov*, оплат*, shartlar*, shartlari*
         """,
     "discount": """
-        chegirma*, skidk*, скидк*, скидочк*
+        chegirma*, chegrima*, skidk*, скидк*, скидочк*
         """,
     "guarantee": """
-        kafolat*, garant*, гарант*
+        kafolat*, kapolat*, garant*, gorant*, гарант*
+        """,
+    "promise": """
+        kelishuv*, shartnoma*, kontrakt*, контракт*, договор*, dogovor*
         """,
 }
-TOPICS: Final[tuple[tuple[Flag, Lexicon], ...]] = tuple(
-    (flag, Lexicon.of(flag, raw)) for flag, raw in _TOPIC_RAW.items()
+# Insurance is a guarantee to defer like the others, and a detail a draft may
+# ask about («Нужна ли страховка груза?»).
+INSURANCE: Final = Lexicon.of("guarantee", "sug'urta*, страхов*, застрахов*")
+TOPICS: Final[tuple[tuple[Flag, Lexicon], ...]] = (
+    *((flag, Lexicon.of(flag, raw)) for flag, raw in _TOPIC_RAW.items()),
+    ("guarantee", INSURANCE),
 )
 
 # The words that make a topic the subject of a deferral.
-_REGARDING_AFTER = frozenset(
-    normalise_for_search(w)
-    for w in ("bo'yicha", "haqida", "masalasida", "borasida", "xususida", "yuzasidan")
+_REGARDING_AFTER = _words(
+    """
+    bo'yicha, haqida, masalasida, borasida, xususida, yuzasidan
+    """
 )
-_REGARDING_BEFORE = frozenset(
-    normalise_for_search(w)
-    for w in ("по", "о", "об", "насчёт", "насчет", "касательно", "про", "относительно")
+_REGARDING_BEFORE = _words(
+    """
+    по, о, об, насчёт, насчет, касательно, про, относительно
+    """
 )
 # What may stand between a topic and its stall verb: «narxini ham hozir
 # aniqlashtirib».
-_FILLERS = frozenset(
-    normalise_for_search(w)
-    for w in (
-        "ham",
-        "hozir",
-        "buni",
-        "uni",
-        "yana",
-        "bir",
-        "o'zim",
-        "o'zimiz",
-        "sizga",
-        "sizlarga",
-        "всё",
-        "все",
-        "сейчас",
-        "это",
-        "сам",
-        "сами",
-        "вам",
-    )
+_FILLERS = _words(
+    """
+    ham, hozir, buni, uni, yana, bir, o'zim, o'zimiz, sizga, sizlarga, всё, все,
+    сейчас, это, сам, сами, вам
+    """
 )
 
 
@@ -572,11 +720,11 @@ def _forms(raw: str) -> tuple[tuple[str, bool], ...]:
     out = []
     for entry in _entries(raw):
         prefix = entry.endswith("*")
-        norm = normalise_for_search(entry.rstrip("*"))
-        if norm:
-            out.append((norm, prefix))
-            if "ye" in norm:
-                out.append((norm.replace("ye", "e"), prefix))
+        for norm in _o_variants(_marked(entry.rstrip("*")).strip()):
+            if norm:
+                out.append((norm, prefix))
+                if "ye" in norm:
+                    out.append((norm.replace("ye", "e"), prefix))
     return tuple(out)
 
 
@@ -603,15 +751,23 @@ STALL_VERBS = _forms(
 # «xabar beraman», «javob beraman», «aniqlab beraman».
 STALL_LEADS = _forms(
     """
-    xabar, javob, aniqlab, aniqlashtirib, bilib, tekshirib, so'rab, qarab, ko'rib,
-    o'rganib, surishtirib
+    xabar, javob, javobi*, aniqlab, aniqlashtirib, bilib, tekshirib, so'rab, qarab,
+    ko'rib, o'rganib, surishtirib
+    """
+)
+# «yozib qo'yaman», «aytib qo'yaman» defer only once the finding out is said
+# («Aniqlab, yozib qo'yaman»): alone («Narxini aytib qo'yaman») they promise
+# to tell.
+WEAK_LEADS = _forms(
+    """
+    yozib, aytib
     """
 )
 # Auxiliaries: the verb they follow decides what they commit to.
 AUXILIARIES = _forms(
     """
     beraman, beramiz, qo'yaman, qo'yamiz, olaman, olamiz, ko'raman, ko'ramiz, chiqaman,
-    chiqamiz, turaman, qolaman, qilaman
+    chiqamiz, qolaman, qilaman, beray, ko'ray, qo'yay, chiqay, beraylik, ko'raylik
     """
 )
 # Verbs that commit to nothing: knowing, understanding, thinking, waiting,
@@ -622,17 +778,19 @@ NEUTRAL_VERBS = _forms(
     tilayman, tilaymiz,
     tabriklayman, tabriklaymiz, iltimos qilaman, rahmat aytaman, qulay, noqulay,
     shug'ullan*, arzimaydi, eshitaman, qalay, kechirasiz*, понимаю, понимаем, знаю,
-    думаю, жду, ждем, ждём, благодарю, благодарим, извиняюсь, прошу, рад, рады, давай,
+    думаю, жду, ждем, ждём, благодарю, благодарим, извиняюсь, прошу, рад, рады,
     совсем, всем, затем, зачем, причем, причём, xursandman, xursandmiz, mamnunman,
     mamnunmiz, minnatdorman, minnatdormiz, shodman, dushman, karman, roman, obman,
-    tushundim, tushundik, думаем, желаем, желаю
+    tushundim, tushundik, думаем, желаем, желаю, qalaysiz, xizmatingizdamiz,
+    tushunmadim, tushunmadik, слушаю, слушаем, работаем, занимаемся, rahmat
     """
 )
 # Words that make a clause a real question («qayerdan», «qaysi», «какой»).
 QUESTION_WORDS = _forms(
     """
     qayer*, qaysi*, nima*, qanday, qanaqa*, kim*, necha*, qancha*, qachon*, nega,
-    откуда, куда, где, какой, какая, какое, какие, какую, сколько, что, кто, чем, когда
+    откуда, куда, где, какой, какая, какое, какие, какую, сколько, что, кто, чем, когда,
+    как, каком, какого, каких, почему, зачем, where, what, which, who, when, how, why
     """
 )
 
@@ -661,6 +819,22 @@ _UZ_COMMIT = re.compile(
     r"|[gkq]an(?:man|miz)$"
     r"|.{3,}[dt]ik$"
     r"|[aeiouy]r(?:man|miz)$"
+    # The Fergana «-opmiz», the colloquial «-voman»/«-vomiz», the Khorezm
+    # future «-jakmiz», and the first person's «if»: «yuborsak» (an offer,
+    # «shall we send it?»), «yuborsam».
+    r"|op(?:miz|mz)$"
+    r"|vo(?:man|miz)$"
+    r"|.{2,}jak(?:man|miz)?$"
+    r"|.{2,}(?:sak|sam)(?:mi|chi)?$"
+)
+# The contracted first-person future «yuboram», «qilam», «olib kelam»; not
+# in Russian, where «по срокам» ends the same way.
+_UZ_CONTRACTED = re.compile(r"^.{2,}(?:[rltnz]|sh)am$")
+_NOT_CONTRACTED = _words(
+    """
+    muhtaram, bayram, dadam, ilham, islam, qadam, xolam, bolam, madam, salam, program,
+    akam, opam, onam, ukam, olam, kelajak
+    """
 )
 # Third person, future or habitual: consonant stem + «adi» («keladi»), vowel
 # stem + «ydi» («ishlaydi»), the negative «-maydi», the plural «-ishadi»;
@@ -671,17 +845,163 @@ _UZ_THIRD = re.compile(
     # «ketyapti», «yuklanyabdi», «kelvotti», «kutilmoqda», «berarsiz», and the
     # passive past («topshirildi», «bajarildi»).
     r"|(?:yap|yab|vot|yotib)(?:ti|di)$|moqda$|[aeiou]rsiz$|.{4,}(?:il|in)di$"
+    # The colloquial progressives «kelyotti», «kelopti», «keyopti»,
+    # «kelayotir», «kelayotgan».
+    r"|(?:yot|op)(?:ti|di|ir)$|yotgan$"
+)
+
+# Status words: what a draft says has already happened, which the AI cannot
+# know («yetdi», «ketti», «kepti», «kelibdi», «ortilgan», «kelgandir»).
+# Uzbek, read outside Russian text: the past in «-di» and its assimilated
+# «-ti» («ketti», «chiqti», «tushti»), the evidential «-ibdi»/«-ipti», the
+# first person's past «-dim».
+_UZ_PAST = re.compile(r"^(?=[a-z-]{4,}$).*(?:di|(?:[io]k|[pt]|sh|ch)ti)(?:m|lar)?$")
+_NOT_PAST = _words(
+    """
+    endi, edi, idi, hindi, kerakdi
+    """
+)
+# The perfect «-gan» as the predicate («yuk ortilgan», «kelgan edi»), not as
+# an attribute («qadoqlangan holda»).
+_UZ_PERFECT = re.compile(r"^(?=[a-z]{4,}$).*(?:gan|kan)$")
+_AFTER_PERFECT = _words(
+    """
+    bo'lishi, edi, ekan, emish, emas, ekanku
+    """
+)
+_NOT_PERFECT = _words(
+    """
+    joylashgan, ixtisoslashgan, topgan, organ
+    """
+)
+# The third person's «let it»: «yuk kelsin», «bo'lsin».
+_UZ_JUSSIVE = re.compile(r"^(?=[a-z]{5,}$).*sin(?:lar)?$")
+# Particles glued to a word: «kelishdikku», «yo'ldaku», «bilasiz-ku»,
+# «tushibdiyu»; the probability «-dir» and the hearsay «-mish»
+# («kelgandir», «kelganmish», «kelarmish»). The word is read without them.
+_GLUED: Final = (
+    re.compile(r"([a-z]{2,}(?:di|ti|dik|gan|kan|da|ta|siz|miz|man|adi|ydi|moqda))-?ku"),
+    re.compile(r"([a-z]{2,}(?:di|ti))yu"),
+    re.compile(r"([a-z]{2,}(?:gan|kan|da|ta|ar|ir|ur|dek))(?:dir|mish)"),
+)
+# «tushgan-tushmaganini» (whether or not it arrived) asks, it states nothing.
+_WHETHER = re.compile(r"(?<![a-z0-9-])[a-z]+[gk]an-[a-z]+ma[gk]an[a-z]*(?![a-z0-9-])")
+# «-dek» (like): «avvalgidek», «kelishilgandek», «aytganimdek» state a price
+# or terms by reference.
+_LIKE = re.compile(r"^(?=[a-z-]{5,}$).*dek$")
+# Time clauses: «kun botmasdan» (before), «majlisdan chiqqach» (after),
+# «yuk kelganda» (when).
+_BEFORE_DOING = re.compile(r"^(?=[a-z]{7,}$).*masdan$")
+_AFTER_DOING = re.compile(r"^(?=[a-z]{5,}$).*(?:gach|kach)$|^(?=[a-z]{6,}$).*[gk]anda$")
+_AFTER_WORDS = _words(
+    """
+    keyin, kein, so'ng, oldin, burun, avval
+    """
+)
+_NOT_AFTER = _words(
+    """
+    shundan, undan, bundan, ulardan, bizdan, sizdan
+    """
+)
+_UNTIL = re.compile(r"(?:gacha|[gk]u(?:n|nim|nimiz|ningiz|ni|nlari)cha)$")
+# The cargo, the truck or the papers as the subject of a place («yuk
+# Toshkentda», «yukingiz bizda»): a status claim.
+_CARGO = re.compile(
+    r"^(?:yuk|mashina|fura|tovar|konteyner|kontayner|haydovchi|posilka|buyurtma"
+    r"|mahsulot|hujjat|deklaratsiya|partiya|zakaz)(?:lar)?"
+    r"(?:i|im|imiz|ingiz|ngiz|miz|si|ri|lari|laringiz)?$"
+)
+_NOT_LOCATIVE = _words(
+    """
+    haqida, xususida, borasida, masalasida, holda, tarzda, juda, orada, ichida,
+    shunda, unda, bunda, aslida, hozirda, vaqtda
+    """
+)
+_RU_CARGO = _words(
+    """
+    груз, грузы, машина, машины, фура, фуры, товар, посылка, контейнер, документы,
+    документ
+    """
+)
+_RU_PLACE = _words(
+    """
+    в, во, на, у
+    """
+)
+# A price per unit stated, not asked: «kilosi elik», «kubi saksan».
+_PER_UNIT = re.compile(
+    r"^(?:kilo|kg|kub|kubometr|tonna|dona|kuti|metr)(?:si|i)(?:ga|dan|ni|da)?$"
+)
+PER_UNIT = Lexicon.of(
+    "price",
+    """
+    kub hisobida, kilo hisobida, za kilo, za kg, za kub, za mesto, za korobku,
+    za shtuku, za tonnu, za meshok, за кило, за кг, за куб, за место, за коробку,
+    за штуку, за тонну, за мешок
+    """,
+    english="""
+    per kg, per kilo, per cbm, a kilo
+    """,
 )
 _SO_FAR = frozenset({"hozirgacha", "shugacha", "hanuzgacha"})
-_RU_COMMIT = re.compile(
-    r"^(?=[a-z]{5,}$)(?:(?!.*iyu$).*(?:lyu|ayu|eyu|nyu|ryu|vyu|ruyu|zuyu)"
-    r"|(?:s|so|po|pri|ot|pere|vy|za|do|pod|raz|na|pro|ob)[a-z]{3,}(?:em|im|yom)"
-    r"|(?:pri|pere|vy|s|za|do|pod|ot|raz|pro)[a-z]{2,}[zdlnrt]u)$"
+# Russian verb prefixes; «вы-» is «vi» in the word view.
+_RU_PREFIX: Final = (
+    r"(?:s|so|po|pri|ot|pere|vy|vi|za|do|pod|raz|ras|na|pro|ob|obe|u|v|vo|voz|vos|is"
+    r"|iz)"
 )
-# The Russian first-person plural («организуем», «довезём», «перешлём») in
-# any script: no Uzbek word ends this way, so it is read in Uzbek text too
-# («Ака, организуем») and in Russian typed in Latin («Aka, zakinem»).
-_RU_WE = re.compile(r"^(?=[a-z]{6,}$)[a-z]{3,}(?:uem|aem|yaem|iem|zem|nem|yom|shlem)$")
+# The Russian first person singular of a perfective verb («отправлю»,
+# «организую», «найду», «помогу», «закажу», «обеспечу»), in any script: in
+# an Uzbek sentence too («Ака, сам отвезу») and typed in Latin («zakinu»).
+_RU_COMMIT = re.compile(
+    r"^(?=[a-z]{5,}$)(?:(?!.*iyu$).*(?:lyu|ayu|eyu|nyu|ryu|vyu|ruyu|zuyu|xuyu|oyu)"
+    rf"|{_RU_PREFIX}[a-z]+(?:[zdlnrtgkj]|zh|[aeiou]ch|sh)u)$"
+)
+# Nouns those endings also fit: «доставку», «дорогу», «программу».
+_RU_NOUN_U = re.compile(r"(?:[vzstpln]k|chk|shk|mm|cht|sch)u$")
+_NOT_RU_COMMIT = _words(
+    """
+    дорогу, погоду, страну, почту, базу, награду, встречу, продажу, задачу, работу,
+    систему, посуду, одежду, воду, сумму
+    """
+)
+# The plural («выдадим», «выгрузим»), read in Russian only: «savolim» is
+# Uzbek for «my question».
+_RU_COMMIT_PL = re.compile(rf"^(?=[a-z]{{5,}}$){_RU_PREFIX}[a-z]{{2,}}(?:em|im|yom)$")
+# The Russian first-person plural («организуем», «довезём», «перешлём»,
+# «поможем», «разберёмся») in any script: no Uzbek word ends this way, so it
+# is read in Uzbek text too («Ака, организуем») and in Russian typed in
+# Latin («Aka, zakinem»).
+_RU_WE = re.compile(
+    r"^(?=[a-z]{6,}$)[a-z]{3,}(?:uem|aem|yaem|iem|zem|nem|yom|shlem|zhem|jem)$"
+    r"|^(?=[a-z]{6,}$)[a-z]{3,}(?:em|im|yom)sya$"
+)
+# Russian, read in Russian text: the past («пересекла», «зашли», «тронулась»),
+# the third person («привезут», «пропустит», «ждёт»), its reflexive («всё
+# решится», «отгружается»), and the short passive («оформлен», «упакован»).
+_RU_PAST = re.compile(r"^(?=[a-z]{4,}$).*(?:[aeiouy]l|l[aoi])(?:sya|s)?$")
+_RU_THIRD = re.compile(r"^(?=[a-z]{5,}$).*(?:yot|et|it|ut|yut|[^i]yat|at)$")
+_RU_THIRD_MIXED = re.compile(r"^(?=[a-z]{6,}$).*(?:yot|et|ut|yut)$")
+_RU_REFLEXIVE = re.compile(r"(?:etsya|itsya|yotsya|utsya|yutsya|yatsya)$")
+_RU_PARTICIPLE = re.compile(
+    rf"^(?=[a-z]{{6,}}$)(?:o|op|{_RU_PREFIX})[a-z]{{2,}}(?:ovan|en|yon|an)[aoi]?$"
+)
+_NOT_RU_VERB = _words(
+    """
+    понял, поняла, поняли, или, если, сколько, столько, только, несколько, около,
+    кило, стекло, число, дело, масло, мало, детали, материал, канал, сигнал, вокзал,
+    персонал, терминал, портал, капитал, журнал, оригинал, мебель, отель, цель,
+    модель, отдел, панель, текстиль, автомобиль, автомобили, профиль, стиль, стол,
+    пол, футбол, контроль, стул, модуль, кресло, привет, ответ, совет, пакет, бюджет,
+    предмет, объект, маршрут, транзит, кредит, лимит, депозит, визит, интернет, билет,
+    цвет, свет, секрет, самолёт, самолет, отчёт, отчет, счёт, счет, учёт, учет, полёт,
+    институт, валют, салют, минут, результат, формат, адресат, автомат, брат, салат,
+    опять, работ, забот, находится, находятся, является, являются, называется,
+    кажется, нравится, требуется, занимается, узбекистан, казахстан, кыргызстан,
+    таджикистан, туркменистан, стакан, ресторан, магнит, кабинет, предмет, расчет,
+    расчёт, квадрат, аппарат, пункт, банкомат, дела, написали, написал, обратились,
+    обратился, связались
+    """
+)
 # A verb ending typed as its own word («yetkaz amiz», «yubor aman»).
 _LONE_ENDING = re.compile(
     r"^(?:(?:a|ya|y|e)?(?:miz|mz)|a(?:man|mn)|yman|adi|aydi|ydi|ishadi|yapti|yapmiz"
@@ -754,6 +1074,19 @@ _NUMBER_WORDS = re.compile(
     r"|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|\w+teen"
     r"|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred\w*"
     r"|thousand\w*|million\w*|half|dozen\w*"
+    # Typed without the apostrophe or the doubled letter, «o'» as «u», «q» as
+    # «k», and the dialect forms: «tort», «elik», «kirk», «tuqson», «uttiz».
+    r"|tort(?:ta\w*|dan|ga|da)?|elik\w*|altmish\w*|saksan\w*|tuq?son\w*|tukson\w*"
+    r"|kirk\w*|yigrma\w*|igirma\w*|uttiz\w*|sakiz\w*|tu[qk]{1,2}iz\w*|iki|ikita\w*"
+    r"|alti|altita\w*|yeti|yetita\w*|unta\w*|bittadan|chorak\w*"
+    # Russian: the ordinals of a date («седьмого»), the forms «двум»,
+    # «тремя», «одна», the slang counts («семёрка», «двушка») and «пол-»
+    # (half) before anything («пол-ляма»).
+    r"|perv(?:ogo|omu|oe|aya|uyu)|vtor(?:ogo|omu|oe|aya|uyu)|tret\w*"
+    r"|chetv[yo]?ert\w*|chetvyort\w*|pyat(?:ogo|omu)|shest(?:ogo|omu)|sedm\w*"
+    r"|vosm\w*|dvum\w*|dvuh|tremya|trem|tryom|odin|odna|odnu|odno|odnogo|odnoy"
+    r"|nul\w*|dyujin\w*|dyuzhin\w*|semyork\w*|chetvyork\w*|dvushk\w*|tryoshk\w*"
+    r"|polsotn\w*|poltish\w*|polti[sh]ch\w*|tishi|tischonk\w*|pol-\w+"
     r")(?![\w'])"
     # «on» is «o'n» (ten) typed without the apostrophe, and Russian «он» (he):
     # a figure only before a count, a unit or a time word.
@@ -982,6 +1315,7 @@ _RED_LINES: Final[tuple[tuple[Lexicon, Flag], ...]] = (
     (DISCOUNT, "discount"),
     (PAYMENT_TERMS, "payment_terms"),
     (PAYMENT_CLAIM, "payment_claim"),
+    (SAME_AS, "price"),
 )
 
 
@@ -989,23 +1323,63 @@ _RED_LINES: Final[tuple[tuple[Lexicon, Flag], ...]] = (
 class _Clause:
     words: str
     question: bool
+    # The segment the question mark asks with: the sentence's last one, or the
+    # last before a trailing «aka» («Qachon tayyor bo'ladi, aka?»).
+    final: bool
+    # A probability «-dir» or hearsay «-mish» was glued to a word: «yuk
+    # kelgandir», «kelarmish» report a status at second hand.
+    hedged: bool = False
+    # The first segment of its sentence.
+    first: bool = True
 
-    @property
-    def tokens(self) -> list[str]:
-        return self.words.split()
+
+# Words of address: a segment of these alone does not end the question.
+_ADDRESS = _words(
+    """
+    aka, opa, uka, akajon, opajon, ukajon, brat, bratan, do'stim, xonim, janob,
+    aka-uka
+    """
+)
+
+
+def _unglue(words: str) -> str:
+    """``words`` with every glued particle off its word, and every «whether
+    or not» («kelgan-kelmaganini») taken out."""
+    words = _WHETHER.sub(" ", words)
+    out = []
+    for token in words.split():
+        for pattern in _GLUED:
+            match = pattern.fullmatch(token)
+            if match is not None:
+                token = match.group(1)
+                break
+        out.append(token)
+    return " ".join(out)
+
+
+def _hedging(words: str) -> bool:
+    return any(_GLUED[2].fullmatch(token) for token in words.split())
 
 
 def _clauses(text: str) -> list[_Clause]:
     """The segments of every sentence, each marked with whether its sentence
-    is a question."""
+    is a question and whether it is the segment the question asks with."""
     out = []
     for match in _CLAUSE.finditer(text):
         raw = match.group(0)
         question = "?" in raw
-        for segment in _SEGMENT.split(raw):
-            words = normalise_for_search(segment)
-            if words:
-                out.append(_Clause(words, question))
+        searched = [normalise_for_search(s) for s in _SEGMENT.split(raw)]
+        segments = [(_unglue(w), _hedging(w)) for w in searched if w]
+        final = max(
+            (
+                k
+                for k, (w, _h) in enumerate(segments)
+                if not all(t in _ADDRESS for t in w.split())
+            ),
+            default=-1,
+        )
+        for k, (words, hedged) in enumerate(segments):
+            out.append(_Clause(words, question, k == final, hedged, k == 0))
     return out
 
 
@@ -1015,8 +1389,19 @@ def _blank(words: str, lexicon: Lexicon) -> str:
     return words
 
 
-def _asks(clause: _Clause) -> bool:
-    return clause.question and any(_token_in(t, QUESTION_WORDS) for t in clause.tokens)
+def _asked_from(clause: _Clause, tokens: Sequence[str]) -> int | None:
+    """The index of the question word a question asks with («Qaysi shahardan
+    jo'natiladi?»): what follows it is asked, not said. None in a statement,
+    and in a segment the question does not end («Когда груз будет у вас, кто
+    его примет?» says the cargo will be there)."""
+    if not (clause.question and clause.final):
+        return None
+    return next((i for i, t in enumerate(tokens) if _token_in(t, QUESTION_WORDS)), None)
+
+
+def _token_at(words: str, start: int) -> int:
+    """The index of the token a lexicon hit at ``start`` begins in."""
+    return len(words[:start].split())
 
 
 def _past_fillers(tokens: list[str], j: int) -> int:
@@ -1044,7 +1429,7 @@ def _deferral(tokens: list[str], i: int) -> bool:
     must follow in the same segment: «narx bo'yicha o'zgarish yo'q, …» and
     «по скидке есть, уточню» state something about the topic first."""
     before = tokens[i - 1] if i > 0 else ""
-    if _token_in(before, STALL_VERBS):
+    if _stall_verb(before):
         return True
     j = _past_fillers(tokens, i + 1)
     if _stall_at(tokens, j):
@@ -1054,15 +1439,36 @@ def _deferral(tokens: list[str], i: int) -> bool:
     return False
 
 
-def _committing(tokens: list[str], i: int, *, russian: bool) -> bool:
+# A stall verb's past or passive is a report, not a deferral: «tekshirdim»
+# (I checked), «aniqlandi» (it was found), «уточнил».
+_DONE = re.compile(
+    r"(?:di|ti)(?:m|k|ngiz|lar)?$|[gk]an$|[aeiouy](?:l|la|lo|li)$|(?:en|yon)[aoi]?$"
+)
+
+
+def _stall_verb(token: str) -> bool:
+    return _token_in(token, STALL_VERBS) and _DONE.search(token) is None
+
+
+def _committing(
+    tokens: list[str], i: int, *, script: Script | None, primed: bool = False
+) -> bool:
     """Is token ``i`` a first-person commitment the backstop refuses? The
-    Russian endings are read only in Russian text: «savolim» is Uzbek for
-    «my question», not a Russian verb."""
+    Russian plural is read only in Russian text and the contracted «-am» only
+    outside it: «savolim» is Uzbek for «my question», «по срокам» Russian
+    for «as to the terms»."""
     token = tokens[i]
+    russian = script == "russian"
     if not (
         _UZ_COMMIT.search(token)
         or _RU_WE.search(token)
-        or (russian and _RU_COMMIT.search(token))
+        or (
+            _RU_COMMIT.search(token)
+            and not _RU_NOUN_U.search(token)
+            and token not in _NOT_RU_COMMIT
+        )
+        or (russian and _RU_COMMIT_PL.search(token))
+        or (not russian and _UZ_CONTRACTED.search(token) and token not in _NOT_CONTRACTED)
     ):
         return False
     if len(token) < 5:
@@ -1070,11 +1476,10 @@ def _committing(tokens: list[str], i: int, *, russian: bool) -> bool:
     pair = " ".join(tokens[max(i - 1, 0) : i + 1])
     if _token_in(token, NEUTRAL_VERBS) or _token_in(pair, NEUTRAL_VERBS):
         return False
-    if _token_in(token, STALL_VERBS):
+    if _stall_verb(token):
         return False
     if _token_in(token, AUXILIARIES):
-        before = tokens[i - 1] if i > 0 else ""
-        return not _token_in(before, STALL_LEADS)
+        return not _led(tokens, i, primed=primed)
     return True
 
 
@@ -1089,25 +1494,178 @@ def _predicting(token: str) -> bool:
     )
 
 
+def _status(tokens: list[str], i: int, *, script: Script | None) -> str | None:
+    """A verb form that says what has already happened or is happening, or
+    what someone else will do: the AI cannot know it. The hit code, or None."""
+    token = tokens[i]
+    if _token_in(token, NEUTRAL_VERBS):
+        return None
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    before = tokens[i - 1] if i > 0 else ""
+    if script == "russian":
+        if token in _NOT_RU_VERB or _stall_verb(token):
+            return None
+        if _RU_PAST.search(token):
+            return "status:ru_past"
+        if _RU_REFLEXIVE.search(token):
+            return "status:ru_reflexive"
+        if _RU_THIRD.search(token):
+            return "status:ru_third"
+        if _RU_PARTICIPLE.search(token) and not token.endswith("stan"):
+            return "status:ru_passive"
+        return None
+    if (
+        script == "cyrillic"
+        and _RU_THIRD_MIXED.search(token)
+        and token not in _NOT_RU_VERB
+    ):
+        return "status:ru_third"
+    # «Savolingizni oldim» (I got your question) reports the message.
+    reported = token.endswith(("dim", "tim")) and _token_in(before, _MESSAGES)
+    if _UZ_PAST.search(token) and token not in _NOT_PAST and not reported:
+        return "status:past"
+    if (
+        _UZ_PERFECT.search(token)
+        and token not in _NOT_PERFECT
+        and (not after or after in _AFTER_PERFECT)
+    ):
+        return "status:perfect"
+    if _UZ_JUSSIVE.search(token):
+        return "status:jussive"
+    return None
+
+
+# What «oldim» (I got) may report getting: the client's message.
+_MESSAGES = _forms(
+    """
+    savol*, xabar*, murojaat*, so'rov*, ma'lumot*, yozgan*, gapingiz*
+    """
+)
+
+
 def _until(token: str) -> bool:
-    """«uyingizgacha», «oxirigacha», «ertagacha», «tugaguncha»: until a time
-    or as far as a place, a deadline or a delivery either way. «hozirgacha»
-    (so far) is neither, nor is the farewell «ko'rishguncha»."""
+    """«uyingizgacha», «oxirigacha», «ertagacha», «tugaguncha»,
+    «bo'lgunimcha»: until a time or as far as a place, a deadline or a
+    delivery either way. «hozirgacha» (so far) is neither, nor is the
+    farewell «ko'rishguncha»."""
     if len(token) <= 6 or token in _SO_FAR:
         return False
-    if token.endswith("gacha"):
-        return True
-    return token.endswith(("guncha", "kuncha")) and not token.startswith(
+    return _UNTIL.search(token) is not None and not token.startswith(
         ("korishgun", "korishga")
     )
 
 
-def _stalling(tokens: list[str], i: int) -> bool:
+def _time_clause(tokens: list[str], i: int) -> bool:
+    """«kun botmasdan» (before), «majlisdan chiqqach» (after), «yuk kelganda»
+    (when), «ishdan keyin», «hayitdan so'ng» (after a time or an event)."""
     token = tokens[i]
-    if _token_in(token, STALL_VERBS):
+    if _BEFORE_DOING.search(token) or _AFTER_DOING.search(token):
         return True
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    return (
+        len(token) >= 5
+        and token.endswith(("dan", "tan", "nan"))
+        and after in _AFTER_WORDS
+        and token not in _NOT_AFTER
+    )
+
+
+def _led(tokens: list[str], i: int, *, primed: bool = False) -> bool:
+    """Does the auxiliary at ``i`` follow a stall lead («xabar beraman»,
+    «aniqlab beraman»)? Not «javob beramiz» for the cargo («yuk uchun biz
+    javob beramiz»: we answer for it), nor «qarab beramiz» for someone
+    («siz uchun alohida qarab beramiz»). A weak lead («yozib qo'yaman»)
+    counts once a stall verb came before it in the sentence (``primed``)."""
     before = tokens[i - 1] if i > 0 else ""
-    return _token_in(token, AUXILIARIES) and _token_in(before, STALL_LEADS)
+    if primed and _token_in(before, WEAK_LEADS):
+        return True
+    if not _token_in(before, STALL_LEADS):
+        return False
+    return not _vouching(tokens, i - 1)
+
+
+_FOR = _words(
+    """
+    uchun, biz, men
+    """
+)
+_LOOKING = _words(
+    """
+    qarab, qarayman, qaraymiz, ko'rib, javob, javobini
+    """
+)
+
+
+def _vouching(tokens: list[str], j: int) -> bool:
+    """«yuk uchun javob beramiz», «biz javob beramiz», «yukingizga qaraymiz»:
+    answering for or looking after, a promise."""
+    if tokens[j] not in _LOOKING:
+        return False
+    earlier = tokens[:j]
+    if any(t in _FOR for t in earlier[-2:]) or "uchun" in earlier:
+        return True
+    return any(_CARGO.match(t[:-2]) for t in earlier if t.endswith(("ga", "ka")))
+
+
+def _stalling(tokens: list[str], i: int, *, primed: bool = False) -> bool:
+    token = tokens[i]
+    if _stall_verb(token):
+        return not _vouching(tokens, i)
+    return _token_in(token, AUXILIARIES) and _led(tokens, i, primed=primed)
+
+
+def _located(tokens: list[str], i: int, *, script: Script | None) -> bool:
+    """The cargo, the truck or the papers somewhere: «yuk Toshkentda»,
+    «yukingiz bizda», «груз уже в Ташкенте». A status the AI cannot know."""
+    token = tokens[i]
+    earlier = tokens[:i]
+    if script == "russian":
+        return token in _RU_PLACE and any(t in _RU_CARGO for t in earlier)
+    return (
+        len(token) >= 4
+        and token.endswith("da")
+        and token not in _NOT_LOCATIVE
+        and any(_CARGO.match(t) for t in earlier)
+    )
+
+
+# Said, not asked, «можно» (one may) and «есть» (there is) agree to
+# whatever was asked: «Можно налом», «Есть, спасибо».
+_UNLESS_ASKED = _words(
+    """
+    можно, mumkin, есть
+    """
+)
+_INFINITIVE = re.compile(r"[а-яё]+(?:ть|ться|ти|тись|чь)(?![а-яё])")
+
+
+def _agreeing(tokens: list[str], i: int) -> bool:
+    """«Можно налом», «Euroda ham mumkin»: an offer. Not «если есть вопросы»
+    (if there are questions) nor «yozishingiz mumkin» (you may write)."""
+    if tokens[i] not in _UNLESS_ASKED:
+        return False
+    before = tokens[i - 1] if i > 0 else ""
+    return before != "esli" and not before.endswith("ingiz")
+
+
+def _infinitives(text: str) -> frozenset[str]:
+    """The Russian infinitives in ``text`` as the word view spells them: the
+    soft sign that tells «растаможить» from «растаможит» is gone there."""
+    return frozenset(
+        normalise_for_search(word) for word in _INFINITIVE.findall(text.casefold())
+    )
+
+
+def _bare(tokens: list[str], i: int) -> str | None:
+    """«aniq» (sure) and «qabul» (accepted) said alone: a guarantee and an
+    agreement. «aniq bilib» (once I know) and «qabul qiladi» are not."""
+    token = tokens[i]
+    after = tokens[i + 1] if i + 1 < len(tokens) else ""
+    if token == "anik" and (not after or after in _ADDRESS or after == "gap"):
+        return "guarantee"
+    if token == "kabul" and not after.startswith("kil"):
+        return "promise"
+    return None
 
 
 # The lexicons a disguised word is read against: a word split into short
@@ -1118,6 +1676,10 @@ _DISGUISABLE: Final[tuple[tuple[Lexicon, Flag], ...]] = (
     (DEADLINE, "deadline"),
     *_RED_LINES,
     *((lexicon, flag) for flag, lexicon in TOPICS),
+)
+# Every one of them in one pattern: does a joined form hit any at all?
+_ANY_DISGUISABLE: Final = re.compile(
+    "|".join(f"(?:{lex.union.pattern})" for lex, _f in _DISGUISABLE if lex.union)
 )
 _SHORT_PIECE: Final = 3
 # The most pieces one word is read back from («e r t a g a» is six).
@@ -1177,7 +1739,11 @@ def _join_hits(words: str, hits: _Hits, *, kb: bool) -> None:
             pieces = tokens[start : start + size]
             joined = "".join(pieces)
             first = len(pieces[0])
-            for lexicon, flag in _DISGUISABLE:
+            if _ANY_DISGUISABLE.search(joined) is None:
+                lexicons: tuple[tuple[Lexicon, Flag], ...] = ()
+            else:
+                lexicons = _DISGUISABLE
+            for lexicon, flag in lexicons:
                 if (kb and lexicon is TIME) or not lexicon.hit(joined):
                     continue
                 if any(lexicon.hit(piece) for piece in pieces):
@@ -1201,50 +1767,94 @@ def _polite(words: str) -> str:
 
 def _word_hits(clean_masked: str, hits: _Hits, *, role: GuardRole) -> None:
     kb = role == "kb"
-    russian = script_of(clean_masked) == "russian"
+    script = script_of(clean_masked)
+    russian = script == "russian"
     stall_verb = False
     time_hit = False
     soon = False
     topics: list[tuple[Flag, str]] = []
     if role != "owner":
         _join_hits(_polite(normalise_for_search(clean_masked)), hits, kb=kb)
+    infinitives = _infinitives(clean_masked) if russian else frozenset()
+    primed = False
     for clause in _clauses(clean_masked):
         words = _polite(clause.words)
+        primed = primed and not clause.first
+        if not kb and clause.hedged:
+            hits.add("promise", "promise:status:hedged")
         if role == "stall" and OWNER_SOON.hit(words):
             soon = True
             words = _blank(words, OWNER_SOON)
+        tokens = words.split()
+        asked = _asked_from(clause, tokens)
+
+        def said(start: int, words: str = words, asked: int | None = asked) -> bool:
+            """Is the hit at ``start`` said, not asked after a question word?"""
+            return asked is None or _token_at(words, start) <= asked
+
         if not kb:
-            for entry, _span in TIME.hits(words):
-                hits.add("deadline", f"time:{entry}")
-                time_hit = True
+            for entry, (start, _end) in TIME.hits(words):
+                if said(start):
+                    hits.add("deadline", f"time:{entry}")
+                    time_hit = True
         for entry, _span in DEADLINE.hits(words):
             hits.add("deadline", f"deadline:{entry}")
             time_hit = True
         for lexicon, flag in _RED_LINES:
             for entry, _span in lexicon.hits(words):
                 hits.add(flag, f"{lexicon.name}:{entry}")
-        if not _asks(clause):
-            for entry, _span in PROMISE_THIRD.hits(words):
+        for entry, (start, _end) in PROMISE_THIRD.hits(words):
+            if said(start):
                 hits.add("promise", f"promise:{entry}")
+        if not clause.question:
+            for entry, _span in PER_UNIT.hits(words):
+                hits.add("price", f"price:{entry}")
         if role != "owner":
             for entry, _span in SELF_DISCLOSURE.hits(words):
                 hits.add(None, f"self_disclosure:{entry}")
             _disguise_hits(words, hits, kb=kb)
-        tokens = words.split()
-        asks = _asks(clause)
         for i, token in enumerate(tokens):
+            told = asked is None or i <= asked
+            topical = any(lexicon.hit(token) for _flag, lexicon in TOPICS)
             if not kb and _LONE_ENDING.search(token):
                 hits.add("promise", "promise:commitment")
-            if _stalling(tokens, i):
+            if _stalling(tokens, i, primed=primed):
                 stall_verb = True
-            elif not kb and _committing(tokens, i, russian=russian):
+                primed = primed or not _token_in(token, WEAK_LEADS)
+            elif not kb and _stall_verb(token):
+                # «yukingizga qaraymiz», «yuk uchun javob beramiz»
                 hits.add("promise", "promise:commitment")
-            elif not (kb or russian or asks) and _predicting(token):
+            elif (
+                not kb
+                and not topical
+                and _committing(tokens, i, script=script, primed=primed)
+            ):
+                hits.add("promise", "promise:commitment")
+            elif not (kb or russian or topical) and told and _predicting(token):
                 hits.add("promise", "promise:prediction")
-            if not kb and _until(token):
+            if not clause.question and _agreeing(tokens, i):
+                hits.add("promise", f"promise:{token}")
+            if not kb and not topical and told and token not in infinitives:
+                status = _status(tokens, i, script=script)
+                if status is not None:
+                    hits.add("promise", f"promise:{status}")
+            if not kb and _LIKE.search(token):
+                hits.add("price", "price:like")
+            if not kb and not clause.question and _PER_UNIT.match(token):
+                hits.add("price", "price:per_unit")
+            if not (kb or clause.question) and _located(tokens, i, script=script):
+                hits.add("promise", "promise:located")
+            bare = _bare(tokens, i)
+            if bare == "guarantee":
+                hits.add("guarantee", "guarantee:aniq")
+            elif bare == "promise":
+                hits.add("promise", "promise:qabul")
+            if not kb and told and (_until(token) or _time_clause(tokens, i)):
                 hits.add("deadline", "deadline:gacha")
                 time_hit = True
             for flag, lexicon in TOPICS:
+                if lexicon is INSURANCE and clause.question:
+                    continue
                 for entry, _span in lexicon.hits(token):
                     if not _deferral(tokens, i):
                         hits.add(flag, f"topic:{entry}")
@@ -1286,7 +1896,8 @@ _RU_ONLY = frozenset("ыщЫЩ")
 # «келади».
 _UZ_ENDING = re.compile(
     r"(?:миз|сиз|ингиз|нинг|иб|ган|япти|ябди|моқчи|моқда|дими|дингиз|лар\w+"
-    r"|ади|йди|майди|ишади)$"
+    r"|ади|йди|майди|ишади|пти|бди|тти|кти|шти|[бвгзйклмнпрстфхчш]дим?"
+    r"|вом(?:из|ан|миз|ман)|[бвгджзклмнпрстфхчш]ми|[бдмнптфхч]ли)$"
 )
 _UZ_CYRILLIC_WORDS = frozenset(
     {
