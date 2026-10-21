@@ -98,6 +98,29 @@ SCAM: list[dict] = [
     case("Это ты на фото? https://telegra.ph/foto-10-20", "scam", "photo_lure"),
     # A known contact gets no pass for a hard rule.
     case("Akmal aka, kelgan sms kodni ayting", "scam", "code_request", **KNOWN),
+    # «My code» claimed, but sent to the reader by mistake; a question about a
+    # code that came to the reader; a one-time password.
+    case("Kodim adashib sizga keldi, aytib yuboring iltimos", "scam", "code_request"),
+    case("Скажите, какой код пришёл вам в смс?", "scam", "code_request"),
+    case("Введите одноразовый пароль из смс", "scam", "code_request"),
+    # The card's expiry and its back digits, by any name.
+    case(
+        "Пришлите номер карты, срок действия и три цифры на обороте",
+        "scam",
+        "card_data_request",
+    ),
+    case("Orqasidagi 3 raqamni yozib yuboring, pul tushadi", "scam", "card_data_request"),
+    # «Is this you?» as the whole message, with a link or a document.
+    case(
+        "Привет, это ты на этом фото?? https://bit.ly/x1",
+        "scam",
+        "photo_lure",
+        **KNOWN,
+    ),
+    case("Bu sizmi?", "scam", "photo_lure", attachment="video_2026.pdf"),
+    # An everyday-word brand alone or beside a lure word is the brand.
+    case("Kartangizga bonus: https://humo-bonus.uz/karta", "scam", "brand_domain"),
+    case("Sovg'a sizni kutmoqda: https://humo.top/bonus", "scam", "brand_domain"),
 ]
 
 
@@ -129,6 +152,24 @@ SPAM: list[dict] = [
         "Yutib oldingiz! Sovrin olish uchun: https://tinyurl.com/prize",
         "spam",
     ),
+    # A channel to join, a site built, a portfolio: an advert's shape.
+    case(
+        "Kripto signal kanalimizga qo'shiling, kunlik foyda 30% gacha "
+        "https://t.me/kripto_signal_test",
+        "spam",
+        forwarded=True,
+    ),
+    case(
+        "Бизнесингиз учун сайт ва Телеграм бот ясаб берамиз. "
+        "Портфолио: https://webstudio-test.online",
+        "spam",
+    ),
+    # «Do'stlaringizga ham yuboring» and «faqat shu hafta», in Cyrillic.
+    case(
+        "🎁 Чегирма! Фақат шу ҳафта юк ташиш 3$/кг. Дўстларингизга ҳам юборинг!",
+        "spam",
+        forwarded=True,
+    ),
 ]
 
 
@@ -138,6 +179,8 @@ HIJACK: list[dict] = [
     case("Aka, pul kerak edi, qarz berib turing ertaga qaytaraman", "hijack", **KNOWN),
     case("Mana ko'ring: https://bit.ly/3abcde", "hijack", **KNOWN),
     case("", "hijack", attachment="hisob_faktura.html", **KNOWN),
+    # Money to my card and a promise to repay, with no trade around it.
+    case("Привет, можешь скинуть 2000 на карту? Завтра верну", "hijack", **KNOWN),
 ]
 
 
@@ -197,4 +240,110 @@ BENIGN: list[dict] = [
     # A text link that opens a real site of the same family.
     case("Video", "ok", text_links=[("youtube.com", "https://youtu.be/abc")]),
     case("Xizmat", "ok", text_links=[("gov.uz", "https://my.gov.uz/uz/service/1")]),
+    # A named code (a client's GS code, a tariff code, a Wi-Fi password), the
+    # writer's own code, a code said to the warehouse keeper at pickup, and a
+    # question about how the code comes are no one-time code asked for.
+    case("GS412 kodi kelganmi? Kelgan bo'lsa Samarqandga yuboring", "ok", **KNOWN),
+    case(
+        "SMS keldi yukim omborga keldi deb, lekin kodim esimda yo'q. "
+        "Kodni yozib yuboring iltimos",
+        "ok",
+        prior_messages=6,
+        owner_wrote_before=True,
+    ),
+    case(
+        "Груз прибыл на склад. Код получения отправлен вам в СМС — при выдаче "
+        "назовите его кладовщику.",
+        "ok",
+        **KNOWN,
+    ),
+    case("Скажите, а код для получения груза придёт в смс?", "ok", **KNOWN),
+    case("Omborning wifi parolini yozib yuboring, internet yo'q", "ok", **KNOWN),
+    case("Пришлите фото: поддоны одноразовые или евро?", "ok", **KNOWN),
+    # A document's term and back, an ID card, the writer's own card.
+    case(
+        "Shartnoma amal qilish muddati 1 yil, to'lov kartaga yoki bank o'tkazmasi "
+        "orqali. Imzolab yuboring",
+        "ok",
+        attachment="Shartnoma_2026.docx",
+        **KNOWN,
+    ),
+    case(
+        "ID kartaning orqa tomonini ham rasmga olib yuboring, broker so'rayapti",
+        "ok",
+        **KNOWN,
+    ),
+    case(
+        "Kartamning amal qilish muddati o'tib ketibdi. Boshqa karta raqamingizni "
+        "tashlang",
+        "ok",
+        **KNOWN,
+    ),
+    # «Bu sizmi?» under a warehouse photo from a known client, and «you in the
+    # photo from the fair?» with a link, are about the cargo.
+    case(
+        "Bu sizmi? Ombordagi yigitlar yukni shu odamga berib yuborishgan",
+        "ok",
+        attachment="IMG_20261020_143512.jpg",
+        **KNOWN,
+    ),
+    case(
+        "Это вы на фото с выставки? https://www.cantonfair.org.cn/en-US/news",
+        "ok",
+        **KNOWN,
+    ),
+    # A company named with an everyday-word brand.
+    case(
+        "Мы — транспортная компания Humo, наш сайт: https://humo-logistika-test.uz",
+        "ok",
+    ),
+    # Google Maps share links, the marketplaces clients buy from.
+    case(
+        "Manzil shu",
+        "ok",
+        buttons=["https://maps.app.goo.gl/AbCdEfGh12345"],
+        forwarded=True,
+    ),
+    case("Lokatsiya: https://maps.app.goo.gl/AbCdEfGh12345", "ok", **KNOWN),
+    case(
+        "Посчитайте доставку, срочно: https://detail.tmall.com/item.htm?id=1 "
+        "https://item.jd.com/2.html https://mobile.yangkeduo.com/goods.html?id=3",
+        "ok",
+    ),
+    # A seller's track numbers on a parcel tracker, and a contact asked to be
+    # shared, are no mass mail.
+    case(
+        "Mana sotuvchi yuborgan treklar: https://t.17track.net/en#nums=YT1 "
+        "https://t.17track.net/en#nums=YT2 https://t.17track.net/en#nums=YT3",
+        "ok",
+        forwarded=True,
+    ),
+    case(
+        "Поделитесь, пожалуйста, контактом вашего брокера, срочно нужно оформить.",
+        "ok",
+        forwarded=True,
+    ),
+    # A refund to the client's own card and shipping on credit are trade.
+    case(
+        "Ortiqcha to'lagan ekanman 85 000 so'm, kartamga tashlab bering iltimos",
+        "ok",
+        **KNOWN,
+    ),
+    case(
+        "Отгрузите, пожалуйста, в долг, оплату переведём в пятницу. Как обычно.",
+        "ok",
+        **KNOWN,
+    ),
+    # «Признателен» holds no «приз», «акциз» no «акция», and free storage
+    # days are a freight term.
+    case(
+        "Пересылаю запрос: нужна доставка из Иу, срочно. Буду признателен за ставку.",
+        "ok",
+        forwarded=True,
+    ),
+    case(
+        "Ҳамкоримиз сўраяпти: акциз тўлови бўйича маслаҳат керак, срочно.",
+        "ok",
+        forwarded=True,
+    ),
 ]
