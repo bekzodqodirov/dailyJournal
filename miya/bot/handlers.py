@@ -958,13 +958,29 @@ JARVIS_PAUSE_WORDS = {"toxtat", "to'xtat", "stop"}
 JARVIS_RESUME_WORDS = {"yoq", "yoqish", "start"}
 JARVIS_HISTORY_WORDS = {"tarix"}
 JARVIS_MODES_WORDS = {"rejim", "rejimlar", "rejimi"}
+# The global mode, in the owner's words: `/jarvis qoralama` (or `rejim
+# qoralama`) raises it to draft after a confirm tap, `/jarvis kuzatuv` lowers
+# it to shadow at once. auto is never set here: only the JV-23 graduation.
+JARVIS_DRAFT_WORDS = {"qoralama", "draft"}
+JARVIS_SHADOW_WORDS = {"kuzatuv", "kuzat", "shadow"}
+
+
+def _jarvis_mode_word(word: str) -> str | None:
+    folded = fold_apostrophes(word).casefold()
+    if folded in JARVIS_DRAFT_WORDS:
+        return "draft"
+    if folded in JARVIS_SHADOW_WORDS:
+        return "shadow"
+    return None
 
 
 @router.message(Command("jarvis"))
 async def cmd_jarvis(message: Message, command: CommandObject) -> None:
     """`/jarvis` status · `toxtat` pauses everything · `yoq [kanal]` resumes ·
     `tarix` lists the last 20 actions (JV-11) · `rejim` shows each reply
-    kind's mode per channel and its progress towards graduation (JV-23).
+    kind's mode per channel and its progress towards graduation (JV-23) ·
+    `qoralama` asks to raise the global mode to draft (the tap changes it) ·
+    `kuzatuv` lowers it to shadow at once (restricting is immediate).
 
     miya.jarvis is imported here, on the owner's command, never at startup
     (rule 20). A pause is checked at claim time, so it holds the moment this
@@ -979,6 +995,15 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
     sub = fold_apostrophes(words[0]).casefold() if words else ""
     now = datetime.now(settings.tz)
     scope = jarvis_policy.GLOBAL
+    wanted = _jarvis_mode_word(sub) if len(words) == 1 else None
+    if sub in JARVIS_MODES_WORDS and len(words) > 1:
+        wanted = _jarvis_mode_word(words[1])
+        if wanted is None or len(words) > 2:
+            await _safe_answer(message, replies.JARVIS_USAGE)
+            return
+    if wanted is not None:
+        await _jarvis_set_mode(message, wanted, now=now)
+        return
     if sub in JARVIS_RESUME_WORDS and len(words) > 1:
         channel = jarvis_chatkey.channel_word(words[1])
         if channel is None:
@@ -1029,6 +1054,90 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
         )
         body = replies.JARVIS_FAILED
     await _safe_answer(message, body)
+
+
+def _jarvis_mode_hint(wanted: str) -> str | None:
+    from miya.jarvis import policy as jarvis_policy
+
+    return replies.jarvis_mode_hint(
+        wanted, jarvis_policy.ceiling(), enabled=settings.jarvis_enabled
+    )
+
+
+async def _jarvis_set_mode(message: Message, wanted: str, *, now: datetime) -> None:
+    """`/jarvis qoralama` asks first (loosening is the owner's tap, JV-12);
+    `/jarvis kuzatuv` lowers the global mode at once. The env ceiling still
+    caps whatever is stored; the reply says what in .env holds it back."""
+    from miya.jarvis import policy as jarvis_policy
+
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            if wanted == "draft":
+                policies = await jarvis_policy.load(session)
+                current = jarvis_policy.global_stored_mode(policies)
+                if current == "draft":
+                    body = replies.jarvis_mode_already(
+                        current, _jarvis_mode_hint("draft")
+                    )
+                else:
+                    body = replies.jarvis_draft_ask(_jarvis_mode_hint("draft"))
+                    keyboard = keyboards.jarvis_mode_confirm()
+            else:
+                before = await jarvis_policy.set_global_mode(
+                    session, mode="shadow", by=records.BY_COMMAND, now=now
+                )
+                policies = await jarvis_policy.load(session)
+                narrower = jarvis_policy.narrower_above(policies, "shadow")
+                body = (
+                    replies.jarvis_mode_already("shadow", None)
+                    if before == "shadow" and not narrower
+                    else replies.jarvis_mode_set("shadow", narrower=narrower)
+                )
+    except Exception as exc:
+        log.error(
+            "/jarvis mode failed",
+            extra={"mode": wanted, "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_MODE_PREFIX}:"))
+async def on_jarvis_mode_button(callback: CallbackQuery) -> None:
+    """✅ Ha, qoralama rejimi / ✖️ Yo'q under `/jarvis qoralama`: the owner's
+    tap is the only way the global mode goes up, and only to draft. Under the
+    global row's lock; a second tap changes nothing. Not in
+    ``_button_handlers``. miya.jarvis is imported here, never at startup."""
+    from miya.jarvis import policy as jarvis_policy
+
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) == 2 else ""
+    if action == keyboards.JARVIS_MODE_KEEP:
+        await _edit_callback(callback, replies.JARVIS_MODE_KEPT)
+        return
+    if action != keyboards.JARVIS_MODE_DRAFT:
+        await _ack(callback)
+        return
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            before = await jarvis_policy.set_global_mode(
+                session, mode="draft", by=records.BY_BUTTON, now=now
+            )
+    except Exception as exc:
+        log.error("jarvis mode tap failed", extra={"error": type(exc).__name__})
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    hint = _jarvis_mode_hint("draft")
+    body = (
+        replies.jarvis_mode_already("draft", hint)
+        if before == "draft"
+        else replies.jarvis_mode_set("draft", hint=hint)
+    )
+    await _edit_callback(callback, body)
 
 
 @router.message(Command("qoralamalar"))

@@ -89,10 +89,13 @@ This plan continues `docs/handoff-plan.md` (WP-01…85). Its work packages are n
    - **Bilimlar bazasi**: ish vaqti, manzil, yo'nalishlar, qanday yuklar olinadi, qanday hujjatlar
      kerak (`/bilim qo'sh Savol | Javob`). Narx yozib bo'lmaydi.
    - **Google Sheets**: jadval ochib, uni MIYA'ning xizmat hisobiga «Muharrir» sifatida ulashish.
-   - **Gmail**: `make gmail-auth` bilan bir marta ruxsat berish; Google Cloud'da ruxsat oynasini
-     «In production» holatiga o'tkazish (aks holda ruxsat 7 kunda tugashi mumkin).
-   - **WhatsApp**: botga kelgan 8 xonali kodni telefonda «Bog'langan qurilmalar → Telefon raqami
-     bilan bog'lash» orqali kiritish.
+   - **Gmail** (4-bosqich, hali qurilmagan): `make gmail-auth` bilan bir marta ruxsat berish;
+     Google Cloud'da ruxsat oynasini «In production» holatiga o'tkazish (aks holda ruxsat 7 kunda
+     tugashi mumkin).
+   - **WhatsApp** (4-bosqich, hali qurilmagan): botga kelgan 8 xonali kodni telefonda «Bog'langan
+     qurilmalar → Telefon raqami bilan bog'lash» orqali kiritish.
+   - 1–3-bosqichlarni (faqat Telegram) yoqish bo'yicha egasi uchun qo'llanma:
+     [docs/jarvis-egasi.md](jarvis-egasi.md).
    - Pul tushadigan kartalaringiz ro'yxati (`PAYMENT_OWN_CARDS`) — chekni «shubhali» deyish uchun.
    - Kunlik Jarvis xarajat chegarasi (standart: 3 dollar).
 
@@ -828,6 +831,16 @@ with ids and counts; `/jarvis tarix` shows the last 20 actions.
 The effective mode resolves from the most specific `jarvis_policy` scope (channel+intent, intent,
 channel, global) and never exceeds the env ceiling `JARVIS_MODE` (default `draft`, so moving any
 intent to `auto` needs the owner to raise the ceiling in `.env` as well as tap «Ha»).
+
+The global mode starts at the migration's seed, `shadow`, and moves only on the owner's word:
+`/jarvis qoralama` (or `/jarvis rejim qoralama`) asks first and the «✅ Ha, qoralama rejimi»
+tap (`jm:d`, not in `_button_handlers`) stores `draft`, a loosening change like JV-12's;
+`/jarvis kuzatuv` stores `shadow` at once and names the channel or intent scopes that keep a
+mode of their own above it (a graduated intent). Neither ever stores `auto`
+(`policy.set_global_mode` refuses it); autonomy is only the per-intent graduation of §6.4. Both
+replies name the `.env` line (`JARVIS_ENABLED`, `JARVIS_MODE`) that still holds the mode back.
+`/jarvis yoq` only lifts a pause or a breaker; in `shadow` its reply says nothing will be shown
+and points at `/jarvis qoralama`.
 
 ### 6.2 Intents
 

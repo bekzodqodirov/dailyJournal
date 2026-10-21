@@ -119,7 +119,9 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /process — javob yozilgan media'ni qayta ishlash
 /xarajat — MIYA'ning API xarajati
 /holat — MIYA'ning ahvoli
-/jarvis — Jarvis holati (toxtat — to'xtatish, yoq [kanal] — yoqish, tarix, rejim)
+/jarvis — Jarvis holati (toxtat, yoq [kanal] — to'xtatishni bekor qilish, tarix, rejim)
+/jarvis qoralama — qoralama rejimi: har javobni siz tasdiqlaysiz
+/jarvis kuzatuv — kuzatuv rejimi: faqat yozib boradi, sizga ko'rsatmaydi
 /shaxsiy &lt;ism yoki GS kod&gt; — shaxsiy chat: MIYA u yerga hech qachon o'zi yozmaydi
 /shaxsiylar — shaxsiy chatlar va oila/do'st takliflari
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
@@ -167,7 +169,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("chats", "Qaysi chatlar o'qilishi"),
     ("xarajat", "MIYA'ning API xarajati"),
     ("holat", "MIYA'ning ahvoli"),
-    ("jarvis", "Jarvis holati, to'xtatish va yoqish"),
+    ("jarvis", "Jarvis holati, rejimi va to'xtatish"),
     ("shaxsiy", "Chatni shaxsiy deb belgilash"),
     ("shaxsiylar", "Shaxsiy chatlar va takliflar"),
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
@@ -3539,19 +3541,66 @@ JARVIS_STATUS = (
     "🤖 Jarvis: {rejim}\n"
     "Bugun: {q} ta qoralama · {y} ta yuborildi · {e} ta eskalatsiya\n"
     "Limit: {used}/{cap}\n"
-    "Kanallar: Telegram {telegram} · WhatsApp {whatsapp} · Gmail {gmail}"
+    "Kanallar: {kanallar}"
 )
+JARVIS_STATUS_CHANNEL = "{kanal} {holat}"
+# Shown in /jarvis whatever their state: WhatsApp and Gmail (phase 4) only
+# once they report something other than «ulanmagan».
+JARVIS_STATUS_ALWAYS = ("telegram",)
 JARVIS_PAUSED = (
     "⛔ Jarvis to'xtatildi. Hech qanday xabar yuborilmaydi. Qayta yoqish: /jarvis yoq"
 )
 JARVIS_RESUMED = "✅ Jarvis yoqildi ({rejim} rejimi)."
 JARVIS_USAGE = (
-    "<code>/jarvis</code> — holat · <code>/jarvis toxtat</code> — hammasini "
-    "to'xtatish · <code>/jarvis yoq [kanal]</code> — qayta yoqish · "
+    "<code>/jarvis</code> — holat · <code>/jarvis qoralama</code> — qoralama "
+    "rejimi (har javobni siz tasdiqlaysiz) · <code>/jarvis kuzatuv</code> — "
+    "kuzatuv rejimi (faqat yozib boradi) · <code>/jarvis toxtat</code> — hammasini "
+    "to'xtatish · <code>/jarvis yoq [kanal]</code> — to'xtatishni bekor qilish · "
     "<code>/jarvis tarix</code> — oxirgi 20 ta amal · "
     "<code>/jarvis rejim</code> — har javob turining rejimi"
 )
-JARVIS_UNKNOWN_CHANNEL = "Kanal nomi: telegram, whatsapp yoki gmail."
+JARVIS_UNKNOWN_CHANNEL = "Kanal nomi: telegram (WhatsApp va Gmail hali ulanmagan)."
+# --- the global mode: /jarvis qoralama (a confirmed tap), /jarvis kuzatuv ----------
+JARVIS_SHADOW_HINT = (
+    "👀 Hozir kuzatuv rejimi: qoralamalar sizga ko'rsatilmaydi va hech narsa "
+    "yuborilmaydi. Qoralama rejimi: /jarvis qoralama"
+)
+JARVIS_MODE_DRAFT_ASK = (
+    "✍️ Qoralama rejimini yoqaymi?\n"
+    "Mijoz yozsa, MIYA javob qoralamasini sizga karta qilib yuboradi — siz "
+    "tasdiqlamaguningizcha hech narsa yuborilmaydi. Narx, pul, muddat va "
+    "va'da haqidagi savollar sizga eskalatsiya bo'lib keladi.\n"
+    "Orqaga qaytish: /jarvis kuzatuv"
+)
+JARVIS_BUTTON_MODE_DRAFT = "✅ Ha, qoralama rejimi"
+JARVIS_BUTTON_MODE_KEEP = "✖️ Yo'q"
+JARVIS_MODE_NOW_DRAFT = (
+    "✅ Qoralama rejimi yoqildi: endi har javob sizga karta bo'lib keladi, "
+    "siz tasdiqlaysiz. Orqaga: /jarvis kuzatuv"
+)
+JARVIS_MODE_NOW_SHADOW = (
+    "👀 Kuzatuv rejimi: MIYA javoblarni faqat yozib boradi — sizga "
+    "ko'rsatmaydi va yubormaydi. Ko'rish: /qoralamalar. "
+    "Qoralama rejimi: /jarvis qoralama"
+)
+JARVIS_MODE_ALREADY = "Jarvis allaqachon {rejim} rejimida."
+JARVIS_MODE_KEPT = "Mayli, rejim o'zgarmadi."
+JARVIS_MODE_NARROWER = (
+    "Bularning o'z rejimi bor va o'zgarmadi: {turlar}. Holat: /jarvis rejim · "
+    "hammasini to'xtatish: /jarvis toxtat"
+)
+# The server-side step after any edit of the Jarvis lines in .env: bot,
+# worker and userbot each read them, and a plain restart keeps the old env.
+JARVIS_RELOAD = "serverda: <code>make reload</code>"
+JARVIS_SWITCHED_OFF = (
+    "⚠️ Serverda Jarvis o'chiq: .env da <code>JARVIS_ENABLED=true</code> qiling, "
+    "keyin " + JARVIS_RELOAD + "."
+)
+JARVIS_MODE_CEILING_LOW = (
+    "⚠️ Serverdagi .env da <code>JARVIS_MODE={m}</code>: qoralamalar ko'rinishi "
+    "uchun <code>JARVIS_MODE=draft</code> qiling, keyin " + JARVIS_RELOAD + "."
+)
+_JARVIS_MODE_ORDER = ("off", "shadow", "draft", "auto")
 JARVIS_FAILED = (
     "⚠️ Jarvis buyrug'ini bajarib bo'lmadi — hech narsa o'zgarmadi. "
     "Birozdan keyin qayta urinib ko'ring."
@@ -4227,6 +4276,14 @@ def jarvis_status(status) -> str:
         channel: JARVIS_CHANNEL_STATES.get(state, JARVIS_CHANNEL_STATES["not_connected"])
         for channel, state in status.channels
     }
+    off = JARVIS_CHANNEL_STATES["not_connected"]
+    shown = [
+        JARVIS_STATUS_CHANNEL.format(
+            kanal=jarvis_channel_label(channel), holat=states.get(channel, off)
+        )
+        for channel in ("telegram", "whatsapp", "gmail")
+        if channel in JARVIS_STATUS_ALWAYS or states.get(channel, off) != off
+    ]
     body = JARVIS_STATUS.format(
         rejim=jarvis_mode_label(status.mode),
         q=status.counts.drafts,
@@ -4234,19 +4291,64 @@ def jarvis_status(status) -> str:
         e=status.counts.escalations,
         used=status.limit_used,
         cap=status.limit_cap,
-        telegram=states.get("telegram", JARVIS_CHANNEL_STATES["not_connected"]),
-        whatsapp=states.get("whatsapp", JARVIS_CHANNEL_STATES["not_connected"]),
-        gmail=states.get("gmail", JARVIS_CHANNEL_STATES["not_connected"]),
+        kanallar=" · ".join(shown),
     )
     shadow = getattr(status, "shadow", None)
     if shadow is not None:
         body = "\n".join([body, *jarvis_shadow_lines(shadow)])
+    if status.mode == "shadow":
+        body = f"{body}\n{JARVIS_SHADOW_HINT}"
     return f"{body}\n{JARVIS_PAUSED}" if status.paused else body
 
 
+def jarvis_mode_short(mode: str) -> str:
+    """«qoralama», not the whole explanation."""
+    return jarvis_mode_label(mode).split(" (")[0]
+
+
 def jarvis_resumed(mode: str) -> str:
-    """The mode's short name: «qoralama rejimi», not the whole explanation."""
-    return JARVIS_RESUMED.format(rejim=jarvis_mode_label(mode).split(" (")[0])
+    """The mode's short name: «qoralama rejimi», not the whole explanation.
+    In observation mode the owner is told nothing will be shown: «yoq» only
+    lifts a pause, it does not raise the mode."""
+    body = JARVIS_RESUMED.format(rejim=jarvis_mode_short(mode))
+    return f"{body}\n{JARVIS_SHADOW_HINT}" if mode == "shadow" else body
+
+
+def jarvis_mode_hint(wanted: str, ceiling: str, *, enabled: bool) -> str | None:
+    """What in .env keeps ``wanted`` from taking effect, if anything: Jarvis
+    switched off, or the JARVIS_MODE ceiling below it."""
+    if not enabled:
+        return JARVIS_SWITCHED_OFF
+    order = _JARVIS_MODE_ORDER
+    rank = order.index(ceiling) if ceiling in order else 0
+    if order.index(wanted) > rank:
+        return JARVIS_MODE_CEILING_LOW.format(m=escape(ceiling))
+    return None
+
+
+def jarvis_mode_already(mode: str, hint: str | None) -> str:
+    body = JARVIS_MODE_ALREADY.format(rejim=jarvis_mode_short(mode))
+    return f"{body}\n{hint}" if hint else body
+
+
+def jarvis_draft_ask(hint: str | None) -> str:
+    """The /jarvis qoralama question, above its two buttons."""
+    return f"{JARVIS_MODE_DRAFT_ASK}\n{hint}" if hint else JARVIS_MODE_DRAFT_ASK
+
+
+def jarvis_mode_set(mode: str, *, narrower=(), hint: str | None = None) -> str:
+    """The global mode changed: what it means now; the scopes that keep a
+    mode of their own (a graduated reply kind) and the .env hint, if any."""
+    lines = [JARVIS_MODE_NOW_DRAFT if mode == "draft" else JARVIS_MODE_NOW_SHADOW]
+    if narrower:
+        lines.append(
+            JARVIS_MODE_NARROWER.format(
+                turlar=", ".join(escape(_jarvis_ref("scope", s)) for s in narrower)
+            )
+        )
+    if hint:
+        lines.append(hint)
+    return "\n".join(lines)
 
 
 def _jarvis_ref(kind: str, ref: str) -> str:

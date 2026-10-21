@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
-.PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
+.PHONY: help reprice import-clients env up down restart reload logs ps health migrate revision downgrade psql \
         bot worker userbot userbot-login shell install test lint fmt typecheck check gcal-auth \
         backfill import-history payments-corpus backup backup-key backup-key-show restore doctor update
 
@@ -43,6 +43,9 @@ down: ## Stop everything (volumes are kept)
 
 restart: ## Restart the api container
 	$(COMPOSE) restart api
+
+reload: ## After editing .env: recreate bot, worker and userbot so they read it again
+	$(COMPOSE) up -d --force-recreate bot worker userbot
 
 logs: ## Tail logs from all running services
 	$(COMPOSE) logs -f --tail=100

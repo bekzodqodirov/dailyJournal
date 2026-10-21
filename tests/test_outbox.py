@@ -2334,7 +2334,10 @@ def test_the_mode_labels_and_strings():
         "auto": "avtomatik",
     }
     assert replies.jarvis_resumed("auto") == "✅ Jarvis yoqildi (avtomatik rejimi)."
-    assert replies.jarvis_resumed("shadow") == "✅ Jarvis yoqildi (kuzatuv rejimi)."
+    # In observation «yoq» also says nothing will be shown, and how to raise it.
+    assert replies.jarvis_resumed("shadow") == (
+        f"✅ Jarvis yoqildi (kuzatuv rejimi).\n{replies.JARVIS_SHADOW_HINT}"
+    )
     off = status.Status(
         mode="off",
         paused=False,

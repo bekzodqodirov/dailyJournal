@@ -384,6 +384,40 @@ async def set_mode(
     return row
 
 
+def global_stored_mode(policies: Policies) -> Mode:
+    """The global row's mode before the ceiling (the seed when unset)."""
+    row = policies.get(GLOBAL)
+    return row.mode if row is not None and row.mode is not None else DEFAULT_MODE
+
+
+def narrower_above(policies: Policies, mode: Mode) -> list[str]:
+    """The channel, intent and channel × intent scopes whose own stored mode
+    is above ``mode``: they win over the global mode, so a global change to
+    ``mode`` does not reach them (``/jarvis kuzatuv`` names them)."""
+    return sorted(
+        scope
+        for scope, row in policies.items()
+        if scope not in (GLOBAL, QUESTION_BANK)
+        and row.mode is not None
+        and MODE_RANK[row.mode] > MODE_RANK[mode]
+    )
+
+
+async def set_global_mode(
+    session: AsyncSession, *, mode: Literal["shadow", "draft"], by: str, now: datetime
+) -> Mode:
+    """The owner's ``/jarvis kuzatuv`` (at once) or the confirmed tap of
+    ``/jarvis qoralama``: the global mode, under its row lock. Never
+    ``auto``: autonomy is only per intent, through the JV-23 graduation. The
+    mode before. The ceiling JARVIS_MODE still caps it."""
+    if mode not in ("shadow", "draft"):
+        raise ValueError(mode)
+    row = await _locked(session, GLOBAL)
+    before = as_mode(row.mode) or DEFAULT_MODE
+    await set_mode(session, scope=GLOBAL, mode=mode, by=by, now=now)
+    return before
+
+
 async def lock_scope(session: AsyncSession, scope: str) -> JarvisPolicy:
     """A scope's row under a row lock, created when missing (JV-23: the
     rollout's notes and the question bank)."""
@@ -1571,6 +1605,7 @@ __all__ = [
     "effective_mode",
     "enabled_group_titles",
     "enabled_groups",
+    "global_stored_mode",
     "group_enabled",
     "group_reply_state",
     "hard_exclusion",
@@ -1586,6 +1621,7 @@ __all__ = [
     "mark_chat",
     "mark_person",
     "mark_personal",
+    "narrower_above",
     "never_rule",
     "note",
     "pause",
@@ -1596,6 +1632,7 @@ __all__ = [
     "resume",
     "rule_mode",
     "scope_intent",
+    "set_global_mode",
     "set_group_reply",
     "set_mode",
     "snapshot",

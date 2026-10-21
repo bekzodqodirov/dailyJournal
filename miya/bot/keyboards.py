@@ -1298,6 +1298,35 @@ def jarvis_graduation(channel: str, intent: str) -> InlineKeyboardMarkup:
     )
 
 
+# --- /jarvis qoralama: raising the global mode is a confirmed tap -------------------
+#
+# jm:d raises the global mode from observation (shadow) to draft, jm:n keeps
+# it. Lowering (/jarvis kuzatuv) is immediate and has no button. Not in
+# handlers._button_handlers: a typed batch answer never changes the mode.
+
+JARVIS_MODE_PREFIX = "jm"
+JARVIS_MODE_DRAFT = "d"
+JARVIS_MODE_KEEP = "n"
+
+
+def jarvis_mode_confirm() -> InlineKeyboardMarkup:
+    """✅ Ha, qoralama rejimi / ✖️ Yo'q under the /jarvis qoralama question."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_MODE_DRAFT,
+                    callback_data=f"{JARVIS_MODE_PREFIX}:{JARVIS_MODE_DRAFT}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_MODE_KEEP,
+                    callback_data=f"{JARVIS_MODE_PREFIX}:{JARVIS_MODE_KEEP}",
+                ),
+            ]
+        ]
+    )
+
+
 def jarvis_auto_sent(row_id: int) -> InlineKeyboardMarkup:
     """↩️ Bu xato edi under the notice of one autonomous send."""
     return InlineKeyboardMarkup(

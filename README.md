@@ -59,7 +59,14 @@ reasoning model only phrases a query result in Uzbek.
 
 ## Quick start
 
-The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md).
+The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md);
+the complete owner guide to phases 1-3 (updating the server, the new shields, receipts,
+Google Sheets and switching Jarvis on step by step, Telegram only) is
+[docs/jarvis-qollanma.md](docs/jarvis-qollanma.md); a one-page summary is
+[docs/jarvis-egasi.md](docs/jarvis-egasi.md).
+After any `.env` edit run `make reload` (`docker compose up -d --force-recreate bot
+worker userbot`): bot, worker and userbot each read the Jarvis switches, and
+`docker compose restart` does not re-read `env_file`.
 
 ### Server requirements
 
@@ -100,6 +107,7 @@ every service refuses a blank or short API token.
 | `make payments-corpus [ALL=1]` | Export the payment texts you labelled (booked, «not money», voided) to `/data/exports/payments.jsonl` for parser regression tests; card digits and phone numbers are masked, merchants and names are not — the file stays on the server and is never committed |
 | `make update` | Back up, `git pull --ff-only`, stop bot/worker/userbot, `make up`, restart Syncthing if it was running, prune old images |
 | `make down` | Stop everything (the database volume is kept) |
+| `make reload` | After editing `.env`: recreate bot, worker and userbot so they read it again (`restart` keeps the old environment) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
 | `make psql` | Open a psql shell |
@@ -109,7 +117,7 @@ every service refuses a blank or short API token.
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
 | `make import-clients FILE=… [APPLY=1]` | Import the client-code list (CSV/.xlsx); a dry run unless APPLY=1 |
-| `make doctor` | Check `.env` and the server before `make up` |
+| `make doctor` | Check `.env` and the server before `make up`; also the Sheets key (and the address to share the sheet with), Jarvis switches that contradict each other (sending without Jarvis, Jarvis without the userbot or its session) and an unpriced model with Jarvis on. More than three missing keys after an update are one ⚠️ line: they run on their defaults |
 | `make backup-key` | Create the backup key and print the `.env` line |
 | `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
@@ -259,7 +267,7 @@ ledger only ever has the bank's own record and your own words.
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
 | `/savollar` | Every question waiting for the owner's tap (claims, money texts, missed calls, groups, files), ranked money first and paged; answering here spends none of the day's 5–10 asked questions |
 | `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong. With `JARVIS_ENABLED` also Jarvis: the mode, today's capped count against its daily cap (auto sends in auto mode, draft cards otherwise, as `/jarvis` shows its limit) and the send queue, today's drafts, escalations and spend against `JARVIS_DAILY_COST_CAP_USD`, Telegram sending (working, limited until when, paused, waiting out a flood wait, or the sender down), sends stuck in a claim or in doubt, and the responder's last run. A queue that has not moved for ten minutes is alerted («📤 N ta xabar … yuborilmay turibdi»), in quiet hours too, silently, since approved sends go out at night; it says «tiklandi» only once the rows have left, not while they wait on a paused, switched-off or limited channel; a Telegram limit and the cost cap are told the moment they happen, repeated every `ALERT_REPEAT_HOURS` while they last, and each says «tiklandi» once when it clears. A Jarvis state that could not be read is never taken as recovered. With Jarvis off none of this is shown or alerted |
-| `/jarvis [toxtat\|yoq [kanal]\|tarix\|rejim]` | Jarvis (off until `JARVIS_ENABLED`): the mode, today's drafts, sends and escalations, the daily limit and each channel; `toxtat` stops every send at once (checked whenever a message is about to leave), `yoq` or `yoq telegram` resumes everything or one channel, `tarix` lists the last 20 actions, `rejim` shows the mode of each reply kind per channel (drafts, sent on its own, or always yours) with its progress towards graduation and the `JARVIS_MODE` ceiling |
+| `/jarvis [qoralama\|kuzatuv\|toxtat\|yoq [kanal]\|tarix\|rejim]` | Jarvis (off until `JARVIS_ENABLED`): the mode, today's drafts, sends and escalations, the daily limit and Telegram (WhatsApp and Gmail are phase 4, not built, and are listed only once connected); `qoralama` (or `rejim qoralama`) raises the global mode from observation to draft after your «✅ Ha, qoralama rejimi» tap, `kuzatuv` lowers it back to observation at once and names any reply kind that keeps a mode of its own (nothing here ever sets auto: that is only the per-kind graduation); both say which `.env` line (`JARVIS_ENABLED`, `JARVIS_MODE`) still holds it back; `toxtat` stops every send at once (checked whenever a message is about to leave), `yoq` or `yoq telegram` lifts that stop for everything or one channel (it does not change the mode: in observation it says nothing will be shown), `tarix` lists the last 20 actions, `rejim` shows the mode of each reply kind per channel (drafts, sent on its own, or always yours) with its progress towards graduation and the `JARVIS_MODE` ceiling |
 | `/savolbank [qo'sh\|o'chir]` | Your question bank: the only questions Jarvis may ask a client on its own (where from, where to, what cargo, weight, cubes, number of places, the GS code, who receives it, documents or an invoice, the pickup address; Uzbek Latin, Cyrillic and Russian to start with). `/savolbank` lists them with a 🗑 button each, `/savolbank qo'sh Savol?` adds one after your «✅ Qo'shish» (one question, no time, price, promise or figure), `/savolbank o'chir 3` removes the third, with the same question in the other two scripts. Any other question Jarvis writes is a card for you |
 | `/shaxsiy <ism yoki GS kod>` | Mark a person (by name or client code) or a chat (a family group by its title) personal: MIYA never writes there on its own, reading goes on. Every address the person is known at is kept (their Telegram chat, a WhatsApp number written with its country code), so `/unut` or `/birlashtir` never reopens it. On a chat already personal it asks before unmarking (✅ Ha, chiqar / ✖️ Yo'q) |
 | `/shaxsiylar` | The personal chats, each with 🔓 (unmark, asks first), and likely family and friends found in the database (kinship in the contact name or the relationship you set, your informal «sen» towards them, no work talk, no client code), each with 🔒 to mark in one tap; nothing is marked without you |
@@ -460,9 +468,13 @@ columns, the bank's cross-check and the bank's own record). Setup: in Google
 Cloud Console enable the Sheets API, create a service account, download its
 JSON key to `secrets/sheets_service_account.json`, share the spreadsheet with
 the account's e-mail address as **Editor**, then set `SHEETS_ENABLED=true` and
-`SHEETS_SPREADSHEET_ID` (the long id in the spreadsheet's address) and
-restart the worker. Missing tabs and their headers are created on the first
-sync.
+`SHEETS_SPREADSHEET_ID` (the long id in the spreadsheet's address) and run
+`make reload`. `make doctor` reads the key as the worker will (a readable
+file with `type: service_account`) and prints the `client_email` to share
+the spreadsheet with; a key copied in after `make up` as root needs
+`sudo chown 10001:10001 secrets/sheets_service_account.json` (or `make up`
+again). Missing tabs and their headers are created on the first sync. The
+owner's steps in Uzbek: [docs/jarvis-qollanma.md](docs/jarvis-qollanma.md), section 4.
 
 The database stays the truth: nothing typed into the sheet comes back, and a
 row you edit is overwritten when its record changes. Each record owns its row
