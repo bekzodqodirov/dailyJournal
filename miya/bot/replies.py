@@ -123,6 +123,7 @@ Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</
 /guruhai &lt;guruh&gt; — guruhda MIYA javob yozishini yoqish yoki o'chirish
 /uslub [yukla] — yozish uslubingiz (yukla — eski yozishmalardan o'rganish)
 /bilim [qo'sh|tuzat|o'chir|taklif] — bilimlar bazasi: mijozlarga umumiy javoblar
+/qoralamalar — Jarvis kuzatuv rejimida tayyorlagan javoblar (yuborilmagan)
 /bajarildi &lt;id&gt; — va'da/vazifa bajarildi, qarz to'liq yopildi
 /yop &lt;id&gt; — va'da/vazifani bajarilmagan holda yopish
 /qaytar &lt;id&gt; — yopilgan yozuvni qayta ochish (noto'g'ri bosilgan bo'lsa)
@@ -169,6 +170,7 @@ COMMAND_MENU: tuple[tuple[str, str], ...] = (
     ("guruhai", "Guruhda MIYA javobini yoqish/o'chirish"),
     ("uslub", "Yozish uslubingiz"),
     ("bilim", "Bilimlar bazasi: umumiy javoblar"),
+    ("qoralamalar", "Jarvis kuzatuv qoralamalari"),
     ("unut", "Ma'lumotni butunlay o'chirish"),
     ("bajarildi", "Va'da yoki vazifa bajarildi"),
     ("yop", "Bajarilmagan holda yopish"),
@@ -3364,6 +3366,7 @@ JARVIS_FIELD_LABELS = {
     "warned_safety": "xavf ogohlantirishi",
     "reason": "sabab",
     "linked": "bog'langan belgi",
+    "repeat": "yana yozdi",
 }
 JARVIS_STATE_LABELS = {
     "shadow": "kuzatuv",
@@ -3419,6 +3422,82 @@ JARVIS_SEND_UNKNOWN = (
 )
 
 
+# --- the responder in observation mode (JV-16) -------------------------------------
+JARVIS_SHADOW_LINE = (
+    "Kuzatuv: bugun {n} ta javob tayyorlanardi ({e} tasi sizga yo'naltirilardi)."
+)
+# Drafts per kind with a free-form statement: never sent on their own.
+JARVIS_SHADOW_STRAYED = "Erkin gapli qoralamalar (o'zi yuborilmasdi): {items}"
+JARVIS_COST_STOP = (
+    "💸 Jarvis bugungi xarajat chegarasiga yetdi — ertagacha faqat sizga yo'naltiradi."
+)
+SHADOW_DRAFTS_HEADER = "🧪 Kuzatuv qoralamalari:"
+SHADOW_DRAFT_LINE = "{i}. {ism}: «{mijoz}» → «{qoralama}» [{intent}]"
+SHADOW_DRAFTS_EMPTY = "🧪 Kuzatuv qoralamalari hali yo'q."
+# How much of a client's message and of a draft a list line shows.
+SHADOW_SHOWN_CHARS = 120
+# A reply's kind (intent) in the owner's words.
+JARVIS_INTENT_LABELS = {
+    "greeting": "salomlashish",
+    "info_gathering": "ma'lumot so'rash",
+    "general_question": "umumiy savol",
+    "stall": "kutib turish javobi",
+    "other": "boshqa",
+    "price": "narx",
+    "discount": "chegirma",
+    "payment_terms": "to'lov sharti",
+    "deadline": "muddat",
+    "promise": "va'da",
+    "guarantee": "kafolat",
+    "payment_claim": "to'lov",
+    "identity": "kimligi",
+    "complaint": "shikoyat",
+    "legal": "huquqiy",
+    "other_people": "boshqa odamlar",
+}
+
+
+def jarvis_intent_label(intent: str | None) -> str:
+    return JARVIS_INTENT_LABELS.get(intent or "other", intent or "boshqa")
+
+
+def _shadow_text(text: str | None) -> str:
+    value = " ".join((text or "").split())
+    if len(value) > SHADOW_SHOWN_CHARS:
+        value = value[: SHADOW_SHOWN_CHARS - 1].rstrip() + "…"
+    return _shown(value)
+
+
+def shadow_drafts(drafts) -> str:
+    """`/qoralamalar`: the newest observation drafts (status.ShadowDraft).
+    The client's words, their name and the draft are shown through _shown."""
+    if not drafts:
+        return SHADOW_DRAFTS_EMPTY
+    lines = [SHADOW_DRAFTS_HEADER]
+    for i, item in enumerate(drafts, start=1):
+        lines.append(
+            SHADOW_DRAFT_LINE.format(
+                i=i,
+                ism=_shown(item.name or "Nomaʼlum"),
+                mijoz=_shadow_text(item.client_text),
+                qoralama=_shadow_text(item.body),
+                intent=escape(jarvis_intent_label(item.intent)),
+            )
+        )
+    return clip("\n".join(lines))
+
+
+def jarvis_shadow_lines(shadow) -> list[str]:
+    """The `/jarvis` lines of status.ShadowCounts."""
+    lines = [JARVIS_SHADOW_LINE.format(n=shadow.prepared, e=shadow.escalated)]
+    if shadow.unapproved:
+        items = " · ".join(
+            f"{escape(jarvis_intent_label(kind))} {n}" for kind, n in shadow.unapproved
+        )
+        lines.append(JARVIS_SHADOW_STRAYED.format(items=items))
+    return lines
+
+
 def jarvis_mode_label(mode: str) -> str:
     return JARVIS_MODE_LABELS.get(mode, JARVIS_MODE_LABELS["off"])
 
@@ -3440,6 +3519,9 @@ def jarvis_status(status) -> str:
         whatsapp=states.get("whatsapp", JARVIS_CHANNEL_STATES["not_connected"]),
         gmail=states.get("gmail", JARVIS_CHANNEL_STATES["not_connected"]),
     )
+    shadow = getattr(status, "shadow", None)
+    if shadow is not None:
+        body = "\n".join([body, *jarvis_shadow_lines(shadow)])
     return f"{body}\n{JARVIS_PAUSED}" if status.paused else body
 
 

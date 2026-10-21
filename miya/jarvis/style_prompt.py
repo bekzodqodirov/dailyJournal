@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from miya.services.text import alias_pattern, normalise_for_search
+from miya.services.windows import quote_body
 
 # The counterparty's name in an example, wherever it stood.
 PLACEHOLDER: Final = "[ISM]"
@@ -280,7 +281,9 @@ _TONE_LINES: Final[Mapping[str, str]] = {
 
 def render(style: ReplyStyle) -> str:
     """The style block of a reply prompt (JV-16): the guide, this person's
-    tone, and the examples as CLIENT/OWNER pairs fenced as data."""
+    tone, and the examples as CLIENT/OWNER pairs fenced as data, each text
+    one JSON string (``windows.quote_body``), so no example can end the
+    fence or add a line of its own."""
     lines = ["STYLE:", style.prompt_text]
     tone = style.tone
     if tone.honorific:
@@ -292,8 +295,8 @@ def render(style: ReplyStyle) -> str:
     if style.examples:
         lines.append(UNTRUSTED_OPEN)
         for pair in style.examples:
-            lines.append(f"CLIENT: {pair.context}")
-            lines.append(f"OWNER: {pair.reply}")
+            lines.append(f"CLIENT: {quote_body(pair.context)}")
+            lines.append(f"OWNER: {quote_body(pair.reply)}")
         lines.append(UNTRUSTED_CLOSE)
     return "\n".join(lines)
 

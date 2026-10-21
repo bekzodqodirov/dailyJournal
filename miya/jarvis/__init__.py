@@ -4,8 +4,9 @@ Everything under this package is type-checked with mypy in strict mode
 (``make typecheck``) and held to the no-placeholder rule from its first
 module on. Core MIYA never imports it at startup: the bot's ``/jarvis``
 handler and the worker's ``jarvis_outbox`` job import it when they run, and
-the job exists only with JARVIS_ENABLED (rule 20). Importing this package
-imports nothing else.
+the job exists only with JARVIS_ENABLED (rule 20); the userbot imports the
+responder only inside ``enqueue_reply``, after the JARVIS_ENABLED check.
+Importing this package imports nothing else.
 
 The core (JV-11):
 
@@ -41,4 +42,20 @@ The knowledge base (JV-15):
   answers the outbox reads for the statement allowlist, and the weekly
   suggestions mined from the owner's own answers (never used before the
   owner's tap).
+
+The responder (JV-16):
+
+* ``responder`` — a client's private message to a proposal: the enqueue the
+  userbot calls after ``ingest_message``, the debounce and owner-first
+  window, the deterministic signals first, then intent, KB, draft and the
+  guards; every outcome an outbox row or an escalation with a stall.
+* ``envelope`` — the client's thread as quoted, cleaned, untrusted data.
+* ``intent`` — what the message asks (deterministic greeting, else
+  EXTRACT_MODEL strict JSON).
+* ``draft`` — the reply writer (REASON_MODEL, no tools, no private data).
+* ``guard`` — the model guard (EXTRACT_MODEL): it can only block, and reads
+  the thread for spam, scams and hijacked accounts.
+* ``costs.ask`` is the one way these calls reach a model: nothing over the
+  cost cap, usage recorded as ``jarvis_intent``, ``jarvis_draft`` and
+  ``jarvis_guard``.
 """

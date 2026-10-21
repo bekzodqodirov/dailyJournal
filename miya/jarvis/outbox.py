@@ -27,6 +27,12 @@ entry, JV-15, which the outbox loads itself). A text with a free-form
 statement becomes a draft card (``unapproved_statement``) instead;
 ``gate.evaluate`` holds the same line at the claim.
 
+The model guard (JV-16, ``guard``) runs before a row is created, and only on
+a body the deterministic guard passes (``preview`` runs that check with
+exactly the inputs ``create`` uses). Its verdict rides into ``create`` as
+``model_verdict``: anything but ``pass`` makes the stored verdict a block
+(``model_block``), and a deterministic block is never lifted by it.
+
 Every transition appends ``{at, field, old, new, by}`` to ``history``.
 Functions take the caller's session and flush; the caller commits. Logs
 carry ids and codes only, never a body (rule 23).
@@ -38,7 +44,7 @@ import hashlib
 import logging
 import random
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Final
 
@@ -115,6 +121,10 @@ BAD_KB_IDS: Final = "bad_kb_entry_ids"
 KB_IDS_KEY: Final = "kb_entry_ids"
 # approve() is the owner's tap: the autonomous approver is create()'s alone.
 BAD_APPROVER: Final = "bad_approver"
+# The stored verdict of a body the deterministic guard passed but the model
+# guard (JV-16) objected to; its flag on the verdict.
+MODEL_BLOCK: Final = "model_block"
+MODEL_PASS: Final = "pass"
 ORIGINS: Final = ("auto_reply", "stall", "owner_command", "escalation")
 AUTHORS: Final = (gate.AI, gate.OWNER)
 
@@ -258,12 +268,40 @@ def _kb_ids(guard: Mapping[str, Any] | None) -> list[int]:
 
 
 def _bound_guard(
-    result: gate.GuardResult, sha: str, *, kb_ids: Sequence[int] = ()
+    result: gate.GuardResult,
+    sha: str,
+    *,
+    kb_ids: Sequence[int] = (),
+    model_verdict: object = None,
 ) -> dict[str, object]:
     guard = result.bound_to(sha)
     if kb_ids:
         guard[KB_IDS_KEY] = sorted(set(kb_ids))
+    if result.model_verdict is None and isinstance(model_verdict, str):
+        # The model guard read this exact body (JV-16); a re-guard of the
+        # same body keeps what it said.
+        guard["model_verdict"] = model_verdict
     return guard
+
+
+def with_model_verdict(
+    result: gate.GuardResult, model_verdict: str | None
+) -> gate.GuardResult:
+    """The deterministic verdict with the model guard's (JV-16) on top. The
+    model can only add a block: a deterministic block stays the verdict, and
+    a pass with a model objection becomes ``model_block``."""
+    if model_verdict is None:
+        return result
+    verdict = model_verdict[:64]
+    if not result.passed or verdict == MODEL_PASS:
+        return replace(result, model_verdict=verdict)
+    return replace(
+        result,
+        verdict=MODEL_BLOCK,
+        flags=(*result.flags, MODEL_BLOCK),
+        model_verdict=verdict,
+        shapes_ok=False,
+    )
 
 
 def _bind(
@@ -622,6 +660,58 @@ def snapshot(row: OutboxMessage) -> gate.Row:
 # --- create ------------------------------------------------------------------------
 
 
+async def preview(
+    session: AsyncSession,
+    *,
+    channel: str,
+    chat_key: str,
+    origin: str,
+    authored_by: str,
+    body: str,
+    now: datetime,
+    person_id: int | None = None,
+    trigger_interaction_id: int | None = None,
+    kb_entry_ids: Sequence[int] = (),
+) -> gate.GuardResult:
+    """The deterministic verdict ``create`` would bind to this body, with
+    exactly its inputs (the chat's codes, the names, the client's script, the
+    named KB entries still active, the owner's stall overrides); nothing is
+    stored. The responder (JV-16) asks it before the model guard, which runs
+    only on a body this passes."""
+    if isinstance(kb_entry_ids, str | bytes) or any(
+        not isinstance(i, int) or isinstance(i, bool) for i in kb_entry_ids
+    ):
+        raise OutboxError(BAD_KB_IDS)
+    if origin not in ORIGINS or authored_by not in AUTHORS:
+        raise OutboxError("bad_row")
+    if not gate.plain_text(body):
+        return gate.GuardResult(verdict=gate.PAYLOAD_NOT_TEXT)
+    # A transient row, never added to the session: the guard's inputs are
+    # read from it exactly as create() reads them from the row it stores.
+    row = OutboxMessage(
+        channel=channel,
+        chat_key=chat_key,
+        tg_chat_id=chatkey.tg_chat_id(chat_key),
+        person_id=person_id,
+        trigger_interaction_id=trigger_interaction_id,
+        origin=origin,
+        authored_by=authored_by,
+        body=body,
+        created_at=now,
+    )
+    ai = authored_by == gate.AI
+    kb_texts = (
+        await owner_kb_texts(session, list(kb_entry_ids)) if ai and kb_entry_ids else {}
+    )
+    return _run_guard(
+        row,
+        await allowed_tokens(session, row),
+        await guard_names(session, row),
+        approved_kb=tuple(kb_texts.values()),
+        stall_texts=await owner_stall_texts(session) if ai else (),
+    )
+
+
 async def create(
     session: AsyncSession,
     *,
@@ -643,6 +733,7 @@ async def create(
     approved_kb: Sequence[str] = (),
     stall_texts: Sequence[str] = (),
     kb_entry_ids: Sequence[int] = (),
+    model_verdict: str | None = None,
 ) -> OutboxMessage:
     """Store a proposal: shadow, draft, approved (a graduated auto intent
     whose text passed the statement allowlist only) or blocked. The same
@@ -656,7 +747,11 @@ async def create(
     approved statements a verbatim text may be made of. They never loosen a
     red line. Texts a caller hands in (``approved_kb``, ``stall_texts``) are
     never trusted as approved and are refused, and so is a bare string (it
-    would be read one character a text) or an id that is not an int."""
+    would be read one character a text) or an id that is not an int.
+
+    ``model_verdict`` is what the model guard (JV-16) said about this body:
+    ``pass``, or the code of its objection, which makes the stored verdict a
+    block (``with_model_verdict``). It never lifts a deterministic block."""
     if isinstance(approved_kb, str) or isinstance(stall_texts, str):
         raise OutboxError(APPROVED_TEXTS_REFUSED)
     if approved_kb or stall_texts:
@@ -745,6 +840,8 @@ async def create(
         approved_kb=tuple(kb_texts.values()),
         stall_texts=await owner_stall_texts(session) if ai else (),
     )
+    if ai:
+        result = with_model_verdict(result, model_verdict)
     _bind(row, result, kb_ids=sorted(kb_texts))
     state, code = await _initial_state(
         session, row=row, facts=facts, rules=rules, guard=result, now=now
@@ -813,13 +910,15 @@ async def _initial_state(
         and policy.rule_mode(rules) != policy.RULE_DRAFT
         and not await costs.over_cap(session, now)
     )
-    if auto and guard.shapes_ok:
+    if auto and gate.auto_shapes_ok(row.intent, guard.shapes_ok, guard.shapes):
+        # A general question only with a verbatim KB entry in it (§6.2).
         return APPROVED, None
     if await caps.draft_cap_reached(session, now):
         return DRAFT, caps.DRAFT_CAP_CODE
     if auto:
-        # Rule 13a: a free-form statement is never sent on its own; the
-        # owner reads it on a card first.
+        # Rule 13a: a free-form statement (or a general question that
+        # matched no KB entry) is never sent on its own; the owner reads it
+        # on a card first.
         return DRAFT, gate.UNAPPROVED_STATEMENT
     return DRAFT, None
 
@@ -881,6 +980,11 @@ async def approve(
         )
         if mode in ("off", "shadow"):
             return Approval(row, False, f"mode_{mode}")
+        stored_model = (row.guard or {}).get("model_verdict")
+        if _bound(row) and stored_model not in (None, MODEL_PASS):
+            # The model guard objected to this exact body (JV-16): a re-run of
+            # the deterministic guard must not approve it behind its back.
+            return Approval(row, False, MODEL_BLOCK)
         if not (_bound(row) and (row.guard or {}).get("verdict") == gate.GUARD_PASS):
             kb_ids = _kb_ids(row.guard)
             kb_texts = await owner_kb_texts(session, kb_ids) if kb_ids else {}
@@ -1114,10 +1218,15 @@ def _apply(
 ) -> bool:
     """Write one gate decision; True when the row was claimed."""
     if decision.guard is not None:
+        sha = decision.body_sha256 or gate.body_hash(row.body)
+        before = row.guard or {}
         row.guard = _bound_guard(
             decision.guard,
-            decision.body_sha256 or gate.body_hash(row.body),
-            kb_ids=_kb_ids(row.guard),
+            sha,
+            kb_ids=_kb_ids(before),
+            model_verdict=(
+                before.get("model_verdict") if before.get("body_sha256") == sha else None
+            ),
         )
         row.body_sha256 = decision.body_sha256 or gate.body_hash(row.body)
         _log_guard_error(row, decision.guard)
@@ -1644,6 +1753,7 @@ __all__ = [
     "idempotency_key",
     "mark_told",
     "pacing_for",
+    "preview",
     "quiet_until",
     "reconcile",
     "record_warning",
@@ -1651,4 +1761,5 @@ __all__ = [
     "snapshot",
     "unknown_untold",
     "unsafe_inbound",
+    "with_model_verdict",
 ]

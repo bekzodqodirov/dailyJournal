@@ -17,8 +17,9 @@ skip a line. The first line that objects decides:
 
 An autonomous row (``auto:policy``, no owner tap) also needs the statement
 allowlist (§5.2 step 3, rule 13a): its bound verdict must say ``shapes_ok``,
-every sentence a courtesy, a question, a stall or an approved KB text. One
-without it never goes out on its own: it goes back to the owner's card
+every sentence a courtesy, a question, a stall or an approved KB text, and a
+``general_question`` must quote an approved KB text (§6.2). One without it
+never goes out on its own: it goes back to the owner's card
 (``unapproved_statement``).
 
 The red-line guard is reached through the small ``Guard`` interface.
@@ -90,6 +91,10 @@ WARNED_SAFETY: Final = "warned_safety"
 AUTO_INTENTS: Final = frozenset(
     {"greeting", "info_gathering", "general_question", "stall"}
 )
+# Auto intents that go out on their own only when the text quotes an active
+# knowledge-base entry verbatim (§6.2: «only when a KB entry matched»).
+KB_ONLY_INTENTS: Final = frozenset({"general_question"})
+KB_SHAPE: Final = "kb"
 
 
 def body_hash(body: str) -> str:
@@ -139,6 +144,14 @@ def shapes_passed(guard: Mapping[str, object]) -> bool:
     statement-allowlist check? A verdict stored before the check existed, or
     by a guard that does not make it, does not."""
     return guard.get("verdict") == GUARD_PASS and guard.get("shapes_ok") is True
+
+
+def auto_shapes_ok(intent: str | None, shapes_ok: bool, shapes: Sequence[str]) -> bool:
+    """The statement allowlist as an autonomous send needs it: every sentence
+    an approved shape and, for a ``KB_ONLY_INTENTS`` intent, a verbatim
+    knowledge-base entry among them (§6.2). A general question answered with
+    questions and courtesy alone matched no entry: it is the owner's card."""
+    return shapes_ok and (intent not in KB_ONLY_INTENTS or KB_SHAPE in shapes)
 
 
 class Guard(Protocol):
@@ -510,9 +523,12 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         return None  # the payload line refuses it
     sha = body_hash(row.body)
     bound = row.body_sha256 == sha and row.guard.get("body_sha256") == sha
-    leaned_on_kb = row.auto and "kb" in _shape_names(row.guard)
+    leaned_on_kb = row.auto and KB_SHAPE in _shape_names(row.guard)
     if row.ai and bound and row.guard.get("verdict") == GUARD_PASS and not leaned_on_kb:
-        if row.auto and not shapes_passed(row.guard):
+        if row.auto and not (
+            shapes_passed(row.guard)
+            and auto_shapes_ok(row.intent, True, _shape_names(row.guard))
+        ):
             # Rule 13a: free-form statements go out only after an owner tap.
             return Decision("redraft", "guard", UNAPPROVED_STATEMENT)
         return None
@@ -546,9 +562,10 @@ def _guard(row: Row, ctx: Context) -> Decision | None:
         # The owner tapped send on another text: the new one goes back to
         # the card, with the fresh verdict bound to it (rule 16).
         return Decision("redraft", "guard", "body_changed", guard=result, body_sha256=sha)
-    if not result.shapes_ok:
+    if not auto_shapes_ok(row.intent, result.shapes_ok, result.shapes):
         # Re-guarded, the red lines pass but a sentence is a free-form
-        # statement: back to the owner's card with the fresh verdict bound.
+        # statement (or a general question quotes no KB entry): back to the
+        # owner's card with the fresh verdict bound.
         return Decision(
             "redraft", "guard", UNAPPROVED_STATEMENT, guard=result, body_sha256=sha
         )
@@ -620,6 +637,8 @@ __all__ = [
     "GUARD_FAILED",
     "GUARD_PASS",
     "GUARD_UNAVAILABLE",
+    "KB_ONLY_INTENTS",
+    "KB_SHAPE",
     "LINES",
     "MAX_BODY_CHARS",
     "NO_TRIGGER",
@@ -638,6 +657,7 @@ __all__ = [
     "GuardRole",
     "Row",
     "Trigger",
+    "auto_shapes_ok",
     "body_hash",
     "evaluate",
     "guard_role",

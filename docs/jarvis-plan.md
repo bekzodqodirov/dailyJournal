@@ -1774,6 +1774,43 @@ stop: "💸 Jarvis bugungi xarajat chegarasiga yetdi — ertagacha faqat sizga y
 **Acceptance.** With fake model payloads, shadow rows and escalations are correct. Owner check:
 `/qoralamalar` shows plausible drafts in their style.
 
+**As built.** `miya/jarvis/responder.py`, `envelope.py`, `intent.py`, `draft.py`, `guard.py`
+(mypy strict). The userbot's live `NewMessage` handler is `userbot.on_new_message`: it ingests,
+and only when `ingest_message` returned True calls `enqueue_reply`, which imports the responder
+lazily after the JARVIS_ENABLED check (the catch-up, backfills and `record_edit` call
+`ingest_message` directly and never enqueue); the enqueue is one upsert, no model call.
+`respond_after` is the latest message plus JARVIS_DEBOUNCE_SECONDS; the claim leases a chat
+for three minutes instead of holding a row lock through the model calls (so the next enqueue
+never waits), and the owner-first window (JARVIS_OWNER_FIRST_SECONDS) runs from the client's
+first unanswered message: a chat claimed earlier is looked at again when it ends. Every Jarvis
+model call goes through `costs.ask`: it refuses over the cost cap before sending anything,
+sends no `tools` parameter at all (a request without tools, rather than an empty list), and
+records the usage in a transaction of its own (falling back to the caller's), so a run that
+fails later never hides a spend. The deterministic guard runs before the model guard through
+`outbox.preview` (exactly `create`'s inputs, nothing stored), and the model verdict rides into
+`outbox.create(model_verdict=...)`: anything but `pass` makes the stored verdict `model_block`,
+`approve` refuses a model-blocked body, and a claim re-guard of the same body keeps the model
+verdict. «Model failures → needs_review» is an escalation (reason `other`, history code
+`needs_review` and the failing step) with no stall: `interactions.needs_review` stays the
+extraction pipeline's (`/tekshir`, `/qayta`). An injection tripwire in the new messages, the
+model guard's spam/scam/hijack reading of the thread, the AI turn limit and the per-chat cap
+send the chat to the owner with no stall; a red-line signal, an escalating intent, the
+writer's `needs_owner`, a guard block and the cost cap add the one stall (the owner's default
+stall when the client asked nothing only the owner may answer). An open escalation makes a
+new push a `repeat` entry in its history (real signals merged into `reasons`; a push with no
+signal adds no `other`), never a second stall. It holds the chat only until the owner writes
+there after it opened (then the responder resolves it as `owner_replied`, `auto:own`) or, still
+`open`, for JARVIS_DRAFT_EXPIRY_HOURS (`expired`, `auto:expiry`). A `general_question` is
+approved on its own only when its text quotes an active KB entry (a `kb` shape), in
+`outbox.create` and at the claim (`gate.auto_shapes_ok`). A message the shield flagged reads
+`[hidden by the shield]` in every thread a model sees. Escalations record the channel's mode in their creation entry (`mode`), so the cards
+(JV-18) can tell observation-only ones apart; there is no summary prose yet (`summary` NULL).
+The writer only sees KB answers that pass the reply role. The envelope masks phone and card
+numbers and money figures (codes and waybills stay) besides removing format characters,
+hidden HTML, quoted mail chains and the delimiters. `/jarvis` adds the observation line and,
+when drafts strayed, «Erkin gapli qoralamalar (o'zi yuborilmasdi): …» per intent; the cost
+stop is told once a day (`reminder_log` kind `jarvis_cost_stop`).
+
 ---
 
 #### JV-17 — Owner-first window, takeover and draft invalidation

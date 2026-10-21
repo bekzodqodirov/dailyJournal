@@ -1019,6 +1019,22 @@ async def cmd_jarvis(message: Message, command: CommandObject) -> None:
     await _safe_answer(message, body)
 
 
+@router.message(Command("qoralamalar"))
+async def cmd_shadow_drafts(message: Message) -> None:
+    """`/qoralamalar` — the replies Jarvis prepared in observation (shadow)
+    mode, newest first; none of them was sent (JV-16). miya.jarvis is
+    imported here, never at startup (rule 20)."""
+    from miya.jarvis import status as jarvis_status
+
+    try:
+        async with session_scope() as session:
+            body = replies.shadow_drafts(await jarvis_status.shadow_drafts(session))
+    except Exception as exc:
+        log.error("/qoralamalar failed", extra={"error": type(exc).__name__})
+        body = replies.JARVIS_FAILED
+    await _safe_answer(message, body)
+
+
 # --- personal chats and group replies (JV-12) ---------------------------------------
 #
 # miya.jarvis is imported inside each handler, never at startup (rule 20).

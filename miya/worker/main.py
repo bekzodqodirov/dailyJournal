@@ -18,6 +18,12 @@ Jobs:
   * jarvis_outbox — every minute, only with JARVIS_ENABLED; expires stale
                    drafts, reconciles claimed sends whose lease ran out and
                    tells the owner once about a send in doubt (JV-11)
+  * jarvis_respond — every 15 s, only with JARVIS_ENABLED; the responder
+                   (JV-16): a client's private message, after the debounce and
+                   the owner-first window, gets a style-cloned draft or an
+                   escalation with a stall, stored as the mode says (shadow
+                   until the owner raises it); over the cost cap only stalls
+                   and escalations, and the owner is told once a day
   * style_refresh — every 10 min, only with JARVIS_ENABLED; builds the
                    owner's style profile (JV-14) once a requested history
                    import is read and tells the owner it is ready, and
@@ -527,6 +533,51 @@ async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
                 "jarvis unknown-send notice failed",
                 extra={"outbox_id": row_id, "error": type(exc).__name__},
             )
+
+
+# The ReminderLog kind that records "the owner was told today that the cost
+# cap stopped drafting" (ref: the day), so they hear it once a day.
+JARVIS_COST_STOP_KIND = "jarvis_cost_stop"
+
+
+async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The responder (JV-16): the chats whose debounce and owner-first window
+    are over get a draft or an escalation, stored in the mode's state. When
+    the cost cap stopped a draft, the owner is told once a day that Jarvis
+    only forwards to them until tomorrow.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
+    startup (rule 20). The run contains each chat on its own (rule 25); a
+    failure of the run or of the notice is logged and the next tick goes on.
+    """
+    from miya.jarvis import responder
+
+    now = now or datetime.now(settings.tz)
+    try:
+        result = await responder.run(now=now)
+    except Exception as exc:
+        log.error("jarvis responder run failed", extra={"error": type(exc).__name__})
+        return
+    if not result.cost_capped:
+        return
+    day = reminders.day_start(now).date().isoformat()
+    try:
+        async with session_scope() as session:
+            told = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(ReminderLog)
+                .where(ReminderLog.kind == JARVIS_COST_STOP_KIND, ReminderLog.ref == day)
+            )
+        if told:
+            return
+        if not await notify(
+            bot, replies.JARVIS_COST_STOP, silent=reminders.in_quiet_hours(now)
+        ):
+            return
+        async with session_scope() as session:
+            session.add(ReminderLog(kind=JARVIS_COST_STOP_KIND, ref=day))
+    except Exception as exc:
+        log.error("jarvis cost-stop notice failed", extra={"error": type(exc).__name__})
 
 
 # The ReminderLog kind that records "the style profile of this import was
@@ -2014,6 +2065,14 @@ async def run() -> None:
             IntervalTrigger(minutes=1),
             args=[bot],
             id="jarvis_outbox",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            jarvis_respond_job,
+            IntervalTrigger(seconds=15),
+            args=[bot],
+            id="jarvis_respond",
             max_instances=1,
             coalesce=True,
         )

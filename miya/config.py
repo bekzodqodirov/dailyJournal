@@ -257,6 +257,20 @@ class Settings(BaseSettings):
     # entry to be retrieved: meaning similarity or word overlap, 0 to 1.
     kb_match_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
 
+    # --- Responder (JV-16) ------------------------------------------------
+    # A burst of client messages collapses into one reply: the responder looks
+    # at a chat this long after its latest message.
+    jarvis_debounce_seconds: int = Field(default=45, ge=0, le=3600)
+    # The owner gets this long, from the client's first unanswered message,
+    # to answer before MIYA drafts anything.
+    jarvis_owner_first_seconds: int = Field(default=120, ge=0, le=86400)
+    # An inbound message older than this never gets an AI reply.
+    jarvis_max_message_age_seconds: int = Field(default=900, ge=60, le=86400)
+    # Consecutive AI turns in one chat without the owner; then only the owner.
+    jarvis_max_ai_turns: int = Field(default=2, ge=0, le=20)
+    # How many of the chat's latest turns the reply writer sees.
+    jarvis_history_turns: int = Field(default=8, ge=1, le=50)
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"

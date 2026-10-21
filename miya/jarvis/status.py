@@ -3,6 +3,13 @@ trail (docs/jarvis-plan.md JV-11 behaviour 4, §5.9).
 
 Read-only. Every number is counted in SQL (``caps.day_counts``); the audit
 trail is the ``history`` of the Jarvis rows themselves, newest first.
+
+The observation numbers (JV-16, ``shadow_counts``) say what the responder
+would have done today in ``shadow`` mode: the replies it would have prepared,
+how many of them it would have sent to the owner instead, and per intent how
+many drafts strayed from the approved shapes (``unapproved_statement``), so
+the owner sees how often the model would need their eye. ``shadow_drafts``
+is ``/qoralamalar``.
 """
 
 from __future__ import annotations
@@ -13,17 +20,39 @@ from datetime import datetime
 from typing import Any, Final, Literal
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.models import Escalation, JarvisPolicy, OutboxMessage, ReplyRule
-from miya.jarvis import caps, chatkey, outbox, policy
+from miya.db.models import (
+    Escalation,
+    Interaction,
+    JarvisPolicy,
+    OutboxMessage,
+    Person,
+    ReplyRule,
+)
+from miya.jarvis import caps, chatkey, gate, outbox, policy
 from miya.jarvis.policy import Mode
+from miya.services.reminders import day_start
 
 ChannelState = Literal["working", "limited", "paused", "not_connected"]
 
 # How many recent rows of each table the audit trail looks through.
 HISTORY_SCAN: Final = 60
+# How many observation drafts `/qoralamalar` lists.
+SHADOW_LIST: Final = 10
+
+
+@dataclass(frozen=True, slots=True)
+class ShadowCounts:
+    """Today in ``shadow`` mode (JV-16): replies the responder would have
+    prepared (drafts and escalations), how many of those it would have sent
+    to the owner, and the drafts per intent with a free-form statement."""
+
+    prepared: int = 0
+    escalated: int = 0
+    unapproved: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +63,7 @@ class Status:
     limit_used: int
     limit_cap: int
     channels: tuple[tuple[chatkey.Channel, ChannelState], ...]
+    shadow: ShadowCounts | None = None
 
 
 def global_mode(policies: policy.Policies) -> Mode:
@@ -65,6 +95,7 @@ async def gather(session: AsyncSession, now: datetime) -> Status:
     else:
         used, cap = counts.draft_cards, settings.jarvis_draft_daily_cap
     stored = policies.get(policy.GLOBAL)
+    shadow = await shadow_counts(session, now)
     return Status(
         mode=mode,
         paused=stored is not None and stored.paused(now),
@@ -75,7 +106,96 @@ async def gather(session: AsyncSession, now: datetime) -> Status:
             (channel, channel_state(policies, channel, now))
             for channel in chatkey.CHANNELS
         ),
+        shadow=shadow if mode == "shadow" or shadow.prepared else None,
     )
+
+
+def _shadow_escalation() -> sa.ColumnElement[bool]:
+    """An escalation the responder opened in ``shadow`` mode (its creation
+    entry says so): never alerted, only counted."""
+    return Escalation.history.op("@>")(
+        sa.cast(sa.literal([{"field": "state", "mode": "shadow"}], JSONB), JSONB)
+    )
+
+
+async def shadow_counts(session: AsyncSession, now: datetime) -> ShadowCounts:
+    start = day_start(now)
+    shadow_reply = sa.and_(
+        OutboxMessage.created_at >= start,
+        OutboxMessage.state == outbox.SHADOW,
+        OutboxMessage.origin == "auto_reply",
+    )
+    drafts = await session.scalar(
+        sa.select(sa.func.count()).select_from(OutboxMessage).where(shadow_reply)
+    )
+    escalated = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(Escalation)
+        .where(Escalation.created_at >= start, _shadow_escalation())
+    )
+    strayed = OutboxMessage.guard["flags"].op("@>")(
+        sa.cast(sa.literal([gate.UNAPPROVED_STATEMENT], JSONB), JSONB)
+    )
+    per_intent = await session.execute(
+        sa.select(OutboxMessage.intent, sa.func.count())
+        .where(shadow_reply, strayed)
+        .group_by(OutboxMessage.intent)
+        .order_by(OutboxMessage.intent)
+    )
+    escalations = int(escalated or 0)
+    return ShadowCounts(
+        prepared=int(drafts or 0) + escalations,
+        escalated=escalations,
+        unapproved=tuple((str(k or "other"), int(n)) for k, n in per_intent),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ShadowDraft:
+    """One observation draft as ``/qoralamalar`` shows it (plain values:
+    replies.py never imports miya.jarvis)."""
+
+    id: int
+    name: str | None
+    client_text: str
+    body: str
+    intent: str | None
+    origin: str
+
+
+async def shadow_drafts(
+    session: AsyncSession, *, limit: int = SHADOW_LIST
+) -> list[ShadowDraft]:
+    """The newest ``shadow`` rows, newest first: who wrote, what they wrote,
+    what MIYA would have answered."""
+    rows = await session.execute(
+        sa.select(
+            OutboxMessage.id,
+            Person.display_name,
+            Interaction.raw_text,
+            Interaction.transcript,
+            OutboxMessage.body,
+            OutboxMessage.intent,
+            OutboxMessage.origin,
+        )
+        .select_from(OutboxMessage)
+        .outerjoin(Person, Person.id == OutboxMessage.person_id)
+        .outerjoin(Interaction, Interaction.id == OutboxMessage.trigger_interaction_id)
+        .where(OutboxMessage.state == outbox.SHADOW)
+        .order_by(OutboxMessage.created_at.desc(), OutboxMessage.id.desc())
+        .limit(limit)
+    )
+    return [
+        ShadowDraft(
+            id=int(row_id),
+            name=name,
+            client_text=(raw or transcript or "").strip(),
+            body=body,
+            intent=kind,
+            origin=origin,
+        )
+        for row_id, name, raw, transcript, body, kind, origin in rows
+    ]
 
 
 # Which table an audit entry comes from; replies.py renders the reference
@@ -160,9 +280,13 @@ __all__ = [
     "Action",
     "ChannelState",
     "RefKind",
+    "ShadowCounts",
+    "ShadowDraft",
     "Status",
     "channel_state",
     "gather",
     "global_mode",
     "recent_actions",
+    "shadow_counts",
+    "shadow_drafts",
 ]

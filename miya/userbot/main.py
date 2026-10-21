@@ -25,7 +25,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
@@ -894,6 +894,70 @@ async def ingest_message(
     return True
 
 
+# --- the reply candidate (JV-16) -----------------------------------------------
+
+
+async def enqueue_reply(message) -> bool:
+    """Queue a live incoming private message for Jarvis's responder, once it
+    is stored. Only SQL here: no model is called in a Telethon handler, and
+    the responder reads the chat later in the worker. Never called for the
+    catch-up, a backfill or an edit (only ``on_new_message`` calls it);
+    miya.jarvis is imported only with JARVIS_ENABLED (rule 20)."""
+    if not settings.jarvis_enabled or getattr(message, "out", False):
+        return False
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "id", None)
+    sent_at = getattr(message, "date", None)
+    if not isinstance(chat_id, int) or chat_id <= 0 or not isinstance(message_id, int):
+        return False  # a group or a channel: the responder answers private chats only
+    now = datetime.now(settings.tz)
+    if sent_at is None or sent_at < now - timedelta(
+        seconds=settings.jarvis_max_message_age_seconds
+    ):
+        return False
+    from miya.jarvis import responder
+
+    async with session_scope() as session:
+        interaction = await session.scalar(
+            sa.select(Interaction).where(
+                Interaction.source == InteractionSource.telegram_userbot,
+                Interaction.tg_chat_id == chat_id,
+                Interaction.meta.has_key("tg_message_id"),
+                Interaction.meta["tg_message_id"].astext.cast(sa.BigInteger)
+                == message_id,
+            )
+        )
+        if interaction is None:
+            return False
+        return await responder.enqueue_candidate(session, interaction, now=now)
+
+
+async def on_new_message(client: TelegramClient, message) -> None:
+    """The live NewMessage handler: store the message, then (JV-16) queue it
+    as a reply candidate when ``ingest_message`` returned True. Each step is
+    contained: one bad message never takes the reader down."""
+    try:
+        stored = await ingest_message(client, message)
+    except Exception:
+        # One bad message must never take the reader down; the next
+        # message still lands.
+        log.exception("failed to ingest message %s", getattr(message, "id", "?"))
+        return
+    if not stored:
+        return
+    try:
+        await enqueue_reply(message)
+    except Exception as exc:
+        log.error(
+            "reply candidate not queued",
+            extra={
+                "tg_chat_id": getattr(message, "chat_id", None),
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+
+
 # --- who a message was aimed at ----------------------------------------------
 #
 # The Latin→Cyrillic table and alias_pattern live in services/text.py (WP-28).
@@ -1374,12 +1438,7 @@ async def run() -> None:
         await sync_from_client(client)
 
         async def _on_message(event) -> None:
-            try:
-                await ingest_message(client, event.message)
-            except Exception:
-                # One bad message must never take the reader down; the next
-                # message still lands.
-                log.exception("failed to ingest message %s", getattr(event, "id", "?"))
+            await on_new_message(client, event.message)
 
         async def _on_edit(event) -> None:
             try:

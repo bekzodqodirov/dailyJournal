@@ -663,6 +663,31 @@ def test_gate_rechecks_a_kb_row_at_the_claim():
     tapped = _gate_row(body=body, guard=bound, approved_by="button")
     assert gate.evaluate(tapped, _gate_ctx(guard=KbGuard())).sends
 
+    # §6.2: a general question that quotes no entry is a card at the claim,
+    # bound or re-guarded; the owner's tap still sends it.
+    asked = "Qaysi yuk haqida so'rayapsiz?"
+    question = {
+        "verdict": "pass",
+        "body_sha256": gate.body_hash(asked),
+        "shapes_ok": True,
+        "shapes": ["question"],
+    }
+    bare = _gate_row(body=asked, guard=question, intent="general_question")
+    back = gate.evaluate(bare, _gate_ctx())
+    assert (back.action, back.code) == ("redraft", gate.UNAPPROVED_STATEMENT)
+    moved = _gate_row(
+        body=asked,
+        guard={**question, "body_sha256": "0" * 64},
+        intent="general_question",
+    )
+    again = gate.evaluate(moved, _gate_ctx(guard=PassGuard()))
+    assert (again.action, again.code) == ("redraft", gate.UNAPPROVED_STATEMENT)
+    assert again.guard is not None and again.guard.shapes_ok
+    owner_sent = _gate_row(
+        body=asked, guard=question, intent="general_question", approved_by="button"
+    )
+    assert gate.evaluate(owner_sent, _gate_ctx()).sends
+
 
 async def test_create_takes_no_approved_texts_from_its_caller(session, jarvis):
     """Rule 13a: a caller cannot hand create() the texts that make a body an
@@ -2115,15 +2140,37 @@ async def test_jarvis_off_registers_nothing(monkeypatch):
     off = await jobs(False)
     assert off and not [job for job in off if job.startswith("jarvis")]
     on = await jobs(True)
-    # The owner-style refresh (JV-14) and the knowledge-base job (JV-15) import
-    # miya.jarvis: Jarvis-only too.
-    assert set(on) - set(off) == {"jarvis_outbox", "style_refresh", "kb_mining"}
-    # The userbot has no Telegram write path yet, and never imports miya.jarvis.
+    # The owner-style refresh (JV-14), the knowledge-base job (JV-15) and the
+    # responder (JV-16) import miya.jarvis: Jarvis-only too.
+    assert set(on) - set(off) == {
+        "jarvis_outbox",
+        "jarvis_respond",
+        "style_refresh",
+        "kb_mining",
+    }
+    # The userbot has no Telegram write path yet. It imports miya.jarvis in one
+    # place only: the responder, inside enqueue_reply, after the
+    # JARVIS_ENABLED check (JV-16) — never at module level.
     tree = ast.parse(Path(userbot.__file__).read_text(encoding="utf-8"))
-    imports = [
-        node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
-    ] + [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
-    assert not [name for name in imports if name.startswith("miya.jarvis")]
+    at_module = [
+        node.module or "" for node in tree.body if isinstance(node, ast.ImportFrom)
+    ] + [a.name for n in tree.body if isinstance(n, ast.Import) for a in n.names]
+    assert not [name for name in at_module if name.startswith("miya.jarvis")]
+    lazy = {
+        (function.name, alias.name)
+        for function in ast.walk(tree)
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+        for node in ast.walk(function)
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "miya.jarvis"
+        for alias in node.names
+    }
+    deep = [
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("miya.jarvis.")
+    ]
+    assert lazy == {("enqueue_reply", "responder")} and deep == []
 
 
 async def test_the_outbox_job_reconciles_and_tells_the_owner(
