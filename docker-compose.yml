@@ -134,6 +134,9 @@ services:
   userbot:
     build: .
     # Passive Telegram reader on the owner's personal account (spec §7B).
+    # With JARVIS_ENABLED and TELEGRAM_SEND_ENABLED it also runs the one
+    # Telegram sender (JV-19): it sends the outbox rows that passed the gate
+    # (the owner's approval, or auto mode's allowlist), nothing else.
     # With USERBOT_ENABLED=false the process idles instead of exiting, so
     # unless-stopped is safe and the reader survives a VPS reboot.
     restart: unless-stopped

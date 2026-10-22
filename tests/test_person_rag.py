@@ -425,7 +425,22 @@ async def test_jsonable_renders_timeline_entries_and_memory_person(session):
 
 def test_the_toolbox_and_the_prompt_route_person_questions():
     names = [t["name"] for t in rag.TOOLS]
-    assert "person_summary" in names and "person_timeline" in names
+    # The whole toolbox, pinned: a new tool is a deliberate change (JV-06).
+    assert names == [
+        "search_history",
+        "lookup_code",
+        "open_debts",
+        "person_summary",
+        "person_timeline",
+        "spending_summary",
+        "list_transactions",
+        "promises_made",
+        "who_wrote",
+        "due_items",
+        "upcoming_events",
+        "search_memories",
+        "recent_interactions",
+    ]
     timeline_tool = next(t for t in rag.TOOLS if t["name"] == "person_timeline")
     assert timeline_tool["input_schema"]["properties"]["limit"]["maximum"] == 100
     assert timeline_tool["input_schema"]["properties"]["days"]["maximum"] == 365

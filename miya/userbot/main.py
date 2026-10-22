@@ -1,11 +1,18 @@
-"""Telethon userbot — passive, read-only (spec §7B).
+"""Telethon userbot — a passive reader, with one narrow sender (spec §7B, JV-19).
 
-This process **never writes to Telegram**. There is no call to `send_message`,
+This module **never writes to Telegram**. There is no call to `send_message`,
 `send_file`, `edit_message`, `delete_messages` or `send_read_acknowledge`
-anywhere in this package, and a test asserts that stays true. It connects with
-an existing session string, registers read-only handlers for new messages in
-monitored chats, and stores each one as an interaction. Extraction happens
-later, per conversation window, in the worker (spec §7B).
+here, and a test asserts that stays true. It connects with an existing
+session string, registers read-only handlers for new messages in monitored
+chats, and stores each one as an interaction. Extraction happens later, per
+conversation window, in the worker (spec §7B).
+
+The one exception is ``miya.userbot.sender`` (JV-19): with JARVIS_ENABLED and
+TELEGRAM_SEND_ENABLED it runs as a task next to the reader and sends the
+outbox rows that passed the gate (the ones the owner approved and, in auto
+mode, the ones Jarvis may send by itself), which it takes only from
+``outbox.claim_ready``. The same AST test allows a Telegram write call only
+in its named send functions; without both switches it is never imported.
 
 Safety properties, all deliberate:
   * ``USERBOT_ENABLED=false`` idles without connecting — one flag disables it.
@@ -14,40 +21,66 @@ Safety properties, all deliberate:
   * No history is downloaded on start: only messages that arrive from now on.
     ``chat_monitors`` is synced from the dialog list, which reads titles only.
   * Nothing is ingested from a chat whose ``monitor_enabled`` is false.
+  * With JARVIS_ENABLED it also records the owner-first signals (JV-17):
+    the owner reading a chat, typing in it, writing in it, and a client
+    editing or deleting a message. Those handlers only write MIYA's own
+    database; none of them writes to Telegram.
+  * A Telegram flood wait never ends the process: Telethon sleeps through
+    one up to 60 s, or only up to USERBOT_FLOOD_SLEEP_SECONDS while the
+    sender runs; the dialog sync waits out a short one and skips a long one
+    (JV-19), a media download or re-read waits out a short one itself, and
+    the sweeps contain their own.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import signal
 import sys
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 import sqlalchemy as sa
 from telethon import TelegramClient, events
+from telethon import utils as tg_utils
+from telethon.errors import FloodPremiumWaitError, FloodWaitError
 from telethon.sessions import StringSession
-from telethon.tl.types import Channel, Chat, User
+from telethon.tl.types import (
+    Channel,
+    Chat,
+    DraftMessage,
+    MessageEntityTextUrl,
+    UpdateDraftMessage,
+    User,
+)
 
 from miya.config import settings
 from miya.db.enums import ChatType, Direction, InteractionSource, WindowStatus
 from miya.db.models import ChatMonitor, ConversationWindow, Interaction, Person
 from miya.db.session import engine, session_scope
+from miya.logs import setup_logging
 from miya.services import (
     approvals,
     audio,
+    authorship,
     chats,
     documents,
     health,
+    media_policy,
     owner_address,
+    safety,
     windows,
 )
 from miya.services import usage as usage_service
 from miya.services.chats import DialogInfo, ensure_monitor, sync_dialogs
-from miya.services.ingest import create_interaction
+from miya.services.ingest import apply_vision, create_interaction
 from miya.services.media_policy import (
     MediaKind,
     MediaPlan,
@@ -61,7 +94,7 @@ from miya.services.text import (  # noqa: F401 - transliterate is re-exported
     transliterate,
 )
 from miya.services.transcription import TranscriptionError, get_transcriber
-from miya.services.vision import describe_image
+from miya.services.vision import read_image
 
 log = logging.getLogger(__name__)
 
@@ -150,14 +183,54 @@ class MediaOutcome:
     path: Path | None = None
     audio_path: Path | None = None
     transcript: object | None = None  # Transcript
-    vision: object | None = None  # VisionResult
+    vision: object | None = None  # VisionReading
     document: object | None = None  # DocumentText
     skip_reason: str | None = None
     failed: bool = False  # download or conversion failed; needs the owner's eye
+    # What the bytes turned out to be when they were not plain safe (JV-01).
+    risk: safety.Verdict | None = None
+
+
+# Telethon's own default: a flood wait up to this long is slept through. The
+# reader keeps it; only the sender wants a shorter one (JV-19).
+READER_FLOOD_SLEEP_SECONDS = 60
+# A multi-chunk download can meet a wait on more than one of its chunks.
+READER_FLOOD_RETRIES = 3
+# The plain flood wait, and the download-speed one Telegram gives an account
+# without Premium (FLOOD_PREMIUM_WAIT_X): siblings, neither a subclass.
+READER_FLOOD_ERRORS = (FloodWaitError, FloodPremiumWaitError)
+
+
+async def _reader_call[T](
+    call: Callable[[], Awaitable[T]], *, retries: int = READER_FLOOD_RETRIES
+) -> T:
+    """One read from Telegram (a live media download) that waits out a flood
+    wait the client did not, up to ``retries`` times, each no longer than
+    Telethon's default: with the sender on, the client sleeps only
+    USERBOT_FLOOD_SLEEP_SECONDS, and the reader must not lose a voice note
+    over a 20 s wait. A longer one, or one more, is raised."""
+    for attempt in range(retries + 1):
+        try:
+            return await call()
+        except READER_FLOOD_ERRORS as exc:
+            seconds = int(exc.seconds or 0)
+            if seconds > READER_FLOOD_SLEEP_SECONDS or attempt == retries:
+                raise
+            log.warning(
+                "reader waits out a flood wait",
+                extra={"seconds": seconds, "attempt": attempt + 1},
+            )
+            await asyncio.sleep(seconds + 1)
+    raise AssertionError("unreachable")
 
 
 async def fetch_media(
-    client: TelegramClient, message: object, plan: MediaPlan, suffix: str
+    client: TelegramClient,
+    message: object,
+    plan: MediaPlan,
+    suffix: str,
+    *,
+    pause_on_flood: bool = False,
 ) -> MediaOutcome:
     """Download and process media **outside any transaction**.
 
@@ -166,20 +239,40 @@ async def fetch_media(
     person-resolution advisory lock the whole time, stalling every other
     writer in the system. So the slow work happens here, with nothing held,
     and only the results are persisted afterwards.
+
+    ``pause_on_flood`` (``fetch_approved``): a flood wait is not waited out
+    here but raised, instead of ending as a failure, so the approved file
+    waits for the next pass.
     """
     if not plan.download:
-        return MediaOutcome(skip_reason=plan.skip_reason)
+        return MediaOutcome(skip_reason=plan.skip_reason, risk=plan.risk)
 
     path = _media_path(suffix)
     try:
-        await client.download_media(message, file=str(path))
-    except Exception:
+        await _reader_call(
+            partial(client.download_media, message, file=str(path)),
+            retries=0 if pause_on_flood else READER_FLOOD_RETRIES,
+        )
+    except Exception as exc:
+        # No partial file is left behind: purge_old_media knows only the
+        # files an interaction points to.
+        path.unlink(missing_ok=True)
+        if pause_on_flood and isinstance(exc, READER_FLOOD_ERRORS):
+            raise
         log.exception(
             "could not download media for message %s", getattr(message, "id", "?")
         )
         return MediaOutcome(failed=True)
     if not path.is_file():
         return MediaOutcome(failed=True)
+
+    sniffed = safety.sniff_magic(path, path.suffix)
+    if sniffed.dangerous:
+        # An installer under a document's, a song's or a video's name: gone
+        # before anything reads or transcribes it, and the owner is warned
+        # like for any other installer.
+        path.unlink(missing_ok=True)
+        return MediaOutcome(skip_reason=media_policy.SKIP_DANGEROUS, risk=sniffed)
 
     outcome = MediaOutcome(path=path)
 
@@ -199,10 +292,27 @@ async def fetch_media(
         return outcome
 
     if plan.vision:
-        outcome.vision = await describe_image(path)
+        if not sniffed.readable:
+            # Not an image whatever its name says (JV-04): never sent to vision.
+            outcome.skip_reason = media_policy.SKIP_MISMATCH
+            outcome.failed = True
+            return outcome
+        sent_at = getattr(message, "date", None)
+        outcome.vision = await read_image(
+            path, now=sent_at.astimezone(settings.tz) if sent_at else None
+        )
         return outcome
 
     if plan.read_document:
+        if not sniffed.readable:
+            # Not what its name says; never parsed, kept for the owner's eye.
+            outcome.skip_reason = media_policy.SKIP_MISMATCH
+            outcome.failed = True
+            return outcome
+        if sniffed.kind == safety.MACRO:
+            outcome.risk = sniffed
+        elif plan.risk is not None and plan.risk.kind == safety.MACRO:
+            outcome.risk = plan.risk
         outcome.document = await documents.read_document_async(path)
         if outcome.document is None:
             # The policy only plans a read for a format we support, so failing
@@ -255,11 +365,35 @@ async def _recheck_to_me(session, interaction: Interaction) -> None:
         )
 
 
+def _warn_owner(*, incoming: bool, archive: bool, occurred_at: datetime) -> bool:
+    """Only what others sent, live: never an archive import or old history."""
+    if not incoming or archive:
+        return False
+    return occurred_at >= datetime.now(settings.tz) - safety.NOTICE_MAX_AGE
+
+
+def _flag_risk(interaction: Interaction, verdict: safety.Verdict) -> None:
+    """media.risk, meta.safety and the owner's warning for a file found risky
+    only once its bytes were read (JV-01)."""
+    meta = interaction.meta or {}
+    if verdict.kind == safety.MACRO and interaction.transcript is None:
+        notify = False  # the warning says it was read as text; it was not
+    else:
+        notify = _warn_owner(
+            incoming=interaction.direction is Direction.in_,
+            archive=bool(meta.get("archive")),
+            occurred_at=interaction.occurred_at,
+        )
+    interaction.meta = safety.with_file_verdict(meta, verdict, notify=notify)
+
+
 async def persist_media(session, interaction: Interaction, outcome: MediaOutcome) -> None:
     """Write what `fetch_media` produced. Short, and inside one transaction."""
     media = dict(interaction.media or {})
     if outcome.skip_reason:
         media["skipped"] = outcome.skip_reason
+    if outcome.risk is not None:
+        media["risk"] = outcome.risk.as_risk(media.get("filename"))
     if outcome.path:
         media["path"] = str(outcome.path)
     if outcome.audio_path:
@@ -285,22 +419,9 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
         await _recheck_to_me(session, interaction)
 
     if outcome.vision is not None:
-        if outcome.vision.usage is not None:
-            await usage_service.record_anthropic_usage(
-                session,
-                model=outcome.vision.model,
-                operation="vision",
-                usage=outcome.vision.usage,
-                source_interaction_id=interaction.id,
-            )
-        if outcome.vision.error:
-            log.warning("vision failed for message: %s", outcome.vision.error)
-            interaction.needs_review = True
-        else:
-            interaction.meta = {
-                **(interaction.meta or {}),
-                "vision": outcome.vision.text,
-            }
+        # The description for the extractor and, for a payment receipt, its
+        # receipts row; the card goes out from the worker (JV-04).
+        await apply_vision(session, interaction, outcome.vision, presume_receipt=False)
 
     if outcome.document is not None:
         interaction.transcript = outcome.document.text
@@ -312,24 +433,34 @@ async def persist_media(session, interaction: Interaction, outcome: MediaOutcome
             },
         }
 
+    if outcome.risk is not None:
+        _flag_risk(interaction, outcome.risk)
+
     media["processed"] = True
     interaction.media = media
 
 
-async def _counterparty(session, message, monitor: ChatMonitor):
+async def _counterparty_entity(message, monitor: ChatMonitor):
+    """The account this message is about: the peer in a DM, the speaker in a
+    group; None for the owner's own group messages. Its Telegram flags
+    (``scam``, ``fake``, ``contact``) feed the message shield (JV-09)."""
+    if monitor.chat_type is ChatType.private:
+        return await message.get_chat()
+    if message.out:
+        return None
+    return await message.get_sender()
+
+
+async def _counterparty(session, message, monitor: ChatMonitor, entity=None):
     """Who this message is about: the peer in a DM, the speaker in a group.
 
     A DM stays attached to the other person in both directions so `/kim` sees
     one thread; in a group an incoming message belongs to whoever wrote it and
-    an outgoing one belongs to nobody (the owner spoke).
+    an outgoing one belongs to nobody (the owner spoke). ``entity`` is the
+    account when the caller already looked it up.
     """
-    if monitor.chat_type is ChatType.private:
-        entity = await message.get_chat()
-    elif message.out:
-        return None
-    else:
-        entity = await message.get_sender()
-
+    if entity is None:
+        entity = await _counterparty_entity(message, monitor)
     if entity is None or not isinstance(entity, User):
         return None
     # A contact the owner saved carries the owner's own spelling, codes and
@@ -343,6 +474,203 @@ async def _counterparty(session, message, monitor: ChatMonitor):
         phone=getattr(entity, "phone", None),
         code_policy="attach" if saved else "suggest",
         source="contact" if saved else "tg_name",
+    )
+
+
+# --- the message shield (JV-09) -------------------------------------------------
+
+# How many of a sender's earlier messages say how they usually write.
+SHIELD_HISTORY = 50
+
+
+def _text_links(message) -> list[tuple[str, str]]:
+    """``(shown text, url)`` for each Telegram text link. Entity offsets count
+    UTF-16 code units, as Telegram does."""
+    raw = getattr(message, "message", None) or ""
+    encoded = raw.encode("utf-16-le")
+    links = []
+    for entity in getattr(message, "entities", None) or ():
+        if not isinstance(entity, MessageEntityTextUrl):
+            continue
+        start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+        links.append((encoded[start:end].decode("utf-16-le", "ignore"), entity.url))
+    return links
+
+
+def _button_urls(message) -> list[str]:
+    """The URLs on a message's inline buttons; read from the markup itself, so
+    nothing is fetched."""
+    urls = []
+    for row in getattr(getattr(message, "reply_markup", None), "rows", None) or ():
+        for button in getattr(row, "buttons", None) or ():
+            url = getattr(button, "url", None)
+            if isinstance(url, str) and url:
+                urls.append(url)
+    return urls
+
+
+@dataclasses.dataclass(slots=True)
+class _History:
+    prior_messages: int = 0
+    owner_wrote_before: bool = False
+    texts: tuple[str, ...] = ()
+    risky_files: bool = False
+    short_links: bool = False
+    loans: bool = False
+
+
+async def _sender_history(
+    session,
+    *,
+    person_id: int | None,
+    chat_id: int,
+    private: bool,
+    edited: Interaction | None = None,
+) -> _History:
+    """What the sender's earlier messages look like: their newest
+    SHIELD_HISTORY incoming messages (by person, else by private chat), and
+    whether the owner ever wrote in this private chat. For an ``edited``
+    message (JV-17) only what came before it counts, as at its ingest.
+
+    A group sender MIYA cannot name (an anonymous admin, a channel posting
+    into the group) has no history of their own: the group's is everyone
+    else's, so they count as unknown and nothing is compared."""
+    if person_id is None and not private:
+        return _History()
+    who = (
+        Interaction.person_id == person_id
+        if person_id is not None
+        else Interaction.tg_chat_id == chat_id
+    )
+    before: list = []
+    others: list = []
+    if edited is not None:
+        before = [Interaction.occurred_at <= edited.occurred_at]
+        others = [Interaction.id != edited.id]
+    rows = (
+        await session.execute(
+            sa.select(Interaction.raw_text, Interaction.media)
+            .where(Interaction.source == InteractionSource.telegram_userbot)
+            .where(Interaction.direction == Direction.in_, who, *before, *others)
+            .order_by(Interaction.occurred_at.desc(), Interaction.id.desc())
+            .limit(SHIELD_HISTORY)
+        )
+    ).all()
+    wrote = False
+    if private:
+        wrote = bool(
+            await session.scalar(
+                sa.select(
+                    sa.exists().where(
+                        Interaction.source == InteractionSource.telegram_userbot,
+                        Interaction.tg_chat_id == chat_id,
+                        # MIYA's own replies are not the owner writing (JV-10).
+                        authorship.owner_words_clause(),
+                        *before,
+                    )
+                )
+            )
+        )
+    texts = tuple(text for text, _ in rows if text)
+    risky = False
+    for _, media in rows:
+        risk = (media or {}).get("risk") if isinstance(media, dict) else None
+        if isinstance(risk, dict) and risk.get("kind") in (safety.HTML, safety.MACRO):
+            risky = True
+    return _History(
+        prior_messages=len(rows),
+        owner_wrote_before=wrote,
+        texts=texts,
+        risky_files=risky,
+        short_links=any(
+            safety.is_short_link(u) for t in texts for u in safety.extract_urls(t)
+        ),
+        loans=any(safety.is_loan_request(t) for t in texts),
+    )
+
+
+async def _message_shield(
+    session,
+    message,
+    monitor: ChatMonitor,
+    *,
+    entity,
+    person,
+    kind: MediaKind,
+    plan: MediaPlan,
+    edited: Interaction | None = None,
+) -> safety.MessageVerdict | None:
+    """The JV-09 verdict on an incoming message, before any download or model
+    call; with ``edited``, on the new words of that stored message (JV-17).
+    A failure here is logged with the message's ids and costs the message
+    nothing: it is stored without a verdict."""
+    try:
+        async with session.begin_nested():
+            history = await _sender_history(
+                session,
+                person_id=person.id if person is not None else None,
+                chat_id=message.chat_id,
+                private=monitor.chat_type is ChatType.private,
+                edited=edited,
+            )
+        text = getattr(message, "message", None) or ""
+        features = safety.MessageFeatures(
+            text=text,
+            urls=tuple(
+                safety.extract_urls(
+                    text,
+                    text_links=_text_links(message),
+                    buttons=_button_urls(message),
+                )
+            ),
+            attachment=plan.risk,
+            has_file=kind is MediaKind.document,
+            sender_scam=bool(getattr(entity, "scam", False)),
+            sender_fake=bool(getattr(entity, "fake", False)),
+            forwarded=getattr(message, "fwd_from", None) is not None,
+            via_bot=bool(getattr(message, "via_bot_id", None)),
+            saved_contact=bool(
+                getattr(entity, "contact", False)
+                or getattr(entity, "mutual_contact", False)
+            ),
+            prior_messages=history.prior_messages,
+            owner_wrote_before=history.owner_wrote_before,
+            history_script=safety.dominant_script(history.texts),
+            history_risky_files=history.risky_files,
+            history_short_links=history.short_links,
+            history_loans=history.loans,
+        )
+        return safety.scam_verdict(
+            features, extra_safe=settings.safety_extra_safe_domains_list
+        )
+    except Exception as exc:
+        log.error(
+            "message shield failed for message %s in %s: %s",
+            getattr(message, "id", None),
+            message.chat_id,
+            type(exc).__name__,
+            extra={
+                "tg_chat_id": message.chat_id,
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+        return None
+
+
+def _quarantined(plan: MediaPlan) -> MediaPlan:
+    """A scam message's media is never fetched, read, transcribed or asked
+    about; a file the JV-01 shield refused keeps that reason."""
+    return dataclasses.replace(
+        plan,
+        download=False,
+        transcribe=False,
+        extract_audio=False,
+        vision=False,
+        read_document=False,
+        ask=False,
+        ask_reason=None,
+        skip_reason=plan.skip_reason or safety.SKIP_QUARANTINED,
     )
 
 
@@ -395,6 +723,57 @@ _SPOKEN_KINDS = (MediaKind.voice, MediaKind.audio, MediaKind.video_note, MediaKi
 MAX_EDITS = 10
 
 
+async def _reshield(
+    session, message, monitor: ChatMonitor, row: Interaction, meta: dict
+) -> dict:
+    """``meta`` with the JV-09 verdict on an edited incoming message's new
+    words (and its owner warning queued). A verdict already there stays: it
+    is the harder one, and an edit never clears it. Contained: a failure is
+    logged with the ids and the message keeps the verdict it had."""
+    try:
+        kind = kind_of(message)
+        filename, size, mime = _file_info(message)
+        plan = plan_for(
+            kind,
+            vision_enabled=monitor.vision_enabled,
+            docs_enabled=monitor.docs_enabled,
+            filename=filename,
+            size=size,
+            mime=mime,
+        )
+        entity = await _counterparty_entity(message, monitor)
+        person = (
+            await session.get(Person, row.person_id)
+            if row.person_id is not None
+            else None
+        )
+    except Exception as exc:
+        log.error(
+            "edited message not shielded",
+            extra={
+                "interaction_id": row.id,
+                "tg_chat_id": row.tg_chat_id,
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+        return meta
+    shield = await _message_shield(
+        session,
+        message,
+        monitor,
+        entity=entity,
+        person=person,
+        kind=kind,
+        plan=plan,
+        edited=row,
+    )
+    if shield is None:
+        return meta
+    warn = _warn_owner(incoming=True, archive=False, occurred_at=row.occurred_at)
+    return safety.with_message_verdict(meta, shield, notify=warn)
+
+
 async def record_edit(client: TelegramClient, message) -> bool:
     """A message was edited: keep the old words as a revision and store the
     new ones (WP-74). Reactions and pins also arrive as edits; the text is
@@ -433,6 +812,10 @@ async def record_edit(client: TelegramClient, message) -> bool:
             if isinstance(row.media, dict) and "caption" in row.media:
                 row.media = {**row.media, "caption": new}
             row.raw_text = new  # the WP-39 listener re-indexes it
+            if row.direction is Direction.in_ and not meta.get("archive"):
+                # JV-17 may draft a reply to the new words: the JV-09 shield
+                # reads them first, as it read the old ones at ingest.
+                meta = await _reshield(session, message, monitor, row, meta)
             if isinstance(getattr(message, "id", None), int):
                 monitor.last_seen_message_id = max(
                     monitor.last_seen_message_id or 0, message.id
@@ -458,6 +841,7 @@ async def ingest_message(
     *,
     archive: bool = False,
     transcribe_media: bool = True,
+    read_media: bool = True,
 ) -> bool:
     """Store one Telegram message. Extraction is the window job's business.
 
@@ -466,7 +850,8 @@ async def ingest_message(
 
     ``archive`` (WP-76): an old message imported for search only — stored
     processed, never windowed or extracted, never an open question. Without
-    ``transcribe_media`` its voice and video are kept as metadata only.
+    ``transcribe_media`` its voice and video are kept as metadata only;
+    without ``read_media`` (the style import, JV-14) all of its media is.
     """
     kind = kind_of(message)
     filename, size, mime = _file_info(message)
@@ -512,6 +897,7 @@ async def ingest_message(
             docs_enabled=monitor.docs_enabled,
             filename=filename,
             size=size,
+            mime=mime,
         )
         if plan.ignore:
             return False
@@ -523,7 +909,36 @@ async def ingest_message(
         if await already_stored(session, message.chat_id, message):
             return False
 
-        person = await _counterparty(session, message, monitor)
+        entity = await _counterparty_entity(message, monitor)
+        person = await _counterparty(session, message, monitor, entity)
+        # JV-09: the spam and scam verdict, before anything is downloaded or
+        # read by a model. A scam is quarantined: nothing fetched, nothing
+        # asked, never windowed for extraction. An archive import is search
+        # history only and needs none.
+        shield = (
+            None
+            if message.out or archive
+            else await _message_shield(
+                session,
+                message,
+                monitor,
+                entity=entity,
+                person=person,
+                kind=kind,
+                plan=plan,
+            )
+        )
+        quarantined = shield is not None and shield.quarantined
+        if quarantined and kind is not MediaKind.text:
+            plan = _quarantined(plan)
+        elif shield is not None and shield.verdict == safety.VERDICT_SPAM and plan.ask:
+            # A spammer's big file is never worth a tap: no question is opened.
+            plan = dataclasses.replace(
+                plan,
+                ask=False,
+                ask_reason=None,
+                skip_reason=safety.SKIP_SPAM,
+            )
         media = None
         if kind is not MediaKind.text:
             media = {
@@ -534,8 +949,13 @@ async def ingest_message(
                 "caption": text,
                 "processed": False,
             }
+            if plan.risk is not None:
+                # JV-01: what the shield saw, before anything was fetched.
+                media["risk"] = plan.risk.as_risk(filename)
             skip_archive = archive and (
-                plan.ask or (not transcribe_media and kind in _SPOKEN_KINDS)
+                plan.ask
+                or not read_media
+                or (not transcribe_media and kind in _SPOKEN_KINDS)
             )
             if skip_archive:
                 # An archive import asks nothing and spends nothing unless told.
@@ -561,6 +981,25 @@ async def ingest_message(
             sender=person,
             aliases=_owner_aliases(),
         )
+        if message.out:
+            # JV-10: an outgoing message MIYA sent from the outbox is tagged as
+            # such, whichever path stores it first (live, catch-up, backfill).
+            echo = await authorship.find_echo(
+                session,
+                channel=authorship.CHANNEL_TELEGRAM,
+                external_id=authorship.telegram_external_id(message.chat_id, message.id),
+            )
+            if echo is not None:
+                meta = authorship.tagged(meta, echo)
+        warn = _warn_owner(
+            incoming=not message.out,
+            archive=archive,
+            occurred_at=message.date.astimezone(settings.tz),
+        )
+        if plan.risk is not None and plan.risk.dangerous:
+            meta = safety.with_file_verdict(meta, plan.risk, notify=warn)
+        if shield is not None:
+            meta = safety.with_message_verdict(meta, shield, notify=warn)
         try:
             async with session.begin_nested():
                 interaction = await create_interaction(
@@ -574,7 +1013,7 @@ async def ingest_message(
                     media=media,
                     meta={**meta, "archive": True} if archive else meta,
                 )
-                if archive:
+                if archive or quarantined:
                     interaction.processed = True
         except sa.exc.IntegrityError as exc:
             # The catch-up and the live handler raced for the same message:
@@ -600,6 +1039,330 @@ async def ingest_message(
         if interaction is None:  # purged while the download ran
             return True
         await persist_media(session, interaction, outcome)
+    return True
+
+
+# --- the reply candidate (JV-16) -----------------------------------------------
+
+
+async def enqueue_reply(message) -> bool:
+    """Queue a live incoming private message for Jarvis's responder, once it
+    is stored. Only SQL here: no model is called in a Telethon handler, and
+    the responder reads the chat later in the worker. Never called for the
+    catch-up, a backfill or an edit (only ``on_new_message`` calls it);
+    miya.jarvis is imported only with JARVIS_ENABLED (rule 20)."""
+    if not settings.jarvis_enabled or getattr(message, "out", False):
+        return False
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "id", None)
+    sent_at = getattr(message, "date", None)
+    if not isinstance(chat_id, int) or chat_id <= 0 or not isinstance(message_id, int):
+        return False  # a group or a channel: the responder answers private chats only
+    now = datetime.now(settings.tz)
+    if sent_at is None or sent_at < now - timedelta(
+        seconds=settings.jarvis_max_message_age_seconds
+    ):
+        return False
+    from miya.jarvis import responder
+
+    async with session_scope() as session:
+        interaction = await _stored(session, chat_id, message_id)
+        if interaction is None:
+            return False
+        return await responder.enqueue_candidate(session, interaction, now=now)
+
+
+async def _stored(session, chat_id: int, message_id: int) -> Interaction | None:
+    """The interaction a Telegram message was stored as, if it was."""
+    return await session.scalar(
+        sa.select(Interaction).where(
+            Interaction.source == InteractionSource.telegram_userbot,
+            Interaction.tg_chat_id == chat_id,
+            Interaction.meta.has_key("tg_message_id"),
+            Interaction.meta["tg_message_id"].astext.cast(sa.BigInteger) == message_id,
+        )
+    )
+
+
+async def on_new_message(client: TelegramClient, message) -> None:
+    """The live NewMessage handler: store the message, then (JV-16) queue it
+    as a reply candidate when ``ingest_message`` returned True, or (JV-17),
+    for the owner's own outgoing message, let the owner take the chat over
+    (a sticker or GIF too, which is never stored). Each step is contained:
+    one bad message never takes the reader down."""
+    try:
+        stored = await ingest_message(client, message)
+    except Exception:
+        # One bad message must never take the reader down; the next
+        # message still lands.
+        log.exception("failed to ingest message %s", getattr(message, "id", "?"))
+        return
+    if not stored:
+        if getattr(message, "out", False):
+            await note_owner_sticker(message)
+        return
+    if getattr(message, "out", False):
+        await note_owner_message(message)
+        return
+    try:
+        await enqueue_reply(message)
+    except Exception as exc:
+        log.error(
+            "reply candidate not queued",
+            extra={
+                "tg_chat_id": getattr(message, "chat_id", None),
+                "tg_message_id": getattr(message, "id", None),
+                "error": type(exc).__name__,
+            },
+        )
+
+
+# --- the owner-first signals (JV-17) -------------------------------------------
+#
+# Each handler only records a signal in MIYA's own database, through
+# miya.jarvis.chat_state, imported here only with JARVIS_ENABLED (rule 20).
+# Each is contained: a signal that cannot be recorded is logged with its ids
+# and the reader goes on (rule 25).
+
+
+def _ids(message) -> tuple[int, int] | None:
+    chat_id = getattr(message, "chat_id", None)
+    message_id = getattr(message, "id", None)
+    if not isinstance(chat_id, int) or not isinstance(message_id, int):
+        return None
+    return chat_id, message_id
+
+
+async def note_owner_message(message) -> bool:
+    """A stored outgoing message (live, or read by the catch-up): when the
+    owner typed it themselves, it cancels the chat's pending drafts, closes
+    its escalation and pauses the AI there for JARVIS_TAKEOVER_MINUTES. MIYA's
+    own sends never count (``chat_state.owner_wrote`` asks authorship). True
+    when the chat was taken over."""
+    if not settings.jarvis_enabled or not getattr(message, "out", False):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            interaction = await _stored(session, *ids)
+            if interaction is None:
+                return False
+            taken = await chat_state.owner_wrote(
+                session, interaction, now=datetime.now(settings.tz)
+            )
+            return taken is not None
+    except Exception as exc:
+        log.error(
+            "owner takeover not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def note_owner_sticker(message) -> bool:
+    """An outgoing sticker or GIF in an allowed chat: the media policy never
+    stores one, but the owner sent it themselves (MIYA never sends media,
+    rule 27), so it takes the chat over as a typed message does. True when
+    the chat was taken over."""
+    if (
+        not settings.jarvis_enabled
+        or not getattr(message, "out", False)
+        or kind_of(message) is not MediaKind.sticker
+    ):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        now = datetime.now(settings.tz)
+        date = getattr(message, "date", None)
+        at = date.astimezone(settings.tz) if isinstance(date, datetime) else now
+        async with session_scope() as session:
+            monitor = await session.scalar(
+                sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == ids[0])
+            )
+            if monitor is None or not monitor.monitor_enabled:
+                return False
+            taken = await chat_state.owner_wrote_at(
+                session, tg_chat_id=ids[0], person_id=None, at=at, now=now
+            )
+            return taken is not None
+    except Exception as exc:
+        log.error(
+            "owner takeover not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+def _media_swapped(interaction: Interaction, message) -> bool:
+    """Did the edit replace the message's media with another kind? Its new
+    file was never fetched or shielded, so nothing is drafted from it."""
+    media = interaction.media if isinstance(interaction.media, dict) else {}
+    stored = media.get("type") or MediaKind.text.value
+    return stored != kind_of(message).value
+
+
+async def note_client_edit(message) -> bool:
+    """A client edited a stored message: the drafts that read it expire and
+    the chat is queued for a fresh one (not when the edit swapped the
+    message's media). True when a draft expired."""
+    if not settings.jarvis_enabled or getattr(message, "out", False):
+        return False
+    ids = _ids(message)
+    if ids is None:
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            interaction = await _stored(session, *ids)
+            if interaction is None:
+                return False
+            expired = await chat_state.client_edited(
+                session,
+                interaction,
+                now=datetime.now(settings.tz),
+                requeue=not _media_swapped(interaction, message),
+            )
+            return bool(expired)
+    except Exception as exc:
+        log.error(
+            "client edit not recorded",
+            extra={
+                "tg_chat_id": ids[0],
+                "tg_message_id": ids[1],
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def on_message_edited(client: TelegramClient, message) -> None:
+    """The live MessageEdited handler: keep the revision (WP-74), then
+    (JV-17) let a client's edit expire the drafts that read the old words."""
+    try:
+        changed = await record_edit(client, message)
+    except Exception:
+        log.exception("failed to record an edit of %s", getattr(message, "id", "?"))
+        return
+    if changed:
+        await note_client_edit(message)
+
+
+async def on_message_read(event) -> bool:
+    """``events.MessageRead(inbox=True)``: the owner read a chat up to
+    ``max_id``. A read of a voice note's contents (no chat) says nothing."""
+    if not settings.jarvis_enabled or getattr(event, "contents", False):
+        return False
+    if getattr(event, "outbox", False):
+        return False  # the client read the owner's messages, not the reverse
+    chat_id = getattr(event, "chat_id", None)
+    max_id = getattr(event, "max_id", None)
+    if not isinstance(chat_id, int) or not isinstance(max_id, int):
+        return False
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            return await chat_state.owner_read(
+                session, tg_chat_id=chat_id, max_id=max_id, now=datetime.now(settings.tz)
+            )
+    except Exception as exc:
+        log.error(
+            "owner read not recorded",
+            extra={
+                "tg_chat_id": chat_id,
+                "tg_message_id": max_id,
+                "error": type(exc).__name__,
+            },
+        )
+        return False
+
+
+async def on_draft_update(update) -> bool:
+    """``events.Raw(UpdateDraftMessage)``: the owner's cloud draft in a chat
+    changed, so they are typing there. A cleared draft (``DraftMessageEmpty``)
+    and a draft in a Saved Messages sub-chat say nothing."""
+    if not settings.jarvis_enabled or not isinstance(update, UpdateDraftMessage):
+        return False
+    draft = update.draft
+    if not isinstance(draft, DraftMessage) or update.saved_peer_id is not None:
+        return False
+    chat_id: int | None = None
+    try:
+        chat_id = tg_utils.get_peer_id(update.peer)
+        from miya.jarvis import chat_state
+
+        now = datetime.now(settings.tz)
+        at = draft.date.astimezone(settings.tz) if draft.date is not None else now
+        async with session_scope() as session:
+            return await chat_state.owner_composing(
+                session, tg_chat_id=chat_id, at=at, now=now
+            )
+    except Exception as exc:
+        log.error(
+            "owner typing not recorded",
+            extra={"tg_chat_id": chat_id, "error": type(exc).__name__},
+        )
+        return False
+
+
+async def on_message_deleted(event) -> int:
+    """``events.MessageDeleted``: Telegram names the chat only for channels
+    and supergroups; the drafts answering a deleted client message are
+    cancelled. Returns how many were."""
+    if not settings.jarvis_enabled:
+        return 0
+    ids = [i for i in (getattr(event, "deleted_ids", None) or []) if isinstance(i, int)]
+    chat_id = getattr(event, "chat_id", None)
+    if not ids:
+        return 0
+    try:
+        from miya.jarvis import chat_state
+
+        async with session_scope() as session:
+            cancelled = await chat_state.client_deleted(
+                session,
+                tg_chat_id=chat_id if isinstance(chat_id, int) else None,
+                message_ids=ids,
+                now=datetime.now(settings.tz),
+            )
+            return len(cancelled)
+    except Exception as exc:
+        log.error(
+            "deleted messages not recorded",
+            extra={
+                "tg_chat_id": chat_id,
+                "tg_message_ids": ids[:20],
+                "error": type(exc).__name__,
+            },
+        )
+        return 0
+
+
+def add_signal_handlers(client: TelegramClient) -> bool:
+    """Register the owner-first handlers (JV-17); only with JARVIS_ENABLED,
+    so with Jarvis off the reader is exactly as before. True when added."""
+    if not settings.jarvis_enabled:
+        return False
+    client.add_event_handler(on_message_read, events.MessageRead(inbox=True))
+    client.add_event_handler(on_draft_update, events.Raw(UpdateDraftMessage))
+    client.add_event_handler(on_message_deleted, events.MessageDeleted())
     return True
 
 
@@ -664,6 +1427,39 @@ def _message_meta(message: object, monitor: ChatMonitor) -> dict:
 APPROVED_POLL_SECONDS = 60
 
 
+# A flood wait on an approved file ends the pass and is waited out by the
+# next one, never inside it: the heartbeat beats once a pass. A short wait
+# counts against the file; a big one restarts from zero each pass and can
+# meet the same wait every time, so after this many it goes to review and
+# the files behind it move on.
+APPROVED_FLOOD_PASSES = 5
+
+
+async def _approved_flood(exc: Exception, interaction_id: int) -> None:
+    """A flood wait on one approved file: a long one (the whole account
+    waits) leaves it as it is; a short one counts, up to
+    APPROVED_FLOOD_PASSES, after which it is DONE with error 'flood' and in
+    needs_review, like a failed download."""
+    seconds = int(getattr(exc, "seconds", 0) or 0)
+    log.warning(
+        "approved media fetch paused: Telegram asked for a wait",
+        extra={"seconds": seconds, "interaction": interaction_id},
+    )
+    if seconds > READER_FLOOD_SLEEP_SECONDS:
+        return
+    async with session_scope() as session:
+        interaction = await session.get(Interaction, interaction_id)
+        if interaction is None:
+            return
+        approval = (interaction.media or {}).get("approval") or {}
+        passes = int(approval.get("flood_passes") or 0) + 1
+        if passes < APPROVED_FLOOD_PASSES:
+            approvals.set_state(interaction, approvals.APPROVED, flood_passes=passes)
+            return
+        await persist_media(session, interaction, MediaOutcome(failed=True))
+        approvals.set_state(interaction, approvals.DONE, error="flood")
+
+
 async def fetch_approved(client: TelegramClient) -> int:
     """Download and process everything the owner has said yes to."""
     async with session_scope() as session:
@@ -682,7 +1478,14 @@ async def fetch_approved(client: TelegramClient) -> int:
         kind = MediaKind(media.get("type", MediaKind.other.value))
         filename = media.get("filename")
         try:
-            message = await client.get_messages(chat_id, ids=message_id)
+            message = await _reader_call(
+                partial(client.get_messages, chat_id, ids=message_id), retries=0
+            )
+        except READER_FLOOD_ERRORS as exc:
+            # A wait is no proof the message is gone: it and the rest of this
+            # pass stay approved, and the next pass tries them again.
+            await _approved_flood(exc, interaction_id)
+            break
         except Exception:
             log.exception("could not re-read approved message %s", message_id)
             message = None
@@ -697,8 +1500,14 @@ async def fetch_approved(client: TelegramClient) -> int:
                     interaction.needs_review = True
             continue
 
-        plan = forced_plan(kind, filename)
-        outcome = await fetch_media(client, message, plan, _suffix_for(kind, filename))
+        plan = forced_plan(kind, filename, mime=media.get("mime"))
+        try:
+            outcome = await fetch_media(
+                client, message, plan, _suffix_for(kind, filename), pause_on_flood=True
+            )
+        except READER_FLOOD_ERRORS as exc:
+            await _approved_flood(exc, interaction_id)
+            break
 
         async with session_scope() as session:
             interaction = await session.get(Interaction, interaction_id)
@@ -756,6 +1565,96 @@ async def fetch_backfills(client: TelegramClient) -> int:
     return done
 
 
+# The style import's pause (JV-14): a long FloodWait sets the monotonic time
+# before which no sweep asks Telegram for history again.
+_style_import_resume_at = 0.0
+
+
+async def fetch_style_imports(client: TelegramClient) -> int:
+    """Read the private chats the owner asked to learn their style from
+    (JV-14, ``/uslub yukla``).
+
+    The same shape as ``fetch_backfills``: the bot recorded the request on
+    each monitor row (``chats.request_style_import``), and this process
+    reads it through ``miya.tools.backfill.fetch_style_history``, so this
+    package still contains no history call of its own. Read-only: what is
+    read is stored as archive rows, nothing is sent. Each chat is contained
+    on its own: a failure is logged with its ids, counted on the row (a
+    chat is given up on after a few sweeps) and the next chat goes on. A
+    long FloodWait ends the sweep and is no failure: the paused chat stays
+    pending with its attempts untouched, and no sweep reads anything until
+    Telegram's wait is over.
+    """
+    global _style_import_resume_at
+    from miya.tools import backfill as backfill_tool
+
+    if time.monotonic() < _style_import_resume_at:
+        return 0
+
+    async with session_scope() as session:
+        jobs = [
+            (monitor.id, monitor.tg_chat_id)
+            for monitor in await chats.pending_style_imports(session)
+        ]
+
+    done = 0
+    for monitor_id, chat_id in jobs:
+        try:
+            result = await backfill_tool.fetch_style_history(client, chat_id)
+        except Exception as exc:
+            log.error(
+                "style import of a chat failed",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "error": type(exc).__name__,
+                },
+            )
+            result = None
+        if result is not None and result.paused:
+            # Telegram's limit, not the chat's failure: the row stays pending
+            # as it is, and the sweeps wait the whole FloodWait out.
+            _style_import_resume_at = time.monotonic() + result.wait_seconds
+            log.info(
+                "style import paused by Telegram",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "seconds": result.wait_seconds,
+                },
+            )
+            break
+        try:
+            async with session_scope() as session:
+                monitor = await session.get(ChatMonitor, monitor_id)
+                if monitor is None:
+                    continue
+                if result is None:
+                    chats.mark_style_import_failed(monitor)
+                else:
+                    chats.mark_style_imported(monitor)
+                    done += 1
+                    log.info(
+                        "style import read a chat",
+                        extra={
+                            "monitor_id": monitor_id,
+                            "tg_chat_id": chat_id,
+                            "stored": result.stored,
+                            "seen": result.seen,
+                        },
+                    )
+        except Exception as exc:
+            log.error(
+                "style import state not saved",
+                extra={
+                    "monitor_id": monitor_id,
+                    "tg_chat_id": chat_id,
+                    "error": type(exc).__name__,
+                },
+            )
+    return done
+
+
 async def beat_userbot(
     *, enabled: bool, connected: bool | None = None, user_id: int | None = None
 ) -> bool:
@@ -772,6 +1671,9 @@ async def beat_userbot(
         # A catch-up line must survive the next beat, which rewrites the
         # detail whole (WP-21).
         detail.update(_last_catch_up or {})
+        # The sender's state (JV-19) rides the same beat: the detail is
+        # replaced whole, so this beat stays its one writer.
+        detail.update(_sender_status)
     try:
         async with session_scope() as session:
             await health.beat(session, "userbot", detail=detail)
@@ -784,7 +1686,8 @@ async def beat_userbot(
 async def approved_media_loop(
     client: TelegramClient, *, user_id: int | None = None
 ) -> None:
-    """The owner's answers, polled: approved attachments and requested backfills.
+    """The owner's answers, polled: approved attachments, requested backfills
+    and the style history import (JV-14).
 
     Every pass also beats the ``userbot`` heartbeat, so a reader whose
     Telegram session died shows up as silent within USERBOT_STALE_MINUTES.
@@ -807,6 +1710,10 @@ async def approved_media_loop(
             await fetch_backfills(client)
         except Exception:
             log.exception("backfill sweep failed")
+        try:
+            await fetch_style_imports(client)
+        except Exception as exc:
+            log.error("style import sweep failed", extra={"error": type(exc).__name__})
         await asyncio.sleep(APPROVED_POLL_SECONDS)
 
 
@@ -874,20 +1781,65 @@ async def _startup_catch_up(client: TelegramClient) -> None:
 # --- dialog sync -------------------------------------------------------------
 
 
-async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
-    """Register the dialog list. Titles only — no messages are fetched."""
-    dialogs: list[DialogInfo] = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        dialogs.append(
-            DialogInfo(
-                tg_chat_id=dialog.id,
-                chat_type=chat_type_of(entity),
-                title=chat_title_of(entity),
-                is_bot=bool(getattr(entity, "bot", False)),
-                top_message_id=getattr(getattr(dialog, "message", None), "id", None),
-            )
-        )
+# A flood wait on the dialog list up to this long is slept through and the
+# list read again (JV-19); a longer one skips this sync, and the next sweep
+# reads the list again. Either way the process goes on.
+DIALOG_FLOOD_WAIT_MAX_SECONDS = 60
+DIALOG_SYNC_ATTEMPTS = 3
+
+
+async def _read_dialogs(
+    client: TelegramClient, *, sleep_through: bool = True
+) -> list[DialogInfo] | None:
+    """The dialog list, or None when Telegram asked for a long wait.
+
+    ``sleep_through=False`` (the sender, inside a claim): any flood wait is
+    raised instead of slept through or skipped, so the caller re-queues at
+    Telegram's time rather than holding the claim or reading an empty cache."""
+    for attempt in range(1, DIALOG_SYNC_ATTEMPTS + 1):
+        dialogs: list[DialogInfo] = []
+        try:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                dialogs.append(
+                    DialogInfo(
+                        tg_chat_id=dialog.id,
+                        chat_type=chat_type_of(entity),
+                        title=chat_title_of(entity),
+                        is_bot=bool(getattr(entity, "bot", False)),
+                        top_message_id=getattr(
+                            getattr(dialog, "message", None), "id", None
+                        ),
+                    )
+                )
+            return dialogs
+        except FloodWaitError as exc:
+            if not sleep_through:
+                raise
+            seconds = int(exc.seconds or 0)
+            if seconds > DIALOG_FLOOD_WAIT_MAX_SECONDS or attempt == DIALOG_SYNC_ATTEMPTS:
+                log.warning(
+                    "dialog sync skipped: Telegram asked for a wait",
+                    extra={"seconds": seconds, "attempt": attempt},
+                )
+                return None
+            await asyncio.sleep(seconds)
+    return None
+
+
+async def sync_from_client(
+    client: TelegramClient, *, sleep_through: bool = True
+) -> tuple[int, int]:
+    """Register the dialog list. Titles only — no messages are fetched.
+
+    A FloodWait never escapes (JV-19): a short one is slept through and the
+    list read again, a long one skips the sync with the previous tops kept,
+    so the startup no longer exits ``run()`` over it. The sender passes
+    ``sleep_through=False``: there a FloodWait is raised to it instead, so it
+    never sleeps inside a claim nor mistakes a skipped sync for a missing chat."""
+    dialogs = await _read_dialogs(client, sleep_through=sleep_through)
+    if dialogs is None:
+        return 0, 0
     async with session_scope() as session:
         created, renamed = await sync_dialogs(session, dialogs)
     global _dialog_tops
@@ -900,6 +1852,108 @@ async def sync_from_client(client: TelegramClient) -> tuple[int, int]:
     return created, renamed
 
 
+# --- the sender (JV-19) ------------------------------------------------------
+#
+# The sender's share of the userbot beat detail, which it updates and the
+# beat merges in (detail is replaced whole, so the beat stays its one writer).
+_sender_status: dict = {}
+
+
+def sender_wanted() -> bool:
+    """Both switches on: JARVIS_ENABLED and TELEGRAM_SEND_ENABLED."""
+    return bool(settings.jarvis_enabled and settings.telegram_send_enabled)
+
+
+def start_sender(client: TelegramClient, *, user_id: int | None):
+    """Start the Telegram sender next to the reader, or None when it is off.
+
+    ``miya.userbot.sender`` (and with it miya.jarvis) is imported only here,
+    with both switches on (rule 20). A sender that cannot start is logged
+    and the reader goes on without it (rule 25)."""
+    if not sender_wanted():
+        _sender_status.clear()
+        return None
+    try:
+        from miya.userbot import sender
+
+        account = f"tg:{user_id}" if user_id is not None else None
+        return sender.start(client, account=account, status=_sender_status)
+    except Exception as exc:
+        log.error("telegram sender not started", extra={"error": type(exc).__name__})
+        _sender_status["sender"] = "not_started"
+        return None
+
+
+# A shutdown waits this long for the sender to put back a row it was pacing
+# (released as ``interrupted``, approved again) before the client goes.
+SENDER_STOP_TIMEOUT_SECONDS = 5.0
+
+
+async def stop_sender(sending) -> None:
+    """Cancel the sender and wait for it to record what it was doing, so a
+    row stopped during its pause or "typing…" waits approved for the next
+    start instead of becoming «in doubt». Never raises (rule 25)."""
+    if sending is None:
+        return
+    try:
+        sending.cancel()
+        task = getattr(sending, "task", None)
+        if task is not None and not task.done():
+            await asyncio.wait({task}, timeout=SENDER_STOP_TIMEOUT_SECONDS)
+    except Exception as exc:
+        log.error(
+            "telegram sender not stopped cleanly", extra={"error": type(exc).__name__}
+        )
+
+
+async def _shutdown(client: TelegramClient, sending) -> None:
+    """SIGTERM/SIGINT: the sender is stopped first, while the client can
+    still end "typing…", then the client disconnects, which ends
+    ``run_until_disconnected`` and lets ``run()`` clean up."""
+    await stop_sender(sending)
+    try:
+        await client.disconnect()
+    except Exception as exc:
+        log.error("userbot disconnect failed", extra={"error": type(exc).__name__})
+
+
+def install_stop_signals(client: TelegramClient, sending) -> tuple[int, ...]:
+    """Turn SIGTERM (``docker compose stop``) and SIGINT into a clean
+    shutdown instead of Python's immediate exit, which runs no ``finally``.
+    Returns the signals installed (none where the loop cannot take them)."""
+    loop = asyncio.get_running_loop()
+    stopping: list[asyncio.Task] = []
+
+    def _stop() -> None:
+        if not stopping:
+            log.info("userbot stopping on a signal")
+            stopping.append(asyncio.ensure_future(_shutdown(client, sending)))
+
+    installed: list[int] = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError, ValueError) as exc:
+            log.warning(
+                "userbot signal handler not installed",
+                extra={"signal": int(sig), "error": type(exc).__name__},
+            )
+    return tuple(installed)
+
+
+def remove_stop_signals(installed: tuple[int, ...]) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in installed:
+        try:
+            loop.remove_signal_handler(sig)
+        except Exception as exc:
+            log.warning(
+                "userbot signal handler not removed",
+                extra={"signal": int(sig), "error": type(exc).__name__},
+            )
+
+
 # --- process -----------------------------------------------------------------
 
 
@@ -908,10 +1962,7 @@ async def _idle_forever() -> None:  # pragma: no cover - patched in tests
 
 
 async def run() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("userbot")
     if not settings.userbot_enabled:
         # Idle instead of exiting: the container uses `restart:
         # unless-stopped` (so it survives a VPS reboot), and a clean exit here
@@ -956,10 +2007,25 @@ async def run() -> None:
             "paste, then re-run miya.tools.userbot_login if it is lost."
         ) from exc
 
+    sending = sender_wanted()
     client = TelegramClient(
         session,
         settings.telethon_api_id,
         settings.telethon_api_hash,
+        # With the sender on, Telethon sleeps through a flood wait only this
+        # short by itself; a longer one reaches the code, so a send never
+        # blocks silently (JV-19). With it off the reader keeps Telethon's
+        # own 60 s, as before Jarvis.
+        flood_sleep_threshold=(
+            settings.userbot_flood_sleep_seconds
+            if sending
+            else READER_FLOOD_SLEEP_SECONDS
+        ),
+        # After its own retries of an internal Telegram error, Telethon raises
+        # that error, not a bare ValueError, so the sender can tell "already
+        # sent" (RANDOM_ID_DUPLICATE) and "outcome unknown" (a -503 timeout)
+        # apart from a chat missing from the session cache (JV-19).
+        raise_last_call_error=sending,
     )
     # connect(), not start(): start() would prompt for a phone number on stdin
     # if the session were invalid, which in a container never returns.
@@ -986,37 +2052,42 @@ async def run() -> None:
         global _RUNTIME_ALIASES
         if getattr(me, "username", None):
             _RUNTIME_ALIASES = ("@" + me.username,)
-        log.info("userbot connected as %s (read-only)", display_name_of(me))
+        log.info(
+            "userbot connected as %s (%s)",
+            display_name_of(me),
+            "sending outbox replies" if sender_wanted() else "read-only",
+        )
         await beat_userbot(enabled=True, connected=True, user_id=me.id)
         await sync_from_client(client)
 
         async def _on_message(event) -> None:
-            try:
-                await ingest_message(client, event.message)
-            except Exception:
-                # One bad message must never take the reader down; the next
-                # message still lands.
-                log.exception("failed to ingest message %s", getattr(event, "id", "?"))
+            await on_new_message(client, event.message)
 
         async def _on_edit(event) -> None:
-            try:
-                await record_edit(client, event.message)
-            except Exception:
-                log.exception("failed to record an edit of %s", getattr(event, "id", "?"))
+            await on_message_edited(client, event.message)
 
         client.add_event_handler(_on_message, events.NewMessage(incoming=True))
         client.add_event_handler(_on_message, events.NewMessage(outgoing=True))
         client.add_event_handler(_on_edit, events.MessageEdited())
+        add_signal_handlers(client)
         sweeper = asyncio.create_task(approved_media_loop(client, user_id=me.id))
         # Whatever was said while this process was down (WP-21), read once
         # the live handlers are in place so nothing falls between the two.
         catcher = asyncio.create_task(_startup_catch_up(client))
+        # The outbox replies that passed the gate (JV-19), only with both
+        # switches on.
+        sending = start_sender(client, user_id=me.id)
+        signals = install_stop_signals(client, sending)
         log.info("listening for new messages in monitored chats")
         try:
             await client.run_until_disconnected()
         finally:
+            remove_stop_signals(signals)
             sweeper.cancel()
             catcher.cancel()
+            # Awaited before the client and the pool go, so a row stopped
+            # mid-pacing is put back before the connection it needs is gone.
+            await stop_sender(sending)
     finally:
         await client.disconnect()
         await engine.dispose()

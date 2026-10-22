@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 COMPOSE := docker compose
-.PHONY: help reprice import-clients env up down restart logs ps health migrate revision downgrade psql \
-        bot worker userbot userbot-login shell install test lint fmt check gcal-auth \
+.PHONY: help reprice import-clients env up down restart reload logs ps health migrate revision downgrade psql \
+        bot worker userbot userbot-login shell install test lint fmt typecheck check gcal-auth \
         backfill import-history payments-corpus backup backup-key backup-key-show restore doctor update
 
 help: ## Show this help
@@ -14,7 +14,7 @@ env: ## Create .env from .env.example if it does not exist
 # --- Docker -----------------------------------------------------------------
 doctor: ## Check .env and the server before make up
 	$(COMPOSE) build api
-	$(COMPOSE) run --rm --no-deps api python -m miya.tools.doctor
+	$(COMPOSE) run --rm --no-deps -e MIYA_IN_UPDATE=$(IN_UPDATE) api python -m miya.tools.doctor
 
 up: env $(if $(SKIP_DOCTOR),,doctor) ## Build and start everything, then run migrations (SKIP_DOCTOR=1 to skip the check)
 	$(COMPOSE) up -d --build db api
@@ -30,7 +30,7 @@ update: ## Backup, pull, rebuild, prune
 	@# first: a running worker would re-write rows a migration just removed.
 	SYNC=$$($(COMPOSE) --profile syncthing ps -q syncthing 2>/dev/null); \
 	$(COMPOSE) stop bot worker userbot && \
-	$(MAKE) up && \
+	$(MAKE) up IN_UPDATE=1 && \
 	if [ -n "$$SYNC" ]; then \
 		$(COMPOSE) --profile syncthing up -d syncthing && \
 		echo "Syncthing ishlayotgan edi — qo'ng'iroq yozuvlari to'xtamasligi uchun qayta yoqildi (--profile syncthing)."; \
@@ -43,6 +43,9 @@ down: ## Stop everything (volumes are kept)
 
 restart: ## Restart the api container
 	$(COMPOSE) restart api
+
+reload: ## After editing .env: recreate bot, worker and userbot so they read it again
+	$(COMPOSE) up -d --force-recreate bot worker userbot
 
 logs: ## Tail logs from all running services
 	$(COMPOSE) logs -f --tail=100
@@ -112,10 +115,11 @@ backup-key: ## Create the backup key and print the .env line
 backup-key-show: ## Print the secret backup key (store it off the server)
 	$(COMPOSE) run --rm --no-deps worker cat /app/secrets/backup-key.txt
 
-backup: ## Run the encrypted database backup now
+backup: ## Run the encrypted database backup now (fails when the backup does, so make update stops)
 	$(COMPOSE) run --rm --no-deps worker python -c \
-		"import asyncio; from miya.services.backup import create_backup; \
-		 print(asyncio.run(create_backup()))"
+		"import asyncio, sys; from miya.services.backup import create_backup; \
+		 result = asyncio.run(create_backup()); print(result); \
+		 sys.exit(0 if result.ok else 1)"
 
 restore: ## Restore a backup: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]
 	@test -n "$(FILE)" || (echo "usage: make restore FILE=/data/backups/miya-….dump.age [DRY=1] [FORCE=1]" && exit 1)
@@ -139,4 +143,7 @@ lint: ## Lint
 fmt: ## Format
 	ruff format .
 
-check: lint test ## Lint + test
+typecheck: ## mypy strict on the Jarvis code (the files listed in pyproject.toml)
+	mypy
+
+check: lint typecheck test ## Lint + typecheck + test

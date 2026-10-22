@@ -29,9 +29,12 @@ Rules:
 - Promises: "Men ... qilaman/beraman" → made_by=me. "U ... qiladi/va'da berdi" → them.
 - Dates: resolve relative dates ("ertaga", "завтра", "indinga", "next Monday")
   against CURRENT_DATE. Output ISO. Unknown → null.
+- A promise or task deadline with a time of day said ("soat 3 da", "14:00
+  gacha", "kechki 6", "завтра в 10"): due_date is YYYY-MM-DDTHH:MM, 24-hour.
 - Conversation windows are transcripts with exactly one message per line:
     [YYYY-MM-DD HH:MM] [SPEAKER] "text"
-  SPEAKER is ME (the owner), THEM (name) (the other person), or bare THEM when
+  SPEAKER is ME (the owner), MIYA (an automatic reply the owner's assistant
+  sent in the owner's name), THEM (name) (the other person), or bare THEM when
   that person's name is not known. A speaker label ending in " → ME" —
   "[THEM (name) → ME]" or "[THEM → ME]" — means that message was addressed to
   the owner directly (a mention or a reply to him) — in a group, treat only
@@ -40,6 +43,11 @@ Rules:
   sent: newlines appear as \n, quotes as \". Media sent without text appears
   inside the quotes as a bracketed placeholder such as [ovozli xabar], [rasm]
   or [hujjat: name].
+- A [MIYA] line is an automatic reply, never the owner's own words or
+  assertion. Use it only as context for the other lines: never extract a debt,
+  settlement, promise, fulfilment, transaction, task, event or fact from what a
+  [MIYA] line says, never read it as the owner agreeing to, confirming or
+  promising anything, and never let it make anything asserted_by "me".
 - A call transcript may be split into speaker turns, one per line:
     [1-ovoz] text
     [2-ovoz] text
@@ -81,8 +89,30 @@ Rules:
   not a person. Copy GS codes and waybill numbers verbatim into summary and facts.
 """
 
-VISION_TRIAGE_PROMPT = """\
-If this is a document/receipt/invoice/payment screenshot/packing list: extract its
-key data (amounts, currencies, parties, dates, items). Otherwise return a one-line
-description. Reply in the language of the image; be terse.
+VISION_READ_PROMPT = """\
+Read this image for the owner's records. Return ONLY a JSON object matching
+the schema. No explanation, no markdown.
+
+"description": if this is a document/receipt/invoice/payment screenshot/packing
+list, extract its key data (amounts, currencies, parties, dates, items);
+otherwise a one-line description. Reply in the language of the image; be
+terse.
+
+"is_receipt": true only for proof that one payment was made: a payment-app or
+bank-app transfer screenshot (Payme, Click, Uzum, a bank app), a card terminal
+slip, a cash-register check. An invoice, a price list or a bank statement of
+many payments is not a receipt.
+
+"receipt": only when is_receipt is true, else null. Copy what is printed;
+never guess, never complete, never compute. Anything not printed is null.
+- amount: the total paid, as a plain number ("1 250 000,00 so'm" -> 1250000.00).
+- currency: UZS for so'm/сум/UZS, else USD, CNY, KRW or RUB as printed.
+- paid_at: the printed date and time as YYYY-MM-DDTHH:MM, 24-hour; a date
+  printed without a year takes the year of CURRENT_DATE; a date printed
+  without a time is YYYY-MM-DD.
+- payer_name / payee_name: the sender and the recipient as printed.
+- payer_card_last4 / payee_card_last4: the last four digits of each card
+  ("8600 **** **** 1234" -> "1234"); null when fewer are shown.
+- issuer: the bank or the payment app that issued the receipt.
+- reference: the receipt, transaction or check number as printed.
 """

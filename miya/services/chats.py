@@ -212,6 +212,80 @@ async def toggle(
     return monitor
 
 
+async def set_monitor(
+    session: AsyncSession,
+    monitor_id: int,
+    enabled: bool,
+    *,
+    now: datetime | None = None,
+) -> ChatMonitor | None:
+    """Reading one chat switched on or off on purpose, as the owner's command
+    asked (JV-20 ``set_group_monitor``): the same change as the ``/chats``
+    toggle (``toggle``), made only when the chat is not already so, under the
+    row's lock, so a tap that comes twice never flips it back. None when the
+    row is gone."""
+    locked = await session.scalar(
+        sa.select(ChatMonitor)
+        .where(ChatMonitor.id == monitor_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        return None
+    if bool(locked.monitor_enabled) == enabled:
+        return locked
+    return await toggle(session, monitor_id, "monitor_enabled", now=now)
+
+
+# The most chats named in one «which one?» answer.
+TITLED_MAX = 6
+
+
+async def find_titled(
+    session: AsyncSession,
+    title: str,
+    *,
+    kinds: tuple[ChatType, ...],
+    exact_only: bool = False,
+) -> list[ChatMonitor]:
+    """Chats of ``kinds`` titled exactly ``title``, else those whose title
+    contains it, newest first; a bare chat id finds that chat. Titles are
+    compared folded like a person's name (case, apostrophes, Cyrillic), so
+    «Do‘stlar» and «Оила» are found as typed «Do'stlar» and «Oila»."""
+    from miya.services.text import normalise_for_search
+
+    wanted = title.strip()
+    if not wanted:
+        return []
+    base = sa.select(ChatMonitor).where(ChatMonitor.chat_type.in_(kinds))
+    if wanted.lstrip("-").isdigit():
+        found = await session.scalar(base.where(ChatMonitor.tg_chat_id == int(wanted)))
+        if found is not None:
+            return [found]
+    folded = normalise_for_search(wanted)
+    if not folded:
+        return []
+    # The monitors table is small: one row per chat the account is in.
+    titled = [
+        (normalise_for_search(monitor.title or ""), monitor)
+        for monitor in await session.scalars(
+            base.where(ChatMonitor.title.isnot(None)).order_by(ChatMonitor.id)
+        )
+    ]
+    exact = [monitor for name, monitor in titled if name == folded]
+    if exact or exact_only:
+        return exact
+    contains = [monitor for name, monitor in titled if folded in name]
+    contains.sort(
+        key=lambda monitor: (
+            monitor.last_seen_at is None,
+            -(monitor.last_seen_at.timestamp() if monitor.last_seen_at else 0.0),
+            monitor.id,
+        )
+    )
+    return contains[:TITLED_MAX]
+
+
 # --- new groups, one tap -----------------------------------------------------
 #
 # Three processes, none of which can call the others, share this: the userbot
@@ -449,3 +523,159 @@ def mark_backfill_failed(monitor: ChatMonitor) -> None:
             monitor.title,
             monitor.backfill_attempts,
         )
+
+
+# --- the style history import (JV-14) ------------------------------------------
+#
+# The same request-on-the-row shape as the backfill above: the bot stamps the
+# request (``/uslub yukla``), the userbot performs it on its next sweep and
+# stamps it done, and the worker builds the style profile once every chat has
+# been read. The import is read-only and stores what it reads as archive
+# rows: searchable, never extracted, never asked about.
+
+# One sweep imports at most this many chats; the rest wait for the next.
+STYLE_IMPORT_PER_SWEEP = 5
+# A chat whose import keeps failing (lost access, flood limits) is left
+# alone after this many sweeps.
+STYLE_IMPORT_MAX_ATTEMPTS = 3
+
+
+def _personal_chat_clause() -> sa.ColumnElement[bool]:
+    """The chat holds an active ``never`` reply rule (JV-12): by its key or
+    by the address snapshot of its user. Spelled here in SQL: core MIYA
+    never imports miya.jarvis."""
+    from miya.db.models import ReplyRule
+
+    key = sa.func.concat("tg:", ChatMonitor.tg_chat_id)
+    return (
+        sa.select(ReplyRule.id)
+        .where(
+            ReplyRule.state == "active",
+            ReplyRule.mode == "never",
+            sa.or_(ReplyRule.chat_key == key, ReplyRule.address == key),
+        )
+        .exists()
+    )
+
+
+def _style_importable() -> list[sa.ColumnElement[bool]]:
+    """Monitored private chats with a person, never the Telegram service
+    chat, the owner's own Saved Messages or a chat marked personal."""
+    clauses = [
+        ChatMonitor.monitor_enabled.is_(True),
+        ChatMonitor.chat_type == ChatType.private,
+        ChatMonitor.tg_chat_id > 0,
+        ChatMonitor.tg_chat_id != TELEGRAM_SERVICE_ID,
+        sa.not_(_personal_chat_clause()),
+    ]
+    if settings.owner_telegram_id is not None:
+        clauses.append(ChatMonitor.tg_chat_id != settings.owner_telegram_id)
+    return clauses
+
+
+async def request_style_import(session: AsyncSession, *, now: datetime) -> int:
+    """``/uslub yukla``: ask the userbot to read every importable private
+    chat once more. Returns how many chats were asked for."""
+    result = await session.execute(
+        sa.update(ChatMonitor)
+        .where(*_style_importable())
+        .values(
+            style_import_requested_at=now,
+            style_import_done_at=None,
+            style_import_attempts=0,
+        )
+    )
+    count = int(result.rowcount or 0)
+    log.info("style import requested", extra={"chats": count})
+    return count
+
+
+async def pending_style_imports(
+    session: AsyncSession, *, limit: int = STYLE_IMPORT_PER_SWEEP
+) -> list[ChatMonitor]:
+    """Chats whose style import was asked for and not read yet. A chat
+    switched off or marked personal in the meantime is never read."""
+    return list(
+        await session.scalars(
+            sa.select(ChatMonitor)
+            .where(
+                ChatMonitor.style_import_requested_at.isnot(None),
+                ChatMonitor.style_import_done_at.is_(None),
+                ChatMonitor.style_import_attempts < STYLE_IMPORT_MAX_ATTEMPTS,
+                *_style_importable(),
+            )
+            .order_by(ChatMonitor.style_import_requested_at, ChatMonitor.id)
+            .limit(limit)
+        )
+    )
+
+
+def mark_style_imported(monitor: ChatMonitor, *, now: datetime | None = None) -> None:
+    monitor.style_import_done_at = _now(now)
+
+
+def mark_style_import_failed(monitor: ChatMonitor) -> None:
+    """One more failed sweep; at STYLE_IMPORT_MAX_ATTEMPTS it is left alone."""
+    monitor.style_import_attempts = (monitor.style_import_attempts or 0) + 1
+    if monitor.style_import_attempts >= STYLE_IMPORT_MAX_ATTEMPTS:
+        log.error(
+            "style import gave up",
+            extra={
+                "monitor_id": monitor.id,
+                "tg_chat_id": monitor.tg_chat_id,
+                "attempts": monitor.style_import_attempts,
+            },
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class StyleImportProgress:
+    """Where the latest ``/uslub yukla`` stands."""
+
+    # When it was asked for; None when it never was.
+    requested_at: datetime | None
+    done: int
+    failed: int
+    pending: int
+
+    @property
+    def finished(self) -> bool:
+        return self.requested_at is not None and self.pending == 0
+
+
+async def style_import_progress(session: AsyncSession) -> StyleImportProgress:
+    """The latest request's chats: read, given up on, and still to read (a
+    chat switched off or marked personal since is no longer waited for)."""
+    requested_at = await session.scalar(
+        sa.select(sa.func.max(ChatMonitor.style_import_requested_at))
+    )
+    if requested_at is None:
+        return StyleImportProgress(None, 0, 0, 0)
+    batch = ChatMonitor.style_import_requested_at == requested_at
+    done = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(ChatMonitor)
+        .where(batch, ChatMonitor.style_import_done_at.isnot(None))
+    )
+    failed = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(ChatMonitor)
+        .where(
+            batch,
+            ChatMonitor.style_import_done_at.is_(None),
+            ChatMonitor.style_import_attempts >= STYLE_IMPORT_MAX_ATTEMPTS,
+        )
+    )
+    pending = await session.scalar(
+        sa.select(sa.func.count())
+        .select_from(ChatMonitor)
+        .where(
+            batch,
+            ChatMonitor.style_import_done_at.is_(None),
+            ChatMonitor.style_import_attempts < STYLE_IMPORT_MAX_ATTEMPTS,
+            *_style_importable(),
+        )
+    )
+    return StyleImportProgress(
+        requested_at, int(done or 0), int(failed or 0), int(pending or 0)
+    )

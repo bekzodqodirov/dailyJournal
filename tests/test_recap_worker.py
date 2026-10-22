@@ -48,6 +48,28 @@ async def test_lunchtime_hisobot_does_not_cause_a_second_evening_send(session):
     assert await worker._evening_to_resume(_at(20)) is None
 
 
+async def test_report_time_moved_later_does_not_rebuild_or_ask_again(
+    session, monkeypatch
+):
+    """The 19:00 → 20:00 update: the recap went out at 19:00, then the owner
+    moved REPORT_TIME and the 20:00 job fires the same day. Nothing is rebuilt
+    (no second model call over the delivered row) and nothing is sent."""
+    bot = _Bot()
+    await worker.report_job(bot, now=_at(19))
+    day = _at(19).date()
+    first = await _row(session, day)
+    assert first.delivered_at is not None
+    sent, updated = list(bot.texts), first.updated_at
+
+    async def _no_rebuild(*args, **kwargs):
+        raise AssertionError("a delivered report was rebuilt")
+
+    monkeypatch.setattr(worker.reports, "generate_report", _no_rebuild)
+    await worker.report_job(bot, now=_at(20))
+    assert bot.texts == sent
+    assert (await _row(session, day)).updated_at == updated
+
+
 class _FailingOn(_Bot):
     def __init__(self, text: str) -> None:
         super().__init__()

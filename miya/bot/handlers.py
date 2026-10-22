@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -39,7 +40,14 @@ from miya.db.enums import (
     InteractionSource,
     TransactionType,
 )
-from miya.db.models import ChatMonitor, ClientCode, Interaction, Person, QuestionLog
+from miya.db.models import (
+    ChatMonitor,
+    ClientCode,
+    Interaction,
+    Person,
+    QuestionLog,
+    Receipt,
+)
 from miya.db.session import session_scope
 from miya.services import (
     approvals,
@@ -64,13 +72,17 @@ from miya.services import (
     rag,
     recall,
     recaps,
+    receipts,
     records,
     reminders,
+    safety,
+    vision,
 )
 from miya.services import codes as client_codes
 from miya.services.embeddings import get_embedder
 from miya.services.extraction import ExtractedTransaction
 from miya.services.ingest import (
+    apply_vision,
     create_interaction,
     describe_into,
     process_interaction,
@@ -180,6 +192,234 @@ async def _download(bot: Bot, message: Message, media, path: Path) -> bool:
             message, "⚠️ Faylni yuklab bo'lmadi — qaytadan yuborib ko'ring."
         )
         return False
+
+
+def _refusal(name: str | None) -> str:
+    return replies.dangerous_file_refused(name, android=safety.is_android_package(name))
+
+
+async def _refuse_dangerous(message: Message, media) -> bool:
+    """JV-01: an installer or an archive is refused before `_download`, so it
+    never reaches MEDIA_DIR. True when the owner was told so."""
+    name = getattr(media, "file_name", None)
+    verdict = safety.classify_attachment(name, getattr(media, "mime_type", None))
+    if not verdict.dangerous:
+        return False
+    log.warning(
+        "refused a dangerous file sent to the bot (kind=%s rule=%s)",
+        verdict.kind,
+        verdict.reason,
+    )
+    await _safe_answer(message, _refusal(name))
+    return True
+
+
+def _sniff_download(path: Path) -> safety.Verdict:
+    """The bytes of a downloaded file, before any parser or transcriber sees
+    them. An installer under a document's, a song's or a video's name is
+    deleted on the spot."""
+    verdict = safety.sniff_magic(path, path.suffix)
+    if verdict.dangerous:
+        path.unlink(missing_ok=True)
+        log.warning(
+            "deleted a disguised dangerous file (kind=%s rule=%s)",
+            verdict.kind,
+            verdict.reason,
+        )
+    return verdict
+
+
+def _with_risk(media: dict, verdict: safety.Verdict | None, name: str | None) -> dict:
+    if verdict is not None and verdict.kind == safety.MACRO:
+        return {**media, "risk": verdict.as_risk(name)}
+    return media
+
+
+# --- images and receipts (JV-04) ----------------------------------------------
+
+
+def _booked_money(applied) -> bool:
+    """Did the owner's own words in this message already write money?"""
+    return applied is not None and bool(
+        applied.transactions
+        or applied.matched_transactions
+        or applied.settlements
+        or applied.debts
+    )
+
+
+@dataclass(slots=True)
+class _ReceiptCard:
+    """The receipt card, its own message: the bank's verdict edits it in
+    place later (JV-05), so it never shares a message with the reply."""
+
+    receipt_id: int
+    text: str
+    keyboard: InlineKeyboardMarkup | None
+
+
+async def _receipt_card(session, receipt: Receipt | None, applied) -> _ReceiptCard | None:
+    """The card for an image the owner sent the bot, stamped as delivered:
+    the owner gets it right here, never again from the worker. When the
+    owner's own words in the message booked the payment, the card leaves
+    out the "booked only from the bank" footer — on every later edit too."""
+    if receipt is None:
+        return None
+    interaction = await session.get(Interaction, receipt.interaction_id)
+    if interaction is not None:
+        receipts.mark_card_alone(interaction)
+        if _booked_money(applied):
+            interaction.meta = {**(interaction.meta or {}), receipts.BOOKED_KEY: True}
+    text = replies.receipt_card_for(
+        receipt,
+        await receipts.card_source(session, receipt, interaction),
+        await receipts.verdict_detail(session, receipt),
+    )
+    keyboard = (
+        keyboards.receipt_verdict(receipt.id)
+        if receipts.owner_can_judge(receipt)
+        else None
+    )
+    receipts.mark_notified(
+        receipt, now=datetime.now(settings.tz), verdict=receipt.verdict
+    )
+    return _ReceiptCard(receipt.id, text, keyboard)
+
+
+async def _read_image(
+    session, interaction: Interaction, path: Path, *, readable: bool = True
+) -> tuple[str, InlineKeyboardMarkup | None, _ReceiptCard | None]:
+    """An image the owner sent the bot — a photo, or a .jpg/.png/.webp sent
+    as a file — read once by vision; a receipt gets its card.
+
+    ``readable`` is False when the file's bytes are not an image
+    (safety.sniff_magic): the model never sees it, and the receipt the owner
+    meant it to be waits in /tekshir. Returns (reply, keyboard, the card).
+    """
+    if readable:
+        described = await describe_into(session, interaction, path, presume_receipt=True)
+    else:
+        described = await apply_vision(
+            session,
+            interaction,
+            vision.VisionReading(
+                description="", model=settings.extract_model, error="not an image"
+            ),
+            presume_receipt=True,
+        )
+    receipt = await receipts.for_interaction(session, interaction.id)
+    keyboard = None
+    applied = None
+    if described is None and not interaction.raw_text:
+        reply = "" if receipt is not None else replies.PHOTO_FAILED_HINT
+    else:
+        interaction.media = {**(interaction.media or {}), "processed": True}
+        result = await process_interaction(session, interaction)
+        reply, keyboard = _receipt(result)
+        applied = result.applied if result.ok else None
+        if result.ok and described is None:
+            # The caption was extracted, but the image itself was not read —
+            # the owner must not be told everything succeeded.
+            reply = reply + "\n" + replies.VISION_PARTIAL_HINT
+    card = await _receipt_card(session, receipt, applied)
+    return reply, keyboard, card
+
+
+async def _answer_image(
+    message: Message,
+    reply: str,
+    keyboard: InlineKeyboardMarkup | None,
+    card: _ReceiptCard | None,
+) -> None:
+    """The receipt card first, then the bot's reply with its own buttons."""
+    if card is not None:
+        sent = await _safe_answer(message, card.text, reply_markup=card.keyboard)
+        await _stamp_receipt_card(card.receipt_id, sent)
+    await _safe_answer(message, reply, reply_markup=keyboard)
+
+
+async def _stamp_receipt_card(
+    receipt_id: int | None, sent, *, verdict: str | None = None
+) -> None:
+    """Which message the card is, so the bank verdict can edit it in place
+    later, and which verdict it now shows. Best-effort: the receipt itself is
+    already committed."""
+    message_id = getattr(sent, "message_id", None)
+    if receipt_id is None or not isinstance(message_id, int):
+        return
+    try:
+        async with session_scope() as session:
+            await receipts.stamp_card(
+                session,
+                receipt_id,
+                now=datetime.now(settings.tz),
+                verdict=verdict,
+                message_id=message_id,
+            )
+    except Exception as exc:
+        log.error(
+            "could not record the receipt card message for receipt %s: %s",
+            receipt_id,
+            type(exc).__name__,
+        )
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.RECEIPT_PREFIX}:"))
+async def on_receipt_button(callback: CallbackQuery) -> None:
+    """✅ Pul keldi / 🚩 Soxta under a receipt card (JV-05).
+
+    Records the owner's verdict under a row lock and edits the card in
+    place. Neither books money nor voids any; the same tap twice changes
+    nothing. Not in ``_button_handlers``: a typed batch answer never
+    judges a receipt.
+    """
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[1] not in (keyboards.RECEIPT_OK, keyboards.RECEIPT_FAKE)
+        or not parts[2].isdigit()
+    ):
+        await callback.answer()
+        return
+    paid = parts[1] == keyboards.RECEIPT_OK
+    receipt_id = int(parts[2])
+    text = verdict = None
+    async with session_scope() as session:
+        receipt, _ = await receipts.set_owner_verdict(
+            session, receipt_id, paid=paid, by=receipts.BY_BUTTON
+        )
+        if receipt is not None:
+            verdict = receipt.verdict
+            text = replies.receipt_card_for(
+                receipt,
+                await receipts.card_source(session, receipt),
+                await receipts.verdict_detail(session, receipt),
+            )
+    if callback.message is not None:
+        edited = False
+        try:
+            if text is not None:
+                await callback.message.edit_text(text, reply_markup=None)
+            else:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            edited = True
+        except Exception as exc:
+            edited = "not modified" in str(exc).lower()
+            if not edited:
+                log.info(
+                    "could not edit receipt card %s: %s",
+                    receipt_id,
+                    type(exc).__name__,
+                    extra={"receipt_id": receipt_id},
+                )
+        if edited and text is not None:
+            # The card shows the owner's verdict; until it does, the
+            # worker's card refresh keeps trying.
+            await _stamp_receipt_card(receipt_id, callback.message, verdict=verdict)
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
 
 
 # --- commands ---------------------------------------------------------------
@@ -712,6 +952,1525 @@ async def cmd_status(message: Message) -> None:
             questions_used=used,
         ),
     )
+
+
+JARVIS_PAUSE_WORDS = {"toxtat", "to'xtat", "stop"}
+JARVIS_RESUME_WORDS = {"yoq", "yoqish", "start"}
+JARVIS_HISTORY_WORDS = {"tarix"}
+JARVIS_MODES_WORDS = {"rejim", "rejimlar", "rejimi"}
+# The global mode, in the owner's words: `/jarvis qoralama` (or `rejim
+# qoralama`) raises it to draft after a confirm tap, `/jarvis kuzatuv` lowers
+# it to shadow at once. auto is never set here: only the JV-23 graduation.
+JARVIS_DRAFT_WORDS = {"qoralama", "draft"}
+JARVIS_SHADOW_WORDS = {"kuzatuv", "kuzat", "shadow"}
+
+
+def _jarvis_mode_word(word: str) -> str | None:
+    folded = fold_apostrophes(word).casefold()
+    if folded in JARVIS_DRAFT_WORDS:
+        return "draft"
+    if folded in JARVIS_SHADOW_WORDS:
+        return "shadow"
+    return None
+
+
+@router.message(Command("jarvis"))
+async def cmd_jarvis(message: Message, command: CommandObject) -> None:
+    """`/jarvis` status · `toxtat` pauses everything · `yoq [kanal]` resumes ·
+    `tarix` lists the last 20 actions (JV-11) · `rejim` shows each reply
+    kind's mode per channel and its progress towards graduation (JV-23) ·
+    `qoralama` asks to raise the global mode to draft (the tap changes it) ·
+    `kuzatuv` lowers it to shadow at once (restricting is immediate).
+
+    miya.jarvis is imported here, on the owner's command, never at startup
+    (rule 20). A pause is checked at claim time, so it holds the moment this
+    commits; when the database does not answer, the owner is told that
+    nothing changed rather than shown a pause that did not happen.
+    """
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+    from miya.jarvis import status as jarvis_status
+
+    words = (command.args or "").split()
+    sub = fold_apostrophes(words[0]).casefold() if words else ""
+    now = datetime.now(settings.tz)
+    scope = jarvis_policy.GLOBAL
+    wanted = _jarvis_mode_word(sub) if len(words) == 1 else None
+    if sub in JARVIS_MODES_WORDS and len(words) > 1:
+        wanted = _jarvis_mode_word(words[1])
+        if wanted is None or len(words) > 2:
+            await _safe_answer(message, replies.JARVIS_USAGE)
+            return
+    if wanted is not None:
+        await _jarvis_set_mode(message, wanted, now=now)
+        return
+    if sub in JARVIS_RESUME_WORDS and len(words) > 1:
+        channel = jarvis_chatkey.channel_word(words[1])
+        if channel is None:
+            await _safe_answer(message, replies.JARVIS_UNKNOWN_CHANNEL)
+            return
+        scope = jarvis_policy.channel_scope(channel)
+    known = (
+        JARVIS_PAUSE_WORDS
+        | JARVIS_RESUME_WORDS
+        | JARVIS_HISTORY_WORDS
+        | JARVIS_MODES_WORDS
+    )
+    if sub and sub not in known:
+        await _safe_answer(message, replies.JARVIS_USAGE)
+        return
+    try:
+        async with session_scope() as session:
+            if sub in JARVIS_PAUSE_WORDS:
+                await jarvis_policy.pause(session, by=records.BY_COMMAND, now=now)
+                body = replies.JARVIS_PAUSED
+            elif sub in JARVIS_RESUME_WORDS:
+                await jarvis_policy.resume(
+                    session, scope=scope, by=records.BY_COMMAND, now=now
+                )
+                state = await jarvis_status.gather(session, now)
+                # «yoqildi» only when something can send now: with Jarvis
+                # off, or the global pause still holding after a channel
+                # resume, the owner sees the status, which says so.
+                body = (
+                    replies.jarvis_resumed(state.mode)
+                    if state.mode != "off" and not state.paused
+                    else replies.jarvis_status(state)
+                )
+            elif sub in JARVIS_HISTORY_WORDS:
+                body = replies.jarvis_history(
+                    await jarvis_status.recent_actions(session, limit=20)
+                )
+            elif sub in JARVIS_MODES_WORDS:
+                from miya.jarvis import rollout as jarvis_rollout
+
+                body = replies.jarvis_modes(await jarvis_rollout.modes(session, now=now))
+            else:
+                body = replies.jarvis_status(await jarvis_status.gather(session, now))
+    except Exception as exc:
+        log.error(
+            "/jarvis failed",
+            extra={"command": sub or "status", "error": type(exc).__name__},
+        )
+        body = replies.JARVIS_FAILED
+    await _safe_answer(message, body)
+
+
+def _jarvis_mode_hint(wanted: str) -> str | None:
+    from miya.jarvis import policy as jarvis_policy
+
+    return replies.jarvis_mode_hint(
+        wanted, jarvis_policy.ceiling(), enabled=settings.jarvis_enabled
+    )
+
+
+async def _jarvis_set_mode(message: Message, wanted: str, *, now: datetime) -> None:
+    """`/jarvis qoralama` asks first (loosening is the owner's tap, JV-12);
+    `/jarvis kuzatuv` lowers the global mode at once. The env ceiling still
+    caps whatever is stored; the reply says what in .env holds it back."""
+    from miya.jarvis import policy as jarvis_policy
+
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            if wanted == "draft":
+                policies = await jarvis_policy.load(session)
+                current = jarvis_policy.global_stored_mode(policies)
+                if current == "draft":
+                    body = replies.jarvis_mode_already(
+                        current, _jarvis_mode_hint("draft")
+                    )
+                else:
+                    body = replies.jarvis_draft_ask(_jarvis_mode_hint("draft"))
+                    keyboard = keyboards.jarvis_mode_confirm()
+            else:
+                before = await jarvis_policy.set_global_mode(
+                    session, mode="shadow", by=records.BY_COMMAND, now=now
+                )
+                policies = await jarvis_policy.load(session)
+                narrower = jarvis_policy.narrower_above(policies, "shadow")
+                body = (
+                    replies.jarvis_mode_already("shadow", None)
+                    if before == "shadow" and not narrower
+                    else replies.jarvis_mode_set("shadow", narrower=narrower)
+                )
+    except Exception as exc:
+        log.error(
+            "/jarvis mode failed",
+            extra={"mode": wanted, "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_MODE_PREFIX}:"))
+async def on_jarvis_mode_button(callback: CallbackQuery) -> None:
+    """✅ Ha, qoralama rejimi / ✖️ Yo'q under `/jarvis qoralama`: the owner's
+    tap is the only way the global mode goes up, and only to draft. Under the
+    global row's lock; a second tap changes nothing. Not in
+    ``_button_handlers``. miya.jarvis is imported here, never at startup."""
+    from miya.jarvis import policy as jarvis_policy
+
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) == 2 else ""
+    if action == keyboards.JARVIS_MODE_KEEP:
+        await _edit_callback(callback, replies.JARVIS_MODE_KEPT)
+        return
+    if action != keyboards.JARVIS_MODE_DRAFT:
+        await _ack(callback)
+        return
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            before = await jarvis_policy.set_global_mode(
+                session, mode="draft", by=records.BY_BUTTON, now=now
+            )
+    except Exception as exc:
+        log.error("jarvis mode tap failed", extra={"error": type(exc).__name__})
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    hint = _jarvis_mode_hint("draft")
+    body = (
+        replies.jarvis_mode_already("draft", hint)
+        if before == "draft"
+        else replies.jarvis_mode_set("draft", hint=hint)
+    )
+    await _edit_callback(callback, body)
+
+
+@router.message(Command("qoralamalar"))
+async def cmd_shadow_drafts(message: Message) -> None:
+    """`/qoralamalar` — the drafts waiting for the owner's tap (JV-22: the
+    morning brief counts them and points here), then the replies Jarvis
+    prepared in observation (shadow) mode, newest first; none of them was
+    sent (JV-16). miya.jarvis is imported here, never at startup (rule 20)."""
+    from miya.jarvis import status as jarvis_status
+
+    try:
+        async with session_scope() as session:
+            body = replies.shadow_drafts(
+                await jarvis_status.shadow_drafts(session),
+                await jarvis_status.waiting_drafts(
+                    session, now=datetime.now(settings.tz)
+                ),
+            )
+    except Exception as exc:
+        log.error("/qoralamalar failed", extra={"error": type(exc).__name__})
+        body = replies.JARVIS_FAILED
+    await _safe_answer(message, body)
+
+
+# --- draft and escalation cards (JV-18) ----------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20). The
+# jv: and je: buttons are not in _button_handlers, so a typed batch answer
+# («hammasi ha») can never approve a send. A tap is honoured only from the card
+# the row is shown on now, under the row's lock; a second tap is stale.
+
+
+class _CardNotShown(Exception):
+    """The re-rendered card did not reach the owner: the new words are rolled
+    back, so the text a tap would send is always the one a card shows."""
+
+
+class _CardTooLong(Exception):
+    """With the owner's words the card would not fit one message whole: the
+    words are rolled back (a card is never clipped)."""
+
+
+def _jarvis_tap_args(data: str | None) -> tuple[str, int | None]:
+    parts = (data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    ident = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    return action, ident
+
+
+def _jarvis_refusal(code: str) -> str:
+    return {
+        "stale": replies.JARVIS_STALE,
+        "answered": replies.JARVIS_ANSWERED,
+        "copy": replies.JARVIS_COPY_FOOTER,
+        "edit": replies.JARVIS_EDIT_HINT,
+        "too_long": replies.JARVIS_TOO_LONG,
+    }.get(code, replies.JARVIS_FAILED)
+
+
+def _jarvis_outcome(result) -> str | None:
+    """The line a tap's card shows under it, or None when the card stays."""
+    if result.code == "queued" and result.until is not None:
+        # A send the owner scheduled (JV-20): the gate holds it until then.
+        return replies.jarvis_command_scheduled(result.until)
+    if result.code == "queued":
+        return replies.jarvis_queued(result.channel)
+    if result.code == "own":
+        return replies.jarvis_own(result.name, settings.jarvis_takeover_minutes)
+    if result.code == "cancelled":
+        return replies.JARVIS_CANCELLED
+    if result.code == "snoozed":
+        if result.to_brief:
+            return replies.JARVIS_SNOOZED.format(vaqt=settings.morning_brief_time)
+        return replies.jarvis_snoozed(result.until)
+    return None
+
+
+async def _strip_buttons(message) -> None:
+    """A card that is no longer the one to tap loses its buttons (cosmetic:
+    a tap on it is stale anyway)."""
+    try:
+        await message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        log.debug("could not take the buttons off an old card", exc_info=True)
+
+
+async def _jarvis_tap(callback: CallbackQuery, kind: str) -> None:
+    from miya.jarvis import cards as jarvis_cards
+
+    action, ident = _jarvis_tap_args(callback.data)
+    message = callback.message
+    if ident is None:
+        await _ack(callback)
+        return
+    message_id = getattr(message, "message_id", None)
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            if kind == jarvis_cards.DRAFT_CARD:
+                card = await jarvis_cards.draft_card(session, ident)
+                result = await jarvis_cards.tap_draft(
+                    session, ident, action, message_id=message_id, now=now
+                )
+            elif kind == jarvis_cards.COMMAND_CARD:
+                card = await jarvis_cards.command_card(session, ident)
+                result = await jarvis_cards.tap_command(
+                    session, ident, action, message_id=message_id, now=now
+                )
+            else:
+                card = await jarvis_cards.escalation_card(session, ident)
+                result = await jarvis_cards.tap_escalation(
+                    session, ident, action, message_id=message_id, now=now
+                )
+    except Exception as exc:
+        log.error(
+            "jarvis card tap failed",
+            extra={
+                "card_kind": kind,
+                "card_action": action,
+                "ref_id": ident,
+                "error": type(exc).__name__,
+            },
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    outcome = _jarvis_outcome(result)
+    if outcome is None or card is None:
+        if message is not None:
+            if result.code in ("stale", "answered"):
+                await _strip_buttons(message)
+            await _safe_answer(message, _jarvis_refusal(result.code))
+        await _ack(callback)
+        return
+    text = replies.jarvis_card_outcome(replies.jarvis_card(card), outcome)
+    if result.code in ("snoozed", "queued") and result.card is not None:
+        # The alert stays tappable: after a snooze (send, write; the snooze
+        # comes back later), or when ✅ approved only the holding reply.
+        try:
+            await message.edit_text(text, reply_markup=keyboards.jarvis_card(result.card))
+        except Exception:
+            log.debug("could not edit the snoozed card", exc_info=True)
+        await _ack(callback)
+        return
+    await _edit_callback(callback, text)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_DRAFT_PREFIX}:"))
+async def on_jarvis_draft_button(callback: CallbackQuery) -> None:
+    """✅ Yuborish / ✏️ Tahrirlash / 🙋 O'zim yozaman / ✖️ Bekor under a draft
+    card (JV-18), and ↩️ Bu xato edi under the notice of an autonomous send
+    (JV-23). Not in ``_button_handlers``."""
+    action, ident = _jarvis_tap_args(callback.data)
+    if action == keyboards.JARVIS_MISTAKE:
+        await _jarvis_mistake(callback, ident)
+        return
+    await _jarvis_tap(callback, "draft")
+
+
+async def _jarvis_mistake(callback: CallbackQuery, ident: int | None) -> None:
+    """«↩️ Bu xato edi» (JV-23): the reply kind goes back to draft at once and
+    the sent text is kept for the red-line review; honoured only from the
+    notice the row was told on, a second tap changes nothing."""
+    from miya.jarvis import rollout as jarvis_rollout
+
+    message = callback.message
+    if ident is None:
+        await _ack(callback)
+        return
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            result = await jarvis_rollout.mistake(
+                session,
+                ident,
+                message_id=getattr(message, "message_id", None),
+                now=now,
+            )
+    except Exception as exc:
+        log.error(
+            "jarvis mistake tap failed",
+            extra={"outbox_id": ident, "error": type(exc).__name__},
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if result.code != "demoted" or result.intent is None:
+        if message is not None:
+            await _strip_buttons(message)
+            await _safe_answer(
+                message,
+                replies.JARVIS_MISTAKE_STALE
+                if result.code == "stale"
+                else replies.JARVIS_ANSWERED,
+            )
+        await _ack(callback)
+        return
+    if message is not None:
+        await _strip_buttons(message)
+        await _safe_answer(
+            message,
+            replies.jarvis_demoted(
+                intent=result.intent,
+                channel=result.channel,
+                code=jarvis_rollout.MISTAKE,
+            ),
+        )
+    await _ack(callback)
+
+
+def _graduation_args(data: str | None) -> tuple[str, str, str] | None:
+    """(action, channel, intent) of a ``jg:`` payload, or None."""
+    parts = (data or "").split(":")
+    if len(parts) != 4 or parts[0] != keyboards.JARVIS_GRADUATION_PREFIX:
+        return None
+    action, channel, intent = parts[1], parts[2], parts[3]
+    if action not in (keyboards.JARVIS_GRADUATE_YES, keyboards.JARVIS_GRADUATE_NO):
+        return None
+    return action, channel, intent
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_GRADUATION_PREFIX}:"))
+async def on_jarvis_graduation_button(callback: CallbackQuery) -> None:
+    """✅ Ha, avtomatik / ⏳ Yana kuzataylik under a graduation offer (JV-23):
+    the owner's tap is the only way a reply kind is sent on its own. Under
+    the scope's row lock and re-checked; a never-auto kind is refused, an
+    old offer is stale. Not in ``_button_handlers``. miya.jarvis is imported
+    here, never at startup (rule 20)."""
+    from miya.jarvis import policy as jarvis_policy
+    from miya.jarvis import rollout as jarvis_rollout
+
+    parsed = _graduation_args(callback.data)
+    message = callback.message
+    if parsed is None:
+        await _ack(callback)
+        return
+    action, channel, intent = parsed
+    now = datetime.now(settings.tz)
+    message_id = getattr(message, "message_id", None)
+    try:
+        async with session_scope() as session:
+            if action == keyboards.JARVIS_GRADUATE_YES:
+                result = await jarvis_rollout.accept(
+                    session, channel, intent, message_id=message_id, now=now
+                )
+            else:
+                result = await jarvis_rollout.decline(
+                    session, channel, intent, message_id=message_id, now=now
+                )
+    except Exception as exc:
+        log.error(
+            "jarvis graduation tap failed",
+            extra={
+                "channel": channel,
+                "intent": intent,
+                "tap": action,
+                "error": type(exc).__name__,
+            },
+        )
+        if message is not None:
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if result.code == "promoted":
+        body = replies.jarvis_graduated(
+            intent=intent,
+            channel=channel,
+            cap=settings.jarvis_auto_daily_cap,
+            ceiling_ok=result.ceiling_ok,
+        )
+    elif result.code == "declined":
+        body = replies.jarvis_kept_draft(
+            intent=intent, channel=channel, days=settings.jarvis_graduation_min_days
+        )
+    elif result.code == jarvis_policy.NEVER_AUTO:
+        body = replies.jarvis_never_auto(intent)
+    elif result.code == "not_ready":
+        body = replies.jarvis_graduation_not_ready(intent=intent, channel=channel)
+    else:
+        body = replies.JARVIS_GRADUATION_STALE
+    if message is not None:
+        await _strip_buttons(message)
+        await _safe_answer(message, body)
+    await _ack(callback)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_ESCALATION_PREFIX}:"))
+async def on_jarvis_escalation_button(callback: CallbackQuery) -> None:
+    """✅ Tasdiqlash va yuborish / ✍️ O'zim javob yozaman / ⏰ 1 soatdan keyin
+    eslat under an escalation alert (JV-18). Not in ``_button_handlers``."""
+    await _jarvis_tap(callback, "escalation")
+
+
+# --- the owner's commands (JV-20) ---------------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20). The
+# ja: buttons are not in _button_handlers, so a typed batch answer never sends
+# or changes a setting. Every proposal is a card; nothing leaves or changes
+# before the owner's tap on it.
+
+
+async def _cancel_unshown(row_id: int, code: str) -> None:
+    """A command card that never reached the owner: its row is cancelled, so
+    no text waits that the owner was never shown. Contained."""
+    from miya.jarvis import outbox as jarvis_outbox
+
+    try:
+        async with session_scope() as session:
+            await jarvis_outbox.cancel(
+                session,
+                row_id,
+                by=jarvis_outbox.BY_COMMAND,
+                now=datetime.now(settings.tz),
+                code=code,
+            )
+    except Exception as exc:
+        log.error(
+            "unshown command row not cancelled",
+            extra={"outbox_id": row_id, "error": type(exc).__name__},
+        )
+
+
+async def _command_send_card(message, outbox_id: int) -> bool:
+    """Show one commanded send's card (exact text, recipient, channel, time,
+    warnings) and record it as shown. A card that does not fit or does not
+    go out cancels its row and tells the owner nothing was queued."""
+    from miya.jarvis import cards as jarvis_cards
+
+    now = datetime.now(settings.tz)
+    code = None
+    try:
+        async with session_scope() as session:
+            card = await jarvis_cards.command_card(session, outbox_id)
+            if card is None:
+                code = "card_missing"
+            elif not replies.jarvis_card_fits(card):
+                code = "too_long"
+            else:
+                sent = await _safe_answer(
+                    message,
+                    replies.jarvis_card(card),
+                    reply_markup=keyboards.jarvis_card(card),
+                )
+                if sent is None or getattr(sent, "message_id", None) is None:
+                    code = "card_failed"
+                else:
+                    await jarvis_cards.command_shown(
+                        session, card, message_id=sent.message_id, now=now
+                    )
+    except Exception as exc:
+        # Contained (rule 25): a card that cannot be recorded as shown is
+        # never tappable, so its row must not wait either.
+        log.error(
+            "command card failed",
+            extra={"outbox_id": outbox_id, "error": type(exc).__name__},
+        )
+        code = "card_error"
+    if code is None:
+        return True
+    log.warning("command card not shown", extra={"outbox_id": outbox_id, "code": code})
+    await _cancel_unshown(outbox_id, code)
+    await _safe_answer(message, replies.JARVIS_COMMAND_NOTHING)
+    return False
+
+
+async def _deliver_actions(message, actions) -> None:
+    """The cards of what one command proposed (JV-20), each a message of its
+    own under the answer. Contained per action (rule 25): one card that
+    fails is logged with its ids and the rest still go out."""
+    if not actions:
+        return
+    from miya.jarvis import commands as jarvis_commands
+
+    for action in actions:
+        try:
+            if action.kind == jarvis_commands.SEND and action.outbox_id is not None:
+                await _command_send_card(message, action.outbox_id)
+            elif action.kind == jarvis_commands.ASK:
+                await _safe_answer(
+                    message,
+                    replies.jarvis_command_which(action.name),
+                    reply_markup=keyboards.command_candidates(action),
+                )
+            elif action.kind == jarvis_commands.NO_CHAT:
+                await _safe_answer(
+                    message, replies.jarvis_command_no_chat(action.name, action.channel)
+                )
+            elif action.kind == jarvis_commands.SETTING:
+                await _safe_answer(
+                    message,
+                    replies.jarvis_setting_question(action.setting, action.name),
+                    reply_markup=keyboards.command_setting(action),
+                )
+        except Exception as exc:
+            log.error(
+                "command card failed",
+                extra={
+                    "outbox_id": action.outbox_id,
+                    "interaction_id": action.interaction_id,
+                    "action_kind": action.kind,
+                    "error": type(exc).__name__,
+                },
+            )
+            await _safe_answer(message, replies.JARVIS_COMMAND_NOTHING)
+
+
+def _command_ids(parts: list[str], count: int) -> list[int] | None:
+    ids = parts[2:]
+    if len(ids) != count or not all(p.isdigit() for p in ids):
+        return None
+    return [int(p) for p in ids]
+
+
+async def _command_pick(callback: CallbackQuery, parts: list[str]) -> None:
+    """One person tapped under «Qaysi …?»: that person's send card."""
+    from miya.jarvis import commands as jarvis_commands
+
+    ids = _command_ids(parts, 3)
+    if ids is None:
+        await _ack(callback)
+        return
+    interaction_id, index, person_id = ids
+    try:
+        async with session_scope() as session:
+            result = await jarvis_commands.pick_candidate(
+                session,
+                interaction_id,
+                index,
+                person_id,
+                now=datetime.now(settings.tz),
+            )
+    except Exception as exc:
+        log.error(
+            "command candidate tap failed",
+            extra={
+                "interaction_id": interaction_id,
+                "person_id": person_id,
+                "error": type(exc).__name__,
+            },
+        )
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if result.code == "sent_card" and result.outbox_id is not None:
+        if callback.message is not None:
+            await _strip_buttons(callback.message)
+            await _command_send_card(callback.message, result.outbox_id)
+        await _ack(callback)
+        return
+    if result.code == "no_chat":
+        await _edit_callback(
+            callback, replies.jarvis_command_no_chat(result.name, result.channel)
+        )
+        return
+    await _edit_callback(
+        callback,
+        replies.JARVIS_ANSWERED
+        if result.code == "answered"
+        else replies.JARVIS_SETTING_STALE,
+    )
+
+
+async def _command_setting_tap(callback: CallbackQuery, parts: list[str]) -> None:
+    """✅ or ✖️ on a setting the owner commanded."""
+    from miya.jarvis import commands as jarvis_commands
+
+    ids = _command_ids(parts, 2)
+    if ids is None:
+        await _ack(callback)
+        return
+    interaction_id, index = ids
+    try:
+        async with session_scope() as session:
+            result = await jarvis_commands.tap_setting(
+                session,
+                interaction_id,
+                index,
+                apply=parts[1] == keyboards.JARVIS_SETTING_APPLY,
+                now=datetime.now(settings.tz),
+            )
+    except Exception as exc:
+        log.error(
+            "command setting tap failed",
+            extra={
+                "interaction_id": interaction_id,
+                "index": index,
+                "error": type(exc).__name__,
+            },
+        )
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    body = {
+        "applied": replies.jarvis_setting_done(result.setting, result.name, result.state),
+        "cancelled": replies.JARVIS_CANCELLED,
+        "answered": replies.JARVIS_ANSWERED,
+    }.get(result.code, replies.JARVIS_SETTING_STALE)
+    await _edit_callback(callback, body)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.JARVIS_COMMAND_PREFIX}:"))
+async def on_jarvis_command_button(callback: CallbackQuery) -> None:
+    """✅ Yuborish / ✏️ Tahrirlash / ✖️ Bekor under a commanded send, a person
+    under «Qaysi …?», ✅ / ✖️ under a commanded setting (JV-20). Not in
+    ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action in (keyboards.JARVIS_SEND, keyboards.JARVIS_EDIT, keyboards.JARVIS_CANCEL):
+        await _jarvis_tap(callback, "command")
+    elif action == keyboards.JARVIS_COMMAND_PICK:
+        await _command_pick(callback, parts)
+    elif action in (keyboards.JARVIS_SETTING_APPLY, keyboards.JARVIS_SETTING_DROP):
+        await _command_setting_tap(callback, parts)
+    else:
+        await _ack(callback)
+
+
+def _replied_id(message: Message) -> int | None:
+    """The bot message this one replies to, only in the owner's private chat
+    with the bot: cards go only there, and a message id from any other chat
+    (a group the bot is in) is not a card's, whatever its number."""
+    chat = getattr(message, "chat", None)
+    owner = settings.owner_telegram_id
+    if owner is None or getattr(chat, "id", None) != owner:
+        return None
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None) if reply is not None else None
+    return reply_id if isinstance(reply_id, int) else None
+
+
+async def _replies_to_card(session, message: Message) -> bool:
+    """Is this message the owner's reply to a Jarvis card? Never with Jarvis
+    off (rule 20: then miya.jarvis is not imported at all)."""
+    reply_id = _replied_id(message)
+    if not settings.jarvis_enabled or reply_id is None:
+        return False
+    from miya.jarvis import cards as jarvis_cards
+
+    try:
+        async with session.begin_nested():
+            return await jarvis_cards.find_card(session, reply_id) is not None
+    except Exception as exc:
+        # Contained: the voice note is then handled as any other.
+        log.error(
+            "jarvis card lookup failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        return False
+
+
+async def _jarvis_card_reply(
+    message: Message, text: str | None, *, interaction_id: int | None = None
+) -> bool:
+    """The owner replied to a draft card or an escalation alert with their own
+    words (typed, or a voice note's transcript): they become the text, the
+    owner's (flagged by the guard, never blocked), and the card is shown again
+    with them, right under the reply; the old card loses its buttons. False
+    when the message replies to no card."""
+    reply_id = _replied_id(message)
+    if not settings.jarvis_enabled or reply_id is None:
+        return False
+    from miya.jarvis import cards as jarvis_cards
+
+    try:
+        async with session_scope() as session:
+            ref = await jarvis_cards.find_card(session, reply_id)
+    except Exception as exc:
+        # Contained: a lookup that fails costs the owner nothing, the message
+        # is then handled as any other.
+        log.error(
+            "jarvis card lookup failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        return False
+    if ref is None:
+        return False
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            result = await jarvis_cards.owner_reply(
+                session, ref, text or "", now=now, interaction_id=interaction_id
+            )
+            if result.code == "edited" and result.card is not None:
+                if not replies.jarvis_card_fits(result.card):
+                    raise _CardTooLong
+                sent = await _safe_answer(
+                    message,
+                    replies.jarvis_card(result.card),
+                    reply_markup=keyboards.jarvis_card(result.card),
+                )
+                if sent is None:
+                    raise _CardNotShown
+                await jarvis_cards.recarded(
+                    session, result.card, message_id=sent.message_id, now=now
+                )
+    except _CardTooLong:
+        log.info(
+            "the owner's words do not fit a card",
+            extra={"card_kind": ref.kind, "ref_id": ref.id},
+        )
+        await _safe_answer(message, replies.JARVIS_TOO_LONG)
+        return True
+    except _CardNotShown:
+        log.warning("the edited card did not reach the owner", extra={"ref_id": reply_id})
+        await _safe_answer(message, replies.JARVIS_FAILED)
+        return True
+    except Exception as exc:
+        log.error(
+            "reply to a jarvis card failed",
+            extra={"message_id": reply_id, "error": type(exc).__name__},
+        )
+        await _safe_answer(message, replies.JARVIS_FAILED)
+        return True
+    if result.code != "edited":
+        await _safe_answer(message, _jarvis_refusal(result.code))
+        return True
+    await _strip_buttons(message.reply_to_message)
+    return True
+
+
+# --- personal chats and group replies (JV-12) ---------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# Restricting is immediate (/shaxsiy, a 🔒 tap, switching a group off);
+# loosening is a confirmed tap (unmarking, switching a group on). The jr:
+# buttons are not in _button_handlers, so a typed batch answer never changes
+# a rule.
+
+
+async def _chats_titled(
+    session, title: str, *, kinds: tuple[ChatType, ...], exact_only: bool = False
+) -> list[ChatMonitor]:
+    """Chats of ``kinds`` titled ``title`` (``chats.find_titled``, which the
+    owner's commands use as well, JV-20)."""
+    return await chats.find_titled(session, title, kinds=kinds, exact_only=exact_only)
+
+
+async def _personal_command(session, name: str, *, now: datetime):
+    """`/shaxsiy` on one name: mark at once, or ask before unmarking."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    # A family group named exactly so is the chat; otherwise a person by
+    # name or code (_lookup), then any chat whose title holds the words.
+    groups = await _chats_titled(session, name, kinds=(ChatType.group,), exact_only=True)
+    monitor = groups[0] if len(groups) == 1 else None
+    person = None
+    if monitor is None:
+        person, body = await _lookup(session, name, command="shaxsiy")
+        if person is None:
+            if body != replies.person_not_found(name):
+                return body, None
+            found = await _chats_titled(
+                session, name, kinds=(ChatType.private, ChatType.group)
+            )
+            if not found:
+                return body, None
+            if len(found) > 1:
+                return (
+                    replies.group_ambiguous(
+                        [(c.title, c.tg_chat_id) for c in found], command="shaxsiy"
+                    ),
+                    None,
+                )
+            monitor = found[0]
+    if person is not None:
+        addresses = await people.known_addresses(session, person)
+        rule = await jarvis_policy.personal_rule(
+            session,
+            person_id=person.id,
+            chat_keys=[a for a in addresses if a.startswith("tg:")],
+        )
+        if rule is not None:
+            return (
+                replies.personal_unmark_question(person.display_name),
+                keyboards.personal_unmark_confirm(rule.id),
+            )
+        await jarvis_policy.mark_person(session, person, by=records.BY_COMMAND, now=now)
+        return replies.personal_marked(person.display_name), None
+    key = jarvis_chatkey.telegram(monitor.tg_chat_id)
+    rule = await jarvis_policy.personal_rule(session, chat_keys=[key])
+    if rule is not None:
+        return (
+            replies.personal_unmark_question(monitor.title),
+            keyboards.personal_unmark_confirm(rule.id),
+        )
+    await jarvis_policy.mark_chat(session, monitor, by=records.BY_COMMAND, now=now)
+    return replies.personal_marked(monitor.title), None
+
+
+@router.message(Command("shaxsiy"))
+async def cmd_personal(message: Message, command: CommandObject) -> None:
+    """`/shaxsiy <ism|kod>` — MIYA never writes into this person's or chat's
+    conversation on its own (JV-12). Marked at once, with every address the
+    person is known at; on a chat already personal it asks before unmarking."""
+    name = (command.args or "").strip()
+    if not name:
+        await _safe_answer(message, replies.PERSONAL_USAGE)
+        return
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            body, keyboard = await _personal_command(
+                session, name, now=datetime.now(settings.tz)
+            )
+    except Exception as exc:
+        log.error(
+            "/shaxsiy failed",
+            extra={"command": "shaxsiy", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _personal_page():
+    """The `/shaxsiylar` text and its buttons. The suggestions run in a
+    savepoint: when they fail, the list still comes out without them."""
+    from miya.jarvis import policy as jarvis_policy
+
+    now = datetime.now(settings.tz)
+    async with session_scope() as session:
+        marked = await jarvis_policy.personal_chats(session)
+        try:
+            async with session.begin_nested():
+                suggestions = await jarvis_policy.suggest_personal(session, now=now)
+        except Exception as exc:
+            log.error(
+                "personal suggestions failed",
+                extra={"marked": len(marked), "error": type(exc).__name__},
+            )
+            suggestions = []
+    body = replies.personal_list(marked, suggestions)
+    keyboard = keyboards.personal_list(
+        [(item.rule_id, item.name) for item in marked],
+        [(item.person_id, item.name) for item in suggestions],
+    )
+    return body, keyboard
+
+
+@router.message(Command("shaxsiylar"))
+async def cmd_personal_list(message: Message) -> None:
+    """`/shaxsiylar` — the personal chats, and likely family and friends MIYA
+    found from the database, each one tap to mark (nothing is marked
+    without the owner)."""
+    try:
+        body, keyboard = await _personal_page()
+    except Exception as exc:
+        log.error(
+            "/shaxsiylar failed",
+            extra={"command": "shaxsiylar", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+@router.message(Command("guruhai"))
+async def cmd_group_reply(message: Message, command: CommandObject) -> None:
+    """`/guruhai <guruh>` — AI replies in one group: off at once, on after a
+    confirm tap, and then only to messages addressed to the owner (JV-12)."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    title = (command.args or "").strip()
+    keyboard = None
+    monitor_id = None
+    try:
+        async with session_scope() as session:
+            if not title:
+                body = replies.group_reply_usage(
+                    await jarvis_policy.enabled_group_titles(session)
+                )
+            else:
+                found = await _chats_titled(session, title, kinds=(ChatType.group,))
+                if not found:
+                    body = replies.group_not_found(title)
+                elif len(found) > 1:
+                    body = replies.group_ambiguous(
+                        [(c.title, c.tg_chat_id) for c in found], command="guruhai"
+                    )
+                else:
+                    monitor = found[0]
+                    monitor_id = monitor.id
+                    key = jarvis_chatkey.telegram(monitor.tg_chat_id)
+                    state = await jarvis_policy.group_reply_state(session, key)
+                    if state == "personal":
+                        body = replies.group_reply_personal(monitor.title)
+                    elif state == "on":
+                        await jarvis_policy.set_group_reply(
+                            session,
+                            chat_key=key,
+                            enabled=False,
+                            by=records.BY_COMMAND,
+                            now=datetime.now(settings.tz),
+                        )
+                        body = replies.group_reply_off(monitor.title)
+                    else:
+                        body = replies.group_reply_question(monitor.title)
+                        keyboard = keyboards.group_reply_confirm(monitor.id)
+    except Exception as exc:
+        log.error(
+            "/guruhai failed",
+            extra={
+                "command": "guruhai",
+                "monitor_id": monitor_id,
+                "error": type(exc).__name__,
+            },
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _rule_tap(action: str, ident: int, *, now: datetime):
+    """One jr: tap: (text, keyboard, edit the tapped message in place)."""
+    from miya.jarvis import chatkey as jarvis_chatkey
+    from miya.jarvis import policy as jarvis_policy
+
+    async with session_scope() as session:
+        if action == keyboards.RULE_MARK:
+            person = await session.get(Person, ident)
+            if person is None:
+                return replies.RULE_STALE, None, False
+            await jarvis_policy.mark_person(
+                session, person, by=records.BY_BUTTON, now=now
+            )
+            return replies.personal_marked(person.display_name), None, False
+        if action == keyboards.RULE_ASK:
+            rule = await jarvis_policy.personal_rule_by_id(session, ident)
+            if rule is None:
+                return replies.RULE_STALE, None, False
+            [listed] = await jarvis_policy.describe(session, [rule])
+            return (
+                replies.personal_unmark_question(listed.name),
+                keyboards.personal_unmark_confirm(rule.id),
+                False,
+            )
+        if action == keyboards.RULE_YES:
+            rule = await jarvis_policy.unmark_personal(
+                session, ident, by=records.BY_BUTTON, now=now
+            )
+            if rule is None:
+                return replies.RULE_STALE, None, True
+            [listed] = await jarvis_policy.describe(session, [rule])
+            return replies.personal_unmarked(listed.name), None, True
+        # keyboards.RULE_GROUP_YES
+        monitor = await session.get(ChatMonitor, ident)
+        if monitor is None or monitor.chat_type != ChatType.group:
+            return replies.RULE_STALE, None, True
+        state = await jarvis_policy.set_group_reply(
+            session,
+            chat_key=jarvis_chatkey.telegram(monitor.tg_chat_id),
+            enabled=True,
+            by=records.BY_BUTTON,
+            now=now,
+        )
+        if state == "personal":
+            return replies.group_reply_personal(monitor.title), None, True
+        return replies.group_reply_on(monitor.title), None, True
+
+
+_RULE_ACTIONS = {
+    keyboards.RULE_MARK,
+    keyboards.RULE_ASK,
+    keyboards.RULE_YES,
+    keyboards.RULE_NO,
+    keyboards.RULE_GROUP_YES,
+}
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.RULE_PREFIX}:"))
+async def on_rule_button(callback: CallbackQuery) -> None:
+    """🔒 / 🔓 under `/shaxsiylar`, and the confirms of unmarking and of
+    switching a group on (JV-12). Every change runs under a row lock and is
+    re-checked; a second tap changes nothing. Not in ``_button_handlers``.
+    """
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    ident = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if action not in _RULE_ACTIONS or ident is None:
+        await _ack(callback)
+        return
+    if action == keyboards.RULE_NO:
+        await _edit_callback(callback, replies.RULE_KEPT)
+        return
+    try:
+        body, keyboard, in_place = await _rule_tap(
+            action, ident, now=datetime.now(settings.tz)
+        )
+    except Exception as exc:
+        log.error(
+            "reply rule tap failed",
+            extra={"rule_action": action, "ref_id": ident, "error": type(exc).__name__},
+        )
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        await _ack(callback)
+        return
+    if in_place:
+        await _edit_callback(callback, body)
+        return
+    if callback.message is not None:
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+        if action == keyboards.RULE_MARK and body != replies.RULE_STALE:
+            await _refresh_personal_page(callback)
+    await _ack(callback)
+
+
+async def _refresh_personal_page(callback: CallbackQuery) -> None:
+    """The tapped list shows the person among the personal chats now."""
+    try:
+        body, keyboard = await _personal_page()
+        await callback.message.edit_text(body, reply_markup=keyboard)
+    except Exception as exc:
+        # Cosmetic: the mark is committed; the next /shaxsiylar shows it.
+        log.info(
+            "could not refresh the personal list", extra={"error": type(exc).__name__}
+        )
+
+
+async def _ack(callback: CallbackQuery) -> None:
+    try:
+        await callback.answer()
+    except Exception:
+        log.debug("could not acknowledge the callback", exc_info=True)
+
+
+# --- the owner's style (JV-14) --------------------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# The js: buttons are not in _button_handlers, so a typed batch answer never
+# changes the style the AI writes in.
+
+STYLE_IMPORT_WORDS = {"yukla", "yuklash", "import"}
+
+
+async def _style_page(session, *, now: datetime, force: bool = False):
+    """The `/uslub` card and its buttons: the newest draft (or the active
+    profile); with none yet, or with ``force``, one is built now."""
+    from miya.jarvis import style as jarvis_style
+
+    profile = None if force else await jarvis_style.current_profile(session)
+    if profile is None:
+        result = await jarvis_style.build_profile(
+            session, now=now, by=records.BY_COMMAND, force=force
+        )
+        if result.status == "too_few" or result.profile is None:
+            return (
+                replies.style_too_few(result.sample_count, jarvis_style.min_samples()),
+                None,
+            )
+        profile = result.profile
+    card = await jarvis_style.card(session, profile)
+    return (
+        replies.style_card(card),
+        keyboards.style_card(profile.version, active=profile.state == "active"),
+    )
+
+
+@router.message(Command("uslub"))
+async def cmd_style(message: Message, command: CommandObject) -> None:
+    """`/uslub` — the owner's texting style as MIYA learned it, with
+    ✅ Faollashtirish / 🔄 Qayta tuzish · `/uslub yukla` — read the older
+    private chats (read-only) to learn from more of the owner's messages."""
+    words = (command.args or "").split()
+    sub = fold_apostrophes(words[0]).casefold() if words else ""
+    if sub and sub not in STYLE_IMPORT_WORDS:
+        await _safe_answer(message, replies.STYLE_USAGE)
+        return
+    now = datetime.now(settings.tz)
+    keyboard = None
+    try:
+        async with session_scope() as session:
+            if sub:
+                asked = await chats.request_style_import(session, now=now)
+                if not asked:
+                    body = replies.STYLE_IMPORT_NO_CHATS
+                elif settings.jarvis_enabled:
+                    # style_refresh says «✅ Uslub tayyor» once it is read.
+                    body = replies.STYLE_IMPORT_STARTED
+                else:
+                    body = replies.STYLE_IMPORT_STARTED_MANUAL
+            else:
+                body, keyboard = await _style_page(session, now=now)
+    except Exception as exc:
+        log.error(
+            "/uslub failed",
+            extra={"command": sub or "show", "error": type(exc).__name__},
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _style_tap(action: str, version: int, *, now: datetime):
+    """One js: tap: (text, keyboard)."""
+    from miya.jarvis import style as jarvis_style
+
+    async with session_scope() as session:
+        if action == keyboards.STYLE_ACTIVATE:
+            profile = await jarvis_style.activate(
+                session, version, by=records.BY_BUTTON, now=now
+            )
+            if profile is None:
+                return replies.STYLE_STALE, None
+            return replies.style_activated(profile.version), None
+        return await _style_page(session, now=now, force=True)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.STYLE_PREFIX}:"))
+async def on_style_button(callback: CallbackQuery) -> None:
+    """✅ Faollashtirish / 🔄 Qayta tuzish under `/uslub` (JV-14). The
+    activation runs under a row lock; a tap on a retired version changes
+    nothing. Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    version = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if (
+        action not in (keyboards.STYLE_ACTIVATE, keyboards.STYLE_REBUILD)
+        or version is None
+    ):
+        await _ack(callback)
+        return
+    try:
+        body, keyboard = await _style_tap(action, version, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "style tap failed",
+            extra={
+                "style_action": action,
+                "version": version,
+                "error": type(exc).__name__,
+            },
+        )
+        body, keyboard = replies.JARVIS_FAILED, None
+    if callback.message is not None:
+        await _safe_answer(callback.message, body, reply_markup=keyboard)
+    await _ack(callback)
+
+
+# --- the knowledge base (JV-15) -------------------------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20).
+# The kb: buttons are not in _button_handlers, so a typed batch answer never
+# adds a text the AI may send on its own.
+
+KB_ADD_WORDS = {"qosh", "qoshish", "qoshing", "add"}
+KB_EDIT_WORDS = {"tuzat", "tuzatish", "edit"}
+KB_RETIRE_WORDS = {"ochir", "ochirish", "uchir", "delete"}
+KB_SUGGEST_WORDS = {"taklif", "takliflar"}
+# The most entries `/bilim` lists, and suggestion cards sent at once.
+KB_LIST_MAX = 50
+KB_SUGGESTIONS_SHOWN = 5
+
+
+def _kb_word(word: str) -> str:
+    return fold_apostrophes(word).casefold().replace("'", "")
+
+
+def _first_word(text: str) -> tuple[str, str]:
+    """(the first word, the rest), split on any whitespace: the owner may
+    put the rest on the next line."""
+    parts = text.split(maxsplit=1)
+    return (parts[0] if parts else "", parts[1] if len(parts) > 1 else "")
+
+
+def _kb_outcome(result) -> str:
+    """The text for a kb.WriteResult: added, or why not."""
+    if result.refusal is not None:
+        refusal = result.refusal
+        return replies.kb_refused(refusal.reason, refusal.labels, refusal.limit)
+    return replies.kb_added(result.entry)
+
+
+async def _kb_command(session, sub: str, rest: str, *, now: datetime):
+    """One `/bilim` subcommand: [(text, keyboard)], one message each."""
+    from miya.jarvis import kb
+
+    if not sub:
+        active = await kb.count(session, kb.ACTIVE)
+        entries = await kb.listing(session, kb.ACTIVE, limit=KB_LIST_MAX)
+        return [(replies.kb_list(entries, active), None)]
+    if sub in KB_ADD_WORDS:
+        question, answer = kb.split_entry(rest)
+        if not answer:
+            return [(replies.KB_USAGE, None)]
+        result = await kb.add(
+            session, question=question, answer=answer, by=records.BY_COMMAND, now=now
+        )
+        return [(_kb_outcome(result), None)]
+    if sub in KB_EDIT_WORDS:
+        handle, body = _first_word(rest)
+        entry_id = kb.parse_ref(handle)
+        question, answer = kb.split_entry(body)
+        if entry_id is None or not answer:
+            return [(replies.KB_USAGE, None)]
+        edited = await kb.edit(
+            session,
+            entry_id,
+            question=question,
+            answer=answer,
+            by=records.BY_COMMAND,
+            now=now,
+        )
+        if edited is None:
+            return [(replies.kb_not_found(entry_id), None)]
+        if edited.refusal is not None:
+            return [(_kb_outcome(edited), None)]
+        return [(replies.kb_edited(kb.view(edited.entry)), None)]
+    if sub in KB_RETIRE_WORDS:
+        entry_id = kb.parse_ref(rest)
+        if entry_id is None:
+            return [(replies.KB_USAGE, None)]
+        retired = await kb.retire(session, entry_id, by=records.BY_COMMAND, now=now)
+        if retired is None:
+            return [(replies.kb_not_found(entry_id), None)]
+        return [(replies.kb_retired(entry_id), None)]
+    if sub in KB_SUGGEST_WORDS:
+        waiting = await kb.listing(session, kb.SUGGESTED, limit=KB_SUGGESTIONS_SHOWN)
+        if not waiting:
+            return [(replies.KB_NO_SUGGESTIONS, None)]
+        cards = [
+            (replies.kb_suggestion(entry), keyboards.kb_suggestion(entry.id))
+            for entry in waiting
+        ]
+        more = await kb.count(session, kb.SUGGESTED) - len(waiting)
+        if more > 0:
+            cards.append((replies.KB_MORE.format(n=more), None))
+        return cards
+    return [(replies.KB_USAGE, None)]
+
+
+@router.message(Command("bilim"))
+async def cmd_knowledge(message: Message, command: CommandObject) -> None:
+    """`/bilim` — the business knowledge base: the facts and answers the
+    owner approved, the only statements Jarvis may make on its own.
+    `/bilim qo'sh Savol | Javob` adds one (a price, discount, payment term,
+    deadline, promise or a client's personal data is refused), `/bilim tuzat
+    b12 Savol | Javob` corrects one, `/bilim o'chir b12` retires one, and
+    `/bilim taklif` shows what MIYA suggests from the owner's own answers."""
+    first, rest = _first_word(command.args or "")
+    sub = _kb_word(first) if first else ""
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            outgoing = await _kb_command(session, sub, rest.strip(), now=now)
+    except Exception as exc:
+        log.error(
+            "/bilim failed",
+            extra={"command": sub or "list", "error": type(exc).__name__},
+        )
+        outgoing = [(replies.JARVIS_FAILED, None)]
+    for body, keyboard in outgoing:
+        await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _kb_tap(action: str, entry_id: int, *, now: datetime) -> str:
+    """One kb: tap: the card's new text."""
+    from miya.jarvis import kb
+
+    async with session_scope() as session:
+        if action == keyboards.KB_ADD:
+            result = await kb.approve_suggestion(
+                session, entry_id, by=records.BY_BUTTON, now=now
+            )
+            if result is None:
+                return replies.KB_STALE
+            return _kb_outcome(result)
+        dismissed = await kb.dismiss_suggestion(
+            session, entry_id, by=records.BY_BUTTON, now=now
+        )
+        if dismissed is None:
+            return replies.KB_STALE
+        return replies.kb_dismissed(entry_id)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.KB_PREFIX}:"))
+async def on_knowledge_button(callback: CallbackQuery) -> None:
+    """✅ Qo'shish / ✖️ Kerak emas under a knowledge-base suggestion
+    (JV-15): the owner's one tap is the only way a mined entry becomes
+    active. Under a row lock and re-checked; a second tap changes nothing.
+    Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    entry_id = int(parts[2]) if len(parts) == 3 and parts[2].isdigit() else None
+    if action not in (keyboards.KB_ADD, keyboards.KB_DISMISS) or entry_id is None:
+        await _ack(callback)
+        return
+    try:
+        body = await _kb_tap(action, entry_id, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "knowledge tap failed",
+            extra={
+                "kb_action": action,
+                "kb_entry_id": entry_id,
+                "error": type(exc).__name__,
+            },
+        )
+        await _ack(callback)
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        return
+    if callback.message is not None:
+        await _edit_callback(callback, body)
+    else:
+        await _ack(callback)
+
+
+# --- /savolbank: the question bank (JV-23) ---------------------------------------
+#
+# miya.jarvis is imported inside each handler, never at startup (rule 20). The
+# qb: buttons are not in _button_handlers, so a typed batch answer never puts a
+# question in the AI's mouth. An addition is the owner's ✅ on the proposal
+# card, guarded again under the row lock; a removal is at once.
+
+QBANK_ADD_WORDS = KB_ADD_WORDS
+QBANK_REMOVE_WORDS = KB_RETIRE_WORDS
+
+
+async def _qbank_command(session, sub: str, rest: str, *, now: datetime):
+    """One `/savolbank` subcommand: [(text, keyboard)]."""
+    from miya.jarvis import qbank
+
+    if not sub:
+        entries = await qbank.load(session)
+        return [
+            (
+                replies.qbank_list(entries),
+                keyboards.qbank_list([entry.ref for entry in entries]),
+            )
+        ]
+    if sub in QBANK_ADD_WORDS:
+        change = await qbank.propose(session, rest, by=records.BY_COMMAND, now=now)
+        if change.code != "proposed" or change.entry is None:
+            return [(replies.qbank_refused(change.code), None)]
+        return [
+            (
+                replies.qbank_proposed(change.entry.text),
+                keyboards.qbank_proposal(change.entry.ref),
+            )
+        ]
+    if sub in QBANK_REMOVE_WORDS:
+        number = rest.strip()
+        entries = await qbank.load(session)
+        if not number.isdigit() or not 1 <= int(number) <= len(entries):
+            return [(replies.QBANK_NOT_FOUND, None)]
+        removed = await qbank.remove(
+            session, entries[int(number) - 1].ref, by=records.BY_COMMAND, now=now
+        )
+        if removed.entry is None:
+            return [(replies.QBANK_STALE, None)]
+        return [(replies.qbank_removed(removed.entry.text), None)]
+    return [(replies.QBANK_USAGE, None)]
+
+
+@router.message(Command("savolbank"))
+async def cmd_question_bank(message: Message, command: CommandObject) -> None:
+    """`/savolbank` — the owner's question bank (JV-23): the only questions
+    Jarvis may ask a client on its own. `/savolbank qo'sh Savol?` proposes
+    one (guarded: one question, no time, price, promise or figure) for the
+    owner's ✅, `/savolbank o'chir 3` removes the third at once."""
+    first, rest = _first_word(command.args or "")
+    sub = _kb_word(first) if first else ""
+    now = datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            outgoing = await _qbank_command(session, sub, rest.strip(), now=now)
+    except Exception as exc:
+        log.error(
+            "/savolbank failed",
+            extra={"command": sub or "list", "error": type(exc).__name__},
+        )
+        outgoing = [(replies.JARVIS_FAILED, None)]
+    for body, keyboard in outgoing:
+        await _safe_answer(message, body, reply_markup=keyboard)
+
+
+async def _qbank_tap(action: str, ref: str, *, now: datetime) -> str:
+    """One qb: tap: the card's new text."""
+    from miya.jarvis import qbank
+
+    async with session_scope() as session:
+        if action == keyboards.QBANK_ADD:
+            change = await qbank.confirm(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "added" and change.entry is not None:
+                return replies.qbank_added(change.entry.text)
+        elif action == keyboards.QBANK_DISMISS:
+            change = await qbank.decline(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "declined" and change.entry is not None:
+                return replies.qbank_declined(change.entry.text)
+        else:
+            change = await qbank.remove(session, ref, by=records.BY_BUTTON, now=now)
+            if change.code == "removed" and change.entry is not None:
+                return replies.qbank_removed(change.entry.text)
+    if change.code == "stale":
+        return replies.QBANK_STALE
+    return replies.qbank_refused(change.code)
+
+
+@router.callback_query(F.data.startswith(f"{keyboards.QBANK_PREFIX}:"))
+async def on_question_bank_button(callback: CallbackQuery) -> None:
+    """✅ Qo'shish / ✖️ Kerak emas under a proposed question, 🗑 under the
+    list (JV-23). Under the row lock and re-checked; a second tap changes
+    nothing. Not in ``_button_handlers``."""
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) == 3 else ""
+    ref = parts[2] if len(parts) == 3 else ""
+    actions = (keyboards.QBANK_ADD, keyboards.QBANK_DISMISS, keyboards.QBANK_REMOVE)
+    if action not in actions or not ref.isalnum():
+        await _ack(callback)
+        return
+    try:
+        body = await _qbank_tap(action, ref, now=datetime.now(settings.tz))
+    except Exception as exc:
+        log.error(
+            "question bank tap failed",
+            extra={"qbank_action": action, "ref": ref, "error": type(exc).__name__},
+        )
+        await _ack(callback)
+        if callback.message is not None:
+            await _safe_answer(callback.message, replies.JARVIS_FAILED)
+        return
+    if callback.message is None:
+        await _ack(callback)
+        return
+    if action == keyboards.QBANK_REMOVE:
+        # The list keeps its other buttons; the outcome is a message of its own.
+        await _safe_answer(callback.message, body)
+        await _ack(callback)
+        return
+    await _edit_callback(callback, body)
 
 
 @router.message(Command("unut"))
@@ -1695,11 +3454,21 @@ async def cmd_process(message: Message, bot: Bot) -> None:
     if media is None:
         await _safe_answer(message, replies.PROCESS_NO_MEDIA)
         return
+    if await _refuse_dangerous(message, media):
+        return
+    if target.document and vision.is_heic(
+        getattr(media, "file_name", None), getattr(media, "mime_type", None)
+    ):
+        await _safe_answer(message, replies.RECEIPT_HEIC_HINT)
+        return
 
     await _typing(message)
     is_video = bool(target.video or target.video_note)
     is_audio = bool(target.voice or target.audio)
-    is_photo = bool(target.photo)
+    # An image sent as a file goes to vision like a photo (JV-04).
+    is_photo = bool(target.photo) or bool(
+        target.document and vision.is_image_document(getattr(media, "file_name", None))
+    )
     suffix = Path(getattr(media, "file_name", "") or "").suffix
     if not suffix:
         suffix = (
@@ -1709,6 +3478,14 @@ async def cmd_process(message: Message, bot: Bot) -> None:
     path = _media_path(suffix)
     if not await _download(bot, message, media, path):
         return
+    name = getattr(media, "file_name", None)
+    sniffed: safety.Verdict | None = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(name))
+        return
+    image_readable = sniffed.readable
+    if is_video or is_audio or is_photo:
+        sniffed = None  # only a document's bytes decide whether it is parsed
 
     async with session_scope() as session:
         interaction = await create_interaction(
@@ -1717,56 +3494,80 @@ async def cmd_process(message: Message, bot: Bot) -> None:
             direction=Direction.in_,
             text=target.caption,
             occurred_at=target.date.astimezone(settings.tz),
-            media={
-                "type": "video" if is_video else "photo" if is_photo else "file",
-                "path": str(path),
-                "filename": getattr(media, "file_name", None),
-                "caption": target.caption,
-                "processed": False,
-            },
+            media=_with_risk(
+                {
+                    "type": "video" if is_video else "photo" if is_photo else "file",
+                    "path": str(path),
+                    "filename": name,
+                    "caption": target.caption,
+                    "processed": False,
+                },
+                sniffed,
+                name,
+            ),
             meta={"tg_message_id": target.message_id, "on_demand": True},
         )
-        reply, keyboard = await _process_on_demand(
+        reply, keyboard, card = await _process_on_demand(
             session,
             interaction,
             path,
             is_video=is_video,
             is_audio=is_audio,
             is_photo=is_photo,
+            sniffed=sniffed,
+            image_readable=image_readable,
         )
-    await _safe_answer(message, reply, reply_markup=keyboard)
+    await _answer_image(message, reply, keyboard, card)
 
 
 async def _process_on_demand(
-    session, interaction, path: Path, *, is_video: bool, is_audio: bool, is_photo: bool
-) -> tuple[str, InlineKeyboardMarkup | None]:
-    """Run the right pipeline for one explicitly requested media file."""
+    session,
+    interaction,
+    path: Path,
+    *,
+    is_video: bool,
+    is_audio: bool,
+    is_photo: bool,
+    sniffed: safety.Verdict | None = None,
+    image_readable: bool = True,
+) -> tuple[str, InlineKeyboardMarkup | None, _ReceiptCard | None]:
+    """Run the right pipeline for one explicitly requested media file.
+
+    A document is parsed only when its bytes matched its name (`sniffed`);
+    a macro document is read as text and the owner told so (JV-01). An
+    image, photo or file, is read by vision and a receipt gets its card
+    (JV-04). Returns (reply, keyboard, the receipt card or None)."""
+    macro_read = False
     if is_video:
         audio_path = path.with_suffix(".mp3")
         if not await audio.extract_audio(path, audio_path):
             interaction.needs_review = True
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
         interaction.media = {**(interaction.media or {}), "audio_path": str(audio_path)}
         if await transcribe_into(session, interaction, audio_path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
     elif is_audio:
         if await transcribe_into(session, interaction, path) is None:
-            return replies.TRANSCRIPTION_FAILED_HINT, None
+            return replies.TRANSCRIPTION_FAILED_HINT, None, None
     elif is_photo:
-        described = await describe_into(session, interaction, path)
-        if described is None and not interaction.raw_text:
-            return replies.PHOTO_FAILED_HINT, None
+        return await _read_image(session, interaction, path, readable=image_readable)
     else:
-        parsed = await documents.read_document_async(path)
+        readable = sniffed is None or sniffed.readable
+        parsed = await documents.read_document_async(path) if readable else None
         if parsed is None and not interaction.raw_text:
             interaction.needs_review = True
-            return replies.DOCUMENT_FAILED_HINT, None
+            return replies.DOCUMENT_FAILED_HINT, None, None
         if parsed is not None:
             interaction.transcript = parsed.text
+            macro_read = sniffed is not None and sniffed.kind == safety.MACRO
 
     interaction.media = {**(interaction.media or {}), "processed": True}
     result = await process_interaction(session, interaction)
-    return _receipt(result)
+    reply, keyboard = _receipt(result)
+    if macro_read:
+        name = (interaction.media or {}).get("filename")
+        reply = reply + "\n" + replies.macro_document_note(name)
+    return reply, keyboard, None
 
 
 # --- client codes by hand (WP-33) ---------------------------------------------
@@ -1946,10 +3747,16 @@ async def _code_to_person(session, code: str, name: str, holder: Person | None):
 _SPOKEN_ASK = re.compile(r"(?<![a-z0-9])(?:nima|kim)(?![a-z0-9])")
 
 
-def _spoken_mode(text: str) -> str:
+def _spoken_mode(text: str, *, commands: bool | None = None) -> str:
     """A transcript has no '?': the "-mi" particle marks the question too,
-    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi")."""
-    mode = rag.classify(text)
+    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi"). The
+    two questions SQL answers alone (JV-06) are questions however spoken.
+    ``commands`` (default: Jarvis on) lets it be a command (JV-20)."""
+    if rag.owner_question(text, datetime.now(settings.tz)) is not None:
+        return "question"
+    if commands is None:
+        commands = settings.jarvis_enabled
+    mode = rag.classify(text, commands=commands)
     if mode != "note":
         return mode
     if loops.ends_in_question_particle(fold_apostrophes(text)):
@@ -2010,6 +3817,50 @@ async def _followup_history(session, message) -> tuple[tuple, bool]:
     return tuple(_turn(r) for r in reversed(rows)), False
 
 
+async def _sql_answer(
+    session, text: str, now: datetime, *, interaction_id: int | None = None
+) -> tuple[str, str] | None:
+    """(kind, reply) for «Bugun kimga nima va'da bergandim?» and «Kecha kimlar
+    yozdi?», rendered from SQL with no model call (JV-06). None for any other
+    text, and when the query fails: the model path answers it then."""
+    asked = rag.owner_question(text, now)
+    if asked is None:
+        return None
+    window = (asked.start, asked.end)
+    try:
+        async with session.begin_nested():
+            if asked.kind == rag.OWNER_PROMISES:
+                made, total = await queries.promises_made(session, window)
+                reply = replies.promises_made_report(
+                    made,
+                    day=asked.day,
+                    days_ago=asked.days_ago,
+                    today=now.astimezone(settings.tz).date(),
+                    total=total,
+                )
+            else:
+                wrote, total = await queries.who_wrote(session, window)
+                reply = replies.who_wrote_report(
+                    wrote, day=asked.day, days_ago=asked.days_ago, total=total
+                )
+    except Exception as exc:
+        log.warning(
+            "sql answer failed: %s",
+            type(exc).__name__,
+            extra={
+                "error": type(exc).__name__,
+                "kind": asked.kind,
+                "interaction_id": interaction_id,
+            },
+        )
+        return None
+    return asked.kind, reply
+
+
+# meta key of a command that queued nothing: the row is a note (JV-20).
+COMMAND_UNQUEUED = "command_unqueued"
+
+
 async def _answer_into(
     session,
     interaction: Interaction,
@@ -2018,18 +3869,94 @@ async def _answer_into(
     *,
     header: str | None = None,
     history: tuple = (),
+    actions: list | None = None,
 ) -> str:
-    """Answer ``text`` and keep the answer and what it cited on the row."""
+    """Answer ``text`` and keep the answer and what it cited on the row.
+
+    A command (JV-20, only with Jarvis on) is answered with the act tools
+    (``allow_actions``, set only here): what they proposed goes into
+    ``actions`` for the caller to show as cards once this row is committed;
+    a command that proposed nothing says so."""
     interaction.processed = True
-    result = await rag.answer_full(session, text, mode=mode, history=history)
-    reply = clip(f"{header}\n\n{result.text}" if header else result.text)
-    interaction.meta = {
+    fast = await _sql_answer(
+        session, text, interaction.occurred_at, interaction_id=interaction.id
+    )
+    if fast is not None:
+        kind, body = fast
+        reply = clip(f"{header}\n\n{body}" if header else body)
+        interaction.meta = {
+            **(interaction.meta or {}),
+            "mode": "question",
+            "sql": kind,
+            "answer": reply[:4000],
+            "refs": [],
+        }
+        return reply
+    # A caller that cannot show cards (no ``actions``) never gets act tools.
+    command = mode == "command" and settings.jarvis_enabled and actions is not None
+    if mode == "command" and not command:
+        mode = "question"
+    result = await rag.answer_full(
+        session,
+        text,
+        mode=mode,
+        history=history,
+        allow_actions=command,
+        command_interaction_id=interaction.id if command else None,
+    )
+    body = result.text
+    proposed = list(getattr(result, "actions", None) or [])
+    # A list_pending read is no proposal (miya.jarvis is not imported here).
+    queued = [a for a in proposed if getattr(a, "kind", None) != "listed"]
+    unqueued = command and not queued and len(queued) == len(proposed)
+    if unqueued:
+        capped = result.mode != "command"
+        nothing = (
+            replies.JARVIS_COMMAND_COST_CAP if capped else replies.JARVIS_COMMAND_NOTHING
+        )
+        body = f"{body}\n\n{nothing}"
+    if actions is not None:
+        actions.extend(proposed)
+    reply = clip(f"{header}\n\n{body}" if header else body)
+    meta = {
         **(interaction.meta or {}),
         "mode": result.mode,
         "answer": reply[:4000],
         "refs": result.refs,
     }
+    if unqueued:
+        # Nothing was proposed: the words are the owner's note after all
+        # («Ertaga konteynerni jo'nat»), extracted like any note by the caller
+        # (_unqueued_note), never left answered and unread.
+        meta.pop("kind", None)
+        meta[COMMAND_UNQUEUED] = True
+        interaction.processed = False
+    interaction.meta = meta
     return reply
+
+
+async def _unqueued_note(session, interaction: Interaction):
+    """The receipt (text, keyboard) of a command that queued nothing, now
+    extracted as the note it was; None for any other answer."""
+    if not (interaction.meta or {}).get(COMMAND_UNQUEUED):
+        return None
+    result = await process_interaction(session, interaction)
+    return _receipt(result)
+
+
+async def _send_answered(
+    message: Message, reply: str, interaction_id: int, actions: list, note
+) -> None:
+    """An answer, then the cards of what a command proposed (JV-20), or the
+    note receipt of a command that queued nothing (no «save as note» button:
+    it is a note already)."""
+    if note is None:
+        await _send_answer(message, reply, interaction_id)
+    else:
+        await _safe_answer(message, reply)
+        receipt, keyboard = note
+        await _safe_answer(message, receipt, reply_markup=keyboard)
+    await _deliver_actions(message, actions)
 
 
 async def _send_answer(message: Message, reply: str, interaction_id: int) -> None:
@@ -2060,9 +3987,13 @@ async def _answer_question(
             occurred_at=message.date.astimezone(settings.tz),
             meta={"kind": "question"},
         )
-        reply = await _answer_into(session, interaction, text, mode, history=history)
+        actions: list = []
+        reply = await _answer_into(
+            session, interaction, text, mode, history=history, actions=actions
+        )
+        note = await _unqueued_note(session, interaction)
         interaction_id = interaction.id
-    await _send_answer(message, reply, interaction_id)
+    await _send_answered(message, reply, interaction_id, actions, note)
 
 
 @router.message(Command("savol"))
@@ -2201,34 +4132,52 @@ async def cmd_code_import(message: Message, bot: Bot) -> None:
     interaction and only a preview comes back, with one Ha to write it.
     """
     document = message.document
+    if await _refuse_dangerous(message, document):
+        return
     suffix = Path(document.file_name or "").suffix.lower() or ".bin"
     path = _media_path(suffix)
     if not await _download(bot, message, document, path):
         return
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(document.file_name))
+        return
     async with session_scope() as session:
+        # Stored even when unreadable, like a file read_rows rejects: the row
+        # is what lets retention delete the download later.
         interaction = Interaction(
             source=InteractionSource.assistant_bot,
             direction=Direction.in_,
             occurred_at=message.date.astimezone(settings.tz),
             raw_text=message.caption,
-            media={
-                "type": "document",
-                "path": str(path),
-                "filename": document.file_name,
-            },
+            media=_with_risk(
+                {
+                    "type": "document",
+                    "path": str(path),
+                    "filename": document.file_name,
+                },
+                sniffed,
+                document.file_name,
+            ),
             meta={"kind": "client_import"},
             processed=True,
         )
         session.add(interaction)
         await session.flush()
-        try:
-            rows = client_import.read_rows(path)
-        except client_import.BadFile:
+        rows = None
+        if sniffed.readable:  # a file that is not what its name says is never parsed
+            try:
+                rows = client_import.read_rows(path)
+            except client_import.BadFile:
+                rows = None
+        if rows is None:
             body, keyboard = replies.IMPORT_BAD_FILE, None
         else:
             plan = await client_import.plan_import(session, rows)
             body = replies.import_preview(document.file_name or path.name, plan.counts())
             keyboard = keyboards.client_import(interaction.id)
+            if sniffed.kind == safety.MACRO:
+                body += "\n" + replies.macro_document_note(document.file_name)
     await _safe_answer(message, body, reply_markup=keyboard)
 
 
@@ -2458,6 +4407,10 @@ async def _batch_reply(message: Message) -> bool:
 @router.message(F.text & ~F.text.startswith("/"))
 async def on_text(message: Message) -> None:
     await _typing(message)
+    if await _jarvis_card_reply(message, message.text):
+        # The owner's own words for a Jarvis card (JV-18), ahead of the
+        # code lookup and the batch reply: a reply to a card is its text.
+        return
     lookup = client_codes.canonical_lookup(
         (message.text or "").strip().rstrip("?").strip()
     )
@@ -2481,9 +4434,20 @@ async def on_text(message: Message) -> None:
         return
     async with session_scope() as session:
         history, replied = await _followup_history(session, message)
-    mode = rag.classify(message.text or "")
+    # «… yozib yubor» is a command only while Jarvis is on (rule 20);
+    # otherwise it is read as before. A forwarded message is someone else's
+    # words, never the owner's command (rule 16).
+    mode = rag.classify(
+        message.text or "",
+        commands=settings.jarvis_enabled and not _forwarded(message),
+    )
     if replied and mode == "note":
         # A reply to MIYA's answer asks on, "?" or not (WP-75).
+        mode = "question"
+    if mode != "question" and rag.owner_question(
+        message.text or "", message.date.astimezone(settings.tz)
+    ):
+        # «Kecha kimlar yozdi» needs no '?': SQL answers it alone (JV-06).
         mode = "question"
     if mode != "note":
         await _answer_question(message, message.text, mode, history=history)
@@ -2502,15 +4466,25 @@ async def on_text(message: Message) -> None:
     await _safe_answer(message, reply, reply_markup=keyboard)
 
 
+def _forwarded(message) -> bool:
+    """A message the owner forwarded: a client's words, not the owner's."""
+    return message is not None and (
+        getattr(message, "forward_origin", None) is not None
+        or getattr(message, "forward_date", None) is not None
+    )
+
+
 async def _spoken_question(
-    session, interaction: Interaction, text: str, message=None
+    session, interaction: Interaction, text: str, message=None, actions=None
 ) -> str | None:
     """A voice or video note that asks something is answered, not logged
-    (WP-60); None when it is a note."""
+    (WP-60); None when it is a note. A forwarded one is never a command."""
     history, replied = (
         await _followup_history(session, message) if message is not None else ((), False)
     )
-    mode = _spoken_mode(text)
+    mode = _spoken_mode(
+        text, commands=settings.jarvis_enabled and not _forwarded(message)
+    )
     if mode == "note" and replied:
         mode = "question"
     if mode == "note":
@@ -2528,16 +4502,22 @@ async def _spoken_question(
         mode,
         header=replies.voice_question_header(text),
         history=history,
+        actions=actions,
     )
 
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message, bot: Bot) -> None:
-    await _typing(message)
     media = message.voice or message.audio
+    if await _refuse_dangerous(message, media):
+        return
+    await _typing(message)
     suffix = ".ogg" if message.voice else ".mp3"
     path = _media_path(suffix)
     if not await _download(bot, message, media, path):
+        return
+    if _sniff_download(path).dangerous:
+        await _safe_answer(message, _refusal(getattr(media, "file_name", None)))
         return
 
     async with session_scope() as session:
@@ -2560,19 +4540,41 @@ async def on_voice(message: Message, bot: Bot) -> None:
         text = await transcribe_into(session, interaction, path)
         keyboard = None
         asked = None
+        card_reply = False
+        actions: list = []
+        note = None
         if text is None:
             reply = replies.TRANSCRIPTION_FAILED_HINT
         else:
             interaction.media = {**(interaction.media or {}), "processed": True}
-            asked = await _spoken_question(session, interaction, text, message)
-            if asked is not None:
-                reply = asked
+            card_reply = await _replies_to_card(session, message)
+            if card_reply:
+                # The owner spoke their words for a Jarvis card (JV-18): the
+                # transcript is the text, never a note or a question.
+                interaction.processed = True
+                interaction.meta = {**(interaction.meta or {}), "kind": "jarvis_reply"}
+                reply = ""
             else:
-                result = await process_interaction(session, interaction)
-                reply, keyboard = _receipt(result)
+                asked = await _spoken_question(
+                    session, interaction, text, message, actions=actions
+                )
+                if asked is not None:
+                    reply = asked
+                    note = await _unqueued_note(session, interaction)
+                else:
+                    result = await process_interaction(session, interaction)
+                    reply, keyboard = _receipt(result)
         interaction_id = interaction.id
+    if card_reply:
+        if not await _jarvis_card_reply(message, text, interaction_id=interaction_id):
+            # The card could not be read again: the note is not lost, but the
+            # owner is told their words did not reach it.
+            await _safe_answer(message, replies.JARVIS_FAILED)
+        return
     if asked is not None:
-        await _send_answer(message, reply, interaction_id)
+        # A spoken command (JV-20): the same cards as a typed one, under the
+        # answer that shows what was heard.
+        await _send_answered(message, reply, interaction_id, actions, note)
         return
     await _safe_answer(message, reply, reply_markup=keyboard)
 
@@ -2583,6 +4585,12 @@ async def on_photo(message: Message, bot: Bot) -> None:
     photo = message.photo[-1]  # highest resolution
     path = _media_path(".jpg")
     if not await _download(bot, message, photo, path):
+        return
+    # Telegram re-encodes a photo as JPEG; its bytes are still checked
+    # before the vision model sees them (JV-01, JV-04).
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(None))
         return
 
     async with session_scope() as session:
@@ -2601,28 +4609,35 @@ async def on_photo(message: Message, bot: Bot) -> None:
             },
         )
         # Photos sent straight to the bot are always vision-processed (spec §6).
-        described = await describe_into(session, interaction, path)
-        keyboard = None
-        if described is None and not message.caption:
-            reply = replies.PHOTO_FAILED_HINT
-        else:
-            interaction.media = {**(interaction.media or {}), "processed": True}
-            result = await process_interaction(session, interaction)
-            reply, keyboard = _receipt(result)
-            if result.ok and described is None:
-                # The caption was extracted, but the image itself was not read —
-                # the owner must not be told everything succeeded.
-                reply = reply + "\n" + replies.VISION_PARTIAL_HINT
-    await _safe_answer(message, reply, reply_markup=keyboard)
+        reply, keyboard, card = await _read_image(
+            session, interaction, path, readable=sniffed.readable
+        )
+    await _answer_image(message, reply, keyboard, card)
 
 
 @router.message(F.document)
 async def on_document(message: Message, bot: Bot) -> None:
-    await _typing(message)
+    """A file sent to the bot. Installers and archives are refused before any
+    download (JV-01); everything else is checked by its bytes before it is
+    parsed, and a macro document is read as text only."""
     document = message.document
+    if await _refuse_dangerous(message, document):
+        return
+    if vision.is_heic(document.file_name, document.mime_type):
+        # Vision cannot read the iPhone's own format; nothing is fetched.
+        await _safe_answer(message, replies.RECEIPT_HEIC_HINT)
+        return
+    await _typing(message)
     suffix = Path(document.file_name or "").suffix or ".bin"
     path = _media_path(suffix)
     if not await _download(bot, message, document, path):
+        return
+    sniffed = _sniff_download(path)
+    if sniffed.dangerous:
+        await _safe_answer(message, _refusal(document.file_name))
+        return
+    if vision.is_image_document(document.file_name):
+        await _on_image_document(message, document, path, sniffed)
         return
 
     async with session_scope() as session:
@@ -2632,17 +4647,21 @@ async def on_document(message: Message, bot: Bot) -> None:
             direction=Direction.in_,
             text=message.caption,
             occurred_at=message.date.astimezone(settings.tz),
-            media={
-                "type": "document",
-                "path": str(path),
-                "filename": document.file_name,
-                "mime": document.mime_type,
-                "size": document.file_size,
-                "caption": message.caption,
-                "processed": False,
-            },
+            media=_with_risk(
+                {
+                    "type": "document",
+                    "path": str(path),
+                    "filename": document.file_name,
+                    "mime": document.mime_type,
+                    "size": document.file_size,
+                    "caption": message.caption,
+                    "processed": False,
+                },
+                sniffed,
+                document.file_name,
+            ),
         )
-        parsed = await documents.read_document_async(path)
+        parsed = await documents.read_document_async(path) if sniffed.readable else None
         keyboard = None
         if parsed is None and not message.caption:
             interaction.needs_review = True
@@ -2660,7 +4679,37 @@ async def on_document(message: Message, bot: Bot) -> None:
             interaction.media = {**(interaction.media or {}), "processed": True}
             result = await process_interaction(session, interaction)
             reply, keyboard = _receipt(result)
+            if parsed is not None and sniffed.kind == safety.MACRO:
+                reply = reply + "\n" + replies.macro_document_note(document.file_name)
     await _safe_answer(message, reply, reply_markup=keyboard)
+
+
+async def _on_image_document(
+    message: Message, document, path: Path, sniffed: safety.Verdict
+) -> None:
+    """A .jpg/.png/.webp sent as a file, uncompressed, is a photo to vision
+    (JV-04) once its bytes passed the shield."""
+    async with session_scope() as session:
+        interaction = await create_interaction(
+            session,
+            source=InteractionSource.receipt_photo,
+            direction=Direction.in_,
+            text=message.caption,
+            occurred_at=message.date.astimezone(settings.tz),
+            media={
+                "type": "document",
+                "path": str(path),
+                "filename": document.file_name,
+                "mime": document.mime_type,
+                "size": document.file_size,
+                "caption": message.caption,
+                "processed": False,
+            },
+        )
+        reply, keyboard, card = await _read_image(
+            session, interaction, path, readable=sniffed.readable
+        )
+    await _answer_image(message, reply, keyboard, card)
 
 
 @router.message(F.video_note)
@@ -2674,6 +4723,8 @@ async def on_video_note(message: Message, bot: Bot) -> None:
     audio_path = path.with_suffix(".mp3")
     keyboard = None
     asked = None
+    actions: list = []
+    note = None
     async with session_scope() as session:
         # The row is created *before* ffmpeg runs. A failed audio extraction
         # must still leave a needs_review interaction the owner can find in
@@ -2705,16 +4756,20 @@ async def on_video_note(message: Message, bot: Bot) -> None:
                 reply = replies.TRANSCRIPTION_FAILED_HINT
             else:
                 interaction.media = {**(interaction.media or {}), "processed": True}
-                asked = await _spoken_question(session, interaction, text, message)
+                asked = await _spoken_question(
+                    session, interaction, text, message, actions=actions
+                )
                 if asked is not None:
                     reply = asked
+                    note = await _unqueued_note(session, interaction)
                 else:
                     result = await process_interaction(session, interaction)
                     reply, keyboard = _receipt(result)
         interaction_id = interaction.id
     # Replied only after the commit, like every other handler here.
     if asked is not None:
-        await _send_answer(message, reply, interaction_id)
+        # A spoken command's cards, as for a voice note (JV-20).
+        await _send_answered(message, reply, interaction_id, actions, note)
         return
     await _safe_answer(message, reply, reply_markup=keyboard)
 
@@ -2723,8 +4778,13 @@ async def on_video_note(message: Message, bot: Bot) -> None:
 async def on_video(message: Message, bot: Bot) -> None:
     """Videos are stored, not transcribed — `/process` opts into the cost."""
     media = message.video
+    if await _refuse_dangerous(message, media):
+        return
     path = _media_path(".mp4")
     if not await _download(bot, message, media, path):
+        return
+    if _sniff_download(path).dangerous:
+        await _safe_answer(message, _refusal(getattr(media, "file_name", None)))
         return
 
     async with session_scope() as session:

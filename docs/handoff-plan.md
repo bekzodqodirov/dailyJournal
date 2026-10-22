@@ -29,7 +29,9 @@ before editing, because earlier work packages move them.
 
 MIYA is a self-hosted, single-user "personal AI second brain" for one owner. The owner runs a
 freight-forwarding business in Tashkent: GSR Logistics, which moves cargo from China to
-Uzbekistan through a Yiwu warehouse. MIYA reads the owner's Telegram, which is read-only, and the owner's
+Uzbekistan through a Yiwu warehouse. MIYA reads the owner's Telegram (read-only, except that with Jarvis
+sending switched on, JV-19, `miya/userbot/sender.py` sends the outbox replies that passed the gate:
+the ones the owner approved and, in `auto` mode, the ones Jarvis may send by itself), and the owner's
 Android phone, meaning call-log events, call recordings, payment SMS and, after this plan,
 payment-app notifications. It extracts debts, promises, tasks, transactions and facts, and asks
 before writing what counterparties claim. It answers questions and sends the morning brief, the
@@ -44,7 +46,7 @@ the assistant bot.
 | API | FastAPI (`miya/api`). It also hosts the local bge-m3 embedder behind `/v1/embed` |
 | DB | PostgreSQL 16 + pgvector (1024-dim bge-m3), SQLAlchemy 2 async + psycopg3, Alembic (head `0012_phone_events`) |
 | Assistant bot | aiogram 3, owner-only (`miya/bot`) |
-| Userbot | Telethon, passive and read-only (`miya/userbot`) |
+| Userbot | Telethon, a passive reader (`miya/userbot`); its one write path is `miya/userbot/sender.py` (JV-19), only with `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`, for outbox rows taken through `outbox.claim_ready` |
 | Worker | APScheduler jobs (`miya/worker/main.py`) |
 | Models | Anthropic API: **the extraction model (EXTRACT_MODEL)** and **the reasoning model (REASON_MODEL)**, both configured in `.env` |
 | Speech | ElevenLabs Scribe (`miya/services/transcription.py`) |

@@ -218,12 +218,120 @@ class Settings(BaseSettings):
     # are stale — the owner has moved on and the file is rarely still relevant.
     media_ask_expiry_hours: int = 48
 
+    # --- Message shield (JV-09) ----------------------------------------------
+    # Owner-verified domains added to the built-in look-alike allowlist
+    # (comma- or space-separated, «www.» and schemes ignored). They only stop
+    # a link from reading as a fake bank or payment site; an installer or an
+    # archive behind one is still refused.
+    safety_extra_safe_domains: str = ""
+
+    # --- Jarvis core (JV-11) ------------------------------------------------
+    # The act layer's master switch. Off: no Jarvis job is registered, no row
+    # is created or claimed, and core MIYA never imports miya.jarvis.
+    jarvis_enabled: bool = False
+    # The ceiling on the rollout mode: whatever jarvis_policy resolves to is
+    # never above it, so autonomy needs this raised as well as the owner's tap.
+    jarvis_mode: Literal["off", "shadow", "draft", "auto"] = "draft"
+    # Caps, counted in SQL from the start of the owner's day: draft cards,
+    # autonomous sends, AI sends to one chat, and the gap between two sends
+    # from one account (the owner's own approved texts count towards the gap).
+    jarvis_draft_daily_cap: int = Field(default=40, ge=0, le=1000)
+    jarvis_auto_daily_cap: int = Field(default=20, ge=0, le=1000)
+    jarvis_per_chat_daily_cap: int = Field(default=6, ge=0, le=100)
+    jarvis_send_min_gap_seconds: int = Field(default=20, ge=0, le=3600)
+    # A draft older than this is never sent.
+    jarvis_draft_expiry_hours: int = Field(default=12, ge=1, le=168)
+    # Jarvis's own model spend per day in USD (usage_log, priced from
+    # config); above it Jarvis only escalates and makes no model call.
+    jarvis_daily_cost_cap_usd: Decimal = Field(default=Decimal("3.00"), ge=0)
+
+    # --- Owner style (JV-14) ------------------------------------------------
+    # How many of the owner's newest genuine outgoing private messages the
+    # style profile is learned from (never MIYA's own replies, never a chat
+    # marked personal), and the fewest below which no profile is built.
+    style_sample_size: int = Field(default=300, ge=10, le=5000)
+    style_min_samples: int = Field(default=50, ge=1, le=5000)
+
+    # --- Knowledge base (JV-15) -------------------------------------------
+    # How close a client's question must be to an owner-approved entry for the
+    # entry to be retrieved: meaning similarity or word overlap, 0 to 1.
+    kb_match_threshold: float = Field(default=0.75, ge=0.0, le=1.0)
+
+    # --- Responder (JV-16) ------------------------------------------------
+    # A burst of client messages collapses into one reply: the responder looks
+    # at a chat this long after its latest message.
+    jarvis_debounce_seconds: int = Field(default=45, ge=0, le=3600)
+    # The owner gets this long, from the client's first unanswered message,
+    # to answer before MIYA drafts anything.
+    jarvis_owner_first_seconds: int = Field(default=120, ge=0, le=86400)
+    # An inbound message older than this never gets an AI reply.
+    jarvis_max_message_age_seconds: int = Field(default=900, ge=60, le=86400)
+    # Consecutive AI turns in one chat without the owner; then only the owner.
+    jarvis_max_ai_turns: int = Field(default=2, ge=0, le=20)
+    # How many of the chat's latest turns the reply writer sees.
+    jarvis_history_turns: int = Field(default=8, ge=1, le=50)
+    # How long Jarvis stays silent in a chat after the owner writes there.
+    jarvis_takeover_minutes: int = Field(default=120, ge=0, le=10080)
+
+    # --- Cards (JV-18) ----------------------------------------------------
+    # «⏰ 1 soatdan keyin eslat»: a snoozed escalation alert comes back this
+    # many minutes after the owner's tap.
+    jarvis_escalation_snooze_minutes: int = Field(default=60, ge=1, le=1440)
+    # The snooze that reaches this count sends the escalation to the morning
+    # brief instead of another alert.
+    jarvis_snooze_max: int = Field(default=3, ge=1, le=20)
+    # Escalation alerts a day; past it the rest fold into one message.
+    jarvis_escalation_daily_cap: int = Field(default=30, ge=0, le=1000)
+
+    # --- Telegram sender (JV-19) --------------------------------------------
+    # Starts the sender inside the userbot process (with JARVIS_ENABLED): the
+    # outbox replies that passed the gate (the ones you approved and, in auto
+    # mode, the ones Jarvis may send by itself) go out from your account.
+    # Off, the cards stay in copy mode and nothing is ever written to Telegram.
+    telegram_send_enabled: bool = False
+    # Telethon sleeps through a flood wait up to this many seconds by itself;
+    # a longer one reaches the sender, which re-queues the row or trips the
+    # Telegram breaker instead of waiting inside a claim.
+    userbot_flood_sleep_seconds: int = Field(default=5, ge=0, le=60)
+    # Human pacing: a random pause between these two before a reply (the chat
+    # is marked read only then), and "typing…" for the reply's length at this
+    # many characters a second, never longer than the cap.
+    jarvis_reply_delay_min_seconds: int = Field(default=3, ge=0, le=60)
+    jarvis_reply_delay_max_seconds: int = Field(default=7, ge=0, le=60)
+    jarvis_typing_chars_per_second: int = Field(default=6, ge=1, le=50)
+    jarvis_typing_max_seconds: int = Field(default=15, ge=0, le=60)
+
+    # --- Rollout (JV-23) --------------------------------------------------
+    # A reply kind (greeting, information gathering, a general question) is
+    # offered for sending on its own only after this many days in draft mode,
+    # this many drafts you decided on, and this share of them approved without
+    # an edit, with no «Bu xato edi», red-line incident or channel limit in
+    # that time. Nothing graduates without your «✅ Ha, avtomatik» tap.
+    jarvis_graduation_min_days: int = Field(default=7, ge=1, le=365)
+    jarvis_graduation_min_drafts: int = Field(default=30, ge=1, le=10000)
+    jarvis_graduation_min_approval_pct: int = Field(default=90, ge=0, le=100)
+    # Replies sent on their own wait out the quiet hours unless this is true.
+    jarvis_auto_in_quiet_hours: bool = False
+
     # --- Google Calendar ----------------------------------------------------
     google_oauth_client_json: str = "./secrets/google_oauth.json"
     google_token_json: str = "./secrets/google_token.json"
     gcal_calendar_id: str = "primary"
     gcal_pull_minutes: int = 30
     gcal_days_ahead: int = 14
+
+    # --- Google Sheets mirror (JV-07) ---------------------------------------
+    # A one-way copy of promises, tasks, followed-up clients and receipts in
+    # the owner's spreadsheet; SQL stays the truth and nothing is read back.
+    # Off until switched on; a no-op while the key file or the spreadsheet id
+    # is missing.
+    sheets_enabled: bool = False
+    # The service account's JSON key; the spreadsheet is shared with that
+    # account as Editor.
+    sheets_service_account_json: str = "./secrets/sheets_service_account.json"
+    sheets_spreadsheet_id: str = ""
+    # How often the worker writes what changed.
+    sheets_sync_seconds: int = Field(default=60, ge=15, le=3600)
 
     # --- Call recordings ----------------------------------------------------
     call_recordings_dir: str = "/data/call_recordings"
@@ -285,6 +393,15 @@ class Settings(BaseSettings):
     # WP-42: an owner-typed payment and a bank record of the same amount on
     # the same day within this many hours are one payment (0 disables).
     money_typed_match_hours: int = Field(default=6, ge=0, le=24)
+    # JV-05: a receipt read from an image is confirmed by a bank income of the
+    # same amount and currency within this many minutes of its printed time.
+    receipt_match_minutes: int = Field(default=30, ge=1, le=720)
+    # Only this many minutes after a receipt arrived does the missing bank
+    # record count: the receipt becomes unconfirmed, or suspicious.
+    receipt_bank_wait_minutes: int = Field(default=60, ge=1, le=1440)
+    # A printed time this many hours older than the message that carried the
+    # receipt is an old receipt sent again (stale_date).
+    receipt_stale_hours: int = Field(default=72, ge=1, le=8760)
     # WP-50: a long evening report goes out in at most this many messages.
     recap_max_parts: int = Field(default=4, ge=1, le=8)
     # The evening recap names a phone silent for longer than this (WP-73).
@@ -398,12 +515,21 @@ class Settings(BaseSettings):
 
     # --- Scheduling ---------------------------------------------------------
     timezone: str = "Asia/Tashkent"
-    report_time: str = "19:00"
+    # The evening recap "Bugun nima bo'ldi" (JV-08: the spec's 20:00 summary).
+    report_time: str = "20:00"
     quiet_hours: str = "23:30-07:30"
+    # A promise or task deadline with a time of day ("ertaga 14:00") is
+    # reminded this many minutes before it, never inside QUIET_HOURS (JV-03).
+    # Date-only deadlines keep the morning-of-the-day ping. At least 5: the
+    # timed sweep runs every five minutes, and a shorter lead would fall
+    # between two runs and never be sent before the deadline.
+    promise_remind_lead_minutes: int = Field(default=60, ge=5, le=720)
     batch_flush_hours: int = 3
 
     # --- Misc ---------------------------------------------------------------
     log_level: str = "INFO"
+    # One JSON object per log line (JV-02), or the plain text lines.
+    log_format: Literal["json", "text"] = "json"
     debug: bool = Field(default=False)
 
     @model_validator(mode="before")
@@ -471,6 +597,36 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _style_min_within_sample(self) -> Settings:
+        # A minimum above the sample size would never build a profile. Only a
+        # pair the owner set is refused (rule 20: an unset key never fails);
+        # otherwise the build uses the smaller of the two (style.min_samples).
+        both = {"style_min_samples", "style_sample_size"} <= self.model_fields_set
+        if both and self.style_min_samples > self.style_sample_size:
+            raise ValueError(
+                f"STYLE_MIN_SAMPLES={self.style_min_samples} must not exceed "
+                f"STYLE_SAMPLE_SIZE={self.style_sample_size}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reply_delay_ordered(self) -> Settings:
+        # The pre-send pause is drawn between the two. Only a pair the owner
+        # set is refused (rule 20: an unset key never fails); otherwise the
+        # pacing takes the smaller one as the lower bound (outbox.pacing_for).
+        pair = {"jarvis_reply_delay_min_seconds", "jarvis_reply_delay_max_seconds"}
+        if (
+            pair <= self.model_fields_set
+            and self.jarvis_reply_delay_min_seconds > self.jarvis_reply_delay_max_seconds
+        ):
+            raise ValueError(
+                "JARVIS_REPLY_DELAY_MIN_SECONDS="
+                f"{self.jarvis_reply_delay_min_seconds} must not exceed "
+                f"JARVIS_REPLY_DELAY_MAX_SECONDS={self.jarvis_reply_delay_max_seconds}"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _report_after_brief(self) -> Settings:
         if self.report_time_parsed <= self.morning_brief_time_parsed:
             raise ValueError(
@@ -520,6 +676,15 @@ class Settings(BaseSettings):
         raw = re.split(r"[,\s]+", self.payment_own_cards)
         cards = (c.strip().lstrip("*") for c in raw)
         return tuple(c for c in cards if len(c) == 4 and c.isdigit())
+
+    @property
+    def safety_extra_safe_domains_list(self) -> tuple[str, ...]:
+        """SAFETY_EXTRA_SAFE_DOMAINS as entries, blanks dropped, order kept."""
+        return tuple(
+            entry.strip()
+            for entry in re.split(r"[,\s]+", self.safety_extra_safe_domains)
+            if entry.strip()
+        )
 
     @property
     def owner_aliases_parsed(self) -> tuple[str, ...]:

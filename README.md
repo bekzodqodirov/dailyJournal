@@ -9,7 +9,10 @@ Owner-facing language is Uzbek. Code, comments and commits are English.
 
 **Status: all five phases complete.** The assistant bot captures text, voice,
 photos and documents; call recordings sync in from the phone via Syncthing; a
-passive Telegram userbot reads whichever chats the owner whitelists. Everything
+passive Telegram userbot reads whichever chats the owner whitelists (and, only
+with `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`, sends from their account
+the outbox replies that passed the gate: the ones the owner approved and, in
+`auto` mode, the ones Jarvis may send by itself). Everything
 is transcribed, extracted and persisted as debts, promises, transactions,
 events, tasks and searchable memories. Questions are answered with figures
 straight from SQL, a report and tomorrow's plan arrive every evening, reminders
@@ -23,7 +26,7 @@ encrypted every night.
 ```
 ┌──────────────── CAPTURE ────────────────────────────────────────────┐
 │ A) Assistant bot (aiogram)   — owner-facing: notes, voice, receipts │
-│ B) Userbot (Telethon)        — passive, read-only DM/group reader   │
+│ B) Userbot (Telethon)        — DM/group reader; outbox replies      │
 │ C) Call recordings           — Syncthing folder sync from the phone │
 │ D) Google Calendar           — pull events, push extracted ones     │
 └────────────────────────────┬────────────────────────────────────────┘
@@ -44,7 +47,7 @@ encrypted every night.
 └────────────────────────────┬────────────────────────────────────────┘
                              ▼
 ┌──────────── ACT (via the assistant bot) ────────────────────────────┐
-│ daily report (19:00 Tashkent) · tomorrow planner · RAG chat ·       │
+│ daily report (20:00 Tashkent) · tomorrow planner · RAG chat ·       │
 │ reminders for due debts, promises and tasks                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -56,7 +59,14 @@ reasoning model only phrases a query result in Uzbek.
 
 ## Quick start
 
-The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md).
+The owner's step-by-step guide, in Uzbek, is [docs/ornatish.md](docs/ornatish.md);
+the complete owner guide to phases 1-3 (updating the server, the new shields, receipts,
+Google Sheets and switching Jarvis on step by step, Telegram only) is
+[docs/jarvis-qollanma.md](docs/jarvis-qollanma.md); a one-page summary is
+[docs/jarvis-egasi.md](docs/jarvis-egasi.md).
+After any `.env` edit run `make reload` (`docker compose up -d --force-recreate bot
+worker userbot`): bot, worker and userbot each read the Jarvis switches, and
+`docker compose restart` does not re-read `env_file`.
 
 ### Server requirements
 
@@ -97,6 +107,7 @@ every service refuses a blank or short API token.
 | `make payments-corpus [ALL=1]` | Export the payment texts you labelled (booked, «not money», voided) to `/data/exports/payments.jsonl` for parser regression tests; card digits and phone numbers are masked, merchants and names are not — the file stays on the server and is never committed |
 | `make update` | Back up, `git pull --ff-only`, stop bot/worker/userbot, `make up`, restart Syncthing if it was running, prune old images |
 | `make down` | Stop everything (the database volume is kept) |
+| `make reload` | After editing `.env`: recreate bot, worker and userbot so they read it again (`restart` keeps the old environment) |
 | `make migrate` | Apply migrations |
 | `make revision m="…"` | Autogenerate a migration from the models |
 | `make psql` | Open a psql shell |
@@ -106,11 +117,11 @@ every service refuses a blank or short API token.
 | `make gcal-auth` | One-time Google Calendar OAuth (see below) |
 | `make backfill CHAT=… DAYS=…` | Read one chat's recent history |
 | `make import-clients FILE=… [APPLY=1]` | Import the client-code list (CSV/.xlsx); a dry run unless APPLY=1 |
-| `make doctor` | Check `.env` and the server before `make up` |
+| `make doctor` | Check `.env` and the server before `make up`; also the Sheets key (and the address to share the sheet with), Jarvis switches that contradict each other (sending without Jarvis, Jarvis without the userbot or its session) and an unpriced model with Jarvis on. More than three missing keys after an update are one ⚠️ line: they run on their defaults |
 | `make backup-key` | Create the backup key and print the `.env` line |
 | `make backup-key-show` | Print the secret backup key (store it off the server) |
 | `make backup` | Run the encrypted database backup now |
-| `make test` / `make lint` / `make fmt` | Local dev loop |
+| `make test` / `make lint` / `make fmt` / `make typecheck` | Local dev loop; `typecheck` runs mypy strict on the Jarvis code |
 
 On first start the api container downloads the bge-m3 embedding model (~2 GB,
 cached in a volume). Until it finishes, `/qidir` and semantic search politely
@@ -128,6 +139,7 @@ model, so give it half an hour).
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 make test          # schema + API tests; DB tests skip if no database
+make typecheck     # mypy strict on miya/jarvis and the helpers it uses
 ```
 
 Database-backed tests skip automatically unless `DATABASE_URL` points at a
@@ -157,10 +169,12 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `OWNER_ALIAS_NAMESAKE_DAYS` | 90 — in a group where another member with the owner's first name spoke this recently, a bare first name is only "maybe to you" |
 | `USERBOT_CATCHUP_MINUTES`, `USERBOT_CATCHUP_MAX_PER_CHAT`, `USERBOT_CATCHUP_MAX_CHATS` | 30 / 500 / 20 — after downtime the userbot re-reads allowed chats past the last message it saw, never before a chat was switched on |
 | `API_BEARER_TOKEN` | `openssl rand -hex 32` — required for every `/v1/*` route |
-| `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 19:00, 23:30–07:30 |
+| `TIMEZONE`, `REPORT_TIME`, `QUIET_HOURS` | Asia/Tashkent, 20:00 (the evening recap; outside the quiet hours and after `MORNING_BRIEF_TIME`), 23:30–07:30 |
+| `PROMISE_REMIND_LEAD_MINUTES` | 60 (5–720, the timed sweep runs every five minutes) — a promise or task deadline with a time of day («ertaga 14:00 gacha») is reminded this long before it, never inside quiet hours (a lead that falls there moves to the end of the quiet hours, or before they begin when the deadline is inside them); date-only deadlines keep the morning ping |
 | `EMBED_SERVICE_URL` | Blank in `.env`; compose points bot/worker at the api container so only one process holds bge-m3 in RAM |
 | `GOOGLE_OAUTH_CLIENT_JSON`, `GOOGLE_TOKEN_JSON` | Calendar OAuth files under `secrets/`; sync stays off until the token exists |
 | `GCAL_CALENDAR_ID`, `GCAL_PULL_MINUTES`, `GCAL_DAYS_AHEAD` | Which calendar, how often, how far ahead |
+| `SHEETS_ENABLED`, `SHEETS_SERVICE_ACCOUNT_JSON`, `SHEETS_SPREADSHEET_ID`, `SHEETS_SYNC_SECONDS` | `false` / `./secrets/sheets_service_account.json` / blank / 60 s (15–3600) — the one-way Google Sheets mirror (tabs `Tasks_Promises`, `Client_FollowUps`, `Receipts`): every 60 s what changed in SQL is written to your spreadsheet, never read back; a no-op until switched on with the service-account key file and the spreadsheet id in place, a `/holat` line and a problem when it keeps failing |
 | `PAYMENT_SMS_SENDERS` | Extra bank/payment SMS senders on top of the built-in list |
 | `PAYMENT_APP_PACKAGES` | Blank — package ids of the payment apps whose pushes may book money; blank trusts the phone's allow-list |
 | `PAYMENT_ADVERTS_TO_REVIEW` | `false` — bank adverts are stored and ignored; `true` sends them to `/tekshir` |
@@ -169,8 +183,9 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `CODE_PLACEHOLDERS` | `false` — when `true`, a client code nobody holds yet becomes a placeholder person named after it; `/kod Akmal GS367` later folds it into Akmal |
 | `PAYMENT_OWN_CARDS` | empty — extra last-4 digits of your own cards (cards seen with a balance count already); an expense on one and an income of the same amount on another within the dedupe window is a transfer, left out of the totals (`/tuzat x12 tashqi` undoes it) |
 | `MONEY_GS_SETTLE_ASK` | `false` — a payment whose comment carries one client's GS code is always linked to that client; with this on, an income from a client who owes also asks whether it pays the debt down |
-| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours |
+| `MONEY_RECEIPTS`, `MONEY_RECEIPTS_FOLD_AT`, `MONEY_RECEIPT_MAX_AGE_HOURS`, `MONEY_RECEIPTS_SILENT_AT_NIGHT` | `each` / 4 / 12 h / `false` — a receipt with 🗑 O'chir per booked payment within the minute, folded for bursts, one summary for a first import, held through quiet hours; the receipt cards read from images (JV-04) follow the same night rule |
 | `MONEY_TYPED_MATCH_HOURS`, `MONEY_RECEIPT_ON_TYPED_MATCH` | 6 / `false` — a payment you typed and the bank's record of the same amount on the same day within 6 h are booked once (a ➕ button splits them); optionally a receipt when the bank confirms |
+| `RECEIPT_MATCH_MINUTES`, `RECEIPT_BANK_WAIT_MINUTES`, `RECEIPT_STALE_HOURS` | 30 min / 60 min / 72 h — a receipt read from an image turns ✅ when a bank SMS or Payme push of the same amount and currency arrives within 30 min of the time printed on it (never the time it was sent); after 60 min without one it is ⏳ unconfirmed, or ⚠️ suspicious only when the image was sent before, its printed time is over 72 h old or in the future, or the payee card is yours (`PAYMENT_OWN_CARDS`) while the phone is reporting; ✅ Pul keldi / 🚩 Soxta on the card record your own verdict and never book money |
 | `RECAP_MAX_PARTS` | 4 — a long evening report is split into at most this many messages, never clipped |
 | `RECAP_PHONE_STALE_HOURS` | 24 — the evening recap names a phone app silent this long, an unconfigured or stale backup, and any open problem (`/holat`) |
 | `RECAP_PROSE_ENABLED`, `RECAP_MODEL`, `RECAP_MAX_PEOPLE`, `RECAP_MAX_GROUPS`, `RECAP_SUBJECT_INPUT_CHARS`, `RECAP_INPUT_MAX_CHARS`, `RECAP_MAX_OUTPUT_TOKENS`, `RECAP_MODEL_TIMEOUT_SECONDS` | `true` / blank (= `REASON_MODEL`) / 8 / 5 / 1200 / 12000 / 1200 / 60 — one capped call per recap writes a sentence or two per person and group; prose with any digit or currency word is dropped, and the recap falls back to its SQL lines when the model is down |
@@ -185,7 +200,18 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `QUESTION_GROUP_DIGEST_SIZE`, `QUESTION_GROUP_MAX_SHOWS`, `QUESTION_GROUP_MIN_MESSAGES`, `QUESTION_ASK_CHANNELS` | 3 / 2 / 1 / `false` — the new-groups digest |
 | `CLAIM_ASK_AFTER_MINUTES`, `CLAIM_DUPLICATE_DAYS`, `CLAIM_BANK_MATCH_HOURS` | 10 / 14 / 48 — when an unshown claim is queued, when a repeat folds into the first, how far a bank payment can settle a claim |
 | `CLAIM_BANK_AUTOCLOSE_TRANSACTIONS`, `CLAIM_BANK_AUTOACCEPT_SETTLEMENTS` | `true` / `false` — what bank evidence may settle without asking |
+| `SAFETY_EXTRA_SAFE_DOMAINS` | Blank — domains you have verified yourself (comma-separated), added to the built-in list of real bank, payment and government sites; a link to one is never called a look-alike, but an installer or an archive behind it is still refused. Spam and scam messages are flagged in `meta.safety`, never answered and kept out of «javobsiz» lists; you are warned about a scam or a possibly hijacked account once per chat per day (silently at night, never from the question budget), and the brief counts what was ignored yesterday |
+| `JARVIS_ENABLED`, `JARVIS_MODE` | `false` / `draft` — the Jarvis act layer's master switch and its mode ceiling (`off`, `shadow`, `draft`, `auto`): every message MIYA may send in your name is a row in `outbox_messages`, and an adapter gets one only through `outbox.claim_ready`, which re-runs the whole gate (kill switches, pauses, mode, personal chats, the spam and file shield, owner-first signals, caps, the red-line guard, plain text only, quiet hours); the mode stored per channel and reply kind in `jarvis_policy` starts at `shadow` and never exceeds this ceiling. Off, no Jarvis job runs and core MIYA never loads it. `/jarvis` shows the status, `/jarvis toxtat` stops all sending at once, `/jarvis yoq [kanal]` resumes, `/jarvis tarix` lists the last 20 actions |
+| `JARVIS_DRAFT_DAILY_CAP`, `JARVIS_AUTO_DAILY_CAP`, `JARVIS_PER_CHAT_DAILY_CAP`, `JARVIS_SEND_MIN_GAP_SECONDS`, `JARVIS_DRAFT_EXPIRY_HOURS`, `JARVIS_DAILY_COST_CAP_USD` | 40 / 20 / 6 / 20 s / 12 h / 3.00 USD — counted in SQL from the start of your day: draft cards, replies sent on their own, AI replies into one chat, the gap between two sends from one account (your own approved texts count too), how old a draft may get before it is never sent, and Jarvis's own model spend (above it Jarvis only forwards to you and makes no model call; a call it cannot price counts as over). Jarvis never spends `QUESTION_BUDGET_PER_DAY` |
+| `STYLE_SAMPLE_SIZE`, `STYLE_MIN_SAMPLES` | 300 / 50 — the style profile (`/uslub`) is learned from your newest genuine outgoing private messages: never MIYA's own replies, never a chat you marked personal, archive imports included (`/uslub yukla` reads older history for style and search only, never sends anything). Below the minimum no profile is built. The traits are deterministic counts over those messages; the profile's prose is written by `REASON_MODEL` (priced from config, refused when it holds a digit), and the few-shot examples are your own replies with no figure, price, promise, link, phone or other person's name in them. A new profile waits as a draft until you tap «✅ Faollashtirish»; it is rebuilt weekly (with `JARVIS_ENABLED`) only when the messages changed |
+| `KB_MATCH_THRESHOLD` | 0.75 — how close a client's question must be to an entry of your knowledge base (`/bilim`) before Jarvis uses it: the meaning similarity of the two questions, or the share of the client's words the entry's question holds, from 0 to 1; at most three entries are used. Only entries you approved count; besides greetings, questions and the fixed holding replies, an entry's answer, word for word, is the only statement Jarvis may ever send on its own. An entry with a price, discount, payment term, payment confirmation, deadline, promise or guarantee, or with a client's phone, card, e-mail, handle, client code or name, is refused (office hours may be stored, but an answer with a digit or a future-tense verb is never sent on its own) |
+| `JARVIS_DEBOUNCE_SECONDS`, `JARVIS_OWNER_FIRST_SECONDS`, `JARVIS_MAX_MESSAGE_AGE_SECONDS`, `JARVIS_MAX_AI_TURNS`, `JARVIS_HISTORY_TURNS` | 45 s / 120 s / 900 s / 2 / 8 — the responder (with `JARVIS_ENABLED`): a burst of client messages in a private chat gets one reply, looked at this long after the latest one; you get the owner-first window, from the client's first unanswered message, to answer yourself (then Jarvis drafts nothing); a message older than the age limit, one read by the catch-up or a backfill, and an edit never get a reply of their own (an edit of a message Jarvis already drafted for replaces that draft, see `JARVIS_TAKEOVER_MINUTES`); after the given number of Jarvis replies in a row without you, the chat is only forwarded to you; the reply writer (`REASON_MODEL`, with no tools) reads only that chat's latest turns, your style profile and the knowledge-base answers that matched, never debts, other people or figures. A price, deadline, promise, payment claim, complaint or identity question is never drafted: it goes to you with a fixed holding reply. Every draft passes the red lines and then a check by `EXTRACT_MODEL`, which may only block (it also flags spam, scams and hijacked accounts); usage is recorded as `jarvis_intent`, `jarvis_draft` and `jarvis_guard`, priced from config, and above `JARVIS_DAILY_COST_CAP_USD` no model is called. In `shadow` mode the drafts are only stored: `/qoralamalar` lists them |
+| `JARVIS_TAKEOVER_MINUTES` | 120 min — you always come first (with `JARVIS_ENABLED`): Jarvis drafts nothing for a chat you have read, are typing in or have answered; the moment you write in a chat yourself (MIYA's own replies never count), its pending drafts are cancelled, its open escalation is closed as answered by you and Jarvis stays silent there for this long. A client who edits their message gets a fresh draft; one who deletes it gets none. A cancelled draft or a closed escalation you were shown is reported to you once |
+| `JARVIS_ESCALATION_SNOOZE_MINUTES`, `JARVIS_SNOOZE_MAX`, `JARVIS_ESCALATION_DAILY_CAP` | 60 min / 3 / 30 — the cards (with `JARVIS_ENABLED`, in `draft` or `auto` mode): each draft reply reaches you as a card with the client's message and the exact text («✏️ Tahrirlash»: reply to the card with your own text or a voice note, which becomes the text, flagged when it names a price or a time; «🙋 O'zim yozaman»: Jarvis stays silent in that chat for `JARVIS_TAKEOVER_MINUTES`; «✖️ Bekor»). A price, deadline, promise, payment or identity question is alerted at once, without waiting for the owner-first window (only the holding reply to the client waits for it): the client's messages, their name and code, their open balance from the ledger (never a figure from a model) and the holding reply; reply to the alert with your own words and «✅ Tasdiqlash va yuborish» sends exactly them. «⏰ 1 soatdan keyin eslat» shows the alert again after this many minutes, and the snooze that reaches the maximum sends it to the morning brief instead. Past the daily cap the day's further alerts fold into one message; draft cards past `JARVIS_DRAFT_DAILY_CAP` are left to the morning brief. At night cards arrive silently. Until a channel can send, no card has a send button: copy the text and send it yourself. A typed batch answer («hammasi ha») never approves a send |
+| `TELEGRAM_SEND_ENABLED`, `USERBOT_FLOOD_SLEEP_SECONDS`, `JARVIS_REPLY_DELAY_MIN_SECONDS`, `JARVIS_REPLY_DELAY_MAX_SECONDS`, `JARVIS_TYPING_CHARS_PER_SECOND`, `JARVIS_TYPING_MAX_SECONDS` | `false` / 5 s / 3 s / 7 s / 6 / 15 s — Telegram sending (with `JARVIS_ENABLED`): the userbot sends from your account the replies that passed the outbox gate (the ones you approved and, in `auto` mode, the ones Jarvis may send by itself), and the cards get «✅ Yuborish» instead of copy mode. Each reply waits a random 3–7 s, marks the chat read only then, shows "typing…" for its length (6 characters a second, at most 15 s) and goes out as plain text, at most one every `JARVIS_SEND_MIN_GAP_SECONDS`; you hear «✅ Yuborildi» under the card. While sending is on, Telethon sleeps through a flood wait only up to `USERBOT_FLOOD_SLEEP_SECONDS` (the reader waits out a short one itself; with sending off it keeps Telethon's 60 s); a longer one re-queues the message («⏳ Telegram N daqiqa kutishni so'radi»), and a long one, a spam limit or a lost session stops Telegram sending and tells you («⛔ … Qayta yoqish: /jarvis yoq telegram») while reading goes on. A client who blocked you, a deleted account, a chat closed to writing or one that takes only paid messages is told as «✖️ … yuborib bo'lmadi»; a message whose fate is unclear is never sent twice («❓ … aniq emas») |
+| `JARVIS_GRADUATION_MIN_DAYS`, `JARVIS_GRADUATION_MIN_DRAFTS`, `JARVIS_GRADUATION_MIN_APPROVAL_PCT`, `JARVIS_AUTO_IN_QUIET_HOURS` | 7 days / 30 / 90 % / `false` — autonomy, one reply kind at a time (with `JARVIS_ENABLED`): once a day Jarvis looks at each channel's greetings, information-gathering questions and general answers in `draft` mode, and when one kind has been a draft for at least these many days, with at least these many drafts you decided on, this share of them approved without an edit, no «↩️ Bu xato edi», no red-line incident, no channel limit in the last 7 days and the cost cap not reached twice in the last week, it asks you «🎓 … Endi bunday javoblarni MIYA o'zi yuborsinmi?». Nothing graduates without your «✅ Ha, avtomatik» tap, and only with `JARVIS_MODE=auto` in `.env` as well. A price, discount, payment, deadline, promise, complaint, identity, legal or holding reply is never sent on its own. Even a graduated kind goes out on its own only when every sentence is a courtesy, a fixed holding sentence, an approved knowledge-base answer or a question from your question bank (`/savolbank`); anything else is a card for you. Each reply sent on its own is followed by a silent «🤖 Avtomatik yuborildi» notice with «↩️ Bu xato edi», which puts that kind back to drafts at once; a channel limit, a red-line problem found in a sent reply, or the cost cap reached twice in a week does the same by itself and tells you. With `JARVIS_AUTO_IN_QUIET_HOURS=false` replies sent on their own wait out the quiet hours. `/jarvis rejim` shows the mode of each reply kind |
 | `MEDIA_ASK_IN_GROUPS`, `MEDIA_ASK_OUTGOING`, `MEDIA_UNASKED_EXPIRY_DAYS` | `false` / `false` / 7 — which big files are asked about, and when an unasked question expires |
+| `LOG_LEVEL`, `LOG_FORMAT` | `INFO` / `json` — every process writes one JSON object per line (`ts`, `level`, `logger`, `component`, `msg` and the record's extras; extras named `text`, `body`, `raw_text`, `transcript` or `draft` are dropped); `text` gives the plain lines |
 
 Credentials in `.env.example` are intentionally blank; blank integer keys
 (`OWNER_TELEGRAM_ID`, `TELETHON_API_ID`) are treated as unset, not as `0`.
@@ -195,7 +221,22 @@ Credentials in `.env.example` are intentionally blank; blank integer keys
 ## Using the bot
 
 Send the bot a note, a voice message or a receipt photo and it replies with what
-it recorded:
+it recorded. A payment receipt — a Payme or bank-app screenshot, a terminal
+check, as a photo or as a `.jpg`/`.png`/`.webp` file — also gets a receipt card:
+the amount, the printed date and time, payer → payee with the card's last four
+digits, the bank or app and the receipt number. The card is what the image says,
+not the bank's record; a receipt a client sends into a chat gets the same card
+within the minute, and money they claim is still asked before it is written.
+HEIC photos cannot be read: send them as JPG.
+
+The card's last line is the bank cross-check, edited in place: ✅ when a bank
+SMS or Payme push of the same amount and currency arrives near the time printed
+on the receipt; ⏳ when none came within `RECEIPT_BANK_WAIT_MINUTES` (some
+accounts never send an SMS); ⚠️ only for a reason it names — the same receipt was
+sent before, its date is old or in the future, or it was paid to one of your
+cards while the phone kept reporting and the bank said nothing. ✅ Pul keldi and
+🚩 Soxta under the card record your own verdict. None of this books money: the
+ledger only ever has the bank's own record and your own words.
 
 > **you:** Akmal akaga 5 mln so'm berdim, 25-avgustgacha qaytaradi
 > **MIYA:** 💰 Qarz: → senga 5 mln so'm, muddat: 25-avg
@@ -209,6 +250,7 @@ it recorded:
 | `/pul [kecha\|YYYY-MM-DD]` | One day's money rows by ref (`x12`), each with ✏️ Tuzat and 🗑 O'chir; voided rows marked 🗑 |
 | `/ochir x12` | Void one wrong money row: it leaves every total, stays in the history, and ↩️ Qaytar (or `/qaytar x12`) restores it |
 | `/tuzat x12 …` | Correct a money row: amount, currency, `kirim`/`chiqim`/`teskari`, `kim <ism>`, `sana kecha`, `izoh …`, `turkum …` |
+| `/tuzat p12 ertaga 14:00` | Move a promise's or task's deadline; a time of day after the day (`14:00`, `soat 3`, `kechki 6`) is kept, shown («ertaga 14:00») and reminded `PROMISE_REMIND_LEAD_MINUTES` before it; `muddatsiz` clears both |
 | `/kim <ism yoki GS kod>` | One person: who they are, the written profile, balances, promises, remembered facts, recent contact |
 | `/tarix <ism> [N]` | A person's full contact history, oldest to newest |
 | `/eslab <ism>: <matn>` | Remember a fact about a person by hand |
@@ -224,7 +266,15 @@ it recorded:
 | `/unut` | Delete a person, a chat or a date range — asks first |
 | `/tekshir` | Inputs whose processing failed and needs the owner's eye |
 | `/savollar` | Every question waiting for the owner's tap (claims, money texts, missed calls, groups, files), ranked money first and paged; answering here spends none of the day's 5–10 asked questions |
-| `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong |
+| `/holat` | MIYA's own health: each process, the database, disk, the last backup, Anthropic, the queue and this month's spend — with what to type for anything wrong. With `JARVIS_ENABLED` also Jarvis: the mode, today's capped count against its daily cap (auto sends in auto mode, draft cards otherwise, as `/jarvis` shows its limit) and the send queue, today's drafts, escalations and spend against `JARVIS_DAILY_COST_CAP_USD`, Telegram sending (working, limited until when, paused, waiting out a flood wait, or the sender down), sends stuck in a claim or in doubt, and the responder's last run. A queue that has not moved for ten minutes is alerted («📤 N ta xabar … yuborilmay turibdi»), in quiet hours too, silently, since approved sends go out at night; it says «tiklandi» only once the rows have left, not while they wait on a paused, switched-off or limited channel; a Telegram limit and the cost cap are told the moment they happen, repeated every `ALERT_REPEAT_HOURS` while they last, and each says «tiklandi» once when it clears. A Jarvis state that could not be read is never taken as recovered. With Jarvis off none of this is shown or alerted |
+| `/jarvis [qoralama\|kuzatuv\|toxtat\|yoq [kanal]\|tarix\|rejim]` | Jarvis (off until `JARVIS_ENABLED`): the mode, today's drafts, sends and escalations, the daily limit and Telegram (WhatsApp and Gmail are phase 4, not built, and are listed only once connected); `qoralama` (or `rejim qoralama`) raises the global mode from observation to draft after your «✅ Ha, qoralama rejimi» tap, `kuzatuv` lowers it back to observation at once and names any reply kind that keeps a mode of its own (nothing here ever sets auto: that is only the per-kind graduation); both say which `.env` line (`JARVIS_ENABLED`, `JARVIS_MODE`) still holds it back; `toxtat` stops every send at once (checked whenever a message is about to leave), `yoq` or `yoq telegram` lifts that stop for everything or one channel (it does not change the mode: in observation it says nothing will be shown), `tarix` lists the last 20 actions, `rejim` shows the mode of each reply kind per channel (drafts, sent on its own, or always yours) with its progress towards graduation and the `JARVIS_MODE` ceiling |
+| `/savolbank [qo'sh\|o'chir]` | Your question bank: the only questions Jarvis may ask a client on its own (where from, where to, what cargo, weight, cubes, number of places, the GS code, who receives it, documents or an invoice, the pickup address; Uzbek Latin, Cyrillic and Russian to start with). `/savolbank` lists them with a 🗑 button each, `/savolbank qo'sh Savol?` adds one after your «✅ Qo'shish» (one question, no time, price, promise or figure), `/savolbank o'chir 3` removes the third, with the same question in the other two scripts. Any other question Jarvis writes is a card for you |
+| `/shaxsiy <ism yoki GS kod>` | Mark a person (by name or client code) or a chat (a family group by its title) personal: MIYA never writes there on its own, reading goes on. Every address the person is known at is kept (their Telegram chat, a WhatsApp number written with its country code), so `/unut` or `/birlashtir` never reopens it. On a chat already personal it asks before unmarking (✅ Ha, chiqar / ✖️ Yo'q) |
+| `/shaxsiylar` | The personal chats, each with 🔓 (unmark, asks first), and likely family and friends found in the database (kinship in the contact name or the relationship you set, your informal «sen» towards them, no work talk, no client code), each with 🔒 to mark in one tap; nothing is marked without you |
+| `/guruhai <guruh>` | AI replies in one group: on after a confirm tap, and then only as drafts for your tap and only to messages addressed to you; off at once. Groups get no AI reply until switched on; `/guruhai` alone lists the groups that are on |
+| `/uslub [yukla]` | Your texting style as MIYA learned it: greetings, how you address people, message length, frequent phrases, emoji, script and Russian words, with a few of your own replies as examples; «✅ Faollashtirish» makes it the one Jarvis drafts with, «🔄 Qayta tuzish» builds it again. `yukla` reads your older private chats (read-only) to learn from more messages (media is not downloaded) and, with `JARVIS_ENABLED`, tells you when the profile is ready; without it, open `/uslub` again in a few minutes |
+| `/bilim [qo'sh\|tuzat\|o'chir\|taklif]` | Your business knowledge base, the facts and answers Jarvis may give clients: `/bilim` lists the active ones (`b12`), `/bilim qo'sh Savol \| Javob` adds one (without «\|», a fact), `/bilim tuzat b12 Savol \| Javob` corrects one, `/bilim o'chir b12` retires one. A price, discount, payment term, deadline, promise or a client's personal data is never stored. `/bilim taklif` shows what MIYA suggested from your own past answers to questions several clients asked (weekly, with `JARVIS_ENABLED`); each needs your «✅ Qo'shish», «✖️ Kerak emas» drops it |
+| `/qoralamalar` | First the drafts waiting for your tap (`j12` · who wrote, what they wrote, the draft, its kind), including drafts held over `JARVIS_DRAFT_DAILY_CAP` that have no card (the morning brief's «✍️ Kutayotgan qoralamalar» points here); then Jarvis's latest drafts in observation (`shadow`) mode, stored and never sent: who wrote, what they wrote, the reply Jarvis would have given and its kind; `/jarvis` shows how many replies it would have prepared today and how many of them it would have forwarded to you |
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
@@ -235,7 +285,7 @@ not in a tool result.
 
 Reminders arrive on the hour for anything due today, tomorrow, or already
 overdue — once per item per 24 hours, and never inside `QUIET_HOURS`. The
-daily report lands at `REPORT_TIME` (19:00 Tashkent = 22:00 in China) with the
+daily report lands at `REPORT_TIME` (20:00 Tashkent = 23:00 in China) with the
 day's money, people, debts, completions and tomorrow's plan.
 
 ---
@@ -341,19 +391,33 @@ Only the api container loads the model — the bot and worker call its
 `POST /v1/embed` over the compose network (`EMBED_SERVICE_URL`), so the ~2 GB
 of weights sit in RAM once, not three times.
 
-**RAG chat.** A question to the bot goes to Sonnet with a fixed toolbox:
+**RAG chat.** A question to the bot goes to REASON_MODEL with a fixed toolbox:
 `open_debts`, `person_summary`, `spending_summary`, `due_items`,
-`upcoming_events`, `search_memories`, `recent_interactions`. The SQL tools are
+`promises_made`, `who_wrote`, `upcoming_events`, `search_memories`,
+`recent_interactions` and the rest of `rag.TOOLS`. The SQL tools are
 the only source of financial figures; `search_memories` covers contextual
 questions. If the model or a tool fails, the owner gets an honest "try again
-later" instead of a guess.
+later" instead of a guess; an answer that comes back empty is asked for once
+more.
+
+Two questions need no model at all: «Bugun kimga nima va'da bergandim?» and
+«Kecha kimlar yozdi?» (any of bugun, kecha, o'tgan kuni or a weekday; typed or
+spoken, with or without a question mark) are answered straight from SQL
+(`queries.promises_made`, `queries.who_wrote`) over the local Asia/Tashkent
+day. Only the owner's own words count: a reply MIYA sent by itself never
+makes a promise and never answers anyone.
 
 **Evening recap.** At `REPORT_TIME` the worker sends "🌆 Bugun nima bo'ldi":
 the day's money per currency, repayments and what the phone booked (with
-`x` refs to check), new and closed records, then a block per person — messages,
-calls, what they asked and whether it was answered, claims and refs — and per
+`x` refs to check), the day's receipts by bank verdict (confirmed / waiting /
+suspicious, counted in SQL), new and closed records, then a block per person —
+messages, calls, what they asked and whether it was answered, claims and refs — and per
 group, the calls, what was aimed at the owner in groups, what is still open,
-and tomorrow. Every figure comes from SQL (`services/recaps.py`); one capped
+and tomorrow; with `JARVIS_ENABLED`, Jarvis's day («🤖 Bugun Jarvis»: replies
+sent on their own and on your tap, escalations and how many are still open,
+sends you commanded, sends in doubt, the spend against
+`JARVIS_DAILY_COST_CAP_USD`, and per reply kind how many drafts you approved
+unchanged, rewrote, or that strayed from the approved shapes). Every figure comes from SQL (`services/recaps.py`); one capped
 model call adds at most a labelled sentence or two per person and group, with
 any digit or currency word refused, and the recap arrives complete without it
 when the model is down. It is stored in `daily_reports`, split into at most
@@ -365,9 +429,17 @@ tomorrow.
 yesterday's money per currency, repayments and phone-booked counts, the new
 and closed records, the main conversations recalled with the evening's own
 prose (no new model call), and a block for everything since the evening
-cutoff — so nothing between 19:00 and 09:00 goes untold. When the evening
+cutoff — so nothing between 20:00 and 09:00 goes untold. When the evening
 recap never reached the owner, the whole of yesterday is told here instead.
-Then the brief with its buttons, then at most the brief's questions.
+Then the brief with its buttons — after the meetings it lists today's
+deadlines that name a time of day, by that time («⏰ Bugungi muddatlar»), and
+with `JARVIS_ENABLED` Jarvis's section: yesterday's activity in the evening
+recap's words («🤖 Jarvis (kecha)»), the drafts waiting for your tap
+(«✍️ Kutayotgan qoralamalar», listed by `/qoralamalar`), the chats whose
+drafts nobody answered («📨 Javobsiz chatlar») and every escalation still
+open, with its reason and since when («⚠️ Ochiq eskalatsiyalar») — then at
+most the brief's questions. Each Jarvis part is read on its own; one that
+fails is left out and the brief still goes out.
 `/kecha` shows the morning recap on demand; `/ertalab` shows both.
 
 **Google Calendar.** One-time auth: create an OAuth *Desktop app* client in
@@ -385,6 +457,39 @@ marked `[MIYA]` in the description. Date-only events (midnight) stay local so
 the calendar isn't spammed with 00:00 entries. Without the token both jobs are
 quiet no-ops.
 
+**Google Sheets mirror.** A one-way copy of the ledger's lists in your own
+spreadsheet, at most a minute behind: `Tasks_Promises` (every promise and
+task, who to whom, deadline with its time, status, where and when it was
+said), `Client_FollowUps` (each client with an active code, an open promise,
+an unanswered question or an open Jarvis escalation: last contact, the
+escalation's reason and since when, open promises, next deadline) and
+`Receipts` (what each receipt image says, who sent it, and, in its own
+columns, the bank's cross-check and the bank's own record). Setup: in Google
+Cloud Console enable the Sheets API, create a service account, download its
+JSON key to `secrets/sheets_service_account.json`, share the spreadsheet with
+the account's e-mail address as **Editor**, then set `SHEETS_ENABLED=true` and
+`SHEETS_SPREADSHEET_ID` (the long id in the spreadsheet's address) and run
+`make reload`. `make doctor` reads the key as the worker will (a readable
+file with `type: service_account`) and prints the `client_email` to share
+the spreadsheet with; a key copied in after `make up` as root needs
+`sudo chown 10001:10001 secrets/sheets_service_account.json` (or `make up`
+again). Missing tabs and their headers are created on the first sync. The
+owner's steps in Uzbek: [docs/jarvis-qollanma.md](docs/jarvis-qollanma.md), section 4.
+
+The database stays the truth: nothing typed into the sheet comes back, and a
+row you edit is overwritten when its record changes. Each record owns its row
+(the `ID` column is the bot's own ref: `p12`, `t7`, `r5`, `k3`), so sort and
+filter with a filter view or in another tab, never by moving the mirrored
+rows. Amounts are exact text with the currency in its own column and are
+never added up across currencies. Values are written as plain text, so
+nothing a client typed becomes a formula. After `/unut` the forgotten rows
+are blanked on the next sync. Google keeps the spreadsheet's version
+history, so what was mirrored before `/unut` can still be seen there (File →
+Version history); to remove it, make a fresh copy of the spreadsheet (a copy
+has no history), share it with the service account and point
+`SHEETS_SPREADSHEET_ID` at it, then delete the old one. While the mirror
+keeps failing (no access, a wrong id) `/holat` names the reason.
+
 ---
 
 ## The Telegram userbot
@@ -393,10 +498,19 @@ The userbot reads the owner's **personal** Telegram account with Telethon so
 that business conversations become debts, promises and facts without anyone
 re-typing them. It is passive by construction:
 
-* It never sends, edits, deletes, forwards or marks anything as read. A test
-  parses the package and fails the build if a writing call ever appears.
-* It downloads no history. Only messages that arrive after it starts are read;
-  the dialog list is used for chat titles only.
+* It never edits, deletes or forwards anything. Sending and marking a chat
+  read happen in exactly one place, `miya/userbot/sender.py` (JV-19), only with
+  `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`, and only for outbox rows that
+  passed the gate — the ones the owner approved and, in `auto` mode, the ones
+  Jarvis may send by itself (`auto:policy`) — taken through
+  `outbox.claim_ready`, which re-runs every check. A test parses the package, and every module that imports Telethon,
+  and fails the build if a writing call appears anywhere else.
+* It reads history only when the owner asks for it: a group's backfill after
+  «Ha», and `/uslub yukla`, which reads up to the 300 newest messages of each
+  monitored private chat (read-only, stored as archive rows, media kept as
+  metadata only). Otherwise only messages that arrive after it starts are
+  read (the sender reads a chat's newest messages back only to check a send
+  whose outcome was unclear); the dialog list is used for chat titles only.
 * `USERBOT_ENABLED=false` turns the whole thing off in one flag.
 * In a group that is switched off and not yet decided, it keeps only a
   message counter and two timestamps (when the owner last wrote there, when
@@ -573,15 +687,18 @@ command ends, success or not.
 
 ### Documented egress
 
-Four external services receive data, plus one optional bare ping. Nothing
-else leaves the VPS.
+Five external services receive data, plus one optional bare ping and, only
+with `TELEGRAM_SEND_ENABLED`, Telegram sending as the owner. Nothing else
+leaves the VPS.
 
 | Destination | What is sent | Why |
 |---|---|---|
-| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names); when the owner asks a question, verbatim quotes of the stored messages found for it | Extraction, the recap's prose, planner, RAG answers |
+| **Anthropic API** | Message text, call transcripts, document text, receipt images; for the recap, conversation and call summaries and message excerpts (no names); when the owner asks a question, verbatim quotes of the stored messages found for it; with JARVIS_ENABLED, a client chat's latest JARVIS_HISTORY_TURNS messages (phone and card numbers and money figures masked), your style guide and example replies, the matching knowledge-base answers and the drafted reply | Extraction, the recap's prose, planner, RAG answers, Jarvis reply intent, drafts and the draft check |
 | **ElevenLabs Scribe** | Audio files (voice notes, call recordings) | Transcription |
 | **Google Calendar API** | Event titles, times, locations, attendees | Calendar pull and push |
+| **Google Sheets API** (only with `SHEETS_ENABLED=true`) | Promise and task texts, deadlines and statuses with the names of the people involved, the Telegram group's title and a context line of up to 300 characters (the conversation summary or, without one, the verbatim message text or call transcript); client names, codes, group titles and last-contact times; receipt figures, names, card last four digits, references, the bank cross-check verdict and the bank's own matching transaction (ref, amount, currency, time, bank) | The one-way mirror in the owner's own spreadsheet |
 | **Telegram Bot API** | The bot's replies to the owner, and the nightly backup as an `age`-encrypted document (ciphertext only) | The assistant channel; an off-server copy of the backup |
+| **Telegram, as the owner** (only with `JARVIS_ENABLED` and `TELEGRAM_SEND_ENABLED`) | The exact text of each outbox reply that passed the gate (approved by the owner, or on its own in `auto` mode), into the chat it answers, with that chat's read receipt and "typing…" status | Telegram sending as the owner |
 
 | **`DEADMAN_PING_URL`** (optional) | A bare GET every `DEADMAN_PING_MINUTES`, no data | An outside watcher notices a dead server |
 
@@ -598,8 +715,11 @@ the other party's consent vary by jurisdiction. Complying with the law where the
 owner and the other party are located is the owner's responsibility.
 
 The Telegram userbot automates a personal account, which technically
-violates Telegram's Terms of Service. It stays strictly passive — it never sends
-messages, never marks chats as read, and never bulk-downloads history — and
+violates Telegram's Terms of Service. It stays passive — it never bulk-downloads
+history on its own, and it sends a message or marks a chat read only when the
+owner switched sending on (`TELEGRAM_SEND_ENABLED`) and the reply passed the
+outbox gate (the owner's tap, or `auto` mode's own allowlist), paced like a
+person, stopping at Telegram's first limit — and
 `USERBOT_ENABLED=false` disables it entirely.
 
 ---
@@ -714,8 +834,11 @@ free and offline.
   person, then a chat purge that leaves nothing behind.
 * An interrupted result stream is replayed on the next poll without
   re-applying what already landed.
-* The userbot package is parsed by a test that fails if any Telegram-writing
-  call (`send_message`, `send_read_acknowledge`, `iter_messages`, …) appears.
+* The userbot package, and every module that imports Telethon, is parsed by
+  a test that fails if any Telegram-writing call (`send_message`,
+  `send_read_acknowledge`, a raw `SendMessageRequest`, …) appears outside the
+  sender's named send functions, or a history read (`iter_messages`, …)
+  outside the reads the owner asked for.
 * `USERBOT_ENABLED=false` returns before a client is even constructed; a
   missing session exits instead of prompting on stdin.
 * Each of the three window triggers is exercised separately, a long backlog

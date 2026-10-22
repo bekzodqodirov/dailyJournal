@@ -11,6 +11,12 @@ bytes, and a chat list page carries one payload per button.
     rec:ma|ms:m<interaction_id> a missed call: got in touch / snooze till morning
     ng:y|n:<monitor_id>         "Yangi guruh / kanal: … — o'qiymi?": read it / not
     cl:y|n|e:<claim_id>         a counterparty's claim: write it / drop it / correct it
+    rcp:ok|f:<receipt_id>       a receipt card: the money came / the receipt is fake
+    jr:p:<person_id>            mark a suggested person personal (one tap, restricting)
+    jr:u:<rule_id>              ask to unmark a personal chat
+    jr:y:<rule_id>              unmark it (the confirm, JV-12)
+    jr:n:<rule_id|monitor_id>   keep it / do not switch on (the id is not read)
+    jr:g:<monitor_id>           switch AI replies on in a group (the confirm)
 """
 
 from __future__ import annotations
@@ -20,9 +26,11 @@ from datetime import timedelta
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from miya.bot import replies
 from miya.bot.formatting import claim_ref, ref
 from miya.db.enums import ChatType
 from miya.db.models import ChatMonitor
+from miya.services import safety
 
 PAGE_SIZE = 8
 TITLE_WIDTH = 22
@@ -88,6 +96,31 @@ def chats_keyboard(page: ChatsPage) -> InlineKeyboardMarkup:
         rows.append(nav)
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# A receipt card's own verdict (JV-05). Never in handlers._button_handlers:
+# a typed batch answer can never judge a receipt.
+RECEIPT_PREFIX = "rcp"
+RECEIPT_OK = "ok"
+RECEIPT_FAKE = "f"
+
+
+def receipt_verdict(receipt_id: int) -> InlineKeyboardMarkup:
+    """✅ Pul keldi / 🚩 Soxta under a receipt card. Neither books money."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Pul keldi",
+                    callback_data=f"{RECEIPT_PREFIX}:{RECEIPT_OK}:{receipt_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🚩 Soxta",
+                    callback_data=f"{RECEIPT_PREFIX}:{RECEIPT_FAKE}:{receipt_id}",
+                ),
+            ]
+        ]
+    )
 
 
 def media_approval(interaction_id: int) -> InlineKeyboardMarkup:
@@ -948,3 +981,411 @@ def merge_confirm(source_id: int, target_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+# --- personal chats and group replies (JV-12) ----------------------------------------
+#
+# Not in handlers._button_handlers: a typed batch answer can never change a
+# reply rule, only the owner's tap on these buttons.
+
+RULE_PREFIX = "jr"
+RULE_MARK = "p"
+RULE_ASK = "u"
+RULE_YES = "y"
+RULE_NO = "n"
+RULE_GROUP_YES = "g"
+RULE_BUTTON_WIDTH = 28
+
+
+def _rule_label(name: str | None) -> str:
+    """A button shows plain text: no HTML escaping, but no bidi or
+    zero-width characters either (the name is the counterparty's)."""
+    text = safety.display_name(name or "").strip() or replies.PERSONAL_UNKNOWN_CHAT
+    return text if len(text) <= RULE_BUTTON_WIDTH else text[: RULE_BUTTON_WIDTH - 1] + "…"
+
+
+def personal_list(
+    marked: list[tuple[int, str | None]], suggested: list[tuple[int, str]]
+) -> InlineKeyboardMarkup | None:
+    """`/shaxsiylar`: 🔓 per personal chat (asks first), 🔒 per suggestion."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=f"🔓 {_rule_label(name)}",
+                callback_data=f"{RULE_PREFIX}:{RULE_ASK}:{rule_id}",
+            )
+        ]
+        for rule_id, name in marked[: replies.PERSONAL_LIST_MAX]
+    ]
+    rows += [
+        [
+            InlineKeyboardButton(
+                text=f"🔒 {_rule_label(name)}",
+                callback_data=f"{RULE_PREFIX}:{RULE_MARK}:{person_id}",
+            )
+        ]
+        for person_id, name in suggested
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def personal_unmark_confirm(rule_id: int) -> InlineKeyboardMarkup:
+    """Loosening needs a tap (§5.4): ✅ Ha, chiqar / ✖️ Yo'q."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.PERSONAL_UNMARK_YES,
+                    callback_data=f"{RULE_PREFIX}:{RULE_YES}:{rule_id}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.PERSONAL_UNMARK_NO,
+                    callback_data=f"{RULE_PREFIX}:{RULE_NO}:{rule_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def group_reply_confirm(monitor_id: int) -> InlineKeyboardMarkup:
+    """Switching AI replies on in a group is a loosening: ✅ Ha, yoq / ✖️ Yo'q."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.GROUP_REPLY_YES,
+                    callback_data=f"{RULE_PREFIX}:{RULE_GROUP_YES}:{monitor_id}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.GROUP_REPLY_NO,
+                    callback_data=f"{RULE_PREFIX}:{RULE_NO}:{monitor_id}",
+                ),
+            ]
+        ]
+    )
+
+
+# --- /uslub (JV-14) -----------------------------------------------------------------
+#
+# js:y:<version> activates a draft profile, js:r:<version> builds it again.
+# Not in handlers._button_handlers: a typed batch answer never changes the
+# style the AI writes in.
+
+STYLE_PREFIX = "js"
+STYLE_ACTIVATE = "y"
+STYLE_REBUILD = "r"
+
+
+def style_card(version: int, *, active: bool) -> InlineKeyboardMarkup:
+    """✅ Faollashtirish (a draft only) and 🔄 Qayta tuzish."""
+    row = []
+    if not active:
+        row.append(
+            InlineKeyboardButton(
+                text=replies.STYLE_ACTIVATE,
+                callback_data=f"{STYLE_PREFIX}:{STYLE_ACTIVATE}:{int(version)}",
+            )
+        )
+    row.append(
+        InlineKeyboardButton(
+            text=replies.STYLE_REBUILD,
+            callback_data=f"{STYLE_PREFIX}:{STYLE_REBUILD}:{int(version)}",
+        )
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+# --- /bilim (JV-15) -----------------------------------------------------------------
+#
+# kb:y:<id> adds a suggested knowledge entry, kb:n:<id> drops it. Not in
+# handlers._button_handlers: a typed batch answer never puts words in the
+# AI's mouth.
+
+KB_PREFIX = "kb"
+KB_ADD = "y"
+KB_DISMISS = "n"
+
+
+def kb_suggestion(entry_id: int) -> InlineKeyboardMarkup:
+    """✅ Qo'shish / ✖️ Kerak emas under one suggestion."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.KB_ADD,
+                    callback_data=f"{KB_PREFIX}:{KB_ADD}:{int(entry_id)}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.KB_DISMISS,
+                    callback_data=f"{KB_PREFIX}:{KB_DISMISS}:{int(entry_id)}",
+                ),
+            ]
+        ]
+    )
+
+
+# --- draft and escalation cards (JV-18) ----------------------------------------------
+#
+# jv:y|e|o|n:<outbox id> under a draft card (send, edit, I'll write, cancel) and
+# je:y|o|s:<escalation id> under an escalation alert (approve and send, I'll
+# write, remind in an hour). Id-only payloads. Not in
+# handlers._button_handlers: a typed batch answer («hammasi ha») never
+# approves a send. The action letters are miya.jarvis.cards's (a test holds
+# them together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_DRAFT_PREFIX = "jv"
+JARVIS_ESCALATION_PREFIX = "je"
+JARVIS_SEND = "y"
+JARVIS_EDIT = "e"
+JARVIS_OWN = "o"
+JARVIS_CANCEL = "n"
+JARVIS_SNOOZE = "s"
+
+
+def _jarvis_button(
+    text: str, prefix: str, action: str, ident: int
+) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text, callback_data=f"{prefix}:{action}:{int(ident)}"
+    )
+
+
+def jarvis_card(card) -> InlineKeyboardMarkup | None:
+    """The buttons of a cards.Card. The send button only when the channel's
+    sender is ready and a text waits (copy mode has none)."""
+    if card.kind == "command":
+        return _command_card(card)
+    if card.kind == "draft":
+        prefix = JARVIS_DRAFT_PREFIX
+        first = [_jarvis_button(replies.JARVIS_BUTTON_EDIT, prefix, JARVIS_EDIT, card.id)]
+        if card.can_send:
+            first.insert(
+                0,
+                _jarvis_button(replies.JARVIS_BUTTON_SEND, prefix, JARVIS_SEND, card.id),
+            )
+        second = [
+            _jarvis_button(replies.JARVIS_BUTTON_OWN, prefix, JARVIS_OWN, card.id),
+            _jarvis_button(replies.JARVIS_BUTTON_CANCEL, prefix, JARVIS_CANCEL, card.id),
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=[first, second])
+    prefix = JARVIS_ESCALATION_PREFIX
+    rows = []
+    if card.can_send:
+        rows.append(
+            [_jarvis_button(replies.JARVIS_BUTTON_APPROVE, prefix, JARVIS_SEND, card.id)]
+        )
+    row = [_jarvis_button(replies.JARVIS_BUTTON_WRITE, prefix, JARVIS_OWN, card.id)]
+    if card.can_snooze:
+        row.append(
+            _jarvis_button(replies.JARVIS_BUTTON_SNOOZE, prefix, JARVIS_SNOOZE, card.id)
+        )
+    rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --- the owner's commands (JV-20) -----------------------------------------------------
+#
+# ja:y|e|n:<outbox id> under a send the owner commanded (send, edit, cancel);
+# ja:c:<command message id>:<n>:<person id> picks one person under «Qaysi …?»;
+# ja:s|x:<command message id>:<n> applies or drops the n-th setting that
+# command proposed. Id-only payloads; what a tap applies is read back from
+# the stored proposal, never from the payload. Not in
+# handlers._button_handlers: a typed batch answer never sends or changes a
+# setting. The action letters are miya.jarvis.cards's and commands's (a test
+# holds them together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_COMMAND_PREFIX = "ja"
+JARVIS_COMMAND_PICK = "c"
+JARVIS_SETTING_APPLY = "s"
+JARVIS_SETTING_DROP = "x"
+# The two loosenings whose confirm card is JV-12's own.
+JV12_SETTINGS = ("personal_off", "group_reply_on")
+
+
+def _command_card(card) -> InlineKeyboardMarkup:
+    prefix = JARVIS_COMMAND_PREFIX
+    first = [_jarvis_button(replies.JARVIS_BUTTON_EDIT, prefix, JARVIS_EDIT, card.id)]
+    if card.can_send:
+        first.insert(
+            0, _jarvis_button(replies.JARVIS_BUTTON_SEND, prefix, JARVIS_SEND, card.id)
+        )
+    second = [
+        _jarvis_button(replies.JARVIS_BUTTON_CANCEL, prefix, JARVIS_CANCEL, card.id)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[first, second])
+
+
+def _candidate_label(name: str, code: str | None) -> str:
+    return _rule_label(f"{name} · {code}" if code else name)
+
+
+def command_candidates(action) -> InlineKeyboardMarkup | None:
+    """One button per person under «Qaysi Sardor?» (a commands.Action)."""
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=_candidate_label(c.name, c.code),
+                callback_data=(
+                    f"{JARVIS_COMMAND_PREFIX}:{JARVIS_COMMAND_PICK}:"
+                    f"{int(action.interaction_id)}:{int(action.index)}:{int(c.person_id)}"
+                ),
+            )
+        ]
+        for c in action.candidates
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+def command_setting(action) -> InlineKeyboardMarkup:
+    """The buttons of a setting card (a commands.Action): the JV-12 confirm
+    card for the loosenings it covers, else ✅ / ✖️ Yo'q."""
+    if action.setting == "personal_off":
+        return personal_unmark_confirm(int(action.target_id))
+    if action.setting == "group_reply_on":
+        return group_reply_confirm(int(action.target_id))
+    ref = f"{int(action.interaction_id)}:{int(action.index)}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_SETTING_YES[action.setting],
+                    callback_data=f"{JARVIS_COMMAND_PREFIX}:{JARVIS_SETTING_APPLY}:{ref}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_SETTING_NO,
+                    callback_data=f"{JARVIS_COMMAND_PREFIX}:{JARVIS_SETTING_DROP}:{ref}",
+                ),
+            ]
+        ]
+    )
+
+
+# --- the rollout (JV-23) ----------------------------------------------------------------
+#
+# jg:y|n:<channel>:<intent> under a graduation offer (go autonomous, keep
+# watching); jv:x:<outbox id> under the silent notice of an autonomous send
+# («↩️ Bu xato edi», the draft prefix: the row is the payload). The channel
+# and the intent are the jarvis_policy scope's own key parts, checked
+# against the known channels and intents before anything is read. Not in
+# handlers._button_handlers: a typed batch answer never makes Jarvis
+# autonomous. The letters are miya.jarvis.rollout's (a test holds them
+# together; this module never imports miya.jarvis, rule 20).
+
+JARVIS_GRADUATION_PREFIX = "jg"
+JARVIS_GRADUATE_YES = "y"
+JARVIS_GRADUATE_NO = "n"
+JARVIS_MISTAKE = "x"
+
+
+def jarvis_graduation(channel: str, intent: str) -> InlineKeyboardMarkup:
+    """✅ Ha, avtomatik / ⏳ Yana kuzataylik under one offer."""
+    ref = f"{channel}:{intent}"
+    yes = f"{JARVIS_GRADUATION_PREFIX}:{JARVIS_GRADUATE_YES}:{ref}"
+    no = f"{JARVIS_GRADUATION_PREFIX}:{JARVIS_GRADUATE_NO}:{ref}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_GRADUATE,
+                    callback_data=yes,
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_KEEP_DRAFT,
+                    callback_data=no,
+                ),
+            ]
+        ]
+    )
+
+
+# --- /jarvis qoralama: raising the global mode is a confirmed tap -------------------
+#
+# jm:d raises the global mode from observation (shadow) to draft, jm:n keeps
+# it. Lowering (/jarvis kuzatuv) is immediate and has no button. Not in
+# handlers._button_handlers: a typed batch answer never changes the mode.
+
+JARVIS_MODE_PREFIX = "jm"
+JARVIS_MODE_DRAFT = "d"
+JARVIS_MODE_KEEP = "n"
+
+
+def jarvis_mode_confirm() -> InlineKeyboardMarkup:
+    """✅ Ha, qoralama rejimi / ✖️ Yo'q under the /jarvis qoralama question."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_MODE_DRAFT,
+                    callback_data=f"{JARVIS_MODE_PREFIX}:{JARVIS_MODE_DRAFT}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.JARVIS_BUTTON_MODE_KEEP,
+                    callback_data=f"{JARVIS_MODE_PREFIX}:{JARVIS_MODE_KEEP}",
+                ),
+            ]
+        ]
+    )
+
+
+def jarvis_auto_sent(row_id: int) -> InlineKeyboardMarkup:
+    """↩️ Bu xato edi under the notice of one autonomous send."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                _jarvis_button(
+                    replies.JARVIS_BUTTON_MISTAKE,
+                    JARVIS_DRAFT_PREFIX,
+                    JARVIS_MISTAKE,
+                    row_id,
+                )
+            ]
+        ]
+    )
+
+
+# --- /savolbank (JV-23) -----------------------------------------------------------------
+#
+# qb:y|n:<ref> adds or drops a proposed question, qb:d:<ref> removes one from
+# the bank (ref: qbank.ref_of, a short hash of the exact text). Not in
+# handlers._button_handlers: a typed batch answer never puts a question in
+# the AI's mouth.
+
+QBANK_PREFIX = "qb"
+QBANK_ADD = "y"
+QBANK_DISMISS = "n"
+QBANK_REMOVE = "d"
+# Remove buttons per row under the list.
+QBANK_PER_ROW = 5
+
+
+def qbank_proposal(ref: str) -> InlineKeyboardMarkup:
+    """✅ Qo'shish / ✖️ Kerak emas under a proposed question."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=replies.QBANK_ADD,
+                    callback_data=f"{QBANK_PREFIX}:{QBANK_ADD}:{ref}",
+                ),
+                InlineKeyboardButton(
+                    text=replies.QBANK_DISMISS,
+                    callback_data=f"{QBANK_PREFIX}:{QBANK_DISMISS}:{ref}",
+                ),
+            ]
+        ]
+    )
+
+
+def qbank_list(refs: list[str]) -> InlineKeyboardMarkup | None:
+    """🗑 1 … 🗑 n under `/savolbank`, numbered as the list."""
+    buttons = [
+        InlineKeyboardButton(
+            text=replies.QBANK_REMOVE.format(i=i),
+            callback_data=f"{QBANK_PREFIX}:{QBANK_REMOVE}:{ref}",
+        )
+        for i, ref in enumerate(refs, start=1)
+    ]
+    if not buttons:
+        return None
+    rows = [buttons[i : i + QBANK_PER_ROW] for i in range(0, len(buttons), QBANK_PER_ROW)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)

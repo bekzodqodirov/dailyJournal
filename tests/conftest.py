@@ -78,7 +78,27 @@ async def _truncate(session) -> None:
     # left behind by one test must not read as "alive" in the next. Nothing
     # references the table, so it goes first, ahead of the ledger below.
     await session.execute(sa.delete(m.Heartbeat))
+    # The Sheets mirror's bookkeeping references nothing either (JV-07).
+    await session.execute(sa.delete(m.SheetRow))
     for model in (
+        # The Jarvis core (JV-11): outbox rows reference escalations,
+        # interactions and people; escalations, chat states and reply rules
+        # reference interactions and people; the policy references nothing.
+        m.OutboxMessage,
+        m.Escalation,
+        # The owner's style (JV-14): examples reference profiles and
+        # interactions, tones reference people.
+        m.OwnerStyleExample,
+        m.OwnerStyleProfile,
+        m.OwnerStylePerson,
+        # Knowledge-base entries reference the interaction they were mined
+        # from (JV-15).
+        m.KnowledgeEntry,
+        m.JarvisChatState,
+        m.ReplyRule,
+        m.JarvisPolicy,
+        # Receipts reference interactions, people, transactions and claims.
+        m.Receipt,
         # Claims reference interactions and people, so they go before both.
         m.QuestionLog,
         m.Claim,

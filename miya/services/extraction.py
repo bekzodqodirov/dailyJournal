@@ -14,7 +14,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from typing import Literal
@@ -39,6 +39,11 @@ CurrencyCode = Literal["UZS", "USD", "CNY", "KRW", "RUB"]
 AssertedBy = Literal["me", "them"]
 
 _client: anthropic.AsyncAnthropic | None = None
+
+# The shared client's own exponential backoff on connection errors, 408, 409,
+# 429 and 5xx (JV-02). Stated here so it is visible and tested; call sites are
+# never wrapped in retry.with_backoff on top of it, which would retry twice.
+MODEL_CLIENT_MAX_RETRIES = 3
 
 
 class AnthropicUnavailable(RuntimeError):
@@ -66,7 +71,9 @@ def get_client() -> anthropic.AsyncAnthropic:
         raise AnthropicUnavailable("ANTHROPIC_API_KEY is not set")
     global _client
     if _client is None:
-        _client = anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key)
+        _client = anthropic.AsyncAnthropic(
+            api_key=settings.anthropic_api_key, max_retries=MODEL_CLIENT_MAX_RETRIES
+        )
     return _client
 
 
@@ -82,6 +89,67 @@ def _parse_iso_date(value: str | None) -> date | None:
     except ValueError:
         log.warning("unparseable due_date from extraction: %r", value)
         return None
+
+
+# A deadline with a time of day, as the prompt asks for it ("2026-10-21T14:00");
+# a space instead of the T, a one-digit hour, trailing seconds with a
+# fraction and a UTC offset or "Z" are tolerated.
+_ISO_DUE = re.compile(
+    r"^(?P<day>\d{4}-\d{2}-\d{2})"
+    r"(?:[T ](?P<hour>\d{1,2}):(?P<minute>\d{2})(?::\d{2}(?:\.\d+)?)?"
+    r"(?P<tz>Z|[+-]\d{2}:?\d{2})?)?$"
+)
+
+
+def _local_due(match: re.Match[str]) -> tuple[date, time]:
+    """Day and time of a value that carries a UTC offset, on the owner's clock."""
+    text = f"{match.group('day')}T{int(match.group('hour')):02d}:{match.group('minute')}"
+    offset = match.group("tz")
+    if offset != "Z" and ":" not in offset:
+        offset = f"{offset[:3]}:{offset[3:]}"
+    moment = datetime.fromisoformat(text + ("+00:00" if offset == "Z" else offset))
+    local = moment.astimezone(settings.tz)
+    return local.date(), local.time().replace(second=0, microsecond=0)
+
+
+def parse_iso_due(value: str | None) -> tuple[date | None, time | None]:
+    """A promise or task deadline: ``YYYY-MM-DD`` or ``YYYY-MM-DDTHH:MM``.
+
+    The day and the time of day come apart into ``due_date`` and
+    ``due_time``. Tolerant like `_parse_iso_date`: a bad date drops the
+    deadline, a bad time keeps the day — neither fails the batch. Midnight is
+    read as no time: it is what a date-only value looks like once a datetime
+    library has touched it, and a deadline the owner gave "at 00:00" is far
+    rarer than that.
+    """
+    if not value:
+        return None, None
+    text = value.strip()
+    if text.lower() in {"null", "none", "unknown", ""}:
+        return None, None
+    match = _ISO_DUE.match(text)
+    if match is None:
+        day = _parse_iso_date(text)
+        if day is not None and len(text) > 10:
+            # Never drop a time silently: the day is kept, the rest is logged.
+            log.warning("due time dropped from extraction: %r", value)
+        return day, None
+    try:
+        day = date.fromisoformat(match.group("day"))
+    except ValueError:
+        log.warning("unparseable due_date from extraction: %r", value)
+        return None, None
+    if match.group("hour") is None:
+        return day, None
+    try:
+        if match.group("tz") is not None:
+            day, at = _local_due(match)
+        else:
+            at = time(int(match.group("hour")), int(match.group("minute")))
+    except ValueError:
+        log.warning("unparseable due time from extraction: %r", value)
+        return day, None
+    return day, (at if at != time(0, 0) else None)
 
 
 def to_money(value: float | int | str) -> Decimal | None:
@@ -144,7 +212,12 @@ class ExtractedPromise(BaseModel):
 
     @property
     def due(self) -> date | None:
-        return _parse_iso_date(self.due_date)
+        return parse_iso_due(self.due_date)[0]
+
+    @property
+    def due_time(self) -> time | None:
+        """The time of day the deadline names, or None (JV-03)."""
+        return parse_iso_due(self.due_date)[1]
 
 
 class ExtractedTransaction(BaseModel):
@@ -186,7 +259,12 @@ class ExtractedTask(BaseModel):
 
     @property
     def due(self) -> date | None:
-        return _parse_iso_date(self.due_date)
+        return parse_iso_due(self.due_date)[0]
+
+    @property
+    def due_time(self) -> time | None:
+        """The time of day the deadline names, or None (JV-03)."""
+        return parse_iso_due(self.due_date)[1]
 
 
 class ExtractedFulfilment(BaseModel):

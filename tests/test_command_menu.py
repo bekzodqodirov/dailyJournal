@@ -31,3 +31,21 @@ def test_menu_entries_are_valid_for_telegram():
     for name, description in replies.COMMAND_MENU:
         assert re.fullmatch(r"[a-z0-9_]{1,32}", name), name
         assert 1 <= len(description) <= 256, name
+
+
+def test_jarvis_is_in_the_menu_and_the_help():
+    # JV-11: /jarvis (status, toxtat, yoq [kanal], tarix).
+    assert "jarvis" in _commands()
+    assert "jarvis" in {name for name, _ in replies.COMMAND_MENU}
+    assert "/jarvis" in replies.HELP
+    for word in ("toxtat", "yoq [kanal]", "tarix"):
+        assert word in replies.HELP, word
+
+
+def test_personal_and_group_commands_are_in_the_menu_and_the_help():
+    # JV-12: /shaxsiy, /shaxsiylar and /guruhai.
+    menu = {name for name, _ in replies.COMMAND_MENU}
+    for command in ("shaxsiy", "shaxsiylar", "guruhai"):
+        assert command in _commands(), command
+        assert command in menu, command
+        assert f"/{command} " in replies.HELP, command

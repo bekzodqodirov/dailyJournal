@@ -19,6 +19,7 @@ from rapidfuzz import fuzz
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
+from miya.db.enums import Direction
 from miya.db.models import Person
 from miya.services import codes
 from miya.services.text import fold_apostrophes, to_latin
@@ -639,6 +640,54 @@ async def find_by_phone(session: AsyncSession, phone: str) -> Person | None:
     )
 
 
+# --- the addresses a person is reached at (JV-12) ----------------------------------
+
+# A WhatsApp user's jid is their international number at this domain.
+WHATSAPP_USER_DOMAIN = "@s.whatsapp.net"
+# A private Telegram chat the person wrote in, looked up only for a person with
+# no telegram_id (an imported history): enough for every real case.
+PRIVATE_CHATS_MAX = 5
+
+
+def whatsapp_jid(phone: str | None) -> str | None:
+    """The jid of a number written with its country code (11-15 digits).
+
+    A shorter number has no country code, and a country is never guessed.
+    """
+    digits = re.sub(r"\D", "", phone or "")
+    return f"{digits}{WHATSAPP_USER_DOMAIN}" if 11 <= len(digits) <= 15 else None
+
+
+async def known_addresses(session: AsyncSession, person: Person) -> list[str]:
+    """Every channel-qualified address this person is known at, for a
+    reply rule's snapshot (docs/jarvis-plan.md §4.2): ``tg:<user id>`` (a
+    Telegram private chat has the user's id), ``wa:<jid>`` from a phone with
+    its country code. Forgetting or merging the person later keeps them.
+    """
+    from miya.db import models as m
+
+    found: list[str] = []
+    if person.telegram_id is not None:
+        found.append(f"tg:{int(person.telegram_id)}")
+    else:
+        chats = await session.scalars(
+            sa.select(m.Interaction.tg_chat_id)
+            .where(
+                m.Interaction.person_id == person.id,
+                m.Interaction.tg_chat_id > 0,
+                m.Interaction.direction == Direction.in_,
+            )
+            .group_by(m.Interaction.tg_chat_id)
+            .order_by(sa.func.max(m.Interaction.occurred_at).desc())
+            .limit(PRIVATE_CHATS_MAX)
+        )
+        found += [f"tg:{int(chat_id)}" for chat_id in chats if chat_id is not None]
+    jid = whatsapp_jid(person.phone)
+    if jid is not None:
+        found.append(f"wa:{jid}")
+    return list(dict.fromkeys(found))
+
+
 # --- merging two people (WP-77) ----------------------------------------------------
 
 
@@ -661,10 +710,111 @@ def _fk_columns():
         ("windows", m.ConversationWindow, m.ConversationWindow.person_id),
         ("memories", m.Memory, m.Memory.person_id),
         ("claims", m.Claim, m.Claim.person_id),
+        ("receipts", m.Receipt, m.Receipt.person_id),
         ("codes", m.ClientCode, m.ClientCode.person_id),
         ("passages", m.Passage, m.Passage.speaker_person_id),
         ("passages_chat", m.Passage, m.Passage.chat_person_id),
+        # The Jarvis rows (JV-11): only the person link moves; an outbox
+        # row's state is never touched here (outbox.py alone changes it).
+        ("outbox", m.OutboxMessage, m.OutboxMessage.person_id),
+        ("escalations", m.Escalation, m.Escalation.person_id),
+        ("chat_state", m.JarvisChatState, m.JarvisChatState.person_id),
+        ("reply_rules", m.ReplyRule, m.ReplyRule.person_id),
     )
+
+
+# The stricter of two reply rules wins a merge: never, then draft, then auto.
+RULE_STRICTNESS = {"never": 0, "draft": 1, "auto": 2}
+
+
+async def _merge_reply_rules(
+    session: AsyncSession, source: Person, target: Person, *, by: str
+) -> None:
+    """A person holds at most one active reply rule
+    (``ux_reply_rules_active_person``). When both sides of a merge hold one,
+    the stricter stays the person's. The other one keeps guarding what it
+    names itself: a rule with its own chat or address snapshot stays active
+    and only loses the person link (as ``/unut`` does), so no later purge of
+    the merged person can reopen that chat; a rule that names only the
+    person is revoked."""
+    from miya.db import models as m
+
+    active = {
+        rule.person_id: rule
+        for rule in await session.scalars(
+            sa.select(m.ReplyRule).where(
+                m.ReplyRule.person_id.in_([source.id, target.id]),
+                m.ReplyRule.state == "active",
+            )
+        )
+    }
+    kept, other = active.get(target.id), active.get(source.id)
+    if kept is None or other is None:
+        return
+    if RULE_STRICTNESS.get(other.mode, 0) < RULE_STRICTNESS.get(kept.mode, 0):
+        kept, other = other, kept
+    entry = {"at": datetime.now(settings.tz).isoformat(), "by": by[:16], "code": "merged"}
+    if other.chat_key or other.address:
+        # One UPDATE: the person link goes, the snapshot stays active.
+        values: dict[str, object] = {
+            "person_id": None,
+            "history": [
+                *(other.history or []),
+                {**entry, "field": "person_id", "old": other.person_id, "new": None},
+            ],
+        }
+    else:
+        # One UPDATE: the rule's state, with its history entry.
+        values = {
+            "state": "revoked",
+            "history": [
+                *(other.history or []),
+                {**entry, "field": "state", "old": "active", "new": "revoked"},
+            ],
+        }
+    await session.execute(
+        sa.update(m.ReplyRule).where(m.ReplyRule.id == other.id).values(values)
+    )
+    await session.flush()
+
+
+async def _merge_style_tone(
+    session: AsyncSession, source: Person, target: Person
+) -> None:
+    """``owner_style_people`` (JV-14) is keyed by the person, so it is not
+    in ``_fk_columns``: the source's row goes, and the target's tone is
+    recomputed from the merged history. miya.jarvis is loaded only when the
+    style was ever learned for either of them (rule 20), and a failure there
+    is logged and never stops the merge (rule 25): the next profile build
+    writes the tone again."""
+    from miya.db import models as m
+
+    try:
+        async with session.begin_nested():
+            held = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(m.OwnerStylePerson)
+                .where(m.OwnerStylePerson.person_id.in_([source.id, target.id]))
+            )
+            if not held:
+                return
+            await session.execute(
+                sa.delete(m.OwnerStylePerson).where(
+                    m.OwnerStylePerson.person_id == source.id
+                )
+            )
+            from miya.jarvis import style
+
+            await style.refresh_person(session, target.id)
+    except Exception as exc:
+        log.error(
+            "style tone not recomputed after a merge",
+            extra={
+                "source_id": source.id,
+                "target_id": target.id,
+                "error": type(exc).__name__,
+            },
+        )
 
 
 async def merge_plan(session: AsyncSession, source: Person, target: Person) -> dict:
@@ -721,10 +871,12 @@ async def merge_into(
                 m.ClientCode.person_id == source.id, m.ClientCode.code.in_(target_codes)
             )
         )
+    await _merge_reply_rules(session, source, target, by=by)
     for _key, model, column in _fk_columns():
         await session.execute(
             sa.update(model).where(column == source.id).values({column.key: target.id})
         )
+    await _merge_style_tone(session, source, target)
 
     # Identity fields only where the target has none; the source's unique
     # telegram_id is cleared first.

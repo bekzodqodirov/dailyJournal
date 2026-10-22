@@ -41,6 +41,7 @@ from miya.db.models import (
     Transaction,
 )
 from miya.db.session import SessionLocal, engine, get_session
+from miya.logs import setup_logging
 from miya.services import (
     call_recordings,
     health,
@@ -60,10 +61,7 @@ log = logging.getLogger(__name__)
 
 
 def configure_logging() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("api")
 
 
 def assert_startup_config() -> None:
@@ -98,10 +96,9 @@ async def _record_start() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    # Served by `python -m miya.api` this only replaces the same handler;
+    # served some other way it is the first configuration.
+    setup_logging("api")
     log.info("MIYA API starting (tz=%s, version=%s)", settings.timezone, __version__)
     await _record_start()
     yield
@@ -364,6 +361,9 @@ async def list_promises(
                 "made_by": promise.made_by.value,
                 "description": promise.description,
                 "due_date": promise.due_date.isoformat() if promise.due_date else None,
+                "due_time": (
+                    promise.due_time.strftime("%H:%M") if promise.due_time else None
+                ),
             }
             for promise, person in items
         ]
@@ -465,7 +465,11 @@ class AskRequest(BaseModel):
 
 @api.post("/ask", tags=["intelligence"])
 async def ask(body: AskRequest, session: SessionDep) -> dict[str, str]:
-    """Same RAG path as the bot: figures come from SQL tools, never invented."""
+    """Same RAG path as the bot: figures come from SQL tools, never invented.
+
+    Read-only, always: ``rag.answer`` never offers the act tools of the bot's
+    command mode (JV-20, rule 16), so «… yozib yubor» here is answered as a
+    question and nothing is proposed, stored or sent."""
     answer = await rag.answer(session, body.question)
     await session.commit()  # usage_log rows from the tool loop
     return {"answer": answer}

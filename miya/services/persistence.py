@@ -618,6 +618,7 @@ async def write_promise(
         person_id=person.id,
         description=item.description.strip(),
         due_date=item.due,
+        due_time=item.due_time,
         source_interaction_id=interaction.id,
     )
     session.add(promise)
@@ -922,6 +923,7 @@ async def apply_extraction(
         task = Task(
             description=item.description.strip(),
             due_date=item.due,
+            due_time=item.due_time,
             priority=TaskPriority(item.priority),
             source_interaction_id=interaction.id,
         )

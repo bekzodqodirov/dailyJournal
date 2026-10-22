@@ -1,4 +1,4 @@
-# Owner decisions (2026-09-15, updated 2026-09-25)
+# Owner decisions (2026-09-15, updated 2026-09-25 and 2026-10-20)
 
 The 2026-09-25 answers replace earlier ones where they differ; see docs/handoff-plan.md §1.5.
 Lines marked 'Design default' are implementation choices, not the owner's words.
@@ -72,6 +72,55 @@ owner's words may not be contradicted.
 - Context (not the owner's words): the code, e.g. GS367, is printed on carton stickers next to
   a waybill number such as YW26-004715. Design default (handoff-plan §5 Q39): a code is exact
   and never fuzzy-matched.
+
+## Jarvis: replies in the owner's name (2026-10-20, docs/jarvis-plan.md)
+- Owner's words (2026-10-20), on autonomy: «Promptdagidek» — as the Jarvis spec says: greetings,
+  asking how to help, gathering the shipment details and general questions are answered by MIYA;
+  a price, a discount, payment terms, a deadline, a promise or a guarantee is never answered by
+  it: a polite stall goes to the client and the owner is alerted at once.
+- Owner's words (2026-10-20), on who MIYA may write to: «hammaga yoza olsin faqat men belgilagan
+  chatlarga yozmasin shaxsiy chatlarga» — MIYA may write to everyone, except the personal chats
+  the owner marks.
+- Owner's words (2026-10-20), on channels — Telegram, WhatsApp, Gmail, Google Sheets: «hammasida
+  yozsin legin apk fillarni ochmasin va spammlardan ehtiyot bolsin» — write on all of them, but
+  never open APK files, and beware of spam.
+- Owner's words (2026-10-20), on risk: «Ehtiyot bo'lib boramiz» — we go carefully.
+- Design default (change if the owner disagrees — docs/jarvis-plan.md §6): everything starts
+  switched off (`JARVIS_ENABLED=false`); once on, Jarvis first only stores what it would have
+  written (`shadow`), then every reply is a card the owner approves (`draft`, the ceiling
+  `JARVIS_MODE=draft`), with daily caps; a kind of reply becomes automatic only after the
+  graduation numbers and the owner's own «Ha», and never for money, deadlines or promises.
+  Groups get no AI reply unless the owner enables one; MIYA never writes first and never denies
+  being an AI.
+- Implemented in JV-11: every message MIYA may send is a row in `outbox_messages` that only
+  `miya/jarvis/outbox.py` changes, and every send re-runs the whole gate when it is claimed (the
+  kill switches, `/jarvis toxtat`, the personal-chat rules, the spam and file shield, the
+  red-line guard, the caps and the cost cap). The rest of MIYA never loads Jarvis and works the
+  same with it off.
+- Implemented in JV-12: `/shaxsiy Ism` (or a GS code, or a family group's title) marks a chat
+  personal at once and keeps every address the person is known at, so forgetting or merging the
+  person never reopens it; `/shaxsiylar` lists the personal chats and suggests likely family and
+  friends from the database, one tap each, and nothing is marked without the owner. Unmarking
+  asks first. Groups get no AI reply until `/guruhai` switches one on with a confirm tap, and
+  then only drafts for the owner's tap, only for messages addressed to the owner. A personal
+  rule outranks every other rule, mode and setting; Saved Messages, Telegram's service chat,
+  bots, channels, the owner's own names and WhatsApp broadcasts are never written to at all.
+
+## Dangerous files (owner rule 4, docs/jarvis-plan.md decision 4)
+- The owner's decision of 2026-10-20 (docs/jarvis-plan.md §8.1): MIYA never downloads,
+  opens or offers to fetch an APK, an executable, an installer or an archive, on any
+  channel, even from a known contact (such files often come from hijacked accounts); the
+  owner is warned once instead.
+- Implemented in JV-01: `miya/services/safety.py` classifies a file by its normalised name,
+  its double extensions and its MIME type before any download, and checks the bytes of an
+  allowed document before it is parsed. The blocklists are code constants; no setting can
+  loosen them, and the owner's «✅ O'qi» tap cannot fetch such a file either. Macro
+  documents are read as text only, with a note.
+- The one exception is MIYA's own phone app: MIYA Companion comes only from the MIYA bot,
+  with its signing-certificate SHA-256 printed under it (docs/ornatish.md, step 11).
+- Design default (change if the owner disagrees): the warning goes out within a minute, also
+  at night (silently then), and is never counted in QUESTION_BUDGET_PER_DAY; the owner's own
+  outgoing files and messages older than a week raise no warning.
 
 ## Delivery
 - Owner's words (2026-09-25): «telegramga jonatishi maqul» — everything is delivered to

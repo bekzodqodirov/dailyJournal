@@ -31,17 +31,25 @@ from miya.db.models import (
     DailyReport,
     Debt,
     DebtPayment,
+    Escalation,
     Event,
     Interaction,
+    JarvisChatState,
+    KnowledgeEntry,
     Memory,
+    OutboxMessage,
+    OwnerStyleExample,
+    OwnerStyleProfile,
     Passage,
     Person,
     Promise,
     RecapDigest,
+    Receipt,
+    ReplyRule,
     Task,
     Transaction,
 )
-from miya.services import call_recordings, claims, windows
+from miya.services import call_recordings, claims, sheets_sync, windows
 from miya.services.people import best_match
 from miya.services.queries import day_bounds
 from miya.services.text import (
@@ -85,6 +93,9 @@ class PurgePlan:
     # kept payments, and other people's profiles that mention them.
     memory_ids: list[int] = field(default_factory=list)
     claim_ids: list[int] = field(default_factory=list)
+    # Receipts read from their images or naming them (JV-04): the printed
+    # names and cards go, and the reading mirrored on a kept message too.
+    receipt_ids: list[int] = field(default_factory=list)
     rerender_window_ids: list[int] = field(default_factory=list)
     scrub_transaction_ids: list[int] = field(default_factory=list)
     profile_stale_person_ids: list[int] = field(default_factory=list)
@@ -94,6 +105,15 @@ class PurgePlan:
     # WP-72: stored recaps of the affected days, and AI digests about them.
     report_days: list[date] = field(default_factory=list)
     digest_ids: list[int] = field(default_factory=list)
+    # The Jarvis rows (JV-11): drafts and sent texts, escalations and the
+    # chat bookkeeping go. Reply rules that carry a chat or an address stay
+    # (only the person link and the note go), so forgetting a person never
+    # reopens their personal chat; a rule that names only the person goes.
+    outbox_ids: list[int] = field(default_factory=list)
+    escalation_ids: list[int] = field(default_factory=list)
+    chat_state_keys: list[str] = field(default_factory=list)
+    rule_ids_dropped: list[int] = field(default_factory=list)
+    rule_ids_kept: list[int] = field(default_factory=list)
 
     def is_empty(self) -> bool:
         if self.kind == "person":
@@ -104,6 +124,11 @@ class PurgePlan:
             and not self.memory_ids
             and not self.digest_ids
             and not self.counts.get("reports")
+            and not self.outbox_ids
+            and not self.escalation_ids
+            and not self.chat_state_keys
+            and not self.rule_ids_dropped
+            and not self.rule_ids_kept
         )
 
 
@@ -140,6 +165,29 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
         "events": await _count(session, Event, Event.source_interaction_id, ids),
         "tasks": await _count(session, Task, Task.source_interaction_id, ids),
         "memories": await _count(session, Memory, Memory.source_interaction_id, ids),
+        "receipts": await _count(session, Receipt, Receipt.interaction_id, ids),
+        # The owner's style examples (JV-14) hang off the reply and the client
+        # message it answers; either one purged takes the example.
+        "style_examples": (
+            await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(OwnerStyleExample)
+                .where(
+                    sa.or_(
+                        OwnerStyleExample.interaction_id.in_(ids),
+                        OwnerStyleExample.context_interaction_id.in_(ids),
+                    )
+                )
+            )
+            or 0
+        )
+        if ids
+        else 0,
+        # A knowledge-base entry mined from the owner's answer (JV-15) goes
+        # with that answer, suggested or approved.
+        "knowledge_entries": await _count(
+            session, KnowledgeEntry, KnowledgeEntry.source_interaction_id, ids
+        ),
     }
 
     if ids:
@@ -167,7 +215,103 @@ async def _collect(session: AsyncSession, plan: PurgePlan) -> PurgePlan:
         )
         plan.window_ids = [w for w in window_ids if w]
     await _collect_recaps(session, plan)
+    await _collect_jarvis(session, plan)
     return plan
+
+
+def _tg_chat_key(tg_chat_id: int) -> str:
+    """``chatkey.telegram`` spelled here: core MIYA never imports miya.jarvis."""
+    return f"tg:{int(tg_chat_id)}"
+
+
+async def _collect_jarvis(session: AsyncSession, plan: PurgePlan) -> None:
+    """The Jarvis rows a purge takes (JV-11). Rows that hang off a purged
+    message cascade anyway; these are the ones that would outlive it."""
+    ids = plan.interaction_ids
+    keys: set[str] = set()
+    if plan.kind == "chat" and plan.tg_chat_id is not None:
+        keys.add(_tg_chat_key(plan.tg_chat_id))
+    if plan.kind == "person" and plan.person_id is not None:
+        # Their private chats: a draft there quotes them even when the
+        # outbox row has no person link.
+        private = await session.scalars(
+            sa.select(Interaction.tg_chat_id)
+            .where(
+                Interaction.person_id == plan.person_id,
+                Interaction.tg_chat_id > 0,
+            )
+            .distinct()
+        )
+        keys |= {_tg_chat_key(chat_id) for chat_id in private if chat_id is not None}
+
+    outbox_where = []
+    escalation_where = []
+    if ids:
+        outbox_where += [
+            OutboxMessage.trigger_interaction_id.in_(ids),
+            OutboxMessage.command_interaction_id.in_(ids),
+            OutboxMessage.sent_interaction_id.in_(ids),
+        ]
+        escalation_where.append(Escalation.interaction_id.in_(ids))
+    if keys:
+        outbox_where.append(OutboxMessage.chat_key.in_(keys))
+        escalation_where.append(Escalation.chat_key.in_(keys))
+    if plan.kind == "person" and plan.person_id is not None:
+        outbox_where.append(OutboxMessage.person_id == plan.person_id)
+        escalation_where.append(Escalation.person_id == plan.person_id)
+    if plan.kind == "range" and plan.date_from and plan.date_to:
+        start, _ = day_bounds(plan.date_from)
+        _, end = day_bounds(plan.date_to)
+        outbox_where.append(
+            sa.and_(OutboxMessage.created_at >= start, OutboxMessage.created_at < end)
+        )
+        escalation_where.append(
+            sa.and_(Escalation.created_at >= start, Escalation.created_at < end)
+        )
+    plan.outbox_ids = (
+        sorted(
+            await session.scalars(
+                sa.select(OutboxMessage.id).where(sa.or_(*outbox_where))
+            )
+        )
+        if outbox_where
+        else []
+    )
+    plan.escalation_ids = (
+        sorted(
+            await session.scalars(
+                sa.select(Escalation.id).where(sa.or_(*escalation_where))
+            )
+        )
+        if escalation_where
+        else []
+    )
+    state_where = []
+    if keys:
+        state_where.append(JarvisChatState.chat_key.in_(keys))
+    if plan.kind == "person" and plan.person_id is not None:
+        state_where.append(JarvisChatState.person_id == plan.person_id)
+    plan.chat_state_keys = (
+        sorted(
+            await session.scalars(
+                sa.select(JarvisChatState.chat_key).where(sa.or_(*state_where))
+            )
+        )
+        if state_where
+        else []
+    )
+    if plan.kind == "person" and plan.person_id is not None:
+        for rule_id, chat_key, address in await session.execute(
+            sa.select(ReplyRule.id, ReplyRule.chat_key, ReplyRule.address).where(
+                ReplyRule.person_id == plan.person_id
+            )
+        ):
+            if chat_key or address:
+                plan.rule_ids_kept.append(rule_id)
+            else:
+                plan.rule_ids_dropped.append(rule_id)
+    plan.counts["outbox"] = len(plan.outbox_ids)
+    plan.counts["escalations"] = len(plan.escalation_ids)
 
 
 async def _collect_recaps(session: AsyncSession, plan: PurgePlan) -> None:
@@ -285,6 +429,30 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
             claim_ids.append(claim.id)
     plan.claim_ids = sorted(claim_ids)
 
+    # (c2) receipts: from their messages, sent by them, or with their name
+    # printed on them as payer or payee.
+    receipt_ids = set(
+        await session.scalars(sa.select(Receipt.id).where(Receipt.person_id == person.id))
+    )
+    if ids:
+        receipt_ids |= set(
+            await session.scalars(
+                sa.select(Receipt.id).where(Receipt.interaction_id.in_(ids))
+            )
+        )
+    if pattern is not None:
+        for receipt_id, payer, payee in await session.execute(
+            sa.select(Receipt.id, Receipt.payer_name, Receipt.payee_name).where(
+                sa.or_(Receipt.payer_name.isnot(None), Receipt.payee_name.isnot(None))
+            )
+        ):
+            if any(
+                pattern.search(normalise_for_search(name or ""))
+                for name in (payer, payee)
+            ):
+                receipt_ids.add(receipt_id)
+    plan.receipt_ids = sorted(receipt_ids)
+
     # (d) windows: a window of their own goes; a group window loses their
     # lines and is re-rendered from the rest.
     person_windows = set(
@@ -358,6 +526,7 @@ async def plan_person(session: AsyncSession, person: Person) -> PurgePlan:
 
     plan.counts["memories"] = len(plan.memory_ids)
     plan.counts["claims"] = len(plan.claim_ids)
+    plan.counts["receipts"] = len(plan.receipt_ids)
     plan.counts["group_lines"] = group_lines
     # Debts and promises hang off the person too, not only off an interaction.
     plan.counts["debts"] = (
@@ -497,8 +666,11 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         )
     if plan.claim_ids:
         await session.execute(sa.delete(Claim).where(Claim.id.in_(plan.claim_ids)))
+    if plan.receipt_ids:
+        await _forget_receipts(session, plan)
     if plan.memory_ids:
         await session.execute(sa.delete(Memory).where(Memory.id.in_(plan.memory_ids)))
+    await _forget_jarvis(session, plan)
     if plan.interaction_ids:
         # Cascades take the derived rows (debts, promises, memories, …).
         await session.execute(
@@ -535,6 +707,9 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
         result.person_deleted = True
 
     await session.flush()
+    # The Sheets mirror (JV-07) clears the rows of what is gone on its next
+    # sync; never a reason for the purge itself to fail.
+    await sheets_sync.tombstone_missing(session)
     result.files_deleted = _unlink(plan.files)
     log.warning(
         "purged %s %r: %d interactions, %d files",
@@ -546,10 +721,84 @@ async def execute(session: AsyncSession, plan: PurgePlan) -> PurgeResult:
     return result
 
 
+async def _forget_jarvis(session: AsyncSession, plan: PurgePlan) -> None:
+    """Drafts, sent texts, escalations and chat bookkeeping go; a reply rule
+    keeps its chat or address snapshot and loses only the person and the
+    note, so a forgotten person's personal chat stays personal (JV-11)."""
+    if plan.outbox_ids:
+        await session.execute(
+            sa.delete(OutboxMessage).where(OutboxMessage.id.in_(plan.outbox_ids))
+        )
+    if plan.escalation_ids:
+        await session.execute(
+            sa.delete(Escalation).where(Escalation.id.in_(plan.escalation_ids))
+        )
+    if plan.chat_state_keys:
+        await session.execute(
+            sa.delete(JarvisChatState).where(
+                JarvisChatState.chat_key.in_(plan.chat_state_keys)
+            )
+        )
+    if plan.rule_ids_dropped:
+        await session.execute(
+            sa.delete(ReplyRule).where(ReplyRule.id.in_(plan.rule_ids_dropped))
+        )
+    if plan.rule_ids_kept:
+        await session.execute(
+            sa.update(ReplyRule)
+            .where(ReplyRule.id.in_(plan.rule_ids_kept))
+            .values(person_id=None, note=None)
+        )
+
+
+async def _forget_receipts(session: AsyncSession, plan: PurgePlan) -> None:
+    """Receipts go, and so does the reading mirrored on a message that stays
+    (``meta.receipt``): it carries the same printed names and cards."""
+    kept = sorted(
+        set(
+            await session.scalars(
+                sa.select(Receipt.interaction_id).where(Receipt.id.in_(plan.receipt_ids))
+            )
+        )
+        - set(plan.interaction_ids)
+    )
+    await session.execute(sa.delete(Receipt).where(Receipt.id.in_(plan.receipt_ids)))
+    for interaction in await session.scalars(
+        sa.select(Interaction).where(Interaction.id.in_(kept))
+    ):
+        meta = dict(interaction.meta or {})
+        if meta.pop("receipt", None) is not None:
+            interaction.meta = meta
+
+
 def _redact(pattern, text: str | None) -> str | None:
     if pattern is None or not text:
         return text
     return pattern.sub(REDACTED, text)
+
+
+async def _forget_in_knowledge_base(session: AsyncSession, pattern, person_id) -> None:
+    """Strike a forgotten person's names from the knowledge base (JV-15).
+    miya.jarvis is loaded only when the base holds an entry (rule 20);
+    retired entries are struck too. A failure there is logged and never
+    stops the purge (rule 25)."""
+    try:
+        async with session.begin_nested():
+            held = await session.scalar(
+                sa.select(sa.func.count()).select_from(KnowledgeEntry)
+            )
+            if not held:
+                return
+            from miya.jarvis import kb
+
+            await kb.forget_names(
+                session, pattern, now=datetime.now(settings.tz), mark=REDACTED
+            )
+    except Exception as exc:
+        log.error(
+            "knowledge entries not scrubbed after a purge",
+            extra={"person_id": person_id, "error": type(exc).__name__},
+        )
 
 
 async def _forget_person(session: AsyncSession, plan: PurgePlan) -> None:
@@ -578,6 +827,31 @@ async def _forget_person(session: AsyncSession, plan: PurgePlan) -> None:
             .where(Person.id.in_(plan.profile_stale_person_ids))
             .values(profile_updated_at=None)
         )
+    # The owner's style guides (JV-14) are written name-free, but a guide is
+    # model prose: the forgotten person's names are struck from it too, and a
+    # frequent phrase that names them (one built before they were known) is
+    # dropped from the traits. Their examples went with their messages; their
+    # tone goes with the person.
+    if pattern is not None:
+        for profile in await session.scalars(sa.select(OwnerStyleProfile)):
+            redacted = _redact(pattern, profile.prompt_text)
+            if redacted != profile.prompt_text:
+                profile.prompt_text = redacted or ""
+            traits = dict(profile.traits or {})
+            rows = traits.get("phrases") or []
+            kept = [
+                row
+                for row in rows
+                if not (row and isinstance(row[0], str) and pattern.search(row[0]))
+            ]
+            if len(kept) != len(rows):
+                traits["phrases"] = kept
+                profile.traits = traits
+    # A knowledge-base entry (JV-15) never names a client: one that names the
+    # forgotten person anyway (written before they were known) has the name
+    # struck and is retired, so it is never quoted again.
+    if pattern is not None:
+        await _forget_in_knowledge_base(session, pattern, plan.person_id)
     # Deleting the person cascades to their debts and promises, including
     # ones that came from a call the owner is otherwise keeping.
     await session.execute(sa.delete(Person).where(Person.id == plan.person_id))

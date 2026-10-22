@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
 import sqlalchemy as sa
@@ -48,8 +48,8 @@ from miya.db.models import (
     Task,
     Transaction,
 )
+from miya.services import amounts, people, when
 from miya.services import codes as client_codes
-from miya.services import people
 from miya.services.people import resolve_person
 
 Record = Debt | Promise | Task | Transaction
@@ -321,6 +321,8 @@ def _plain(value: object) -> str | None:
         return str(value.value)
     if isinstance(value, date):
         return value.isoformat()
+    if isinstance(value, time):
+        return value.strftime("%H:%M")
     if isinstance(value, Decimal):
         return f"{value:.2f}"  # the same text whether it came from SQL or a command
     return str(value)
@@ -655,11 +657,44 @@ async def set_field(
         record.person = person  # type: ignore[union-attr]
 
     else:  # due
-        old, new = _note(record, field, record.due_date, value, by, now)
-        record.due_date = value  # type: ignore[assignment]
+        day, at = split_due(value)
+        if isinstance(record, Debt):
+            if at is not None:
+                raise NotEditable(field)  # a debt's deadline is a day, never a time
+            old, new = _note(record, field, record.due_date, day, by, now)
+            record.due_date = day
+        else:
+            old, new = _set_due(record, day, at, by, now)
 
     await session.flush()
     return Change(kind, record, person_of(record), field, old, new)
+
+
+def split_due(value: object) -> tuple[date | None, time | None]:
+    """A parsed deadline as (day, time of day): what `parse_date` returns —
+    a date, a naive local datetime when a time was given, or None — apart."""
+    if value is None:
+        return None, None
+    if isinstance(value, datetime):
+        return value.date(), value.time().replace(second=0, microsecond=0)
+    if isinstance(value, date):
+        return value, None
+    raise NotEditable("due")
+
+
+def _set_due(
+    record: Promise | Task, day: date | None, at: time | None, by: str, now: datetime
+) -> tuple[str | None, str | None]:
+    """A promise's or task's deadline: the day as it always was, and the time
+    of day beside it (JV-03). The value given is the whole new deadline — a
+    day alone clears an old time — and a changed time is its own history
+    entry, so a correction from 14:00 to 16:00 on the same day is visible."""
+    old, new = _note(record, "due", record.due_date, day, by, now)
+    record.due_date = day
+    if record.due_time != at:
+        _note(record, "due_time", record.due_time, at, by, now)
+    record.due_time = at
+    return old, new
 
 
 async def _set_transaction_field(
@@ -706,7 +741,11 @@ async def _set_transaction_field(
         if not isinstance(value, date):
             raise NotEditable("due")  # a payment always happened on some day
         local = txn.occurred_at.astimezone(settings.tz)
-        moved = datetime.combine(value, local.timetz())
+        if isinstance(value, datetime):
+            # «sana kecha 14:00»: the day and the clock time the owner gave.
+            moved = value.replace(tzinfo=settings.tz)
+        else:
+            moved = datetime.combine(value, local.timetz())
         old, new = _note(txn, "due", txn.occurred_at, moved, by, now)
         txn.occurred_at = moved
         return old, new
@@ -877,49 +916,44 @@ def pending_person(record: Record, index: int) -> str | None:
 
 # --- parsing `/tuzat` arguments ----------------------------------------------
 
-_CURRENCY_WORDS = {
-    Currency.UZS: ("so'm", "so’m", "som", "sum", "uzs", "сум", "сўм"),
-    Currency.USD: ("$", "usd", "dollar", "dollor", "доллар", "долл"),
-    Currency.CNY: ("¥", "cny", "yuan", "юань"),
-    Currency.KRW: ("₩", "krw", "won", "von", "вон"),
-    Currency.RUB: ("₽", "rub", "rubl", "руб", "рубль", "ruble"),
-}
+# The words and symbols of each currency, and the scale words, come from the
+# one table every money reader shares (amounts.py, JV-13). Only currencies a
+# row can store are kept: «100 евро» is not an amount `/tuzat` can write.
+_STORABLE = {currency.value: currency for currency in Currency}
 _CURRENCY_OF = {
-    word: currency for currency, words in _CURRENCY_WORDS.items() for word in words
+    word: _STORABLE[code]
+    for word, code in amounts.CURRENCY_WORDS.items()
+    if code in _STORABLE
 }
 
-_SCALE = {
-    "mln": 1_000_000,
-    "million": 1_000_000,
-    "млн": 1_000_000,
-    "ming": 1_000,
-    "k": 1_000,
-    "тыс": 1_000,
-}
+_SCALE = amounts.SCALE_WORDS
+_LEADS = "".join(
+    re.escape(word) for word in _CURRENCY_OF if word in amounts.CURRENCY_SYMBOLS
+)
+_SCALES = "|".join(sorted(map(re.escape, _SCALE), key=len, reverse=True))
 
 # The scale token must end the string or be followed by whitespace: "300k" is
 # 300 000, but "300 krw" is 300 won, not scale "k" plus a tail "rw".
 _AMOUNT = re.compile(
-    r"^(?P<lead>[$¥₩₽])?\s*(?P<number>\d+(?:[.,]\d+)?)\s*"
-    r"(?:(?P<scale>mln|million|млн|ming|k|тыс)(?=\s|$))?\s*(?P<tail>[^\d\s]+)?$",
+    rf"^(?P<lead>[{_LEADS}])?\s*(?P<number>\d+(?:[.,]\d+)?)\s*"
+    rf"(?:(?P<scale>{_SCALES})(?=\s|$))?\s*(?P<tail>[^\d\s]+)?$",
     re.IGNORECASE,
 )
 
 # The relative words the owner uses, and that the extractor resolves the
-# same way against CURRENT_DATE.
-_RELATIVE_DAYS = {"bugun": 0, "ertaga": 1, "indinga": 2, "kecha": -1}
-_WEEKDAYS = {
-    "dushanba": 0,
-    "seshanba": 1,
-    "chorshanba": 2,
-    "payshanba": 3,
-    "juma": 4,
-    "shanba": 5,
-    "yakshanba": 6,
-}
+# same way against CURRENT_DATE. One table with the phrase reader (JV-03).
+_RELATIVE_DAYS = when.RELATIVE_DAYS
+_WEEKDAYS = when.WEEKDAYS
 _IN_DAYS = re.compile(r"^(\d{1,3})\s*kun(?:dan keyin)?$", re.IGNORECASE)
 _IN_WEEKS = re.compile(r"^(\d{1,2})\s*hafta(?:dan keyin)?$", re.IGNORECASE)
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISO_DATE_TIME = re.compile(r"^(\d{4}-\d{2}-\d{2})[t ](\d{1,2}):(\d{2})$")
+# What may follow the day as its time of day: «14:00», «soat 3», «kechki 6»,
+# «soat 14 gacha». The reading itself is when.parse_time's.
+_TIME_TAIL = re.compile(
+    r"^(?:(?:ertalab|kunduzi|kechki|kechqurun|kechasi)\s+)?(?:soat\s*)?"
+    r"\d{1,2}(?:[:.]\d{2})?\s*(?:da|ga|gacha)?$"
+)
 
 # Optional field prefixes for when the bare value would be misread —
 # "/tuzat d12 kim Juma" is a person, "/tuzat d12 juma" is a date.
@@ -992,16 +1026,25 @@ def parse_date(text: str, *, today: date | None = None) -> date | None | bool:
 
     The whole value must be the date: "2026-09-20xyz" is not the 20th with
     junk, and the 8-digit form is a phone fragment more often than a date.
+    A time of day may follow the day — «ertaga 14:00», «juma soat 3»,
+    «2026-10-21 14:00» — and the value is then a naive local ``datetime``
+    (JV-03). A time with two readings («ertaga soat 7») is not a date.
     """
     today = today or datetime.now(settings.tz).date()
     lowered = text.strip().lower().replace("’", "'")
+    day = _parse_day(lowered, today)
+    if day is not False:
+        return day
+    return _parse_day_and_time(lowered, today)
+
+
+def _parse_day(lowered: str, today: date) -> date | None | bool:
     if lowered in CLEAR_DUE:
         return None
     if lowered in _RELATIVE_DAYS:
         return today + timedelta(days=_RELATIVE_DAYS[lowered])
     if lowered in _WEEKDAYS:
-        ahead = (_WEEKDAYS[lowered] - today.weekday()) % 7 or 7
-        return today + timedelta(days=ahead)
+        return when.next_weekday(today, _WEEKDAYS[lowered])
     if lowered in ("keyingi hafta", "bir hafta"):
         return today + timedelta(days=7)
     match = _IN_DAYS.match(lowered)
@@ -1016,6 +1059,37 @@ def parse_date(text: str, *, today: date | None = None) -> date | None | bool:
         return date.fromisoformat(lowered)
     except ValueError:
         return False
+
+
+def _parse_day_and_time(lowered: str, today: date) -> datetime | bool:
+    """«<day> <time of day>», or False. The day is any form `_parse_day`
+    reads except "clear"; the rest must be a time and nothing else."""
+    match = _ISO_DATE_TIME.match(lowered)
+    if match:
+        try:
+            day = date.fromisoformat(match.group(1))
+        except ValueError:
+            return False
+        # The clock is read as everywhere else: «3:00» is 15:00, «7:00» has
+        # two readings, «03:00» is 03:00.
+        at = when.parse_time(f"{match.group(2)}:{match.group(3)}")
+        if at is None:
+            return False
+        return datetime.combine(day, at)
+    tokens = lowered.split()
+    for cut in range(1, len(tokens)):
+        day = _parse_day(" ".join(tokens[:cut]), today)
+        if not isinstance(day, date):
+            continue
+        tail = " ".join(tokens[cut:])
+        if not _TIME_TAIL.match(tail):
+            continue
+        at = when.parse_time(tail)
+        if at is None or when.is_small_hours_of_a_night(tail, at):
+            # «bugun kechasi 2»: that day's small hours or the next night's.
+            continue
+        return datetime.combine(day, at)
+    return False
 
 
 def parse_amount(text: str) -> tuple[Decimal, Currency | None] | None:
@@ -1033,7 +1107,8 @@ def parse_amount(text: str) -> tuple[Decimal, Currency | None] | None:
             return None
         currency = found
     try:
-        amount = Decimal(number.replace(",", ".")) * _SCALE.get((scale or "").lower(), 1)
+        scaled = _SCALE.get((scale or "").lower(), Decimal(1))
+        amount = Decimal(number.replace(",", ".")) * scaled
     except InvalidOperation:
         return None
     amount = amount.quantize(Decimal("0.01"))

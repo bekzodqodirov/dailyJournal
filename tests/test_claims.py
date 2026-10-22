@@ -957,8 +957,13 @@ def test_the_claims_table_is_wiped_before_what_it_references():
         for line in py_inspect.getsource(conftest._truncate).splitlines()
         if line.strip().startswith("m.")
     ]
-    # The question log references nothing, so it may go first (WP-16).
-    assert order[:2] == ["m.QuestionLog,", "m.Claim,"]
+    # The question log references nothing, so it may go early (WP-16);
+    # receipts reference claims, so they go before them (JV-04); the Jarvis
+    # tables (JV-11) reference interactions and people, so they go first.
+    assert order.index("m.Receipt,") < order.index("m.Claim,")
+    assert order.index("m.QuestionLog,") < order.index("m.Claim,")
+    for jarvis in ("m.OutboxMessage,", "m.Escalation,", "m.JarvisChatState,"):
+        assert order.index(jarvis) < order.index("m.Interaction,")
     assert order.index("m.Claim,") < order.index("m.Interaction,")
     assert order.index("m.Claim,") < order.index("m.Person,")
 

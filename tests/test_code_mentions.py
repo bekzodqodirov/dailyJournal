@@ -12,7 +12,7 @@ from miya.db.enums import Direction, InteractionSource
 from miya.services import codes, ingest
 from miya.services import extraction as ex
 from miya.services.persistence import apply_extraction
-from miya.services.vision import VisionResult
+from miya.services.vision import VisionReading
 
 
 async def _note(session, text: str | None = "salom", **fields) -> m.Interaction:
@@ -72,10 +72,10 @@ async def test_a_vision_description_is_indexed_again(session, monkeypatch, tmp_p
     photo = await _note(session, None, media={"type": "photo"})
     await codes.index_interaction(session, photo)
 
-    async def describe(path):
-        return VisionResult(text="Stiker: GS367, YW26-004715", model="x")
+    async def describe(path, *, now=None):
+        return VisionReading(description="Stiker: GS367, YW26-004715", model="x")
 
-    monkeypatch.setattr(ingest, "describe_image", describe)
+    monkeypatch.setattr(ingest, "read_image", describe)
     await ingest.describe_into(session, photo, tmp_path / "x.jpg")
     await session.flush()
     assert photo.codes_indexed_at is None

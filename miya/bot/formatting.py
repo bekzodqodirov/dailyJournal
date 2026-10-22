@@ -7,7 +7,7 @@ place that decides how money, dates and names are rendered.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -161,6 +161,47 @@ def relative_day(value: date, *, today: date | None = None) -> str:
     if delta <= 7:
         return f"{delta} kundan keyin"
     return short_date(value)
+
+
+def due_label(day: date, at: time | None = None, *, today: date | None = None) -> str:
+    """A deadline: `relative_day` for a date-only one, and with its time for
+    a timed one (JV-03) — 'bugun 14:00', 'ertaga 14:00', 'dushanba 10:00'.
+
+    A timed deadline later this week is named by its weekday, one more than a
+    week away by its date; one more than a day overdue is just overdue, the
+    hour no longer matters.
+    """
+    if at is None:
+        return relative_day(day, today=today)
+    today = today or datetime.now(settings.tz).date()
+    delta = (day - today).days
+    hhmm = at.strftime("%H:%M")
+    if delta < -1:
+        return relative_day(day, today=today)
+    if -1 <= delta <= 2:
+        return f"{relative_day(day, today=today)} {hhmm}"
+    if delta <= 6:
+        return f"{WEEKDAYS_UZ[day.weekday()]} {hhmm}"
+    return f"{short_date(day)} {hhmm}"
+
+
+def record_due(record, *, today: date | None = None) -> str:
+    """A promise's or task's deadline as `due_label` reads it; the caller
+    checks that there is a due date at all."""
+    return due_label(record.due_date, getattr(record, "due_time", None), today=today)
+
+
+def short_due(day: date | None, at: time | None = None) -> str:
+    """The deadline in a confirmation: '21-okt' as always for a date-only one,
+    'ertaga 15:00' for a timed one, so the owner sees the time was heard."""
+    if day is None or at is None:
+        return short_date(day)
+    return due_label(day, at)
+
+
+def record_short_due(record) -> str:
+    """`short_due` of a promise or task row."""
+    return short_due(record.due_date, getattr(record, "due_time", None))
 
 
 def age_label(delta: timedelta) -> str:
@@ -409,12 +450,12 @@ def record_line(kind: str, record, person=None, *, markup: bool = True) -> str:
         return transaction_line(record, person, handle=handle, markup=markup)
     if kind == "promise":
         who = "Men" if record.made_by is PromiseMadeBy.me else "U"
-        due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+        due = f" · {record_due(record)}" if record.due_date else " · muddatsiz"
         return (
             f"🤝 {handle}{who} — {name}: {_text(record.description, markup)}{due}"
             f"{_PROMISE_STATUS.get(record.status, '')}"
         )
-    due = f" · {relative_day(record.due_date)}" if record.due_date else " · muddatsiz"
+    due = f" · {record_due(record)}" if record.due_date else " · muddatsiz"
     status = _TASK_STATUS.get(record.status, "")
     return f"✔️ {handle}{_text(record.description, markup)}{due}{status}"
 
@@ -562,7 +603,8 @@ def _claim_body(view: ClaimView, markup: bool) -> str:
         label = _TXN_LABEL.get(getattr(view, "txn_type", None) or "", "pul harakati")
         return f"{_claim_money(view)} {label}{detail}"
     if kind == "promise":
-        due = f" ({short_date(view.due)})" if view.due else ""
+        at = getattr(view, "due_time", None)
+        due = f" ({short_due(view.due, at)})" if view.due else ""
         return f"sen va'da bergansan — {quote(view.description, markup=markup)}{due}"
     # fulfilment: the counterparty says he did what he had promised
     return quote(view.description, markup=markup)
@@ -652,7 +694,10 @@ SOURCE_WORD = {
 
 # A DM line shown on its own (``/tarix`` with a direction, the RAG tool)
 # needs to say who said it; a note the owner typed into the bot does not.
+# MIYA's own automatic reply is outgoing too, but never the owner's line
+# (JV-10): it is MIYA's.
 _SPEAKER = {Direction.out: "sen", Direction.in_: "u"}
+SPEAKER_MIYA = "MIYA"
 
 TIMELINE_TEXT_LIMIT = 200
 TIMELINE_NO_TEXT = "[matn yo'q]"
@@ -673,8 +718,11 @@ def timeline_line(entry: TimelineEntry, *, markup: bool = True) -> str:
     if not body:
         body = TIMELINE_NO_TEXT
     speaker = ""
-    if entry.source is InteractionSource.telegram_userbot and entry.direction in _SPEAKER:
-        speaker = f"{_SPEAKER[entry.direction]}: "
+    if entry.source is InteractionSource.telegram_userbot:
+        if entry.by_miya:
+            speaker = f"{SPEAKER_MIYA}: "
+        elif entry.direction in _SPEAKER:
+            speaker = f"{_SPEAKER[entry.direction]}: "
     return f"{day_label(entry.when)} · {emoji} {word} · {speaker}{_text(body, markup)}"
 
 
@@ -715,7 +763,7 @@ def new_record_lines(new_debts, new_promises) -> list[str]:
     lines += [
         ("Men: " if p.made_by is PromiseMadeBy.me else "U: ")
         + f"{escape(person_label(p.person))} — {escape(p.description)}"
-        + (f" · {relative_day(p.due_date)}" if p.due_date else "")
+        + (f" · {record_due(p)}" if p.due_date else "")
         + tag("promise", p.id)
         for p in new_promises
     ]
@@ -740,3 +788,100 @@ WEEKDAYS_UZ = [
     "shanba",
     "yakshanba",
 ]
+
+
+# --- Jarvis in the 09:00 brief and the 20:00 recap (JV-22) ---------------------------
+#
+# Here, not in replies: the recap renderer imports only this module. Each
+# report has its own headline (the brief's «🤖 Jarvis (kecha)», the recap's
+# «🤖 Bugun Jarvis»); the lines under it are the same in both. The values are
+# miya.jarvis.status.DayReport's, read by attribute: nothing here imports
+# miya.jarvis (rule 20).
+
+# A reply's kind (intent) in the owner's words.
+JARVIS_INTENT_LABELS = {
+    "greeting": "salomlashish",
+    "info_gathering": "ma'lumot so'rash",
+    "general_question": "umumiy savol",
+    "stall": "kutib turish javobi",
+    "other": "boshqa",
+    "price": "narx",
+    "discount": "chegirma",
+    "payment_terms": "to'lov sharti",
+    "deadline": "muddat",
+    "promise": "va'da",
+    "guarantee": "kafolat",
+    "payment_claim": "to'lov",
+    "identity": "kimligi",
+    "complaint": "shikoyat",
+    "legal": "huquqiy",
+    "other_people": "boshqa odamlar",
+}
+
+JARVIS_DAY_COMMANDS = "📤 Buyrug'ingiz bilan yuborildi: {n} ta"
+JARVIS_DAY_UNKNOWN = "❓ {n} ta xabar yuborilganmi — aniq emas (/holat)"
+JARVIS_DAY_OBSERVED = "🧪 Kuzatuv rejimida {n} ta xabar sizga yo'naltirilardi"
+JARVIS_DAY_COST = "💸 Jarvis xarajati: {x} / {cap}"
+JARVIS_DAY_UNPRICED = " · narxi noma'lum: {n} ta chaqiruv"
+# The day's drafts per kind: how the owner treated them, and how many strayed
+# from the approved shapes (never sent on their own).
+JARVIS_DAY_QUALITY = "🧪 Qoralamalar sifati:"
+JARVIS_DAY_INTENT = "• {intent}: {n} ta qoralama"
+JARVIS_DAY_UNCHANGED = "{n} tasi o'zgartirilmasdan tasdiqlandi"
+JARVIS_DAY_EDITED = "{n} tasi tahrirlandi"
+JARVIS_DAY_STRAYED = "{n} tasi erkin gapli (o'zi yuborilmasdi)"
+
+
+def jarvis_intent_label(intent: str | None) -> str:
+    return JARVIS_INTENT_LABELS.get(intent or "other", intent or "boshqa")
+
+
+def _intent_quality_line(quality) -> str:
+    line = JARVIS_DAY_INTENT.format(
+        intent=escape(jarvis_intent_label(quality.intent)), n=quality.drafts
+    )
+    parts = [
+        template.format(n=count)
+        for template, count in (
+            (JARVIS_DAY_UNCHANGED, quality.unchanged),
+            (JARVIS_DAY_EDITED, quality.edited),
+            (JARVIS_DAY_STRAYED, quality.unapproved),
+        )
+        if count
+    ]
+    return f"{line} — {', '.join(parts)}" if parts else line
+
+
+def jarvis_day_lines(report, headline: str) -> list[str]:
+    """Jarvis's section of a report: ``headline`` filled with the replies
+    sent and the escalations, then the owner's commanded sends, the sends in
+    doubt, what observation mode would have escalated, the spend and a line
+    per intent. Empty for a report without Jarvis (None) or a quiet day."""
+    if report is None or report.is_empty():
+        return []
+    lines = [
+        headline.format(
+            y=report.sent,
+            a=report.auto,
+            t=report.approved,
+            e=report.escalations,
+            o=report.escalations_open,
+        )
+    ]
+    if report.commands:
+        lines.append(JARVIS_DAY_COMMANDS.format(n=report.commands))
+    if report.unknown:
+        lines.append(JARVIS_DAY_UNKNOWN.format(n=report.unknown))
+    if report.shadow_escalations:
+        lines.append(JARVIS_DAY_OBSERVED.format(n=report.shadow_escalations))
+    if report.cost_usd or report.cost_unpriced:
+        cost = JARVIS_DAY_COST.format(
+            x=usd(report.cost_usd), cap=usd(report.cost_cap_usd)
+        )
+        if report.cost_unpriced:
+            cost += JARVIS_DAY_UNPRICED.format(n=report.cost_unpriced)
+        lines.append(cost)
+    if report.quality:
+        lines.append(JARVIS_DAY_QUALITY)
+        lines += [_intent_quality_line(q) for q in report.quality]
+    return lines

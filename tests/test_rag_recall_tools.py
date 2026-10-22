@@ -120,7 +120,11 @@ def test_date_hints_for_friday_2026_09_25():
         "CURRENT_DATE: 2026-09-25 (juma), Asia/Tashkent\n"
         "bugun=2026-09-25; kecha=2026-09-24; o'tgan kuni=2026-09-23\n"
         "bu hafta=2026-09-21..2026-09-25; o'tgan hafta=2026-09-14..2026-09-20\n"
-        "bu oy=2026-09-01..2026-09-25; o'tgan oy=2026-08-01..2026-08-31"
+        "bu oy=2026-09-01..2026-09-25; o'tgan oy=2026-08-01..2026-08-31\n"
+        "day window: a date is [00:00, next day 00:00) Asia/Tashkent\n"
+        "dushanba=2026-09-21; seshanba=2026-09-22; chorshanba=2026-09-23; "
+        "payshanba=2026-09-24; juma=2026-09-25; shanba=2026-09-19; "
+        "yakshanba=2026-09-20"
     )
 
 

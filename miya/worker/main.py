@@ -3,12 +3,58 @@
 Jobs:
   * reminders    — hourly, on the hour; quiet-hours aware; escalates and then
                    asks "Hali ochiqmi?" (see services/reminders.py)
+  * timed_reminders — every 5 min; the ping PROMISE_REMIND_LEAD_MINUTES
+                   before a promise or task deadline that has a time of day
+                   (quiet-hours aware; JV-03)
   * call_scan    — every minute; ingests new call recordings (Phase 2)
   * retention    — daily at 04:15; deletes audio past AUDIO_RETENTION_DAYS
   * embed        — every 2 min; backfills bge-m3 vectors for new memories
   * daily_report — cron at REPORT_TIME; composes and sends the day's report
   * gcal_pull    — every GCAL_PULL_MINUTES; Google → events (when authed)
   * gcal_push    — every 5 min; extracted events → Google (when authed)
+  * sheets_sync  — every SHEETS_SYNC_SECONDS; the one-way Google Sheets mirror
+                   of promises, tasks, followed-up clients and receipts
+                   (JV-07); a no-op unless SHEETS_ENABLED and configured
+  * jarvis_outbox — every minute, only with JARVIS_ENABLED; expires stale
+                   drafts, reconciles claimed sends whose lease ran out and
+                   tells the owner once about a send in doubt (JV-11), and
+                   once about a draft card or escalation alert their own
+                   message or the client's edit took off the table (JV-17)
+  * jarvis_respond — every 15 s, only with JARVIS_ENABLED; the responder
+                   (JV-16): a client's private message, after the debounce and
+                   the owner-first window, gets a style-cloned draft or an
+                   escalation with a stall, stored as the mode says (shadow
+                   until the owner raises it); over the cost cap only stalls
+                   and escalations, and the owner is told once a day. In draft
+                   and auto mode a red-line message is escalated as soon as the
+                   debounce ends and its alert goes out in the same run (JV-18
+                   1a; only the stall waits for the owner-first window), and a
+                   new draft's card goes out the same way
+  * jarvis_cards — every minute, only with JARVIS_ENABLED; the owner's cards
+                   (JV-18): retries escalation alerts and draft cards that did
+                   not go out, alerts a snoozed escalation again once its hour
+                   is up (the snooze is a DB row, not a scheduler timer), folds
+                   alerts past JARVIS_ESCALATION_DAILY_CAP into one message,
+                   tells the owner once a day that the draft cap was reached,
+                   and expires escalations the snooze limit sent to the morning
+                   brief once a brief named them; silent in quiet hours
+  * style_refresh — every 10 min, only with JARVIS_ENABLED; builds the
+                   owner's style profile (JV-14) once a requested history
+                   import is read and tells the owner it is ready, and
+                   rebuilds it weekly when the owner's messages changed (a
+                   new version waits as a draft for the owner's tap)
+  * kb_mining    — hourly, only with JARVIS_ENABLED; embeds new knowledge-base
+                   entries, and once a week suggests entries from the
+                   owner's own answers to questions several clients asked
+                   (JV-15); a suggestion is never used before the owner's tap
+  * jarvis_rollout — daily at 10:17, only with JARVIS_ENABLED; the rollout
+                   controller (JV-23): reads the week's autonomous sends
+                   again with today's red-line guard and checks the cost cap
+                   (either demotes a reply kind back to draft), then offers
+                   each reply kind that met the graduation criteria with
+                   «✅ Ha, avtomatik» / «⏳ Yana kuzataylik»; only the
+                   owner's tap promotes. jarvis_outbox tells each autonomous
+                   send (silently, with «↩️ Bu xato edi») and each demotion
   * windows      — every 5 min; flushes userbot conversation windows (Phase 4)
                    and extracts the ``instant`` ones (private chats, group
                    messages aimed at the owner) on the spot, receipt included
@@ -28,6 +74,20 @@ Jobs:
   * money_notices — every minute; a receipt with ✏️ Tuzat / 🗑 O'chir per
                    payment the phone booked, folded for bursts, one summary
                    for a first import (quiet-hours aware; WP-15)
+  * safety_notices — every minute; one warning per dangerous file someone
+                   sent into a chat, one note per macro document read as
+                   text (JV-01), one scam or possible-hijack warning per
+                   chat per day (JV-09); silent in quiet hours, never
+                   counted in the question budget
+  * receipt_notices — every minute; the receipt card for each payment
+                   receipt someone sent into a chat, once (notified_at;
+                   JV-04); held in quiet hours unless receipts are set to
+                   arrive silently, never counted in the question budget
+  * receipt_check — every minute; the bank cross-check of receipts read
+                   from images (JV-05): confirmed by a bank income near the
+                   printed time, else after RECEIPT_BANK_WAIT_MINUTES
+                   unconfirmed or suspicious; the card is edited in place.
+                   Never books money
   * code_index   — every 2 min; GS codes and waybills of every stored text
                    into code_mentions for exact lookup (WP-39)
   * profile_refresh — every 60 min; rewrites the written profile of up to
@@ -36,7 +96,11 @@ Jobs:
   * heartbeat    — every minute; the worker's own liveness row (build step 5)
   * health       — every 5 min; one status, the problems it shows, one alert
                    per problem per ALERT_REPEAT_HOURS and one recovery notice
-                   when it clears; critical ones ignore quiet hours
+                   when it clears; critical ones ignore quiet hours. With
+                   JARVIS_ENABLED it also judges Jarvis (JV-21): a send queue
+                   stuck past its time, the Telegram breaker and the cost cap
+                   (the last two first told at once by jarvis_outbox and
+                   jarvis_respond; the sweep only repeats and recovers them)
 
 Every job's outcome is also recorded as a ``job:<id>`` heartbeat by an
 APScheduler listener, so /holat can name the job that last failed.
@@ -49,6 +113,7 @@ import functools
 import logging
 import signal
 import sys
+from collections.abc import Collection
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from time import monotonic
@@ -58,7 +123,8 @@ import sqlalchemy as sa
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.types import FSInputFile, Message
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import FSInputFile, Message, ReplyParameters
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -66,10 +132,20 @@ from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from miya.bot import keyboards, notices, replies
-from miya.bot.formatting import clip, clock, escape, short_date
+from miya.bot.formatting import TELEGRAM_LIMIT, clip, clock, escape, short_date
 from miya.config import settings
-from miya.db.models import DailyReport, Person, ReminderLog, Transaction
+from miya.db.enums import ChatType
+from miya.db.models import (
+    ChatMonitor,
+    DailyReport,
+    Interaction,
+    Person,
+    Receipt,
+    ReminderLog,
+    Transaction,
+)
 from miya.db.session import engine, session_scope
+from miya.logs import setup_logging
 from miya.services import (
     backup,
     batch,
@@ -87,9 +163,12 @@ from miya.services import (
     profiles,
     questions,
     recaps,
+    receipts,
     reminders,
     reports,
     restore_drill,
+    safety,
+    sheets_sync,
     windows,
 )
 from miya.services.embeddings import EmbeddingError, get_embedder
@@ -98,7 +177,12 @@ log = logging.getLogger(__name__)
 
 
 async def deliver(
-    bot: Bot, text: str, *, reply_markup=None, silent: bool = False
+    bot: Bot,
+    text: str,
+    *,
+    reply_markup=None,
+    silent: bool = False,
+    reply_to: int | None = None,
 ) -> tuple[bool, Message | None]:
     """Send to the owner; retry as plain text if Telegram rejects the HTML.
 
@@ -107,14 +191,25 @@ async def deliver(
     single stray tag must not silently cost the owner his evening summary.
     ``reply_markup`` (the reminder buttons) rides along on both attempts.
     Returns (delivered, the sent message) — the message id goes into
-    question_log.
+    question_log. ``reply_to`` answers one of the bot's earlier messages (a
+    card); one deleted since is no reason to lose the text.
     """
+    extra = (
+        {
+            "reply_parameters": ReplyParameters(
+                message_id=reply_to, allow_sending_without_reply=True
+            )
+        }
+        if reply_to is not None
+        else {}
+    )
     try:
         sent = await bot.send_message(
             settings.owner_telegram_id,
             clip(text),
             reply_markup=reply_markup,
             disable_notification=silent,
+            **extra,
         )
         return True, sent
     except Exception:
@@ -126,6 +221,7 @@ async def deliver(
             parse_mode=None,
             reply_markup=reply_markup,
             disable_notification=silent,
+            **extra,
         )
         return True, sent
     except Exception:
@@ -197,6 +293,76 @@ async def reminder_job(bot: Bot) -> None:
         len(bundle.promises),
         len(bundle.tasks),
         len(bundle.events),
+    )
+
+
+def _renderable_timed(bundle: reminders.DueBundle) -> reminders.DueBundle:
+    """The timed bundle without the items whose ping line cannot be rendered.
+
+    One bad row is logged and dropped, never a stop for the sweep; the keys
+    are rebuilt from what is left so mark_sent and the buttons stay aligned
+    with the lines actually shown.
+    """
+    kept = reminders.DueBundle()
+    for promise, person in bundle.promises:
+        try:
+            replies.timed_reminder_line("promise", promise, person)
+        except Exception as exc:
+            log.error(
+                "timed reminder for promise %s failed to render: %s",
+                promise.id,
+                type(exc).__name__,
+            )
+            continue
+        kept.promises.append((promise, person))
+        kept.keys.append(("promise", str(promise.id)))
+    for task in bundle.tasks:
+        try:
+            replies.timed_reminder_line("task", task)
+        except Exception as exc:
+            log.error(
+                "timed reminder for task %s failed to render: %s",
+                task.id,
+                type(exc).__name__,
+            )
+            continue
+        kept.tasks.append(task)
+        kept.keys.append(("task", str(task.id)))
+    return kept
+
+
+async def timed_reminder_job(bot: Bot) -> None:
+    """The ping before a deadline that names a time of day (JV-03).
+
+    Every five minutes, so «bugun 14:00» is reminded close to
+    PROMISE_REMIND_LEAD_MINUTES before 14:00 rather than at whichever hourly
+    sweep comes first. Only those first pings go out here; the later ones
+    and "Hali ochiqmi?" stay with the hourly sweep, which never sends them.
+    """
+    now = datetime.now(settings.tz)
+    if reminders.in_quiet_hours(now):
+        return
+
+    async with session_scope() as session:
+        bundle = _renderable_timed(await reminders.collect_timed(session, now=now))
+        if bundle.is_empty():
+            return
+        body, rendered = replies.timed_reminder_with_counts(bundle.promises, bundle.tasks)
+        if not body:
+            return
+        keyboard = keyboards.record_actions(
+            replies.timed_reminder_refs(bundle.promises, bundle.tasks, rendered)
+        )
+        if not await notify(bot, body, reply_markup=keyboard):
+            return
+        # As for the hourly pings: logged after the send, and only what fit.
+        await reminders.mark_sent(session, bundle, rendered=rendered)
+        await session.commit()
+
+    log.info(
+        "sent timed reminder: %d promises, %d tasks",
+        rendered["promise"],
+        rendered["task"],
     )
 
 
@@ -296,6 +462,17 @@ async def report_job(bot: Bot, *, now: datetime | None = None) -> None:
     now = now or datetime.now(settings.tz)
     day = now.astimezone(settings.tz).date()
     async with session_scope() as session:
+        delivered_at = await session.scalar(
+            sa.select(DailyReport.delivered_at).where(
+                DailyReport.report_date == day, DailyReport.kind == reports.EVENING
+            )
+        )
+        if delivered_at is not None:
+            # Already out today: REPORT_TIME moved later after it went (the
+            # 19:00 → 20:00 update). Not rebuilt, and the evening questions
+            # are not asked twice.
+            log.info("report for %s already delivered; not rebuilt", day)
+            return
         await reports.generate_report(session, day, now=now)
         await session.commit()
     if reminders.in_quiet_hours(now):
@@ -360,6 +537,629 @@ async def gcal_push_job() -> None:
         pushed = await gcal.push_pending(session, api)
     if pushed:
         log.info("gcal push: %d events created in Google Calendar", pushed)
+
+
+async def sheets_sync_job() -> None:
+    """The Google Sheets mirror (JV-07): what changed in SQL, written to the
+    owner's spreadsheet. A no-op while SHEETS_ENABLED is false; it never
+    raises, and nothing else in MIYA waits on it."""
+    await sheets_sync.run()
+
+
+async def jarvis_outbox_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The outbox's own housekeeping (JV-11): drafts past
+    JARVIS_DRAFT_EXPIRY_HOURS expire and are never sent; a claimed row whose
+    lease ran out with no report is reconciled (an echo found is sent, none
+    is unknown), and the owner is told once about each unknown row — MIYA
+    never sends it again. Then (JV-17) the owner is told once about a draft
+    card or escalation alert that their own message or the client's edit
+    took off the table, and (JV-19) about what the Telegram sender recorded:
+    a breaker trip, a flood wait, a failed send and a tapped send that went
+    out (``jarvis_send_notices``); and (JV-23) about each autonomous send
+    and each automatic demotion (``jarvis_autonomy_notices``).
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
+    startup (rule 20). Each step and each notice is contained on its own:
+    one failure is logged with its ids and the rest go on (rule 25).
+    """
+    from miya.jarvis import outbox
+
+    now = now or datetime.now(settings.tz)
+    for step in (outbox.expire_due, outbox.reconcile):
+        try:
+            async with session_scope() as session:
+                await step(session, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis outbox step failed",
+                extra={"step": step.__name__, "error": type(exc).__name__},
+            )
+    if not await _jarvis_unknown_notices(bot, now=now):
+        return  # Telegram is down: the rest wait for the next sweep
+    await jarvis_takeover_notices(bot, now=now)
+    await jarvis_send_notices(bot, now=now)
+    await jarvis_autonomy_notices(bot, now=now)
+
+
+async def _jarvis_unknown_notices(bot: Bot, *, now: datetime) -> bool:
+    """The owner hears once about each send in doubt. False when Telegram is
+    down (the rest stay untold for the next sweep)."""
+    from miya.jarvis import outbox
+
+    try:
+        async with session_scope() as session:
+            untold = await outbox.unknown_untold(session)
+    except Exception as exc:
+        log.error("jarvis unknown sends unreadable", extra={"error": type(exc).__name__})
+        return True
+    silent = reminders.in_quiet_hours(now)
+    for row_id in untold:
+        try:
+            text = replies.JARVIS_SEND_UNKNOWN.format(id=row_id)
+            if not await notify(bot, text, silent=silent):
+                return False  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_told(session, row_id, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis unknown-send notice failed",
+                extra={"outbox_id": row_id, "error": type(exc).__name__},
+            )
+    return True
+
+
+async def jarvis_takeover_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """JV-17: a draft card the owner's own message cancelled or the client's
+    edit replaced, and an escalation alert their own message closed, are told
+    once, silently (the owner acted themselves), as a reply to that card.
+    Each notice is contained (rule 25); returns how many went out."""
+    from miya.jarvis import chat_state
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            notices = await chat_state.untold(session, now=now)
+    except Exception as exc:
+        log.error(
+            "jarvis takeover notices unreadable", extra={"error": type(exc).__name__}
+        )
+        return 0
+    told = 0
+    for notice in notices:
+        try:
+            text = replies.jarvis_takeover_notice(notice.kind, notice.name)
+            ok, _ = await deliver(bot, text, silent=True, reply_to=notice.reply_to)
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await chat_state.mark_told(session, notice, now=now)
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis takeover notice failed",
+                extra={
+                    "kind": notice.kind,
+                    "row_id": notice.row_id,
+                    "error": type(exc).__name__,
+                },
+            )
+    return told
+
+
+# The ReminderLog kinds that record the Telegram sender's limits the owner
+# was told about (JV-19): a breaker trip (ref: the channel and the trip's end)
+# and a flood wait (ref: the row and its attempt), each once.
+JARVIS_BREAKER_KIND = "jarvis_breaker"
+JARVIS_FLOOD_KIND = "jarvis_flood_wait"
+
+
+async def _told_refs(kind: str, refs: list[str]) -> set[str]:
+    if not refs:
+        return set()
+    async with session_scope() as session:
+        return set(
+            await session.scalars(
+                sa.select(ReminderLog.ref).where(
+                    ReminderLog.kind == kind, ReminderLog.ref.in_(refs)
+                )
+            )
+        )
+
+
+async def _note_told(kind: str, refs: list[str]) -> None:
+    async with session_scope() as session:
+        session.add_all([ReminderLog(kind=kind, ref=ref) for ref in refs])
+
+
+async def jarvis_send_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """What the Telegram sender (JV-19) recorded, told once each: a tripped
+    breaker («⛔ Telegram yuborishni cheklab qo'ydi»), a flood wait of a
+    minute or more («⏳»), a send that failed for good («✖️ … yuborib
+    bo'lmadi») and a send the owner tapped that went out («✅ Yuborildi»,
+    silently, as a reply to its card). Each step and each notice is
+    contained (rule 25); returns how many went out.
+
+    The breaker trip is said here, at once, and recorded in the health
+    ledger as ``telegram_send_limited`` (JV-21): the 5-minute health sweep
+    never says it first, it only repeats it and announces the recovery."""
+    from miya.jarvis import outbox, policy
+
+    now = now or datetime.now(settings.tz)
+    silent = reminders.in_quiet_hours(now)
+    told = 0
+    try:
+        async with session_scope() as session:
+            telegram = (await policy.load(session)).get(policy.channel_scope("telegram"))
+        until = telegram.breaker_until if telegram is not None else None
+        if telegram is not None and until is not None and telegram.tripped(now):
+            ref = f"telegram:{until.isoformat()}"
+            if not await _told_refs(JARVIS_BREAKER_KIND, [ref]):
+                if not await notify(bot, replies.JARVIS_TELEGRAM_LIMITED, silent=silent):
+                    return told
+                await _note_told(JARVIS_BREAKER_KIND, [ref])
+                # The health ledger's alert of this episode (JV-21): the
+                # health sweep never says it first, only repeats it after
+                # ALERT_REPEAT_HOURS and says «tiklandi» once it clears.
+                await _mark_alert_delivered(health.TELEGRAM_SEND_LIMITED_KEY, now=now)
+                told += 1
+    except Exception as exc:
+        log.error("jarvis breaker notice failed", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            waits = await outbox.flood_waits(session, now=now)
+        done = await _told_refs(JARVIS_FLOOD_KIND, [wait.ref for wait in waits])
+        fresh = [wait for wait in waits if wait.ref not in done]
+        if fresh:
+            text = replies.jarvis_flood_wait(max(wait.seconds for wait in fresh))
+            if not await notify(bot, text, silent=silent):
+                return told
+            await _note_told(JARVIS_FLOOD_KIND, [wait.ref for wait in fresh])
+            told += 1
+    except Exception as exc:
+        log.error("jarvis flood-wait notice failed", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            outcomes = await outbox.outcomes_untold(session, now=now)
+    except Exception as exc:
+        log.error("jarvis send outcomes unreadable", extra={"error": type(exc).__name__})
+        return told
+    for outcome in outcomes:
+        try:
+            if outcome.state == outbox.SENT:
+                text = replies.jarvis_sent(outcome.sent_at or now)
+                quiet = True
+            else:
+                text = replies.jarvis_send_failed(outcome.name, outcome.code)
+                quiet = silent
+            ok, _ = await deliver(
+                bot, text, silent=quiet, reply_to=outcome.card_message_id
+            )
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_told(session, outcome.id, now=now, by=outbox.BY_ADAPTER)
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis send notice failed",
+                extra={"outbox_id": outcome.id, "error": type(exc).__name__},
+            )
+    return told
+
+
+async def jarvis_autonomy_notices(bot: Bot, *, now: datetime | None = None) -> int:
+    """JV-23: each reply Jarvis sent on its own is followed by a silent
+    «🤖 Avtomatik yuborildi · {ism}: «{matn}»» notice with «↩️ Bu xato edi»
+    (the button is honoured only from that message), and each automatic
+    demotion (a breaker, a red line found in a sent reply, the cost cap) is
+    told once. Each notice is contained (rule 25); returns how many went out."""
+    from miya.jarvis import outbox, rollout
+
+    now = now or datetime.now(settings.tz)
+    told = 0
+    try:
+        async with session_scope() as session:
+            sends = await outbox.auto_untold(session, now=now)
+    except Exception as exc:
+        log.error("jarvis auto sends unreadable", extra={"error": type(exc).__name__})
+        sends = []
+    for send in sends:
+        try:
+            ok, sent = await deliver(
+                bot,
+                replies.jarvis_auto_sent(send.name, send.body),
+                reply_markup=keyboards.jarvis_auto_sent(send.id),
+                silent=True,
+            )
+            if not ok:
+                return told  # Telegram is down: the rest wait for the next sweep
+            async with session_scope() as session:
+                await outbox.mark_auto_noticed(
+                    session,
+                    send.id,
+                    message_id=sent.message_id if sent is not None else None,
+                    now=now,
+                )
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis auto-send notice failed",
+                extra={"outbox_id": send.id, "error": type(exc).__name__},
+            )
+    try:
+        async with session_scope() as session:
+            demotions = await rollout.demotions_untold(session)
+    except Exception as exc:
+        log.error("jarvis demotions unreadable", extra={"error": type(exc).__name__})
+        return told
+    silent = reminders.in_quiet_hours(now)
+    for demotion in demotions:
+        try:
+            text = replies.jarvis_demoted(
+                intent=demotion.intent, channel=demotion.channel, code=demotion.code
+            )
+            if not await notify(bot, text, silent=silent):
+                return told
+            async with session_scope() as session:
+                await rollout.mark_demotion_told(
+                    session,
+                    demotion.channel,
+                    demotion.intent,
+                    code=demotion.code,
+                    now=now,
+                )
+            told += 1
+        except Exception as exc:
+            log.error(
+                "jarvis demotion notice failed",
+                extra={
+                    "channel": demotion.channel,
+                    "intent": demotion.intent,
+                    "error": type(exc).__name__,
+                },
+            )
+    return told
+
+
+async def jarvis_rollout_job(bot: Bot, *, now: datetime | None = None) -> int:
+    """The rollout controller (JV-23), once a day. First the automatic
+    demotions: every reply sent on its own in the last week is read again
+    with today's red-line guard (a red line it breaks now demotes its kind),
+    and the cost cap reached on two days of the week demotes every kind.
+    Then each channel × reply kind that met the graduation criteria (§6.4) is
+    offered once with «✅ Ha, avtomatik» / «⏳ Yana kuzataylik», with the
+    JARVIS_MODE hint when the env ceiling is not auto; nothing is promoted
+    here. The demotions are told by ``jarvis_autonomy_notices``.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step and each offer is contained (rule 25);
+    returns how many offers went out."""
+    from miya.jarvis import policy, rollout
+
+    now = now or datetime.now(settings.tz)
+    for step in (rollout.recheck_sends, rollout.check_cost_cap):
+        try:
+            async with session_scope() as session:
+                await step(session, now=now)
+        except Exception as exc:
+            log.error(
+                "jarvis rollout step failed",
+                extra={"step": step.__name__, "error": type(exc).__name__},
+            )
+    try:
+        async with session_scope() as session:
+            due = await rollout.offers_due(session, now=now)
+    except Exception as exc:
+        log.error("jarvis rollout metrics failed", extra={"error": type(exc).__name__})
+        return 0
+    offered = 0
+    silent = reminders.in_quiet_hours(now)
+    for found in due:
+        try:
+            text = replies.jarvis_graduation_offer(
+                intent=found.intent,
+                channel=found.channel,
+                days=found.days,
+                drafts=found.drafts,
+                pct=found.pct,
+                cap=settings.jarvis_auto_daily_cap,
+                ceiling_ok=policy.ceiling() == "auto",
+            )
+            ok, sent = await deliver(
+                bot,
+                text,
+                reply_markup=keyboards.jarvis_graduation(found.channel, found.intent),
+                silent=silent,
+            )
+            if not ok or sent is None:
+                return offered  # Telegram is down: offered again tomorrow
+            async with session_scope() as session:
+                await rollout.record_offer(
+                    session,
+                    found.channel,
+                    found.intent,
+                    message_id=sent.message_id,
+                    now=now,
+                )
+            offered += 1
+        except Exception as exc:
+            log.error(
+                "jarvis graduation offer failed",
+                extra={
+                    "channel": found.channel,
+                    "intent": found.intent,
+                    "error": type(exc).__name__,
+                },
+            )
+    return offered
+
+
+# The ReminderLog kind that records "the owner was told today that the cost
+# cap stopped drafting" (ref: the day), so they hear it once a day.
+JARVIS_COST_STOP_KIND = "jarvis_cost_stop"
+
+
+class JarvisPresenter:
+    """The bot side of miya.jarvis.cards (JV-18): renders a card with
+    replies.jarvis_card and keyboards.jarvis_card and delivers it with
+    ``deliver``; returns the bot message's id, None when Telegram did not take
+    it (the sweep retries)."""
+
+    def __init__(self, bot: Bot) -> None:
+        self.bot = bot
+
+    async def card(self, card, *, silent: bool, reply_to: int | None = None):
+        text = replies.jarvis_card(card)
+        if len(text) > TELEGRAM_LIMIT:
+            # deliver() would clip it: a card shows its text and warnings
+            # whole or not at all (nothing is recorded as shown).
+            log.error(
+                "jarvis card too long to show",
+                extra={"card_kind": card.kind, "ref_id": card.id, "chars": len(text)},
+            )
+            return None
+        ok, sent = await deliver(
+            self.bot,
+            text,
+            reply_markup=keyboards.jarvis_card(card),
+            silent=silent,
+            reply_to=reply_to,
+        )
+        return sent.message_id if ok and sent is not None else None
+
+    async def fold(self, cards, *, cap: int, silent: bool, edit: int | None):
+        text = replies.jarvis_fold(cards, cap)
+        if edit is not None:
+            try:
+                await self.bot.edit_message_text(
+                    text, chat_id=settings.owner_telegram_id, message_id=edit
+                )
+                return edit
+            except Exception as exc:
+                # Deleted, or too old to edit: the fold starts a new message.
+                log.info(
+                    "folded alert not edited",
+                    extra={"message_id": edit, "error": type(exc).__name__},
+                )
+        ok, sent = await deliver(self.bot, text, silent=silent)
+        return sent.message_id if ok and sent is not None else None
+
+    async def draft_cap(self, *, cap: int, silent: bool) -> bool:
+        return await notify(self.bot, replies.jarvis_draft_cap(cap), silent=silent)
+
+    async def edit(self, card, *, message_id: int) -> bool:
+        """The card on screen, rendered again in place (its summary came);
+        its buttons stay. False when Telegram did not take the edit."""
+        text = replies.jarvis_card(card)
+        if len(text) > TELEGRAM_LIMIT:
+            return False
+        try:
+            await self.bot.edit_message_text(
+                text,
+                chat_id=settings.owner_telegram_id,
+                message_id=message_id,
+                reply_markup=keyboards.jarvis_card(card),
+            )
+            return True
+        except Exception as exc:
+            log.info(
+                "jarvis card not edited",
+                extra={"message_id": message_id, "error": type(exc).__name__},
+            )
+            return False
+
+
+async def jarvis_cards_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The owner's cards (JV-18): undelivered escalation alerts and draft
+    cards, snoozed escalations whose time is up, the draft-cap notice, and
+    escalations a morning brief already named. Registered only with
+    JARVIS_ENABLED; miya.jarvis is imported here, not at startup (rule 20).
+    The sweep contains each row on its own (rule 25)."""
+    from miya.jarvis import cards
+
+    now = now or datetime.now(settings.tz)
+    try:
+        await cards.sweep(JarvisPresenter(bot), now=now)
+    except Exception as exc:
+        log.error("jarvis cards sweep failed", extra={"error": type(exc).__name__})
+
+
+async def _jarvis_card_now(bot: Bot, outcome, *, now: datetime) -> None:
+    """A responder outcome's card, in the same run (JV-18 1a): the alert of
+    an escalation it opened, the card of a draft it stored. A push into an
+    open escalation is no new alert. cards never raises."""
+    from miya.jarvis import cards, responder
+
+    presenter = JarvisPresenter(bot)
+    if outcome.escalation_id is not None and outcome.code != responder.REPEAT:
+        await cards.alert_now(presenter, outcome.escalation_id, now=now)
+    if outcome.code == responder.DRAFTED:
+        for row_id in outcome.outbox_ids:
+            await cards.card_now(presenter, row_id, now=now)
+
+
+async def jarvis_respond_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The responder (JV-16): the chats whose debounce and owner-first window
+    are over get a draft or an escalation, stored in the mode's state; each
+    new escalation's alert and each new draft's card goes out in this same
+    run (JV-18 1a). When the cost cap stopped a draft, the owner is told once
+    a day that Jarvis only forwards to them until tomorrow, recorded in the
+    health ledger as ``jarvis_cost_cap`` (JV-21: the health sweep repeats it
+    and announces the recovery, never says it first).
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not at
+    startup (rule 20). The run contains each chat on its own (rule 25); a
+    failure of the run or of the notice is logged and the next tick goes on.
+    """
+    from miya.jarvis import responder
+
+    now = now or datetime.now(settings.tz)
+
+    async def alert(outcome) -> None:
+        await _jarvis_card_now(bot, outcome, now=now)
+
+    try:
+        result = await responder.run(now=now, alert=alert)
+    except Exception as exc:
+        log.error("jarvis responder run failed", extra={"error": type(exc).__name__})
+        return
+    if not result.cost_capped:
+        return
+    day = reminders.day_start(now).date().isoformat()
+    try:
+        async with session_scope() as session:
+            told = await session.scalar(
+                sa.select(sa.func.count())
+                .select_from(ReminderLog)
+                .where(ReminderLog.kind == JARVIS_COST_STOP_KIND, ReminderLog.ref == day)
+            )
+        if told:
+            return
+        if not await notify(
+            bot, replies.JARVIS_COST_STOP, silent=reminders.in_quiet_hours(now)
+        ):
+            return
+        async with session_scope() as session:
+            session.add(ReminderLog(kind=JARVIS_COST_STOP_KIND, ref=day))
+    except Exception as exc:
+        log.error("jarvis cost-stop notice failed", extra={"error": type(exc).__name__})
+        return
+    # The health ledger's alert of this episode (JV-21): the sweep repeats it
+    # and says «tiklandi» when the next day's spend is under the cap.
+    await _mark_alert_delivered(health.JARVIS_COST_CAP_KEY, now=now)
+
+
+# The ReminderLog kind that records "the style profile of this import was
+# announced" (ref: the import request's timestamp), so the owner hears it once.
+STYLE_READY_KIND = "style_ready"
+
+
+async def style_refresh_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The owner's style profile (JV-14). Once every chat of the latest
+    ``/uslub yukla`` has been read (or given up on), a profile is built and
+    the owner is told once; besides, the profile is rebuilt when the newest
+    one is a week old and its input changed (``build_profile`` skips an
+    unchanged input), and the owner is told about the new draft.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step is contained: a failure is logged with
+    its class and the job ends until its next run (rule 25).
+    """
+    from miya.jarvis import style
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            progress = await chats.style_import_progress(session)
+            told = progress.requested_at is not None and bool(
+                await session.scalar(
+                    sa.select(sa.func.count())
+                    .select_from(ReminderLog)
+                    .where(
+                        ReminderLog.kind == STYLE_READY_KIND,
+                        ReminderLog.ref == progress.requested_at.isoformat(),
+                    )
+                )
+            )
+    except Exception as exc:
+        log.error("style import progress unreadable", extra={"error": type(exc).__name__})
+        return
+    if progress.requested_at is not None and not progress.finished:
+        return  # the userbot is still reading; the profile waits for all of it
+    import_due = progress.finished and not told
+    try:
+        async with session_scope() as session:
+            if not import_due and not await style.refresh_due(session, now=now):
+                return
+            result = await style.build_profile(session, now=now)
+            version = result.profile.version if result.profile is not None else None
+    except Exception as exc:
+        log.error("style profile build failed", extra={"error": type(exc).__name__})
+        return
+    if not import_due and result.status != "built":
+        return
+    if result.status == "too_few":
+        text = replies.style_too_few(result.sample_count, style.min_samples())
+    else:
+        text = replies.style_ready(result.sample_count, result.example_count)
+    try:
+        if not await notify(bot, text, silent=reminders.in_quiet_hours(now)):
+            return
+        if import_due and progress.requested_at is not None:
+            async with session_scope() as session:
+                session.add(
+                    ReminderLog(
+                        kind=STYLE_READY_KIND, ref=progress.requested_at.isoformat()
+                    )
+                )
+    except Exception as exc:
+        log.error(
+            "style ready notice failed",
+            extra={"version": version, "error": type(exc).__name__},
+        )
+
+
+async def kb_mining_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The knowledge base (JV-15). Every run embeds the entries still
+    without a vector; once a week (``kb.mining_due``) MIYA suggests entries
+    from the owner's own past answers and tells the owner how many wait for
+    their tap. A run stopped by the cost cap is not counted: the next hourly
+    run checks the cap first (reading and embedding nothing while it holds)
+    and mines once it lifts, the next day.
+
+    Registered only with JARVIS_ENABLED; miya.jarvis is imported here, not
+    at startup (rule 20). Each step is contained: a failure is logged with
+    its class and the job ends until its next run (rule 25); inside the
+    mining, one cluster that fails never stops the others.
+    """
+    from miya.jarvis import kb
+
+    now = now or datetime.now(settings.tz)
+    try:
+        async with session_scope() as session:
+            await kb.embed_pending(session)
+    except Exception as exc:
+        log.error("knowledge entries not embedded", extra={"error": type(exc).__name__})
+    try:
+        async with session_scope() as session:
+            if not await kb.mining_due(session, now=now):
+                return
+            result = await kb.mine(session, now=now)
+            if result.stopped is None:
+                kb.mark_mined(session, now=now)
+    except Exception as exc:
+        log.error("knowledge mining failed", extra={"error": type(exc).__name__})
+        return
+    if result.suggested <= 0:
+        return
+    try:
+        text = replies.kb_suggested(result.suggested)
+        await notify(bot, text, silent=reminders.in_quiet_hours(now))
+    except Exception as exc:
+        log.error(
+            "knowledge suggestion notice failed",
+            extra={"suggested": result.suggested, "error": type(exc).__name__},
+        )
 
 
 async def window_job(bot: Bot) -> None:
@@ -866,6 +1666,320 @@ async def money_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
             await session.commit()
 
 
+# One sweep sends at most this many warnings; the rest wait a minute.
+SAFETY_NOTICE_BATCH = 20
+
+
+async def pending_safety_notices(session, *, now: datetime) -> list[Interaction]:
+    """Queued file warnings not yet delivered, oldest first (JV-01)."""
+    meta = Interaction.meta
+    return list(
+        await session.scalars(
+            sa.select(Interaction)
+            .where(Interaction.occurred_at >= now - safety.NOTICE_MAX_AGE)
+            .where(meta.has_key(safety.SAFETY_NOTICE_KEY))
+            .where(sa.not_(meta.has_key(safety.SAFETY_NOTIFIED_KEY)))
+            .order_by(Interaction.occurred_at, Interaction.id)
+            .limit(SAFETY_NOTICE_BATCH)
+        )
+    )
+
+
+async def chat_warned_today(session, interaction: Interaction, *, now: datetime) -> bool:
+    """Was this chat's owner already warned about a scam or a possible hijack
+    today (JV-09)? Those warnings go out once per chat per calendar day."""
+    if interaction.tg_chat_id is None:
+        return False
+    meta = Interaction.meta
+    notified_at = meta[safety.SAFETY_NOTIFIED_KEY].astext.cast(sa.DateTime(timezone=True))
+    return bool(
+        await session.scalar(
+            sa.select(
+                sa.exists().where(
+                    Interaction.tg_chat_id == interaction.tg_chat_id,
+                    Interaction.id != interaction.id,
+                    meta[safety.SAFETY_NOTICE_KEY].astext.in_(
+                        sorted(safety.CHAT_DAILY_NOTICES)
+                    ),
+                    meta.has_key(safety.SAFETY_NOTIFIED_KEY),
+                    sa.not_(meta.has_key(safety.SAFETY_FOLDED_KEY)),
+                    notified_at >= reminders.day_start(now),
+                )
+            )
+        )
+    )
+
+
+async def safety_notice_text(session, interaction: Interaction) -> str | None:
+    """The owner's warning for one queued notice, or None for an unknown kind."""
+    meta = interaction.meta or {}
+    notice = meta.get(safety.SAFETY_NOTICE_KEY)
+    media = interaction.media or {}
+    name = (media.get("risk") or {}).get("name") or media.get("filename")
+    if notice == safety.NOTICE_MACRO:
+        return replies.macro_document_note(name)
+    if notice not in (
+        safety.NOTICE_DANGEROUS_FILE,
+        safety.NOTICE_SCAM,
+        safety.NOTICE_HIJACK,
+    ):
+        return None
+    person = (
+        await session.get(Person, interaction.person_id)
+        if interaction.person_id
+        else None
+    )
+    who = person.display_name if person else None
+    if notice == safety.NOTICE_HIJACK:
+        return replies.hijack_warning(who=who)
+    if notice == safety.NOTICE_SCAM:
+        verdict = meta.get("safety") if isinstance(meta.get("safety"), dict) else {}
+        reasons = [r for r in verdict.get("reasons") or [] if isinstance(r, str)]
+        return replies.scam_warning(who=who, reasons=reasons)
+    monitor = (
+        await session.scalar(
+            sa.select(ChatMonitor).where(ChatMonitor.tg_chat_id == interaction.tg_chat_id)
+        )
+        if interaction.tg_chat_id is not None
+        else None
+    )
+    if monitor is None or monitor.chat_type is ChatType.private or not monitor.title:
+        chat = replies.PRIVATE_CHAT_LABEL
+    else:
+        chat = monitor.title
+    return replies.dangerous_file_warning(
+        who=who,
+        filename=name,
+        chat=chat,
+        android=safety.is_android_package(name),
+    )
+
+
+async def safety_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """Warn the owner once about each dangerous file sent into a chat, and
+    about each macro document read as text (JV-01); about a scam or a
+    possibly hijacked account at most once per chat per day (JV-09).
+
+    Never held for quiet hours — a warning about an installer or a scam is
+    worth having before it is opened — but delivered silently inside them.
+    Not a question: nothing here touches the question budget. A row is
+    stamped only after its message went out, one commit per message; a scam
+    warning for a chat already warned today is stamped as folded and never
+    sent. One row that cannot be rendered is logged and skipped, never a
+    stop for the rest.
+    """
+    now = now or datetime.now(settings.tz)
+    silent = reminders.in_quiet_hours(now)
+    sent = 0
+    async with session_scope() as session:
+        for interaction in await pending_safety_notices(session, now=now):
+            notice = (interaction.meta or {}).get(safety.SAFETY_NOTICE_KEY)
+            try:
+                async with session.begin_nested():
+                    folded = notice in safety.CHAT_DAILY_NOTICES and (
+                        await chat_warned_today(session, interaction, now=now)
+                    )
+                    text = (
+                        None if folded else await safety_notice_text(session, interaction)
+                    )
+            except Exception as exc:
+                log.error(
+                    "safety notice for interaction %s failed to render: %s",
+                    interaction.id,
+                    type(exc).__name__,
+                    extra={
+                        "interaction_id": interaction.id,
+                        "tg_chat_id": interaction.tg_chat_id,
+                        "error": type(exc).__name__,
+                    },
+                )
+                continue
+            if text is not None and not await notify(bot, text, silent=silent):
+                return  # unreachable: the rest stay queued for the next sweep
+            stamp = {safety.SAFETY_NOTIFIED_KEY: now.isoformat()}
+            if folded:
+                stamp[safety.SAFETY_FOLDED_KEY] = True
+            interaction.meta = {**(interaction.meta or {}), **stamp}
+            await session.commit()
+            if text is not None:
+                sent += 1
+    if sent:
+        log.info("sent %d safety notice(s)", sent)
+
+
+async def receipt_notice_text(session, receipt: Receipt, interaction: Interaction) -> str:
+    """The owner's card for a receipt someone sent into a chat (JV-04), with
+    the bank cross-check it has so far (JV-05)."""
+    return replies.receipt_card_for(
+        receipt,
+        await receipts.card_source(session, receipt, interaction),
+        await receipts.verdict_detail(session, receipt),
+    )
+
+
+def receipt_card_keyboard(receipt: Receipt):
+    """✅ Pul keldi / 🚩 Soxta while the owner's word could still decide."""
+    return (
+        keyboards.receipt_verdict(receipt.id)
+        if receipts.owner_can_judge(receipt)
+        else None
+    )
+
+
+async def receipt_notice_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The receipt card for each payment receipt someone sent into a chat,
+    within the minute, once (JV-04).
+
+    Deduped on ``notified_at``, stamped only after the card went out, one
+    commit per card, with the message id kept so the bank verdict can edit
+    it in place. In quiet hours the cards wait, or arrive silently when
+    receipts are set to (MONEY_RECEIPTS_SILENT_AT_NIGHT). A card that cannot
+    be rendered is logged and skipped, never a stop for the rest. Not a
+    question: nothing here touches the question budget.
+    """
+    now = now or datetime.now(settings.tz)
+    silent = False
+    if reminders.in_quiet_hours(now):
+        if not settings.money_receipts_silent_at_night:
+            return
+        silent = True
+    sent = 0
+    async with session_scope() as session:
+        for receipt, interaction in await receipts.pending_notices(session, now=now):
+            try:
+                text = await receipt_notice_text(session, receipt, interaction)
+            except Exception as exc:
+                log.error(
+                    "receipt card for receipt %s failed to render: %s",
+                    receipt.id,
+                    type(exc).__name__,
+                )
+                continue
+            message = await notify_message(
+                bot, text, reply_markup=receipt_card_keyboard(receipt), silent=silent
+            )
+            if message is None:
+                return  # unreachable: the rest stay queued for the next sweep
+            message_id = getattr(message, "message_id", None)
+            receipts.mark_notified(
+                receipt,
+                now=now,
+                message_id=message_id if isinstance(message_id, int) else None,
+                verdict=receipt.verdict,
+            )
+            await session.commit()
+            sent += 1
+    if sent:
+        log.info("sent %d receipt card(s)", sent)
+
+
+async def receipt_check_job(bot: Bot, *, now: datetime | None = None) -> None:
+    """The bank cross-check of receipts read from images (JV-05).
+
+    Every minute: confirm receipts by the bank's own income records
+    (``receipts.match_bank``), give the ones still without one after
+    RECEIPT_BANK_WAIT_MINUTES their verdict (``receipts.check_waiting``:
+    unconfirmed, or suspicious for a reason), then bring each card that went
+    out up to date. No verdict books money.
+    """
+    now = now or datetime.now(settings.tz)
+    async with session_scope() as session:
+        confirmed: list[Receipt] = []
+        try:
+            async with session.begin_nested():
+                confirmed = await receipts.match_bank(session, now=now)
+        except Exception as exc:
+            # The verdicts and the cards still go ahead; the match is retried
+            # next minute.
+            log.error("receipts not matched: %s", type(exc).__name__)
+        decided = await receipts.check_waiting(session, now=now)
+        await session.commit()
+        edited = await refresh_receipt_cards(bot, session, now=now)
+    if confirmed or decided or edited:
+        log.info(
+            "receipts: %d confirmed, %d judged, %d card(s) updated",
+            len(confirmed),
+            len(decided),
+            edited,
+        )
+
+
+async def refresh_receipt_cards(bot: Bot, session, *, now: datetime) -> int:
+    """Edit each receipt card that shows an older verdict, in place
+    (``notice_tg_message_id``). An edit is silent, so it is made at any
+    hour; a card whose message id is unknown goes out again, under the
+    receipt cards' night rule. One commit per card; one that fails to render
+    or to edit is logged and left for the next sweep. Returns the count."""
+    silent = False
+    hold = False
+    if reminders.in_quiet_hours(now):
+        silent = True
+        hold = not settings.money_receipts_silent_at_night
+    updated = 0
+    for receipt in await receipts.cards_to_refresh(session):
+        receipt_id = receipt.id
+        try:
+            async with session.begin_nested():
+                # The row as it is now: another process (a button tap, an
+                # SMS) may have changed it since the batch was loaded.
+                await session.refresh(receipt)
+                interaction = await session.get(Interaction, receipt.interaction_id)
+                if receipt.verdict_notified_at is not None or interaction is None:
+                    continue
+                verdict = receipt.verdict
+                text = await receipt_notice_text(session, receipt, interaction)
+        except Exception as exc:
+            log.error(
+                "receipt card for receipt %s failed to render: %s",
+                receipt_id,
+                type(exc).__name__,
+                extra={"receipt_id": receipt_id},
+            )
+            continue
+        markup = receipt_card_keyboard(receipt)
+        message_id = receipt.notice_tg_message_id
+        editable = receipts.card_editable(interaction)
+        if not editable:
+            # A card from before JV-05 shares its message with the bot's
+            # reply and buttons: never overwritten, a fresh card goes out.
+            message_id = None
+        if message_id is None:
+            if hold:
+                continue
+            message = await notify_message(bot, text, reply_markup=markup, silent=silent)
+            if message is None:
+                return updated  # unreachable: the rest wait for the next sweep
+            sent_id = getattr(message, "message_id", None)
+            message_id = sent_id if isinstance(sent_id, int) else None
+            if not editable:
+                receipts.mark_card_alone(interaction)
+        else:
+            try:
+                await bot.edit_message_text(
+                    clip(text),
+                    chat_id=settings.owner_telegram_id,
+                    message_id=message_id,
+                    reply_markup=markup,
+                )
+            except TelegramBadRequest as exc:
+                # Not modified, deleted or too old to edit: nothing to retry.
+                log.info("receipt card %s not edited: %s", receipt_id, type(exc).__name__)
+            except Exception as exc:
+                log.warning(
+                    "receipt card %s could not be edited: %s",
+                    receipt_id,
+                    type(exc).__name__,
+                    extra={"receipt_id": receipt_id},
+                )
+                continue
+        await receipts.stamp_card(
+            session, receipt_id, now=now, verdict=verdict, message_id=message_id
+        )
+        await session.commit()
+        updated += 1
+    return updated
+
+
 async def backup_job(bot: Bot) -> None:
     """Nightly encrypted pg_dump (spec §10), then a copy to Telegram.
 
@@ -1105,7 +2219,12 @@ async def health_job(bot: Bot) -> None:
     ignore quiet hours; warnings and recoveries wait for morning — the ledger
     still shows them due then, nothing is lost. Only a delivered message is
     recorded, so an unreachable Telegram means the alert is simply tried
-    again next tick.
+    again next tick. A Telegram breaker trip and the Jarvis cost cap are
+    first told by their own jobs (JV-21, ``health.TOLD_FIRST_ELSEWHERE``):
+    this sweep only repeats them and announces their recovery; a Jarvis key
+    whose state this status could not read is never announced as recovered
+    (``health.unjudged``). A stuck send queue is told in quiet hours too,
+    silently: the owner's approved sends go out at night as well.
     """
     now = datetime.now(settings.tz)
     status: health.Status | None = None
@@ -1113,7 +2232,13 @@ async def health_job(bot: Bot) -> None:
         async with session_scope() as session:
             status = await health.gather(session, now=now)
             if status.db_ok:
-                await _alert_from_ledger(session, bot, health.problems(status), now=now)
+                await _alert_from_ledger(
+                    session,
+                    bot,
+                    health.problems(status),
+                    now=now,
+                    unjudged=health.unjudged(status),
+                )
                 return
     except Exception:
         # Leaving the scope commits; with the database gone that can fail
@@ -1125,10 +2250,15 @@ async def health_job(bot: Bot) -> None:
 
 
 async def _alert_from_ledger(
-    session, bot: Bot, found: list[health.Problem], *, now: datetime
+    session,
+    bot: Bot,
+    found: list[health.Problem],
+    *,
+    now: datetime,
+    unjudged: Collection[str] = (),
 ) -> None:
     quiet = reminders.in_quiet_hours(now)
-    due, recovered = await health.alerts_due(session, found, now=now)
+    due, recovered = await health.alerts_due(session, found, now=now, unjudged=unjudged)
     # Critical problems stand alone; everything else of one sweep is one
     # message (WP-80) — a bad night is one ping, not six.
     bundle = []
@@ -1137,6 +2267,11 @@ async def _alert_from_ledger(
             if await notify(bot, problem.text):
                 health.mark_alerted(session, [problem.key], now=now)
                 # Committed one by one: a crash mid-sweep repeats at most one.
+                await session.commit()
+        elif quiet and problem.key in health.QUIET_SILENT:
+            # Told at night too, without a sound (JV-21).
+            if await notify(bot, problem.text, silent=True):
+                health.mark_alerted(session, [problem.key], now=now)
                 await session.commit()
         elif not quiet:
             bundle.append(problem)
@@ -1251,7 +2386,7 @@ async def _backup_is_missing(now: datetime) -> bool:
 async def catch_up(bot: Bot, scheduler=None) -> None:
     """Run anything the scheduler missed while the worker was down.
 
-    The jobstore is in memory, so a deploy or a VPS reboot spanning 19:00
+    The jobstore is in memory, so a deploy or a VPS reboot spanning REPORT_TIME
     silently loses that day's report, one spanning 09:00 loses the morning
     brief, and one spanning BACKUP_TIME loses a nightly backup. All three
     are cheap to detect on startup and worth recovering: the report and the
@@ -1308,10 +2443,7 @@ async def catch_up(bot: Bot, scheduler=None) -> None:
 
 
 async def run() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("worker")
     if not settings.assistant_bot_token or not settings.owner_telegram_id:
         raise SystemExit(
             "ASSISTANT_BOT_TOKEN and OWNER_TELEGRAM_ID must be set for the worker"
@@ -1337,6 +2469,15 @@ async def run() -> None:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        timed_reminder_job,
+        CronTrigger(minute="*/5", timezone=settings.timezone),
+        args=[bot],
+        id="timed_reminders",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
     )
     scheduler.add_job(
         call_scan_job,
@@ -1400,6 +2541,65 @@ async def run() -> None:
         max_instances=1,
         coalesce=True,
     )
+    scheduler.add_job(
+        sheets_sync_job,
+        IntervalTrigger(seconds=settings.sheets_sync_seconds),
+        id="sheets_sync",
+        max_instances=1,
+        coalesce=True,
+    )
+    if settings.jarvis_enabled:
+        # Rule 20: with Jarvis off no Jarvis job exists at all.
+        scheduler.add_job(
+            jarvis_outbox_job,
+            IntervalTrigger(minutes=1),
+            args=[bot],
+            id="jarvis_outbox",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            jarvis_respond_job,
+            IntervalTrigger(seconds=15),
+            args=[bot],
+            id="jarvis_respond",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            jarvis_cards_job,
+            IntervalTrigger(minutes=1),
+            args=[bot],
+            id="jarvis_cards",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            style_refresh_job,
+            IntervalTrigger(minutes=10),
+            args=[bot],
+            id="style_refresh",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            kb_mining_job,
+            IntervalTrigger(hours=1),
+            args=[bot],
+            id="kb_mining",
+            max_instances=1,
+            coalesce=True,
+        )
+        # Once a day, after the morning brief and outside the quiet hours.
+        scheduler.add_job(
+            jarvis_rollout_job,
+            CronTrigger(hour=10, minute=17, timezone=settings.timezone),
+            args=[bot],
+            id="jarvis_rollout",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
     # Userbot pipeline. These jobs are harmless with the userbot switched off:
     # with no messages there is nothing to window and nothing to submit.
     scheduler.add_job(
@@ -1450,6 +2650,30 @@ async def run() -> None:
         IntervalTrigger(minutes=1),
         args=[bot],
         id="money_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        safety_notice_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="safety_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        receipt_notice_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="receipt_notices",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        receipt_check_job,
+        IntervalTrigger(minutes=1),
+        args=[bot],
+        id="receipt_check",
         max_instances=1,
         coalesce=True,
     )

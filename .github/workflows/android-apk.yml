@@ -137,7 +137,7 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_OWNER_ID }}
-          CAPTION: "📱 MIYA Companion — yangi versiya (#${{ github.run_number }}). O'rnatishdan oldin ilovadagi «Navbat» bo'sh ekanini tekshir. (Tungi soatlarda ovozsiz yuboriladi.)"
+          CAPTION: "📱 MIYA Companion — yangi versiya (#${{ github.run_number }}). Imzo SHA-256: ${{ vars.ANDROID_CERT_SHA256 }}. O'rnatishdan oldin ilovadagi «Navbat» bo'sh ekanini tekshir. (Tungi soatlarda ovozsiz yuboriladi.)"
         run: |
           curl -fsS -o /dev/null \
             -F chat_id="$TG_CHAT" \

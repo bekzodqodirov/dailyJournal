@@ -21,6 +21,7 @@ from miya.bot.formatting import clip
 from miya.bot.handlers import build_reject_router, router
 from miya.config import settings
 from miya.db.session import engine, session_scope
+from miya.logs import setup_logging
 from miya.services import health, reminders
 
 log = logging.getLogger(__name__)
@@ -163,10 +164,7 @@ def build_dispatcher() -> Dispatcher:
 
 
 async def run() -> None:
-    logging.basicConfig(
-        level=settings.log_level.upper(),
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    setup_logging("bot")
 
     if not settings.assistant_bot_token:
         raise SystemExit("ASSISTANT_BOT_TOKEN is not set")

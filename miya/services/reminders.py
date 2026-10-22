@@ -13,6 +13,14 @@ Undated promises and tasks (the same decision) get the question a week after
 they were made, and every week after — a week since whatever touched it last,
 which loops.stale_undated decides for the sweep and the morning brief alike.
 
+A promise or task whose deadline names a time of day (JV-03) gets its first
+ping PROMISE_REMIND_LEAD_MINUTES before that moment instead of on the morning
+of the day — from the five-minute timed sweep, so the lead holds — and never
+inside quiet hours: a lead that falls there moves to the end of the quiet
+hours when that is still before the deadline, else to the same lead before
+they begin. The pings a day and three days later and the question follow the
+date-only rules.
+
 All of this state lives in ``reminder_log`` — one row per thing sent, keyed
 by kind and ref — so a worker restart changes nothing and the sweep can
 count what already went out:
@@ -35,7 +43,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from miya.config import settings
-from miya.db.models import Debt, ReminderLog
+from miya.db.models import Debt, ReminderLog, local_due_at
 from miya.services import loops, queries
 
 log = logging.getLogger(__name__)
@@ -50,6 +58,8 @@ MAX_QUESTIONS = 20
 
 PING = "ping"
 ASK = "ask"
+# The first ping of a timed deadline, sent by the timed sweep only.
+LEAD = "lead"
 
 
 def nudge_every() -> timedelta:
@@ -123,6 +133,43 @@ def in_quiet_hours(now: datetime | None = None) -> bool:
     return current >= start or current < end
 
 
+def remind_lead() -> timedelta:
+    """How long before a timed deadline its first ping goes out. Read on each
+    call so a changed setting is seen without a restart."""
+    return timedelta(minutes=settings.promise_remind_lead_minutes)
+
+
+def _quiet_period(moment: datetime) -> tuple[datetime, datetime]:
+    """The start and end of the quiet hours that ``moment`` falls inside."""
+    local = moment.astimezone(settings.tz)
+    start, end = settings.quiet_hours_parsed
+    day = local.date()
+    if start <= end:
+        first, last = day, day
+    elif local.timetz().replace(tzinfo=None) >= start:
+        first, last = day, day + timedelta(days=1)
+    else:
+        first, last = day - timedelta(days=1), day
+    return (
+        datetime.combine(first, start, tzinfo=settings.tz),
+        datetime.combine(last, end, tzinfo=settings.tz),
+    )
+
+
+def timed_fire_at(due_at: datetime) -> datetime:
+    """When the ping before a timed deadline is due: the lead before it, or —
+    when that falls inside quiet hours — the end of the quiet hours if that
+    is still before the deadline, else the same lead before they begin."""
+    lead = remind_lead()
+    fire = due_at - lead
+    if not in_quiet_hours(fire):
+        return fire
+    start, end = _quiet_period(fire)
+    if end < due_at:
+        return end
+    return start - lead
+
+
 def day_start(now: datetime) -> datetime:
     """Midnight of ``now``'s calendar day in the owner's timezone."""
     return datetime.combine(
@@ -170,11 +217,15 @@ def decide(
     due: date | None,
     created_at: datetime | None,
     now: datetime,
+    due_time: time | None = None,
 ) -> str | None:
-    """PING, ASK or None for one item, from what was already sent.
+    """PING, ASK, LEAD or None for one item, from what was already sent.
 
     Pure, so the schedule is testable without a clock: the caller supplies
-    ``now`` and the log rows.
+    ``now`` and the log rows. With ``due_time`` the first ping is LEAD, due
+    at `timed_fire_at` and only until the deadline itself; the history counts
+    from that moment, so a deadline moved to a later time gets its own ping
+    before the new time.
     """
     # Reached by direct callers and tests only: the sweep takes undated items
     # from loops.stale_undated, one definition of "stale" for brief and ask.
@@ -187,6 +238,10 @@ def decide(
         return ASK if now >= last + nudge_every() else None
 
     since = datetime.combine(due, time.min, tzinfo=settings.tz)
+    due_at = local_due_at(due, due_time)
+    fire = timed_fire_at(due_at) if due_at is not None else None
+    if fire is not None:
+        since = fire
     pings = [sent for k, sent in history if k == kind and sent >= since]
     asks = [sent for k, sent in history if k == ask_kind(kind) and sent >= since]
     acks = [sent for k, sent in history if k == ack_kind(kind) and sent >= since]
@@ -203,6 +258,11 @@ def decide(
 
     today = now.date()
     stage = len(pings)
+    if stage == 0 and due_at is not None and fire is not None and now < due_at:
+        # Before a timed deadline only the lead ping may go; once the moment
+        # has passed unpinged (downtime, or written after it), the day's
+        # ordinary ping takes over.
+        return LEAD if now >= fire else None
     if stage < len(ESCALATION_DAYS):
         fire_on = due + timedelta(days=ESCALATION_DAYS[stage])
         return PING if today >= fire_on else None
@@ -246,6 +306,7 @@ async def collect_questions(
             due=promise.due_date,
             created_at=promise.created_at,
             now=now,
+            due_time=promise.due_time,
         )
         if verdict == ASK:
             questions.append(
@@ -259,6 +320,7 @@ async def collect_questions(
             due=task.due_date,
             created_at=task.created_at,
             now=now,
+            due_time=task.due_time,
         )
         if verdict == ASK:
             questions.append(Question("task", ref, [("task", task.id)], task))
@@ -314,6 +376,7 @@ async def collect_due(
             due=promise.due_date,
             created_at=promise.created_at,
             now=now,
+            due_time=promise.due_time,
         )
         if verdict == PING and not await _already_sent(session, "promise", ref, now):
             bundle.promises.append((promise, person))
@@ -327,6 +390,7 @@ async def collect_due(
             due=task.due_date,
             created_at=task.created_at,
             now=now,
+            due_time=task.due_time,
         )
         if verdict == PING and not await _already_sent(session, "task", ref, now):
             bundle.tasks.append(task)
@@ -344,6 +408,53 @@ async def collect_due(
         bundle.keys.append(("event", ref))
 
     return bundle
+
+
+async def collect_timed(
+    session: AsyncSession, *, now: datetime | None = None
+) -> DueBundle:
+    """The pings due before a timed deadline (LEAD), for the timed sweep.
+
+    Only LEAD: the later pings and the question are the hourly sweep's, so
+    the two sweeps never send the same item. Nothing here checks the
+    calendar day the way the hourly pings do — a deadline moved later the
+    same day gets a ping before its new time; `decide` counts from the lead
+    moment, so one lead is sent once.
+    """
+    now = now or datetime.now(settings.tz)
+    bundle = DueBundle()
+    # A lead is only ever due before its deadline; a day past the lead is
+    # wide enough that one moved before the quiet hours is still seen.
+    until = now + remind_lead() + timedelta(days=1)
+    due = await queries.timed_due_items(session, after=now, until=until)
+    for promise, person in due["promises"]:
+        if await _lead_due(session, "promise", promise, now):
+            bundle.promises.append((promise, person))
+            bundle.keys.append(("promise", str(promise.id)))
+    for task in due["tasks"]:
+        if await _lead_due(session, "task", task, now):
+            bundle.tasks.append(task)
+            bundle.keys.append(("task", str(task.id)))
+    return bundle
+
+
+async def _lead_due(session: AsyncSession, kind: str, record, now: datetime) -> bool:
+    """Whether one timed item's LEAD ping is due. A row that cannot be
+    decided is logged and skipped, never a stop for the rest of the sweep."""
+    ref = str(record.id)
+    try:
+        verdict = decide(
+            kind,
+            await _history(session, kind, ref),
+            due=record.due_date,
+            created_at=record.created_at,
+            now=now,
+            due_time=record.due_time,
+        )
+    except Exception as exc:
+        log.error("timed reminder for %s %s failed: %s", kind, ref, type(exc).__name__)
+        return False
+    return verdict == LEAD
 
 
 async def mark_sent(

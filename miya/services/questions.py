@@ -19,6 +19,7 @@ ever rendered.
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -30,8 +31,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from miya.config import settings
 from miya.db.enums import Currency
 from miya.db.models import ChatMonitor, Claim, Interaction, QuestionLog, ReminderLog
-from miya.services import approvals, chats, claims, loops, nudges, queries, reminders
+from miya.services import (
+    approvals,
+    chats,
+    claims,
+    loops,
+    nudges,
+    queries,
+    receipts,
+    reminders,
+    safety,
+)
 from miya.services.brief import BRIEF_KIND
+
+log = logging.getLogger(__name__)
 
 KIND_CLAIM = "claim"
 KIND_MONEY = "money"
@@ -210,10 +223,13 @@ async def collect(
         day = now.astimezone(settings.tz).date().isoformat()
         items.append(_pending(KIND_GROUPS, f"digest:{day}", Decimal(0), since, monitors))
 
-    # (f) Big files.
+    # (f) Big files. One a spammer or a scammer sent is never worth a tap
+    # (JV-09).
     for row in await approvals.awaiting_question(
         session, limit=20, pushable_only=for_push
     ):
+        if safety.is_hidden(row.meta):  # filtered in SQL; a guard for the rest
+            continue
         items.append(_pending(KIND_MEDIA, f"i{row.id}", Decimal(0), row.occurred_at, row))
 
     # (g) Money texts the reader could not book alone.
@@ -437,7 +453,20 @@ async def auto_resolve(session: AsyncSession, *, now: datetime) -> dict[str, int
         "claims_linked": await claims.collapse_duplicates(session, now=now),
         "claims_superseded": len(await claims.resolve_superseded(session, now=now)),
         "claims_bank": len(await claims.match_bank_evidence(session, now=now)),
+        "receipts_bank": await _receipts_bank(session, now=now),
     }
+
+
+async def _receipts_bank(session: AsyncSession, *, now: datetime) -> int:
+    """Receipts the bank confirmed (JV-05), in a savepoint: a receipt that
+    cannot be matched never costs the brief or the questions; the worker's
+    receipt_check sweep tries again."""
+    try:
+        async with session.begin_nested():
+            return len(await receipts.match_bank(session, now=now))
+    except Exception as exc:
+        log.error("receipts not matched in auto_resolve: %s", type(exc).__name__)
+        return 0
 
 
 # --- what resolved itself (WP-45) -------------------------------------------------

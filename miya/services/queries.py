@@ -18,11 +18,13 @@ from sqlalchemy.orm import selectinload
 
 from miya.config import settings
 from miya.db.enums import (
+    ChatType,
     Currency,
     DebtDirection,
     DebtStatus,
     Direction,
     InteractionSource,
+    PromiseMadeBy,
     PromiseStatus,
     TaskStatus,
     TransactionType,
@@ -40,8 +42,9 @@ from miya.db.models import (
     Transaction,
     TransactionEvidence,
     UsageLog,
+    due_at_expr,
 )
-from miya.services import codes, memories
+from miya.services import authorship, codes, memories, safety
 
 
 @dataclass(slots=True)
@@ -79,6 +82,9 @@ class TimelineEntry:
     direction: Direction
     # The summary when extraction wrote one, else the words themselves.
     text: str
+    # MIYA's own automatic reply (JV-10): shown as MIYA's line, never the
+    # owner's.
+    by_miya: bool = False
 
 
 @dataclass(slots=True)
@@ -192,7 +198,12 @@ async def promises_by_status(
         sa.select(Promise, Person)
         .join(Person, Person.id == Promise.person_id)
         .where(Promise.status == status)
-        .order_by(Promise.due_date.nulls_last(), Promise.created_at)
+        # A timed deadline before a date-only one of the same day (JV-03).
+        .order_by(
+            Promise.due_date.nulls_last(),
+            Promise.due_time.nulls_last(),
+            Promise.created_at,
+        )
         .limit(limit)
     )
     if person_id is not None:
@@ -521,14 +532,16 @@ def timeline_filter(direction: Direction | None = None):
     raw userbot member lines stay out. With one: the member lines *are* the
     point — "what did I say to him" is the owner's own DM lines (direction
     out), "what did he say" his — so only userbot rows with that direction
-    count. The owner's own notes to the bot are stored as direction ``in``
-    too, and a call transcript holds both voices; neither is "his lines".
-    The window row itself has direction ``na`` and drops out on its own.
+    count. A reply MIYA wrote itself is outgoing but not the owner's line, so
+    the side's words come from ``authorship.said_by_clause``. The owner's own
+    notes to the bot are stored as direction ``in`` too, and a call
+    transcript holds both voices; neither is "his lines". The window row
+    itself has direction ``na`` and drops out on its own.
     """
     if direction is not None:
         return sa.and_(
             Interaction.source == InteractionSource.telegram_userbot,
-            Interaction.direction == direction,
+            authorship.said_by_clause(direction),
         )
     return sa.or_(_is_window_row(), Interaction.source.in_(TIMELINE_SOURCES))
 
@@ -547,6 +560,7 @@ def timeline_entry(interaction: Interaction) -> TimelineEntry:
         source=interaction.source,
         direction=interaction.direction,
         text=timeline_text(interaction),
+        by_miya=authorship.is_ai_reply(interaction),
     )
 
 
@@ -691,7 +705,7 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
             sa.select(Task)
             .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
             .where(Task.due_date.isnot(None), Task.due_date <= limit)
-            .order_by(Task.due_date)
+            .order_by(Task.due_date, Task.due_time.nulls_last())
         )
     )
     # One list in the brief: namesakes across debts and promises differ.
@@ -699,6 +713,67 @@ async def due_items(session: AsyncSession, *, horizon_days: int = 1) -> dict[str
         session, [b.person for b in debts] + [person for _, person in promises]
     )
     return {"debts": debts, "promises": promises, "tasks": tasks}
+
+
+async def timed_due_items(
+    session: AsyncSession, *, after: datetime, until: datetime
+) -> dict[str, list]:
+    """Open promises and tasks whose deadline names a time of day, later than
+    ``after`` and at or before ``until``, soonest first — the timed
+    reminder's source (JV-03)."""
+    promises = [
+        (row[0], row[1])
+        for row in (
+            await session.execute(
+                sa.select(Promise, Person)
+                .join(Person, Person.id == Promise.person_id)
+                .where(Promise.status == PromiseStatus.open)
+                .where(Promise.due_time.isnot(None))
+                .where(due_at_expr(Promise) > after, due_at_expr(Promise) <= until)
+                .order_by(due_at_expr(Promise), Promise.id)
+            )
+        ).all()
+    ]
+    tasks = list(
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
+            .where(Task.due_time.isnot(None))
+            .where(due_at_expr(Task) > after, due_at_expr(Task) <= until)
+            .order_by(due_at_expr(Task), Task.id)
+        )
+    )
+    await codes.apply_labels(session, [person for _, person in promises])
+    return {"promises": promises, "tasks": tasks}
+
+
+async def timed_due_on(session: AsyncSession, day: date) -> dict[str, list]:
+    """Open promises and tasks due on ``day`` at a time of day, ordered by
+    ``due_at`` — the brief's «Bugungi muddatlar» (JV-08). Date-only deadlines
+    are not here: they stay in the due section as they always were. The
+    names are not labelled here: the brief labels this list together with
+    its due section (brief._label_brief), so namesakes across both read apart."""
+    promises = [
+        (row[0], row[1])
+        for row in (
+            await session.execute(
+                sa.select(Promise, Person)
+                .join(Person, Person.id == Promise.person_id)
+                .where(Promise.status == PromiseStatus.open)
+                .where(Promise.due_date == day, Promise.due_time.isnot(None))
+                .order_by(due_at_expr(Promise), Promise.id)
+            )
+        ).all()
+    ]
+    tasks = list(
+        await session.scalars(
+            sa.select(Task)
+            .where(Task.status.in_([TaskStatus.todo, TaskStatus.doing]))
+            .where(Task.due_date == day, Task.due_time.isnot(None))
+            .order_by(due_at_expr(Task), Task.id)
+        )
+    )
+    return {"promises": promises, "tasks": tasks}
 
 
 async def upcoming_events(
@@ -1164,6 +1239,36 @@ def not_archive():
     return sa.func.coalesce(Interaction.meta["archive"].astext, "") != "true"
 
 
+def safety_verdict():
+    """``meta.safety.verdict`` as text, '' when the message shield (JV-09) and
+    the file shield (JV-01) found nothing."""
+    return sa.func.coalesce(Interaction.meta[("safety", "verdict")].astext, "")
+
+
+def not_unsafe():
+    """Spam, scam and messages that carried an installer or an archive are
+    never an open question, a nudge or a follow-up (JV-09)."""
+    return safety_verdict().not_in(safety.HIDDEN_VERDICTS)
+
+
+async def unsafe_ignored_count(
+    session: AsyncSession, start: datetime, end: datetime
+) -> int:
+    """Incoming messages in ``[start, end)`` the shields set aside as spam or
+    scam (the brief's «🚫 Kecha …» line)."""
+    return int(
+        await session.scalar(
+            sa.select(sa.func.count(Interaction.id))
+            .where(Interaction.direction == Direction.in_)
+            # An archive import is history the owner never saw arrive.
+            .where(not_archive())
+            .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+            .where(safety_verdict().in_(safety.HIDDEN_VERDICTS))
+        )
+        or 0
+    )
+
+
 def _addressed_to_owner():
     """Rows the userbot marked as aimed at the owner.
 
@@ -1279,3 +1384,211 @@ async def chat_digests(
     ]
     digests.sort(key=lambda d: d.messages, reverse=True)
     return digests
+
+
+# --- what the owner asks about one day (JV-06) --------------------------------
+#
+# «Bugun kimga nima va'da bergandim?» and «Kecha kimlar yozdi?» are answered
+# from these two queries alone, with no model call. A window is the [start,
+# end) of a local day (``day_bounds``); MIYA's own automatic replies are never
+# the owner's words (JV-10), so they neither make a promise nor answer anyone.
+
+
+@dataclass(slots=True)
+class PromiseMade:
+    """One promise made in the window, and where it was made."""
+
+    promise: Promise
+    person: Person
+    # When the words were said: the source interaction's time, else the
+    # moment the row was written (a promise typed in with no source).
+    made_at: datetime
+    source: InteractionSource | None = None
+    chat_title: str | None = None
+    chat_type: ChatType | None = None
+
+
+PROMISES_MADE_LIMIT = 50
+
+
+async def promises_made(
+    session: AsyncSession,
+    window: tuple[datetime, datetime],
+    *,
+    made_by: PromiseMadeBy = PromiseMadeBy.me,
+    limit: int = PROMISES_MADE_LIMIT,
+) -> tuple[list[PromiseMade], int]:
+    """Promises ``made_by`` made in ``window``, oldest first, plus how many
+    there are in all (the list stops at ``limit``).
+
+    Counted by the source interaction's ``occurred_at``, so a promise said
+    late yesterday and extracted this morning is yesterday's. Any status but
+    ``cancelled`` (closed as never meant) counts: a promise already kept was
+    still made that day. A promise read out of MIYA's own automatic reply is
+    nobody's word and is left out.
+    """
+    start, end = window
+    made_at = sa.func.coalesce(Interaction.occurred_at, Promise.created_at)
+    stmt = (
+        sa.select(
+            Promise,
+            Person,
+            made_at.label("made_at"),
+            Interaction.source,
+            ChatMonitor.title,
+            ChatMonitor.chat_type,
+        )
+        .join(Person, Person.id == Promise.person_id)
+        .outerjoin(Interaction, Interaction.id == Promise.source_interaction_id)
+        .outerjoin(ChatMonitor, ChatMonitor.tg_chat_id == Interaction.tg_chat_id)
+        .where(Promise.made_by == made_by)
+        .where(Promise.status != PromiseStatus.cancelled)
+        .where(made_at >= start, made_at < end)
+        # COALESCE: with no source row the clause is NULL, and NOT NULL
+        # would drop a promise the owner typed in by hand.
+        .where(sa.not_(sa.func.coalesce(authorship.ai_reply_clause(), sa.false())))
+    )
+    total = await session.scalar(sa.select(sa.func.count()).select_from(stmt.subquery()))
+    rows = (await session.execute(stmt.order_by(made_at, Promise.id).limit(limit))).all()
+    made = [
+        PromiseMade(
+            promise=promise,
+            person=person,
+            made_at=at,
+            source=source,
+            chat_title=title,
+            chat_type=chat_type,
+        )
+        for promise, person, at, source, title, chat_type in rows
+    ]
+    await codes.apply_labels(session, [item.person for item in made])
+    return made, total or 0
+
+
+@dataclass(slots=True)
+class WhoWrote:
+    """One counterparty who wrote to the owner in the window."""
+
+    person: Person | None
+    # The chat's title, for a sender MIYA has no person row for.
+    chat_title: str | None
+    messages: int
+    last_at: datetime
+    # Did the owner write in each of their chats after their last message
+    # (or tap "✅ Javob berdim" on it)? Only the owner's own words count.
+    answered: bool
+    interaction_ids: list[int] = field(default_factory=list)
+
+
+WHO_WROTE_LIMIT = 50
+
+
+def _wrote_to_owner():
+    """Incoming userbot messages a person wrote to the owner: anything in a
+    private chat, and in a group only what was aimed at them (``to_me``,
+    never ``to_me_maybe``). Archive imports and window rows are not
+    messages someone wrote that day, and spam and scam (``not_unsafe``) are
+    no one the owner owes an answer."""
+    return sa.and_(
+        is_member_message(),
+        Interaction.direction == Direction.in_,
+        not_archive(),
+        # JV-09: spam and scam are never someone waiting for an answer.
+        not_unsafe(),
+        sa.or_(
+            ChatMonitor.chat_type == ChatType.private,
+            sa.and_(ChatMonitor.chat_type == ChatType.group, _addressed_to_owner()),
+        ),
+    )
+
+
+async def who_wrote(
+    session: AsyncSession,
+    window: tuple[datetime, datetime],
+    *,
+    limit: int = WHO_WROTE_LIMIT,
+) -> tuple[list[WhoWrote], int]:
+    """Who wrote to the owner in ``window``, per person, in the order of their
+    last message, plus how many wrote in all (the list keeps the ``limit``
+    most recent).
+
+    Messages of a sender with no person row are grouped by chat. A person
+    counts as answered when, in every chat they wrote in, the owner's own
+    words (``authorship.owner_words_clause``) follow their last message, at
+    any time up to now, or that message was marked answered.
+    """
+    # loops imports this module; the answered mark is its key.
+    from miya.services.loops import ANSWERED_KEY
+
+    start, end = window
+    rows = (
+        await session.execute(
+            sa.select(
+                Interaction.id,
+                Interaction.person_id,
+                Interaction.tg_chat_id,
+                Interaction.occurred_at,
+                Interaction.meta[ANSWERED_KEY].isnot(None).label("marked"),
+                ChatMonitor.title,
+            )
+            .join(ChatMonitor, ChatMonitor.tg_chat_id == Interaction.tg_chat_id)
+            .where(_wrote_to_owner())
+            .where(Interaction.occurred_at >= start, Interaction.occurred_at < end)
+            .order_by(Interaction.occurred_at, Interaction.id)
+        )
+    ).all()
+    if not rows:
+        return [], 0
+
+    chats = {row.tg_chat_id for row in rows}
+    replied = dict(
+        (
+            await session.execute(
+                sa.select(Interaction.tg_chat_id, sa.func.max(Interaction.occurred_at))
+                .where(Interaction.source == InteractionSource.telegram_userbot)
+                .where(Interaction.tg_chat_id.in_(chats))
+                .where(authorship.owner_words_clause())
+                .where(Interaction.occurred_at >= start)
+                .group_by(Interaction.tg_chat_id)
+            )
+        ).all()
+    )
+
+    groups: dict[tuple[str, int], list] = {}
+    for row in rows:
+        key = ("person", row.person_id) if row.person_id else ("chat", row.tg_chat_id)
+        groups.setdefault(key, []).append(row)
+
+    people = {
+        person.id: person
+        for person in await session.scalars(
+            sa.select(Person).where(
+                Person.id.in_([pid for kind, pid in groups if kind == "person"])
+            )
+        )
+    }
+    found: list[WhoWrote] = []
+    for (kind, key_id), members in groups.items():
+        last_in: dict[int, Any] = {}
+        for row in members:  # oldest first, so the last one per chat wins
+            last_in[row.tg_chat_id] = row
+        answered = all(
+            bool(last.marked)
+            or (replied.get(chat) is not None and replied[chat] > last.occurred_at)
+            for chat, last in last_in.items()
+        )
+        found.append(
+            WhoWrote(
+                person=people.get(key_id) if kind == "person" else None,
+                chat_title=members[-1].title,
+                messages=len(members),
+                last_at=members[-1].occurred_at,
+                answered=answered,
+                interaction_ids=[row.id for row in members],
+            )
+        )
+    found.sort(key=lambda item: (item.last_at, item.interaction_ids[-1]))
+    total = len(found)
+    found = found[-limit:]  # the most recent, still oldest first
+    await codes.apply_labels(session, [item.person for item in found if item.person])
+    return found, total

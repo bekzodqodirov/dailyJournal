@@ -106,7 +106,7 @@ async def test_unparsed_text_is_a_normal_note(bound, quiet_handlers, monkeypatch
         return SimpleNamespace(ok=True, applied=handlers.persistence.Applied())
 
     monkeypatch.setattr(handlers, "process_interaction", _process)
-    monkeypatch.setattr(handlers.rag, "classify", lambda text: "note")
+    monkeypatch.setattr(handlers.rag, "classify", lambda text, **_: "note")
 
     await handlers.on_text(_reply("Akmal ertaga keladi"))
 
@@ -128,7 +128,7 @@ async def test_reply_to_a_non_question_message_is_ignored(
         return SimpleNamespace(ok=True, applied=handlers.persistence.Applied())
 
     monkeypatch.setattr(handlers, "process_interaction", _process)
-    monkeypatch.setattr(handlers.rag, "classify", lambda text: "note")
+    monkeypatch.setattr(handlers.rag, "classify", lambda text, **_: "note")
 
     await handlers.on_text(_reply("1 ha", to=12345))
 

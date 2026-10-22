@@ -9,13 +9,14 @@ Conventions:
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import sqlalchemy as sa
 from pgvector.sqlalchemy import Vector
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from miya.config import settings
@@ -37,6 +38,44 @@ EVENT_STATUS = pg_enum(e.EventStatus, e.EVENT_STATUS_ENUM)
 TASK_PRIORITY = pg_enum(e.TaskPriority, e.TASK_PRIORITY_ENUM)
 TASK_STATUS = pg_enum(e.TaskStatus, e.TASK_STATUS_ENUM)
 WINDOW_STATUS = pg_enum(e.WindowStatus, e.WINDOW_STATUS_ENUM)
+
+
+def local_due_at(due_date: date | None, due_time: time | None) -> datetime | None:
+    """The deadline moment of a dated, timed row, in the owner's timezone."""
+    if due_date is None or due_time is None:
+        return None
+    return datetime.combine(due_date, due_time, tzinfo=settings.tz)
+
+
+def due_at_expr(model: type[Promise] | type[Task]) -> sa.ColumnElement[datetime]:
+    """The same moment in SQL: ``due_date + due_time`` read as local time.
+    NULL for a date-only or undated row, like the Python side."""
+    return sa.func.timezone(
+        settings.timezone, model.due_date + model.due_time, type_=sa.DateTime(True)
+    )
+
+
+class _TimedDue:
+    """A deadline that may carry a time of day (JV-03).
+
+    ``due_date`` stays the single source of the day, so every reader that
+    only knows the date keeps working; ``due_time`` is NULL for a date-only
+    deadline and a CHECK keeps it NULL when there is no date. ``due_at`` is
+    the moment the two make, None unless both are set.
+    """
+
+    if TYPE_CHECKING:  # the columns themselves are declared on each model
+        due_date: Mapped[date | None]
+        due_time: Mapped[time | None]
+
+    @hybrid_property
+    def due_at(self) -> datetime | None:
+        return local_due_at(self.due_date, self.due_time)
+
+    @due_at.inplace.expression
+    @classmethod
+    def _due_at_expression(cls) -> sa.ColumnElement[datetime]:
+        return due_at_expr(cls)  # type: ignore[arg-type]
 
 
 class Person(Base):
@@ -122,6 +161,19 @@ class ChatMonitor(Base):
     # (never read before it) and the newest message id the userbot saw.
     monitoring_since: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_seen_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    # The style history import (JV-14, 0026): ``/uslub yukla`` stamps the
+    # request on every monitored private chat; the userbot reads the chat's
+    # recent history for search and style only, then stamps it done. A chat
+    # that keeps failing stops being retried after a few sweeps.
+    style_import_requested_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    style_import_done_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    style_import_attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
     updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
 
 
@@ -369,7 +421,7 @@ class DebtPayment(Base):
     )
 
 
-class Promise(Base):
+class Promise(_TimedDue, Base):
     __tablename__ = "promises"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -379,6 +431,8 @@ class Promise(Base):
     )
     description: Mapped[str] = mapped_column(sa.Text, nullable=False)
     due_date: Mapped[date | None] = mapped_column(sa.Date)
+    # The time of day the deadline names, when it names one (JV-03).
+    due_time: Mapped[time | None] = mapped_column(sa.Time)
     status: Mapped[e.PromiseStatus] = mapped_column(
         PROMISE_STATUS, nullable=False, server_default=e.PromiseStatus.open.value
     )
@@ -394,6 +448,9 @@ class Promise(Base):
     person: Mapped[Person] = relationship(lazy="raise")
 
     __table_args__ = (
+        sa.CheckConstraint(
+            "due_time IS NULL OR due_date IS NOT NULL", name="ck_promises_due_time"
+        ),
         sa.Index("ix_promises_status_due", "status", "due_date"),
         sa.Index("ix_promises_person", "person_id"),
         # Foreign keys that cascade or set null are indexed (WP-23, 0016).
@@ -517,12 +574,14 @@ class Event(Base):
     )
 
 
-class Task(Base):
+class Task(_TimedDue, Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     description: Mapped[str] = mapped_column(sa.Text, nullable=False)
     due_date: Mapped[date | None] = mapped_column(sa.Date)
+    # The time of day the deadline names, when it names one (JV-03).
+    due_time: Mapped[time | None] = mapped_column(sa.Time)
     priority: Mapped[e.TaskPriority] = mapped_column(
         TASK_PRIORITY, nullable=False, server_default=e.TaskPriority.med.value
     )
@@ -542,6 +601,9 @@ class Task(Base):
     )
 
     __table_args__ = (
+        sa.CheckConstraint(
+            "due_time IS NULL OR due_date IS NOT NULL", name="ck_tasks_due_time"
+        ),
         sa.Index("ix_tasks_status_due", "status", "due_date"),
         # Foreign keys that cascade or set null are indexed (WP-23, 0016).
         sa.Index("ix_tasks_source_interaction", "source_interaction_id"),
@@ -922,16 +984,27 @@ __all__ = [
     "DailyReport",
     "Debt",
     "DebtPayment",
+    "Escalation",
     "Event",
     "Heartbeat",
     "Interaction",
+    "JarvisChatState",
+    "JarvisPolicy",
+    "KnowledgeEntry",
     "Memory",
+    "OutboxMessage",
+    "OwnerStyleExample",
+    "OwnerStylePerson",
+    "OwnerStyleProfile",
     "Passage",
     "Person",
     "Promise",
     "QuestionLog",
     "RecapDigest",
+    "Receipt",
     "ReminderLog",
+    "ReplyRule",
+    "SheetRow",
     "Task",
     "Transaction",
     "TransactionEvidence",
@@ -1080,4 +1153,890 @@ class RecapDigest(Base):
         ),
         sa.Index("ix_recap_digests_date_end", "digest_date", "window_end"),
         sa.Index("ix_recap_digests_person", "person_id"),
+    )
+
+
+# The values the receipts CHECKs allow (JV-04, 0023). The migration keeps its
+# own frozen copy; tests/test_receipts_read.py holds the two equal.
+RECEIPT_DIRECTIONS = ("in", "out", "unknown")
+RECEIPT_STATES = ("read", "needs_review", "rejected")
+RECEIPT_VERDICTS = (
+    "waiting",
+    "confirmed",
+    "unconfirmed",
+    "suspicious",
+    "owner_ok",
+    "owner_fake",
+)
+RECEIPT_REASONS = (
+    "duplicate_image",
+    "duplicate_reference",
+    "stale_date",
+    "future_date",
+    "own_card_no_bank",
+    "amount_near_miss",
+)
+
+
+def _sql_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{v}'" for v in values)
+
+
+class Receipt(Base):
+    """A payment receipt read from an image (JV-04, 0023): a Payme or bank-app
+    screenshot, a terminal check, sent to the bot or into a chat.
+
+    What the image says, never the bank's record: nothing here books money.
+    ``reading`` is the model's structured answer kept for audit only; the
+    columns are the parsed, checked values. ``verdict`` is the bank
+    cross-check (JV-05), ``waiting`` until then.
+    """
+
+    __tablename__ = "receipts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    # Who sent it: the chat's counterparty; NULL for the owner's own photo.
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    # Money to the owner (in), from the owner (out), or not known (unknown).
+    direction: Mapped[str] = mapped_column(
+        sa.String(8), nullable=False, server_default="unknown"
+    )
+    amount: Mapped[Decimal | None] = money_column()
+    currency: Mapped[e.Currency | None] = mapped_column(CURRENCY)
+    # The date and time printed on the receipt, on the owner's clock.
+    paid_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    payer_name: Mapped[str | None] = mapped_column(sa.Text)
+    payee_name: Mapped[str | None] = mapped_column(sa.Text)
+    # The bank or the payment app that issued it.
+    issuer: Mapped[str | None] = mapped_column(sa.Text)
+    reference: Mapped[str | None] = mapped_column(sa.Text)
+    payer_card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    payee_card_last4: Mapped[str | None] = mapped_column(sa.String(4))
+    image_sha256: Mapped[str | None] = mapped_column(sa.CHAR(64))
+    reading: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    # read | needs_review | rejected
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    verdict: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="waiting"
+    )
+    verdict_reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    # The bank row that confirms it (JV-05), and the claim it backs.
+    transaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("transactions.id", ondelete="SET NULL")
+    )
+    claim_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("claims.id", ondelete="SET NULL")
+    )
+    # The owner's receipt card: when it went out and which message it is.
+    notified_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    notice_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    verdict_notified_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    history: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"direction IN ({_sql_list(RECEIPT_DIRECTIONS)})",
+            name="ck_receipts_direction",
+        ),
+        sa.CheckConstraint("amount > 0", name="ck_receipts_amount_positive"),
+        sa.CheckConstraint(
+            "(amount IS NULL) = (currency IS NULL)", name="ck_receipts_amount_currency"
+        ),
+        sa.CheckConstraint(
+            "payer_card_last4 IS NULL OR payer_card_last4 ~ '^[0-9]{4}$'",
+            name="ck_receipts_payer_card_last4",
+        ),
+        sa.CheckConstraint(
+            "payee_card_last4 IS NULL OR payee_card_last4 ~ '^[0-9]{4}$'",
+            name="ck_receipts_payee_card_last4",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(RECEIPT_STATES)})", name="ck_receipts_state"
+        ),
+        sa.CheckConstraint(
+            f"verdict IN ({_sql_list(RECEIPT_VERDICTS)})", name="ck_receipts_verdict"
+        ),
+        sa.CheckConstraint(
+            f"verdict_reasons <@ ARRAY[{_sql_list(RECEIPT_REASONS)}]::text[]",
+            name="ck_receipts_verdict_reasons",
+        ),
+        sa.Index("ux_receipts_interaction", "interaction_id", unique=True),
+        sa.Index("ix_receipts_person", "person_id"),
+        sa.Index("ix_receipts_image_sha256", "image_sha256"),
+        sa.Index(
+            "ux_receipts_transaction",
+            "transaction_id",
+            unique=True,
+            postgresql_where=sa.text("transaction_id IS NOT NULL"),
+        ),
+        sa.Index("ix_receipts_claim", "claim_id"),
+        sa.Index(
+            "ix_receipts_waiting",
+            "created_at",
+            postgresql_where=sa.text("verdict = 'waiting'"),
+        ),
+        sa.Index(
+            "ix_receipts_reference",
+            "issuer",
+            "reference",
+            postgresql_where=sa.text("reference IS NOT NULL"),
+        ),
+    )
+
+
+# The values the sheet_rows CHECKs allow (JV-07, 0024). The migration keeps its
+# own frozen copy; tests/test_sheets_sync.py holds the two equal.
+SHEET_TABS = ("Tasks_Promises", "Client_FollowUps", "Receipts")
+SHEET_ENTITY_KINDS = ("promise", "task", "receipt", "person")
+SHEET_ROW_STATES = ("pending", "synced", "failed", "tombstone", "cleared")
+
+
+class SheetRow(Base):
+    """Where one database row sits in the owner's Google Sheets mirror
+    (JV-07, 0024), and whether the sheet has caught up with it.
+
+    The mirror is one-way: SQL is the source of truth and nothing is read
+    back. ``entity_id`` names a promise, task, receipt or person by kind,
+    with no foreign key, so a purge leaves this row behind on purpose: it
+    becomes a ``tombstone`` and the sync clears its cells (``cleared``).
+    ``row_number`` is the sheet row the entity owns for good; every write is
+    to that explicit range, so a retried write never adds a second row.
+    ``content_hash`` is what was last planned for the row (blank zeros on a
+    tombstone, so nothing of forgotten cells is kept), ``last_error`` an
+    error code, never a message.
+    """
+
+    __tablename__ = "sheet_rows"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tab: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    entity_kind: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    entity_id: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    row_number: Mapped[int | None] = mapped_column(sa.Integer)
+    content_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="pending"
+    )
+    attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(sa.String(64))
+    synced_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(f"tab IN ({_sql_list(SHEET_TABS)})", name="ck_sheet_rows_tab"),
+        sa.CheckConstraint(
+            f"entity_kind IN ({_sql_list(SHEET_ENTITY_KINDS)})",
+            name="ck_sheet_rows_entity_kind",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(SHEET_ROW_STATES)})", name="ck_sheet_rows_state"
+        ),
+        sa.CheckConstraint(
+            "row_number IS NULL OR row_number >= 2", name="ck_sheet_rows_row_number"
+        ),
+        sa.UniqueConstraint(
+            "tab", "entity_kind", "entity_id", name="uq_sheet_rows_entity"
+        ),
+        sa.Index(
+            "ux_sheet_rows_row_number",
+            "tab",
+            "row_number",
+            unique=True,
+            postgresql_where=sa.text("row_number IS NOT NULL"),
+        ),
+        sa.Index(
+            "ix_sheet_rows_due",
+            "next_attempt_at",
+            postgresql_where=sa.text("state IN ('pending', 'failed', 'tombstone')"),
+        ),
+    )
+
+
+# --- Jarvis core (JV-11, 0025) -----------------------------------------------------
+#
+# The values the 0025 CHECKs allow. The migration keeps its own frozen copy;
+# tests/test_outbox.py holds the two equal.
+JARVIS_CHANNELS = ("telegram", "whatsapp", "gmail")
+JARVIS_MODES = ("off", "shadow", "draft", "auto")
+REPLY_RULE_SUBJECTS = ("person", "chat", "address")
+REPLY_RULE_MODES = ("never", "draft", "auto")
+REPLY_RULE_REASONS = ("personal", "group", "spam", "bot", "owner")
+REPLY_RULE_STATES = ("active", "proposed", "revoked")
+ESCALATION_REASONS = (
+    "price",
+    "discount",
+    "payment_terms",
+    "deal",
+    "deadline",
+    "promise",
+    "guarantee",
+    "payment_claim",
+    "identity",
+    "complaint",
+    "legal",
+    "other_people",
+    "other",
+)
+ESCALATION_STATES = (
+    "open",
+    "snoozed",
+    "owner_replying",
+    "resolved",
+    "expired",
+    "cancelled",
+)
+# The states that hold a chat's one open escalation (ux_escalations_open_chat).
+ESCALATION_OPEN_STATES = ("open", "snoozed", "owner_replying")
+ESCALATION_RESOLUTIONS = ("sent", "owner_replied", "expired", "cancelled")
+OUTBOX_ORIGINS = ("auto_reply", "stall", "owner_command", "escalation")
+OUTBOX_AUTHORS = ("ai", "owner")
+OUTBOX_STATES = (
+    "shadow",
+    "draft",
+    "approved",
+    "sending",
+    "sent",
+    "failed",
+    "unknown",
+    "cancelled",
+    "expired",
+    "blocked",
+)
+OUTBOX_APPROVERS = ("button", "reply", "command", "auto:policy")
+# global | question_bank | channel:<c> | intent:<i> | channel:<c>:intent:<i>
+# (0025; 0028 added question_bank, the row of the owner's question bank).
+JARVIS_SCOPE_PATTERN = (
+    "^(global|question_bank|channel:[a-z]+|intent:[a-z_]+"
+    "|channel:[a-z]+:intent:[a-z_]+)$"
+)
+# 0028: an AI row the policy approved on its own carries a passing shape
+# check (rule 13a), the JSON boolean true; COALESCE so a verdict without the
+# key never passes.
+OUTBOX_AUTO_SHAPES_CHECK = (
+    "authored_by <> 'ai' OR approved_by IS DISTINCT FROM 'auto:policy' "
+    "OR COALESCE(guard->'shapes_ok' = 'true'::jsonb, false)"
+)
+
+
+def _history_column():
+    """``history JSONB NOT NULL DEFAULT '[]'``: {at, field, old, new, by} entries."""
+    return mapped_column(JSONB, nullable=False, server_default=sa.text("'[]'::jsonb"))
+
+
+class JarvisPolicy(Base):
+    """The rollout mode, pauses and breakers of one Jarvis scope (JV-11, 0025).
+
+    ``scope`` is ``global``, ``channel:<c>``, ``intent:<i>`` or
+    ``channel:<c>:intent:<i>``; a NULL ``mode`` inherits from the next less
+    specific scope, and the env ceiling JARVIS_MODE caps whatever resolves.
+    A pause with no ``paused_until`` lasts until the owner resumes it; a
+    breaker (a platform limit, the cost cap) always has an end.
+    """
+
+    __tablename__ = "jarvis_policy"
+
+    scope: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    mode: Mapped[str | None] = mapped_column(sa.String(8))
+    paused_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    pause_reason: Mapped[str | None] = mapped_column(sa.String(32))
+    breaker_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    breaker_reason: Mapped[str | None] = mapped_column(sa.String(32))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"mode IN ({_sql_list(JARVIS_MODES)})", name="ck_jarvis_policy_mode"
+        ),
+        sa.CheckConstraint(
+            f"scope ~ '{JARVIS_SCOPE_PATTERN}'", name="ck_jarvis_policy_scope"
+        ),
+    )
+
+
+class ReplyRule(Base):
+    """Who the AI may write to (JV-11 table, JV-12 commands): the owner's
+    personal deny-list and the group reply policy.
+
+    ``address`` is channel-qualified (``tg:<user id>``, ``wa:<jid>``,
+    ``mail:<addr>``) and snapshotted when the rule is set, so forgetting or
+    merging the person never reopens a personal chat.
+    """
+
+    __tablename__ = "reply_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    chat_key: Mapped[str | None] = mapped_column(sa.Text)
+    address: Mapped[str | None] = mapped_column(sa.Text)
+    mode: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    reason: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="active"
+    )
+    set_by: Mapped[str | None] = mapped_column(sa.String(16))
+    note: Mapped[str | None] = mapped_column(sa.Text)
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"subject IN ({_sql_list(REPLY_RULE_SUBJECTS)})",
+            name="ck_reply_rules_subject",
+        ),
+        sa.CheckConstraint(
+            f"mode IN ({_sql_list(REPLY_RULE_MODES)})", name="ck_reply_rules_mode"
+        ),
+        sa.CheckConstraint(
+            f"reason IN ({_sql_list(REPLY_RULE_REASONS)})", name="ck_reply_rules_reason"
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(REPLY_RULE_STATES)})", name="ck_reply_rules_state"
+        ),
+        sa.CheckConstraint(
+            "num_nonnulls(person_id, chat_key, address) >= 1",
+            name="ck_reply_rules_target",
+        ),
+        sa.Index("ix_reply_rules_person", "person_id"),
+        sa.Index(
+            "ux_reply_rules_active_chat",
+            "chat_key",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+        sa.Index(
+            "ux_reply_rules_active_address",
+            "address",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+        sa.Index(
+            "ux_reply_rules_active_person",
+            "person_id",
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+    )
+
+
+class JarvisChatState(Base):
+    """One chat's reply bookkeeping (JV-11, 0025): when the client last wrote,
+    when the responder may look at it, and what the owner did since."""
+
+    __tablename__ = "jarvis_chat_state"
+
+    chat_key: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    last_inbound_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    last_inbound_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    respond_after: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    owner_seen_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    owner_composing_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True)
+    )
+    owner_replied_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    ai_paused_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    last_ai_sent_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    ai_turns_since_client: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})",
+            name="ck_jarvis_chat_state_channel",
+        ),
+        sa.Index("ix_jarvis_chat_state_person", "person_id"),
+        sa.Index("ix_jarvis_chat_state_last_inbound", "last_inbound_interaction_id"),
+        sa.Index(
+            "ix_jarvis_chat_state_due",
+            "respond_after",
+            postgresql_where=sa.text("respond_after IS NOT NULL"),
+        ),
+    )
+
+
+class Escalation(Base):
+    """A client message only the owner may answer (JV-11, 0025): a price, a
+    deadline, a promise, an identity question. One open row per chat;
+    repeats append to ``history``. ``summary`` is digit-free prose: the
+    figures on the owner's card come from SQL when it is rendered."""
+
+    __tablename__ = "escalations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    chat_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    summary: Mapped[str | None] = mapped_column(sa.Text)
+    state: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="open"
+    )
+    snoozed_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    snooze_count: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    alerted_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    alert_count: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    alert_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    answered_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    answered_by: Mapped[str | None] = mapped_column(sa.String(16))
+    resolution: Mapped[str | None] = mapped_column(sa.String(16))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})", name="ck_escalations_channel"
+        ),
+        sa.CheckConstraint(
+            f"reasons <@ ARRAY[{_sql_list(ESCALATION_REASONS)}]::text[]",
+            name="ck_escalations_reasons",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(ESCALATION_STATES)})", name="ck_escalations_state"
+        ),
+        sa.CheckConstraint(
+            f"resolution IN ({_sql_list(ESCALATION_RESOLUTIONS)})",
+            name="ck_escalations_resolution",
+        ),
+        sa.Index("ix_escalations_interaction", "interaction_id"),
+        sa.Index("ix_escalations_person", "person_id"),
+        sa.Index(
+            "ux_escalations_open_chat",
+            "chat_key",
+            unique=True,
+            postgresql_where=sa.text(f"state IN ({_sql_list(ESCALATION_OPEN_STATES)})"),
+        ),
+        sa.Index(
+            "ix_escalations_snoozed",
+            "snoozed_until",
+            postgresql_where=sa.text("state = 'snoozed'"),
+        ),
+        sa.Index(
+            "ix_escalations_unalerted",
+            "created_at",
+            postgresql_where=sa.text("alerted_at IS NULL"),
+        ),
+    )
+
+
+class OutboxMessage(Base):
+    """One message MIYA may send from the owner's account (JV-11, 0025): the
+    one outbound chokepoint.
+
+    Only ``miya/jarvis/outbox.py`` creates these rows or changes their state,
+    and an adapter gets one only through ``outbox.claim_ready``, which re-runs
+    the whole gate. The body is plain text and nothing else. ``guard`` is the
+    red-line verdict bound to ``body_sha256``; a DB CHECK keeps AI text that
+    did not pass it from ever being approved, claimed or sent, and another
+    (0028) keeps an autonomous row (``auto:policy``) without a passing shape
+    check (``shapes_ok``) from existing at all.
+    """
+
+    __tablename__ = "outbox_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    channel: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    chat_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    tg_chat_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    to_address: Mapped[str | None] = mapped_column(sa.Text)
+    person_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="SET NULL")
+    )
+    # Purging the client's message takes the draft with it.
+    trigger_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    command_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    sent_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="SET NULL")
+    )
+    escalation_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("escalations.id", ondelete="SET NULL")
+    )
+    reply_to_external_id: Mapped[str | None] = mapped_column(sa.Text)
+    origin: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    intent: Mapped[str | None] = mapped_column(sa.String(24))
+    authored_by: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    body: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # The AI's text before the owner edited it.
+    ai_body: Mapped[str | None] = mapped_column(sa.Text)
+    body_sha256: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    # {verdict, flags, det_hits, model_verdict, body_sha256, checker_version}
+    guard: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    approved_by: Mapped[str | None] = mapped_column(sa.String(16))
+    approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # A scheduled send never leaves before this.
+    not_before: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    card_tg_message_id: Mapped[int | None] = mapped_column(sa.BigInteger)
+    lease_until: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(sa.String(32))
+    attempts: Mapped[int] = mapped_column(
+        sa.SmallInteger, nullable=False, server_default="0"
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    # A code, never text.
+    last_error: Mapped[str | None] = mapped_column(sa.String(64))
+    external_message_id: Mapped[str | None] = mapped_column(sa.Text)
+    read_ack_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    idempotency_key: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"channel IN ({_sql_list(JARVIS_CHANNELS)})",
+            name="ck_outbox_messages_channel",
+        ),
+        sa.CheckConstraint(
+            f"origin IN ({_sql_list(OUTBOX_ORIGINS)})", name="ck_outbox_messages_origin"
+        ),
+        sa.CheckConstraint(
+            f"authored_by IN ({_sql_list(OUTBOX_AUTHORS)})",
+            name="ck_outbox_messages_authored_by",
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(OUTBOX_STATES)})", name="ck_outbox_messages_state"
+        ),
+        sa.CheckConstraint(
+            f"approved_by IN ({_sql_list(OUTBOX_APPROVERS)})",
+            name="ck_outbox_messages_approved_by",
+        ),
+        sa.CheckConstraint(
+            "state <> 'sent' OR approved_by IS NOT NULL",
+            name="ck_outbox_messages_sent_approved",
+        ),
+        # COALESCE: a CHECK passes when its expression is NULL, and an empty
+        # guard makes ``guard->>'verdict'`` NULL.
+        sa.CheckConstraint(
+            "state NOT IN ('approved', 'sending', 'sent') OR authored_by = 'owner' "
+            "OR COALESCE(guard->>'verdict', '') = 'pass'",
+            name="ck_outbox_messages_guarded",
+        ),
+        sa.CheckConstraint(
+            OUTBOX_AUTO_SHAPES_CHECK, name="ck_outbox_messages_auto_shapes"
+        ),
+        sa.Index("ux_outbox_messages_idempotency", "idempotency_key", unique=True),
+        sa.Index("ix_outbox_messages_person", "person_id"),
+        sa.Index("ix_outbox_messages_trigger", "trigger_interaction_id"),
+        sa.Index("ix_outbox_messages_command", "command_interaction_id"),
+        sa.Index("ix_outbox_messages_sent_interaction", "sent_interaction_id"),
+        sa.Index("ix_outbox_messages_escalation", "escalation_id"),
+        sa.Index(
+            "ix_outbox_messages_ready",
+            "channel",
+            "next_attempt_at",
+            postgresql_where=sa.text("state = 'approved'"),
+        ),
+        sa.Index(
+            "ix_outbox_messages_sent_at",
+            "sent_at",
+            postgresql_where=sa.text("sent_at IS NOT NULL"),
+        ),
+        sa.Index(
+            "ux_outbox_messages_external",
+            "channel",
+            "external_message_id",
+            unique=True,
+            postgresql_where=sa.text("external_message_id IS NOT NULL"),
+        ),
+        sa.Index("ix_outbox_messages_chat_state", "chat_key", "state"),
+        sa.Index(
+            "ix_outbox_messages_lease",
+            "lease_until",
+            postgresql_where=sa.text("state = 'sending'"),
+        ),
+    )
+
+
+# The values the owner-style CHECKs allow (JV-14, 0026). The migration keeps
+# its own frozen copy; tests/test_style.py holds the two equal.
+STYLE_PROFILE_STATES = ("draft", "active", "retired")
+STYLE_EXAMPLE_SOURCES = ("history", "owner_edit")
+STYLE_ADDRESS_FORMS = ("siz", "sen", "unknown")
+STYLE_PERSON_SCRIPTS = ("latin", "cyrillic", "mixed")
+STYLE_PERSON_LANGS = ("uz", "ru", "mix")
+
+
+class OwnerStyleProfile(Base):
+    """One built version of the owner's texting style (JV-14, 0026).
+
+    ``traits`` are deterministic counts (``style.compute_traits``: greetings,
+    honorifics, phrases, emoji, length, punctuation, script and language mix);
+    ``prompt_text`` is model prose about them, refused when it holds a digit;
+    ``stalls`` the owner's stall overrides, each used only while it passes
+    the red-line guard in the stall role. A new version is a ``draft`` until
+    the owner activates it; at most one is ``active``.
+    """
+
+    __tablename__ = "owner_style_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    traits: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    prompt_text: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    stalls: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    sample_count: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    window_start: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    window_end: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    input_hash: Mapped[str] = mapped_column(sa.CHAR(64), nullable=False)
+    # The model role's configured value (like RecapDigest.model), or the
+    # deterministic writer's name when no model wrote the prose.
+    model: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
+    approved_by: Mapped[str | None] = mapped_column(sa.String(16))
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint("version", name="uq_owner_style_profiles_version"),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(STYLE_PROFILE_STATES)})",
+            name="ck_owner_style_profiles_state",
+        ),
+        sa.CheckConstraint(
+            "sample_count >= 0", name="ck_owner_style_profiles_sample_count"
+        ),
+        sa.Index(
+            "ux_owner_style_profiles_active",
+            sa.text("(true)"),
+            unique=True,
+            postgresql_where=sa.text("state = 'active'"),
+        ),
+    )
+
+
+class OwnerStyleExample(Base):
+    """A context-reply pair of a profile (JV-14, 0026): a client's message and
+    the owner's own answer to it. Neither text is copied: both are joined by
+    id, so ``/unut`` and edits apply, and purging either takes the example.
+    ``embedding`` is the context's, for retrieval by similarity."""
+
+    __tablename__ = "owner_style_examples"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    profile_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("owner_style_profiles.id", ondelete="CASCADE"), nullable=False
+    )
+    interaction_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE"), nullable=False
+    )
+    context_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    intent: Mapped[str | None] = mapped_column(sa.String(24))
+    script: Mapped[str | None] = mapped_column(sa.String(16))
+    source: Mapped[str] = mapped_column(
+        sa.String(16), nullable=False, server_default="history"
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.UniqueConstraint(
+            "profile_id", "interaction_id", name="uq_owner_style_examples_interaction"
+        ),
+        sa.CheckConstraint(
+            f"source IN ({_sql_list(STYLE_EXAMPLE_SOURCES)})",
+            name="ck_owner_style_examples_source",
+        ),
+        sa.Index("ix_owner_style_examples_interaction", "interaction_id"),
+        sa.Index("ix_owner_style_examples_context", "context_interaction_id"),
+        sa.Index(
+            "ix_owner_style_examples_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+
+class OwnerStylePerson(Base):
+    """How the owner writes to one person (JV-14, 0026), counted from their
+    own messages to them: the honorific («aka»), siz or sen, the script, the
+    language and the usual greeting. ``people.merge_into`` recomputes it."""
+
+    __tablename__ = "owner_style_people"
+
+    person_id: Mapped[int] = mapped_column(
+        sa.ForeignKey("people.id", ondelete="CASCADE"), primary_key=True
+    )
+    honorific: Mapped[str | None] = mapped_column(sa.String(16))
+    address_form: Mapped[str] = mapped_column(
+        sa.String(8), nullable=False, server_default="unknown"
+    )
+    script: Mapped[str | None] = mapped_column(sa.String(16))
+    lang: Mapped[str | None] = mapped_column(sa.String(4))
+    greeting: Mapped[str | None] = mapped_column(sa.Text)
+    sample_count: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"address_form IN ({_sql_list(STYLE_ADDRESS_FORMS)})",
+            name="ck_owner_style_people_address_form",
+        ),
+        sa.CheckConstraint(
+            f"script IN ({_sql_list(STYLE_PERSON_SCRIPTS)})",
+            name="ck_owner_style_people_script",
+        ),
+        sa.CheckConstraint(
+            f"lang IN ({_sql_list(STYLE_PERSON_LANGS)})",
+            name="ck_owner_style_people_lang",
+        ),
+    )
+
+
+# The values the knowledge-base CHECKs allow (JV-15, 0027). The migration keeps
+# its own frozen copy; tests/test_kb.py holds the two equal.
+KB_KINDS = ("fact", "faq")
+KB_STATES = ("suggested", "active", "retired")
+KB_SOURCES = ("owner", "suggested", "import")
+
+
+class KnowledgeEntry(Base):
+    """One fact or question-and-answer the owner approved (JV-15, 0027).
+
+    A ``fact`` is an answer alone; a ``faq`` has the client's question too.
+    ``active`` entries are the owner's: typed in with ``/bilim qo'sh`` or a
+    suggestion they approved with one tap; a ``suggested`` row is MIYA's
+    proposal from the owner's own past answers and is never read as an
+    answer; a ``retired`` one is never read again. ``guard`` is the red-line
+    verdict in the ``kb`` role at write time; every reader checks the text
+    again. Never a client's personal data: no phone, card, e-mail, handle,
+    client code or person's name. The search columns are those of
+    ``memories``.
+    """
+
+    __tablename__ = "knowledge_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    kind: Mapped[str] = mapped_column(sa.String(8), nullable=False)
+    title: Mapped[str | None] = mapped_column(sa.Text)
+    question: Mapped[str | None] = mapped_column(sa.Text)
+    answer: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    lang: Mapped[str | None] = mapped_column(sa.String(4))
+    tags: Mapped[list[str]] = mapped_column(
+        ARRAY(sa.Text), nullable=False, server_default="{}"
+    )
+    state: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    source: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    # The owner's answer a suggestion was mined from: purging it takes the entry.
+    source_interaction_id: Mapped[int | None] = mapped_column(
+        sa.ForeignKey("interactions.id", ondelete="CASCADE")
+    )
+    guard: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+    )
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embed_dim))
+    search_norm: Mapped[str | None] = mapped_column(sa.Text)
+    search_tsv: Mapped[Any] = mapped_column(
+        TSVECTOR,
+        sa.Computed(
+            "to_tsvector('simple'::regconfig, coalesce(search_norm, ''))", persisted=True
+        ),
+    )
+    history: Mapped[list[Any]] = _history_column()
+    created_at: Mapped[datetime] = created_at_column()
+    updated_at: Mapped[datetime] = created_at_column(onupdate=sa.func.now())
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            f"kind IN ({_sql_list(KB_KINDS)})", name="ck_knowledge_entries_kind"
+        ),
+        sa.CheckConstraint(
+            f"state IN ({_sql_list(KB_STATES)})", name="ck_knowledge_entries_state"
+        ),
+        sa.CheckConstraint(
+            f"source IN ({_sql_list(KB_SOURCES)})", name="ck_knowledge_entries_source"
+        ),
+        sa.CheckConstraint("btrim(answer) <> ''", name="ck_knowledge_entries_answer"),
+        sa.CheckConstraint(
+            "kind <> 'faq' OR question IS NOT NULL",
+            name="ck_knowledge_entries_faq_question",
+        ),
+        # Foreign keys that cascade are indexed (WP-23, 0016).
+        sa.Index("ix_knowledge_entries_source_interaction", "source_interaction_id"),
+        sa.Index("ix_knowledge_entries_tags", "tags", postgresql_using="gin"),
+        sa.Index("ix_knowledge_entries_tsv", "search_tsv", postgresql_using="gin"),
+        sa.Index(
+            "ix_knowledge_entries_trgm",
+            "search_norm",
+            postgresql_using="gin",
+            postgresql_ops={"search_norm": "gin_trgm_ops"},
+        ),
+        sa.Index(
+            "ix_knowledge_entries_embedding_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_with={"m": 16, "ef_construction": 64},
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+        sa.Index(
+            "ix_knowledge_entries_unembedded",
+            "id",
+            postgresql_where=sa.text("embedding IS NULL"),
+        ),
     )
