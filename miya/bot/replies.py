@@ -91,7 +91,12 @@ Menga shunchaki yozing, ovozli xabar yuboring yoki chek rasmini tashlang —
 qarz, va'da, xarajat va vazifalarni o'zim ajratib olib yozib qo'yaman.
 
 Savol bersangiz (masalan, «Akmal menga qancha qarz?») — bazadagi aniq
-raqamlar bilan javob beraman.
+raqamlar bilan javob beraman. Oddiy gaplashsangiz ham bo'ladi: salom,
+umumiy savol yoki tarjima — yordamchingiz sifatida javob beraman.
+
+Xabar eslatmami yoki savolmi — o'zim aniqlayman. Adashsam: savolni
+/savol bilan yozing, javob ostidagi «📝 Eslatma sifatida yozib qo'y»
+tugmasi esa uni eslatma qilib saqlaydi.
 
 Har bir qarz, va'da va vazifaning qisqa raqami bor: <code>d12</code>, <code>p7</code>,
 <code>t3</code>. Shu raqam bilan yopasiz yoki tuzatasiz.
@@ -1930,6 +1935,8 @@ OPERATION_LABEL = {
     "report": "kunlik hisobot",
     "planner": "reja tuzish",
     "rag": "savollarga javob",
+    "rag_chat": "suhbat (AI)",
+    "route": "xabar turini aniqlash",
     "profile": "odam haqida profil",
 }
 
@@ -3385,12 +3392,14 @@ QUESTION_GONE = "Bu xabar topilmadi — o'chirilgan bo'lishi mumkin."
 VOICE_QUESTION_CHARS = 300
 
 
-def voice_question_header(text: str) -> str:
-    """What was heard, so a misheard question is visible (WP-60)."""
+def voice_question_header(text: str, *, chat: bool = False) -> str:
+    """What was heard, so a misheard question is visible (WP-60). A chat
+    («Salom, qalaysan») is not called a question."""
     heard = " ".join(text.split())
     if len(heard) > VOICE_QUESTION_CHARS:
         heard = heard[: VOICE_QUESTION_CHARS - 1] + "…"
-    return f"🎙 <i>Savolingiz:</i> «{escape(heard)}»"
+    label = "Eshitganim" if chat else "Savolingiz"
+    return f"🎙 <i>{label}:</i> «{escape(heard)}»"
 
 
 # --- one day's promises and writers, straight from SQL (JV-06) ---------------------

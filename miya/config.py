@@ -437,6 +437,11 @@ class Settings(BaseSettings):
     # up to RAG_FOLLOWUP_PAIRS earlier question/answer pairs as context.
     rag_followup_minutes: int = Field(default=30, ge=0)
     rag_followup_pairs: int = Field(default=2, ge=0, le=6)
+    # Owner request (2026-11-08): a message the rules read as a plain note is
+    # shown once to EXTRACT_MODEL (miya/services/router.py) — a note, a
+    # question or a chat? Any failure keeps it a note. Off: every such
+    # message is a note, as before.
+    router_enabled: bool = True
     # A receipt when the bank confirms a payment the owner already typed.
     money_receipt_on_typed_match: bool = False
 

@@ -192,6 +192,7 @@ Everything is read from `.env` (see `.env.example`). Nothing is hardcoded.
 | `RECAP_MORNING_TOP_PEOPLE` | 5 — the morning "🌙 Kecha" recalls this many of yesterday's main conversations, with the evening's own prose |
 | `PASSAGE_CHUNK_CHARS`, `PASSAGE_CHUNK_OVERLAP`, `PASSAGE_EMBED_MIN_CHARS`, `PASSAGE_INDEX_BATCH`, `PASSAGE_EMBED_BATCH` | 1200 / 200 / 12 / 500 / 128 — every message, transcript, document and note is indexed verbatim for search; long ones are chunked with overlap, short ones are matched by words only; the embed batch stays ≤ 256 |
 | `RAG_FOLLOWUP_MINUTES`, `RAG_FOLLOWUP_PAIRS` | 30 / 2 — a question soon after an answer (or a reply to one) carries the earlier question/answer pairs, so «keyin nima bo'ldi?» works |
+| `ROUTER_ENABLED` | `true` — a message the rules read as a plain note (no `?`, no question word, no command, no small talk) is shown once to EXTRACT_MODEL: a note, a question about the records, or a chat? One short call per such message (`/xarajat`: «xabar turini aniqlash»); any failure keeps the note; `false` = every such message is a note, as before |
 | `RECALL_TOP_K`, `RECALL_CANDIDATES`, `RECALL_MIN_SIMILARITY`, `RECALL_RECENCY_HALFLIFE_DAYS`, `RECALL_RECENCY_WEIGHT`, `RECALL_CONTEXT_LINES` | 12 / 40 / 0.45 / 45 / 0.3 / 3 — hybrid recall: word, typo and meaning matches fused with recency, each hit shown with the lines around it |
 | `EXTRACT_MODEL_PRICE`, `REASON_MODEL_PRICE` | Blank — "input,output" USD per million tokens for the two model roles; set them when you change a model, then `make reprice SINCE=…` |
 | `SPEND_ALERT_DAILY_USD`, `SPEND_ALERT_MONTHLY_USD` | 5 / 60 — a Telegram warning when MIYA's own API spend passes either (0 = off); the hard cap is the Anthropic Console limit |
@@ -278,10 +279,25 @@ ledger only ever has the bank's own record and your own words.
 | `/yordam` | The command list |
 
 Free-form **questions** (ending in `?` or starting with an interrogative like
-*qancha*, *kim*, *сколько*) are answered instead of logged. Money and debt
-figures in those answers always come from SQL tools — Sonnet only phrases the
-result; it is instructed and structurally unable to invent a number that is
-not in a tool result.
+*qancha*, *kim*, *сколько* in either script; and in a short owner's message
+with no figure, also one ending with an interrogative or in the *-mi* particle,
+or asking MIYA to show or list something: «Qarzlarimni ko'rsat») are answered
+instead of logged. Money and debt figures in those answers always
+come from SQL tools — Sonnet only phrases the result; it is instructed and
+structurally unable to invent a number that is not in a tool result.
+
+The owner can also simply **talk** to MIYA: small talk alone («Salom»,
+«Rahmat», «Qalaysan?»), a general question or a request for help («tarjima
+qil», «tushuntirib ber») is a *chat*, answered like an assistant would
+(general knowledge allowed; nothing is written down; the amount guard still
+replaces any large figure no SQL tool returned). Only small talk is a chat by
+the rules alone; what they read as a plain note is shown once to
+EXTRACT_MODEL, with the last exchange (or the answer replied to) for context
+(`miya/services/router.py`, `ROUTER_ENABLED`): a note, a question or a chat?
+A fact is kept a note; any failure keeps it a note (a reply to an answer
+still asks on, WP-75); a forwarded message is never routed and is read by the
+old narrow rules; every answer the router chose carries «📝 Eslatma sifatida
+yozib qo'y» to undo it.
 
 Reminders arrive on the hour for anything due today, tomorrow, or already
 overdue — once per item per 24 hours, and never inside `QUIET_HOURS`. The

@@ -217,6 +217,8 @@ POSSESSIVE_NOT_QUESTION: frozenset[str] = frozenset(
         "qalami",
         "jami",
         "bayrami",
+        "xodimi",
+        "hodimi",
         "muddatlarmi",
         "расми",
         "қисми",
@@ -233,6 +235,8 @@ POSSESSIVE_NOT_QUESTION: frozenset[str] = frozenset(
         "қалами",
         "жами",
         "байрами",
+        "ходими",
+        "ҳодими",
     }
 )
 

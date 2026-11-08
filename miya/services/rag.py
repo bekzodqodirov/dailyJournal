@@ -12,6 +12,7 @@ when two people share a name instead of answering about the wrong one.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
@@ -30,15 +31,15 @@ from miya.config import settings
 from miya.db.enums import DebtDirection, Direction, PromiseMadeBy, TransactionType
 from miya.db.models import ChatMonitor, Interaction, Memory, Person
 from miya.services import codes as client_codes
+from miya.services import loops, queries, recall, retry
 from miya.services import memories as memories_svc
-from miya.services import queries, recall, retry
-from miya.services.amounts import guard_amounts
+from miya.services.amounts import CURRENCY_WORDS, SCALE_WORDS, guard_amounts
 from miya.services.embeddings import Embedder, EmbeddingError, get_embedder
 from miya.services.extraction import API_FAILURES, get_client, to_money
 from miya.services.ingest import text_for_extraction
 from miya.services.people import Match, find_person
 from miya.services.queries import TimelineEntry
-from miya.services.text import normalise_for_search
+from miya.services.text import fold_apostrophes, normalise_for_search
 from miya.services.usage import record_anthropic_usage
 
 log = logging.getLogger(__name__)
@@ -57,8 +58,10 @@ FALLBACK_ANSWER = (
 )
 
 # A message is treated as a question (RAG) rather than a log entry when it ends
-# with a question mark or *starts* with an interrogative. Mid-sentence question
-# words stay logs: "u qancha to'lashini aytdi" is a note, not a question.
+# with a question mark or *starts* with an interrogative; the owner's own short
+# message that states nothing also when it *ends* with one or in the "-mi"
+# particle (looks_like_question). Mid-sentence question words stay logs: "u
+# qancha to'lashini aytdi" is a note, not a question.
 _QUESTION_WORDS = {
     # Uzbek (Latin + common Cyrillic)
     "qancha",
@@ -108,14 +111,181 @@ _QUESTION_WORDS = {
 }
 
 
-def looks_like_question(text: str) -> bool:
+# The Uzbek question words, matched folded (q→k, Cyrillic in Latin) so «Қанча»,
+# «qancha» and «kancha» are one word. Russian and English stay raw, as above:
+# folded, «куда» would be «quda» (an in-law) and «Quda 10 mln berdi» a question.
+_UZBEK_QUESTION_WORDS = (
+    "qancha",
+    "qachon",
+    "qanday",
+    "qanaqa",
+    "qayerda",
+    "qayerga",
+    "qaysi",
+    "nima",
+    "nimaga",
+    "nega",
+    "necha",
+    "nechta",
+    "kim",
+    "kimga",
+    "kimdan",
+)
+
+
+@functools.cache
+def _question_words_folded() -> frozenset[str]:
+    """_UZBEK_QUESTION_WORDS folded, plus «қаерда» («kaerda») and kin."""
+    folded = {normalise_for_search(word) for word in _UZBEK_QUESTION_WORDS}
+    return frozenset(folded | {"kaerda", "kaerga", "kaerdan"})
+
+
+# The wider rules (a question word at either end in any script, the "-mi"
+# particle, an imperative asking for something) decide alone only for a short
+# message that states nothing: no figure, no amount in words, no verb in the
+# past before its last word. «Akmal 3 mln qaytardi, qolganini so'ra», «Akmal
+# ming dollar qaytardi qolgani qancha», «Vali qarzini yopdi, qarzdorlarni
+# ko'rsat» state a payment: the router reads them, and keeps a fact a note.
+PLAIN_MAX_WORDS = 8
+_AMOUNT_WORDS = frozenset(
+    {
+        folded
+        for word in (*SCALE_WORDS, *CURRENCY_WORDS)
+        if (folded := normalise_for_search(word)) and " " not in folded
+    }
+    | {
+        "ikki",
+        "uch",
+        "tort",
+        "besh",
+        "olti",
+        "yetti",
+        "sakkiz",
+        "tokkiz",
+        "yigirma",
+        "ottiz",
+        "kirk",
+        "ellik",
+        "oltmish",
+        "yetmish",
+        "sakson",
+        "tokson",
+        "yuz",
+        "yarim",
+    }
+)
+_CURRENCY_SIGNS = re.compile(r"[$€₽¥£]")
+# A verb in the past (-di, -dim, -dik, -gan…) states what happened.
+_PAST = ("di", "dim", "dik", "ding", "dingiz", "dilar", "ibdi", "gan", "gandi")
+
+
+def _plain(text: str) -> bool:
+    if len(text.split()) > PLAIN_MAX_WORDS or re.search(r"\d", text):
+        return False
+    if _CURRENCY_SIGNS.search(text):
+        return False
+    words = normalise_for_search(text).split()
+    if any(word in _AMOUNT_WORDS for word in words):
+        return False
+    return not any(word.endswith(_PAST) for word in words[:-1])
+
+
+# A question word that ENDS the message asks too: «Akmalning qarzi qancha»,
+# «Konteyner qayerda», «Bu kim». Folded (q→k, Cyrillic in Latin, «қаерда» is
+# «kaerda»). Mid-sentence it stays a note: «u qancha to'lashini aytdi».
+_TRAILING_ASKS = frozenset(
+    {
+        "kancha",
+        "kachon",
+        "kanday",
+        "kanaka",
+        "kayerda",
+        "kaerda",
+        "kayerga",
+        "kaerga",
+        "kayerdan",
+        "kaerdan",
+        "kaysi",
+        "kani",
+        "nechta",
+        "necha",
+        "nega",
+        "nimaga",
+        "nima",
+        "kim",
+        "kimga",
+        "kimdan",
+    }
+)
+# «hech qachon», «hech kim», «har kim» (never, nobody, everyone), «bilmadim
+# qachon» (I don't know when), «bir necha» (a few) end a note.
+_NOT_ASKING_BEFORE = frozenset({"hech", "har", "bilmadim", "bilmayman", "nomalum", "bir"})
+# A clause break: «Akmal qaytaraman dedi, bilmadim qachon» states something
+# before its last word, so only a single-clause message is read by its end.
+_CLAUSE_BREAK = re.compile(r"[,.;:—–]\s*\S")
+
+# Vowels before a final "-mi": Russian instrumental plurals end in a vowel and
+# "mi" («наличными», «частями», «chastyami») and say nothing about asking.
+_VOWELS = frozenset("aeiouаеёиоуыэюяўьъ'")
+
+
+def asks_with_particle(text: str) -> bool:
+    """The "-mi" particle as the open-loops detector reads it (case kept, so
+    «Rahimi keldi» is a name), narrowed for the owner's own typing, where a
+    false question loses a note: the everyday forms, a verb in «-dimi»
+    («berdimi», «келдими»), or a consonant before «mi» («tayyormi», «борми»,
+    «kerakmi», «shundaymi»); never a vowel («Оплата наличными»,
+    «oplata nalichnymi», «uning rejimi»)."""
+    folded = fold_apostrophes(text.strip())
+    if not loops.ends_in_question_particle(folded):
+        return False
+    last = re.search(r"([\w']+)\W*$", folded)
+    if last is None:
+        return False
+    word = last.group(1).lower()
+    if word in loops.QUESTION_PARTICLE_FORMS:
+        return True
+    stem = word[:-2]
+    if stem.endswith(("di", "ди")):
+        return True
+    before = stem[-1:]
+    if before in ("y", "й"):
+        # «shundaymi» asks; «nalichnymi» (Russian «-ymi») does not.
+        return stem[-2:-1] in _VOWELS
+    return bool(before) and before not in _VOWELS
+
+
+def looks_like_question(text: str, *, owner: bool = True) -> bool:
+    """A "?" or a leading question word asks, whoever wrote it. The wider
+    rules read only the owner's own short messages (``_plain``):
+    ``owner=False`` is a forwarded message, someone else's words, read as
+    before them."""
     stripped = text.strip()
     if not stripped:
         return False
     if stripped.rstrip(".! ").endswith("?"):
         return True
     first = re.split(r"[\s,]+", stripped.lower(), maxsplit=1)[0].strip("?!.,")
-    return first in _QUESTION_WORDS
+    if first in _QUESTION_WORDS:
+        return True
+    if not owner or not _plain(stripped):
+        return False
+    words = normalise_for_search(stripped).split()
+    if words and words[0] in _question_words_folded():
+        return True
+    if _CLAUSE_BREAK.search(stripped.rstrip(".!… ")):
+        return False
+    raw = stripped.rstrip(".!… ").split()
+    if (
+        words
+        and words[-1] in _TRAILING_ASKS
+        and (len(words) < 2 or words[-2] not in _NOT_ASKING_BEFORE)
+        # «Mijoz Viktor Kim», «familiyasi Kim»: a capitalised last word is a
+        # name, not «kim?».
+        and not (len(raw) > 1 and raw[-1][:1].isupper())
+    ):
+        return True
+    return asks_with_particle(stripped)
 
 
 RAG_SYSTEM_PROMPT = """\
@@ -146,7 +316,12 @@ Data access rules — these are absolute:
 - direction "they_owe_me" means the person owes the owner ("sizdan qarzi
   bor"); "i_owe_them" means the owner owes them ("siz qarzdorsiz").
 - Dates in tool results are ISO; render them in Uzbek: "25-avgust".
-- If the answer is genuinely outside the stored data, say so briefly.
+- If a question about the owner's own records finds nothing there, say so
+  briefly. A general question that is not about him, his people, his
+  business or his records (how something works, a definition, a translation,
+  advice in general) is answered from general knowledge like a capable
+  assistant: never presented as something the records hold, and never with
+  a figure about his own money.
 
 People — "Akmal kim?", "Akmal bilan nima bo'lgan edi?", "Sardorga nima
 deganman?":
@@ -191,6 +366,27 @@ the CURRENT_DATE lines at the top of the question give for the day word
 (bugun, kecha, o'tgan kuni, a weekday). Report the list as the tool
 returned it; never add or drop a line. When total is larger than the list,
 say how many more there are.
+
+Conversation (MODE: chat at the top of the message) — the owner is talking to
+you rather than asking about his records: a greeting, thanks, small talk, a
+general question, or a request to explain, translate, calculate or write
+something:
+- Reply like a warm, sharp personal assistant would in a chat: natural
+  Uzbek, short (one to three lines for small talk), no lists unless he asked
+  for one. Greet back, take thanks, ask how you can help only when it fits;
+  never answer with a menu of commands.
+- Nothing said in chat is written to his records. Never say you recorded,
+  saved or noted anything; if he seems to want something kept, tell him to
+  tap «📝 Eslatma sifatida yozib qo'y» under your answer.
+- If the conversation turns to his money, people, promises or what happened,
+  use the tools exactly as for any question: every figure about his own
+  affairs still comes only from a tool result.
+- A large figure no tool returned — a sum of money, a number with ming or
+  mln, any number of five or more digits — is replaced with
+  ‹summa tekshirilmadi› before he sees it. Never estimate or compute one;
+  when a general answer would need one, say plainly that you give such
+  figures only from his records.
+- Earlier turns above are the conversation so far; keep its thread.
 
 Clients — the owner identifies clients by a GS code (GS367) or by name. A code
 is exact: pass it as the name to person_summary, person_timeline or open_debts,
@@ -1307,6 +1503,7 @@ ACT_TOOL_NAMES = frozenset(
     }
 )
 COMMAND_OPERATION = "jarvis_command"
+CHAT_OPERATION = "rag_chat"
 REF_RE = re.compile(r"\b([mf]\d+(?:#\d+)?)\b")
 CITED_RE = re.compile(r"\[([mf]\d+(?:#\d+)?)\]")
 
@@ -1349,19 +1546,157 @@ def is_command(text: str) -> bool:
     return any(cue.search(norm) for cue in COMMAND_CUES)
 
 
-def classify(text: str, *, commands: bool = True) -> str:
-    """'opinion', 'command', 'question' or 'note'. The cues are matched on
-    the folded text; looks_like_question always on the raw one (it needs its
-    '?' and the q-spelled first words). A command is read before a question:
-    «Sardorga yozib yubor: ertaga kelasanmi?» is the owner's words to send,
-    not a question to MIYA. ``commands=False`` (Jarvis off) never says
-    'command'."""
+# The owner asking MIYA for something from the records, as an imperative
+# (plain or polite) that ends the message, so reported speech stays a note:
+# «Qarzlarimni ko'rsat» asks, «Akmal ko'rsat dedi» does not. Folded like
+# normalise_for_search (q→k, apostrophes dropped). General help («tarjima
+# qil», «tushuntirib ber», «yordam ber») is left to the router: to a journal
+# «Ertaga Akmalga yordam ber» is as often a task as a request.
+_ASK_END = r"(?:ing|ingiz|gin|chi|ingchi)?(?:\s+(?:iltimos|tezrok|hozir))?\s*$"
+RECORD_ASK_CUES = tuple(
+    re.compile(rf"\b{stem}{_ASK_END}")
+    for stem in (
+        r"korsat",
+        r"korsatib\s+ber",
+        r"sanab\s+ber",
+        r"menga\s+(?:\w+\s+){0,6}ayt",
+        r"(?:reja|royxat)\w*\s+(?:\w+\s+)?tuz(?:ib\s+ber)?",
+    )
+)
+# «Akmalga hujjatni ko'rsat», «Ertaga ko'rsat»: shown to someone else or later
+# is a task for the owner, not a request to MIYA.
+_ASKER_DATIVES = frozenset({"menga", "bizga"})
+
+
+# Small talk: a message made only of these phrases (and words of address) is
+# the owner talking to MIYA, not a note: «Salom», «Rahmat!», «Qalaysan?»,
+# «Assalomu alaykum MIYA». Folded; one phrase per line.
+_SMALL_TALK_RAW = """
+salom
+salom alaykum
+assalom
+assalomu alaykum
+assalomu aleykum
+vaalaykum assalom
+va alaykum assalom
+xayrli tong
+hayrli tong
+xayrli kun
+xayrli kech
+xayrli tun
+rahmat
+raxmat
+katta rahmat
+kattakon rahmat
+kop rahmat
+tashakkur
+kalaysan
+kalaysiz
+kalesan
+kalesiz
+yaxshimisan
+yaxshimisiz
+kalay
+ishlar kanday
+ishlar kalay
+ishlaring kanday
+ishlaringiz kanday
+nima gap
+nima gaplar
+nima yangilik
+yaxshi
+zor
+ajoyib
+barakalla
+ok
+okey
+xop
+hop
+mayli
+tushundim
+tushunarli
+sog bol
+sog boling
+xayr
+hayr
+korishguncha
+privet
+zdravstvuyte
+spasibo
+bolshoe spasibo
+kak dela
+poka
+hi
+hello
+hey
+thanks
+thank you
+good morning
+"""
+_SMALL_TALK = frozenset(
+    tuple(line.split()) for line in _SMALL_TALK_RAW.splitlines() if line.strip()
+)
+_SMALL_TALK_LONGEST = max(len(phrase) for phrase in _SMALL_TALK)
+_SMALL_TALK_ADDRESS = frozenset({"miya", "aka", "dostim", "bro", "jon", "sen", "sizga"})
+SMALL_TALK_MAX_WORDS = 8
+
+
+def is_small_talk(text: str) -> bool:
+    """Is ``text`` only greetings, thanks and the like (at least one phrase,
+    the rest words of address)? Pure, no model call."""
+    words = normalise_for_search(text).split()
+    if not words or len(words) > SMALL_TALK_MAX_WORDS:
+        return False
+    i, seen = 0, False
+    while i < len(words):
+        for size in range(min(_SMALL_TALK_LONGEST, len(words) - i), 0, -1):
+            if tuple(words[i : i + size]) in _SMALL_TALK:
+                i, seen = i + size, True
+                break
+        else:
+            if words[i] not in _SMALL_TALK_ADDRESS:
+                return False
+            i += 1
+    return seen
+
+
+def asks_for_records(text: str) -> bool:
+    """«Qarzlarimni ko'rsat», «Menga bugungi ishlarimni ayt»: an imperative
+    asking MIYA for something the records hold — never one aimed at someone
+    else or at a later time («Akmalga hujjatni ko'rsat», «ertaga»)."""
+    norm = normalise_for_search(text)
+    if not any(cue.search(norm) for cue in RECORD_ASK_CUES):
+        return False
+    return not any(
+        word.endswith(("ga", "ka")) and word not in _ASKER_DATIVES
+        for word in norm.split()
+    )
+
+
+def classify(text: str, *, commands: bool = True, owner: bool = True) -> str:
+    """'opinion', 'command', 'chat', 'question' or 'note'. The cues are
+    matched on the folded text; looks_like_question always on the raw one (it
+    needs its '?' and the q-spelled first words). A command is read before a
+    question: «Sardorga yozib yubor: ertaga kelasanmi?» is the owner's words
+    to send, not a question to MIYA. ``commands=False`` (Jarvis off) never
+    says 'command'. 'chat' is the owner talking to MIYA rather than about his
+    records; the rules call only small talk alone a chat («Salom»,
+    «Qalaysan?»). ``owner=False`` (a forwarded message) is never small talk
+    or an imperative to MIYA. What is left is a 'note' to the rules; the bot
+    asks the router about it (miya.services.router), which also knows a
+    general question or a request for help."""
     norm = normalise_for_search(text)
     if any(cue.search(norm) for cue in OPINION_CUES):
         return "opinion"
     if commands and any(cue.search(norm) for cue in COMMAND_CUES):
         return "command"
-    if looks_like_question(text) or any(cue in norm for cue in ROUTE_CUES):
+    if owner and is_small_talk(text):
+        return "chat"
+    if (
+        looks_like_question(text, owner=owner)
+        or any(cue in norm for cue in ROUTE_CUES)
+        or (owner and _plain(text) and asks_for_records(text))
+    ):
         return "question"
     return "note"
 
@@ -1612,8 +1947,10 @@ async def answer_full(
     evidence_block = ""
     # A command (JV-20) is the owner's words to act on, not a recall: no
     # evidence is fetched first, and a «masala» in the dictated text never
-    # turns it into «nothing found».
-    if mode == "opinion" or (mode != "command" and wants_evidence(question)):
+    # turns it into «nothing found». Nor is a chat («Python haqida
+    # tushuntir»): it is not about the records at all.
+    recalls = mode not in ("command", "chat") and wants_evidence(question)
+    if mode == "opinion" or recalls:
         search_text = question
         if history:
             # A follow-up with nothing of its own ("keyin nima bo'ldi?")
@@ -1653,7 +1990,7 @@ async def answer_full(
         }
     ]
     content = f"{date_hints(now)}\n"
-    if evidence is not None or turn is not None:
+    if evidence is not None or turn is not None or mode == "chat":
         content += f"MODE: {mode}\n"
     content += f"---\n{question}"
     if evidence_block:
@@ -1680,6 +2017,8 @@ async def answer_full(
         if mode == "opinion"
         else COMMAND_OPERATION
         if turn is not None
+        else CHAT_OPERATION
+        if mode == "chat"
         else "rag"
     )
 
