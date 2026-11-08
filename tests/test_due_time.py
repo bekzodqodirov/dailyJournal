@@ -146,6 +146,9 @@ async def test_extraction_keeps_time(session):
 
 
 async def test_a_promise_claim_keeps_its_time_through_correction_and_answer(session):
+    # claim_line compares the due date with the real clock (an overdue one
+    # reads «N kun kechikdi», without its time), so the date comes from it.
+    due = datetime.now(settings.tz).date() + timedelta(days=30)
     interaction = await _interaction(session)
     applied = await apply_extraction(
         session,
@@ -156,24 +159,24 @@ async def test_a_promise_claim_keeps_its_time_through_correction_and_answer(sess
                     made_by="me",
                     person="Akmal",
                     description="hujjat yuborish",
-                    due_date="2026-10-23",
+                    due_date=due.isoformat(),
                     asserted_by="them",
                 )
             ]
         ),
     )
     [claim] = applied.claims
-    edit = records.parse_edit("2026-10-23 14:00")
+    edit = records.parse_edit(f"{due.isoformat()} 14:00")
     await claims.edit(session, claim.id, edit, by=claims.BY_COMMAND)
-    assert claim.payload["due_date"] == "2026-10-23T14:00"
+    assert claim.payload["due_date"] == f"{due.isoformat()}T14:00"
     view = claims.view(claim)
-    assert (view.due, view.due_time) == (date(2026, 10, 23), time(14, 0))
+    assert (view.due, view.due_time) == (due, time(14, 0))
     assert f"({f.short_due(view.due, view.due_time)})" in f.claim_line(view)
     assert "14:00" in f.claim_line(view)
 
     await claims.accept(session, claim.id, by=claims.BY_COMMAND)
     promise = await session.scalar(sa.select(m.Promise))
-    assert (promise.due_date, promise.due_time) == (date(2026, 10, 23), time(14, 0))
+    assert (promise.due_date, promise.due_time) == (due, time(14, 0))
 
 
 async def test_a_debt_claim_refuses_a_time_of_day(session):
