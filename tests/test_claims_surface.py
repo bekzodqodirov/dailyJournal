@@ -580,7 +580,7 @@ async def test_the_bot_receipt_carries_the_question_and_marks_it_asked(
         return SimpleNamespace(ok=True, applied=Applied(claims=[claim]))
 
     monkeypatch.setattr(handlers, "process_interaction", _process)
-    monkeypatch.setattr(handlers.rag, "looks_like_question", lambda text: False)
+    monkeypatch.setattr(handlers.rag, "looks_like_question", lambda text, **_: False)
     message = SimpleNamespace(
         text="Akmal: sen menga 5 mln qarzsan",
         date=datetime.now(TZ),

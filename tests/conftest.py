@@ -54,6 +54,22 @@ def _backups_in_tmp(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def _router_offline(monkeypatch):
+    """No test may reach the model through the note/question/chat router: a
+    laptop's .env can hold a real key. The router then fails as it does in an
+    outage and every message the rules read as a note stays one — the
+    behaviour each older test was written against. tests/test_router.py
+    stubs it per test."""
+    from miya.services import router
+    from miya.services.extraction import AnthropicUnavailable
+
+    def offline():
+        raise AnthropicUnavailable("no router model in tests")
+
+    monkeypatch.setattr(router, "get_client", offline)
+
+
+@pytest.fixture(autouse=True)
 def _strong_api_token(monkeypatch):
     """The bot and worker refuse to start with a short API token; tests that
     drive their run() must not trip on the laptop's blank .env."""

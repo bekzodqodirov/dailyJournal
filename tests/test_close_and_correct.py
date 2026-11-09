@@ -615,7 +615,7 @@ async def test_a_note_is_confirmed_with_its_buttons(bound, monkeypatch):
         message.sent.append((text, kwargs.get("reply_markup")))
 
     message.answer = _answer
-    monkeypatch.setattr(handlers.rag, "looks_like_question", lambda text: False)
+    monkeypatch.setattr(handlers.rag, "looks_like_question", lambda text, **_: False)
 
     await handlers.on_text(message)
 

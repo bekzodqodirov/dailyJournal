@@ -79,6 +79,7 @@ from miya.services import (
     vision,
 )
 from miya.services import codes as client_codes
+from miya.services import router as message_router
 from miya.services.embeddings import get_embedder
 from miya.services.extraction import ExtractedTransaction
 from miya.services.ingest import (
@@ -3747,19 +3748,36 @@ async def _code_to_person(session, code: str, name: str, holder: Person | None):
 _SPOKEN_ASK = re.compile(r"(?<![a-z0-9])(?:nima|kim)(?![a-z0-9])")
 
 
-def _spoken_mode(text: str, *, commands: bool | None = None) -> str:
-    """A transcript has no '?': the "-mi" particle marks the question too,
-    and so does "nima"/"kim" with a recalling verb ("nima bo'lgandi"). The
-    two questions SQL answers alone (JV-06) are questions however spoken.
-    ``commands`` (default: Jarvis on) lets it be a command (JV-20)."""
+# Scribe writes Russian in Cyrillic, where an instrumental plural («годами»,
+# «наличными», «людьми») ends in "-mi" and asks nothing.
+_RUSSIAN_PLURAL_MI = ("ами", "ями", "ыми", "ьми")
+
+
+def _spoken_particle(text: str) -> bool:
+    """The "-mi" particle as heard: broader than typed (rag.asks_with_particle),
+    since speech has no Russian in Latin letters — «ofisdami», «yaxshimi»."""
+    folded = fold_apostrophes(text.strip())
+    if not loops.ends_in_question_particle(folded):
+        return False
+    words = folded.lower().rstrip(".!?… ").split()
+    return bool(words) and not words[-1].endswith(_RUSSIAN_PLURAL_MI)
+
+
+def _spoken_mode(text: str, *, commands: bool | None = None, owner: bool = True) -> str:
+    """A transcript has no '?': the "-mi" particle marks the question (as it
+    does typed, in rag.classify), and so does "nima"/"kim" with a recalling
+    verb ("nima bo'lgandi"). The two questions SQL answers alone (JV-06) are
+    questions however spoken. ``commands`` (default: Jarvis on) lets it be a
+    command (JV-20); ``owner=False`` is a forwarded voice, someone else's
+    words (rag.classify)."""
     if rag.owner_question(text, datetime.now(settings.tz)) is not None:
         return "question"
     if commands is None:
         commands = settings.jarvis_enabled
-    mode = rag.classify(text, commands=commands)
+    mode = rag.classify(text, commands=commands, owner=owner)
     if mode != "note":
         return mode
-    if loops.ends_in_question_particle(fold_apostrophes(text)):
+    if owner and _spoken_particle(text):
         return "question"
     if _SPOKEN_ASK.search(normalise_for_search(text)) and rag.wants_evidence(text):
         return "question"
@@ -3945,13 +3963,19 @@ async def _unqueued_note(session, interaction: Interaction):
 
 
 async def _send_answered(
-    message: Message, reply: str, interaction_id: int, actions: list, note
+    message: Message,
+    reply: str,
+    interaction_id: int,
+    actions: list,
+    note,
+    *,
+    offer_note: bool = True,
 ) -> None:
     """An answer, then the cards of what a command proposed (JV-20), or the
     note receipt of a command that queued nothing (no «save as note» button:
     it is a note already)."""
     if note is None:
-        await _send_answer(message, reply, interaction_id)
+        await _send_answer(message, reply, interaction_id, offer_note=offer_note)
     else:
         await _safe_answer(message, reply)
         receipt, keyboard = note
@@ -3959,10 +3983,13 @@ async def _send_answered(
     await _deliver_actions(message, actions)
 
 
-async def _send_answer(message: Message, reply: str, interaction_id: int) -> None:
-    sent = await _safe_answer(
-        message, reply, reply_markup=keyboards.save_as_note(interaction_id)
-    )
+async def _send_answer(
+    message: Message, reply: str, interaction_id: int, *, offer_note: bool = True
+) -> None:
+    """The answer, with «📝 Eslatma sifatida yozib qo'y» under it unless the
+    message was small talk alone (a «Salom» holds nothing to keep)."""
+    keyboard = keyboards.save_as_note(interaction_id) if offer_note else None
+    sent = await _safe_answer(message, reply, reply_markup=keyboard)
     if sent is not None and getattr(sent, "message_id", None) is not None:
         async with session_scope() as session:
             row = await session.get(Interaction, interaction_id)
@@ -3970,22 +3997,59 @@ async def _send_answer(message: Message, reply: str, interaction_id: int) -> Non
                 row.meta = {**(row.meta or {}), "answer_message_id": sent.message_id}
 
 
+# meta["routed"] on a row the router (not the rules) sent to an answer, so a
+# «📝 Eslatma sifatida yozib qo'y» tap on it is visible as the router's miss.
+ROUTED_BY_MODEL = "model"
+
+
+async def _route_note(
+    session, text: str, message, history: tuple, *, replied: bool = False
+) -> tuple[str, bool]:
+    """(mode, routed) for what the rules read as a plain note: the router's
+    reading, with the earlier exchange (the one replied to, if any) as
+    context (owner request, 2026-11-08). When the router is off or fails, a
+    reply to MIYA's answer asks on, as it always did (WP-75), and anything
+    else stays a note. A forwarded message is someone else's words to keep:
+    never routed. Nor are «… yozib yubor» words with Jarvis off: they are
+    read as before (rule 20), never answered as a chat."""
+    if _forwarded(message):
+        return "note", False
+    fallback = "question" if replied else "note"
+    if rag.is_command(text):
+        return fallback, False
+    asked = await message_router.route(session, text, history=history, replied=replied)
+    if asked is None:
+        return fallback, False
+    if asked == message_router.NOTE:
+        return "note", False
+    return asked, True
+
+
 async def _answer_question(
-    message: Message, text: str, mode: str, *, history: tuple | None = None
+    message: Message,
+    text: str,
+    mode: str,
+    *,
+    history: tuple | None = None,
+    routed: bool = False,
 ) -> None:
-    """A question or an opinion: answered, not extracted — but it still lands
-    in interactions ("every input lands here"), marked so /tekshir and the
-    extractor both leave it alone, with the answer and what it cited."""
+    """A question, an opinion or a chat: answered, not extracted — but it
+    still lands in interactions ("every input lands here"), marked so
+    /tekshir and the extractor both leave it alone, with the answer and what
+    it cited."""
     async with session_scope() as session:
         if history is None:
             history, _ = await _followup_history(session, message)
+        meta: dict = {"kind": "question"}
+        if routed:
+            meta["routed"] = ROUTED_BY_MODEL
         interaction = await create_interaction(
             session,
             source=InteractionSource.assistant_bot,
             direction=Direction.in_,
             text=text,
             occurred_at=message.date.astimezone(settings.tz),
-            meta={"kind": "question"},
+            meta=meta,
         )
         actions: list = []
         reply = await _answer_into(
@@ -3993,7 +4057,10 @@ async def _answer_question(
         )
         note = await _unqueued_note(session, interaction)
         interaction_id = interaction.id
-    await _send_answered(message, reply, interaction_id, actions, note)
+    offer_note = not (mode == "chat" and rag.is_small_talk(text))
+    await _send_answered(
+        message, reply, interaction_id, actions, note, offer_note=offer_note
+    )
 
 
 @router.message(Command("savol"))
@@ -4434,23 +4501,33 @@ async def on_text(message: Message) -> None:
         return
     async with session_scope() as session:
         history, replied = await _followup_history(session, message)
-    # «… yozib yubor» is a command only while Jarvis is on (rule 20);
-    # otherwise it is read as before. A forwarded message is someone else's
-    # words, never the owner's command (rule 16).
-    mode = rag.classify(
-        message.text or "",
-        commands=settings.jarvis_enabled and not _forwarded(message),
-    )
-    if replied and mode == "note":
-        # A reply to MIYA's answer asks on, "?" or not (WP-75).
-        mode = "question"
-    if mode != "question" and rag.owner_question(
-        message.text or "", message.date.astimezone(settings.tz)
-    ):
-        # «Kecha kimlar yozdi» needs no '?': SQL answers it alone (JV-06).
-        mode = "question"
+        # «… yozib yubor» is a command only while Jarvis is on (rule 20);
+        # otherwise it is read as before. A forwarded message is someone else's
+        # words, never the owner's command (rule 16) nor his small talk.
+        forwarded = _forwarded(message)
+        mode = rag.classify(
+            message.text or "",
+            commands=settings.jarvis_enabled and not forwarded,
+            owner=not forwarded,
+        )
+        if mode != "question" and rag.owner_question(
+            message.text or "", message.date.astimezone(settings.tz)
+        ):
+            # «Kecha kimlar yozdi» needs no '?': SQL answers it alone (JV-06).
+            mode = "question"
+        routed = False
+        if mode == "note":
+            # «Bugun nima qilishim kerak», «Xitoy yangi yili qachon»: the
+            # rules cannot tell every chat or question from a note, so the
+            # router reads what they leave; a reply to MIYA's answer is read
+            # with that answer (WP-75: «keyin-chi?» asks on, a fact is kept).
+            mode, routed = await _route_note(
+                session, message.text or "", message, history, replied=replied
+            )
     if mode != "note":
-        await _answer_question(message, message.text, mode, history=history)
+        await _answer_question(
+            message, message.text, mode, history=history, routed=routed
+        )
         return
 
     async with session_scope() as session:
@@ -4482,11 +4559,13 @@ async def _spoken_question(
     history, replied = (
         await _followup_history(session, message) if message is not None else ((), False)
     )
+    forwarded = _forwarded(message)
     mode = _spoken_mode(
-        text, commands=settings.jarvis_enabled and not _forwarded(message)
+        text, commands=settings.jarvis_enabled and not forwarded, owner=not forwarded
     )
-    if mode == "note" and replied:
-        mode = "question"
+    routed = False
+    if mode == "note":
+        mode, routed = await _route_note(session, text, message, history, replied=replied)
     if mode == "note":
         return None
     interaction.meta = {
@@ -4494,13 +4573,14 @@ async def _spoken_question(
         "kind": "question",
         "mode": mode,
         "via": "voice",
+        **({"routed": ROUTED_BY_MODEL} if routed else {}),
     }
     return await _answer_into(
         session,
         interaction,
         text,
         mode,
-        header=replies.voice_question_header(text),
+        header=replies.voice_question_header(text, chat=mode == "chat"),
         history=history,
         actions=actions,
     )
